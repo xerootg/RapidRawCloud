@@ -1,0 +1,46 @@
+[package]
+name = "rrcloud-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97"
+description = "RapidRawCloud sync engine core: S3 client (hand-rolled SigV4), journal, manifests, state machines."
+license = "AGPL-3.0-only"
+publish = false
+
+# Standalone for now: explicitly NOT a member of the src-tauri package/workspace.
+# The empty [workspace] table stops cargo from walking up and trying to attach
+# this crate to a parent workspace.
+[workspace]
+
+[dependencies]
+bytes = "1"
+futures = "0.3"
+hex = "0.4"
+hmac = "0.12"
+percent-encoding = "2"
+quick-xml = { version = "0.38", features = ["serialize"] }
+# 0.13 matches the reqwest/rustls stack the host app (src-tauri) already
+# ships, so joining the workspace does not pull in a second HTTP stack
+# (§3.9 rationale). The rustls-platform-verifier hookup lands with the
+# workspace integration.
+reqwest = { version = "0.13", default-features = false, features = [
+    "rustls",
+    "stream",
+] }
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "macros"] }
+
+[dev-dependencies]
+base64 = "0.22"
+md-5 = "0.10"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "time",
+    "io-util",
+] }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
