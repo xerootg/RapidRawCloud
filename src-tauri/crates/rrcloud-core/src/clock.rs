@@ -41,14 +41,46 @@ impl DeviceId {
     /// Validates `s` as a canonical lowercase UUIDv4 and wraps it.
     pub fn new(s: impl Into<String>) -> Result<Self, DeviceIdError> {
         let s = s.into();
-        let _ = s;
-        todo!("P1-U1 green: DeviceId validation")
+        if is_canonical_uuidv4(&s) {
+            Ok(DeviceId(s))
+        } else {
+            Err(DeviceIdError::Invalid(s))
+        }
     }
 
     /// The canonical string form.
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// `true` when `s` is a canonical lowercase hyphenated UUIDv4: 36 bytes,
+/// hyphens at 8/13/18/23, lowercase hex elsewhere, version nibble `4`.
+fn is_canonical_uuidv4(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, &c) in b.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if c != b'-' {
+                    return false;
+                }
+            }
+            14 => {
+                if c != b'4' {
+                    return false;
+                }
+            }
+            _ => {
+                if !(c.is_ascii_digit() || (b'a'..=b'f').contains(&c)) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
 }
 
 impl TryFrom<String> for DeviceId {
@@ -90,22 +122,26 @@ impl VersionVector {
 
     /// The counter for `device` (`0` when absent).
     pub fn get(&self, device: &DeviceId) -> u32 {
-        let _ = device;
-        todo!("P1-U1 green: VersionVector::get")
+        self.0.get(device).copied().unwrap_or(0)
     }
 
     /// Increments `device`'s component by one (one admitted upload = one
     /// version, §2.6).
     pub fn bump(&mut self, device: &DeviceId) {
-        let _ = device;
-        todo!("P1-U1 green: VersionVector::bump")
+        let slot = self.0.entry(device.clone()).or_insert(0);
+        *slot = slot.saturating_add(1);
     }
 
     /// Elementwise-max merge of `other` into `self` (§2.6: after conflict
     /// resolution the key's vv becomes the max of both branches).
     pub fn merge(&mut self, other: &VersionVector) {
-        let _ = other;
-        todo!("P1-U1 green: VersionVector::merge")
+        for (device, &count) in &other.0 {
+            if count == 0 {
+                continue;
+            }
+            let slot = self.0.entry(device.clone()).or_insert(0);
+            *slot = (*slot).max(count);
+        }
     }
 
     /// Number of non-zero components present.
@@ -128,8 +164,15 @@ impl FromIterator<(DeviceId, u32)> for VersionVector {
     /// Collects `(device, counter)` pairs, dropping zero counters (see the
     /// type docs: zero components are never stored).
     fn from_iter<T: IntoIterator<Item = (DeviceId, u32)>>(iter: T) -> Self {
-        let _ = iter.into_iter();
-        todo!("P1-U1 green: VersionVector construction")
+        let mut map = BTreeMap::new();
+        for (device, count) in iter {
+            if count == 0 {
+                continue;
+            }
+            let slot = map.entry(device).or_insert(0);
+            *slot = (*slot).max(count);
+        }
+        VersionVector(map)
     }
 }
 
@@ -150,8 +193,24 @@ pub enum VvOrder {
 /// matching component of `b` (missing = 0). Neither dominating means the
 /// versions are [`VvOrder::Concurrent`].
 pub fn compare(a: &VersionVector, b: &VersionVector) -> VvOrder {
-    let _ = (a, b);
-    todo!("P1-U1 green: version vector ordering")
+    let mut a_ge_b = true;
+    let mut b_ge_a = true;
+    for device in a.0.keys().chain(b.0.keys()) {
+        let ca = a.get(device);
+        let cb = b.get(device);
+        if ca < cb {
+            a_ge_b = false;
+        }
+        if cb < ca {
+            b_ge_a = false;
+        }
+    }
+    match (a_ge_b, b_ge_a) {
+        (true, true) => VvOrder::Equal,
+        (true, false) => VvOrder::Greater,
+        (false, true) => VvOrder::Less,
+        (false, false) => VvOrder::Concurrent,
+    }
 }
 
 /// One side of a concurrent pair handed to [`pick_winner`].
@@ -169,6 +228,9 @@ pub struct Candidate<'a> {
 /// wins. Totally deterministic and symmetric:
 /// `pick_winner(a, b) == pick_winner(b, a)` for all inputs.
 pub fn pick_winner<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
-    let _ = (a, b);
-    todo!("P1-U1 green: deterministic conflict winner")
+    if (a.ts, a.device) >= (b.ts, b.device) {
+        a
+    } else {
+        b
+    }
 }

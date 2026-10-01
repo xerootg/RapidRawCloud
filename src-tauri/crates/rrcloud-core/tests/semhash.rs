@@ -284,10 +284,13 @@ fn non_object_root_is_an_error() {
 
 #[test]
 fn content_id_is_full_blake3_lowercase_hex() {
-    // Known blake3 vector: empty input.
+    // Known blake3 vector: empty input (official BLAKE3 test_vectors.json,
+    // input_len 0). The red commit had a one-character typo here
+    // ("…0404dee36…" for "…0404dea36…"), caught against the upstream
+    // vectors and the crate's output during the green stage.
     assert_eq!(
         ContentId::from_bytes(b"").as_str(),
-        "af1349b9f5f9a1a6a0404dee36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
+        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262"
     );
     let c = ContentId::from_bytes(b"hello world");
     assert_eq!(c.as_str(), blake3::hash(b"hello world").to_hex().as_str());

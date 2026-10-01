@@ -46,14 +46,24 @@ impl SemHash {
     /// Validates `s` as 64 lowercase hex characters and wraps it.
     pub fn parse(s: impl Into<String>) -> Result<Self, SemHashError> {
         let s = s.into();
-        let _ = s;
-        todo!("P1-U1 green: SemHash::parse")
+        if is_lower_hex64(&s) {
+            Ok(SemHash(s))
+        } else {
+            Err(SemHashError::InvalidHash(s))
+        }
     }
 
     /// The lowercase hex form.
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// `true` when `s` is exactly 64 lowercase hex characters.
+fn is_lower_hex64(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl TryFrom<String> for SemHash {
@@ -85,15 +95,17 @@ pub struct ContentId(String);
 impl ContentId {
     /// Hashes `bytes` with blake3 into a content id.
     pub fn from_bytes(bytes: &[u8]) -> Self {
-        let _ = bytes;
-        todo!("P1-U1 green: ContentId::from_bytes")
+        ContentId(blake3::hash(bytes).to_hex().to_string())
     }
 
     /// Validates `s` as 64 lowercase hex characters and wraps it.
     pub fn parse(s: impl Into<String>) -> Result<Self, SemHashError> {
         let s = s.into();
-        let _ = s;
-        todo!("P1-U1 green: ContentId::parse")
+        if is_lower_hex64(&s) {
+            Ok(ContentId(s))
+        } else {
+            Err(SemHashError::InvalidHash(s))
+        }
     }
 
     /// The lowercase hex form.
@@ -130,8 +142,72 @@ impl fmt::Display for ContentId {
 /// to be enabled anywhere in the build (§2.5: canonicalization sorts via
 /// `BTreeMap`, it does not rely on `Map`'s backing store).
 pub fn canonical_json(value: &serde_json::Value) -> String {
-    let _ = value;
-    todo!("P1-U1 green: canonical JSON serialization")
+    let mut out = String::new();
+    write_canonical(value, &mut out);
+    out
+}
+
+/// Recursive canonical writer: sorted object keys (via `BTreeMap`), no
+/// whitespace, arrays in order, serde_json's own number formatting.
+fn write_canonical(value: &serde_json::Value, out: &mut String) {
+    use serde_json::Value;
+    match value {
+        Value::Null => out.push_str("null"),
+        Value::Bool(true) => out.push_str("true"),
+        Value::Bool(false) => out.push_str("false"),
+        // serde_json::Number's Display is exactly its JSON representation.
+        Value::Number(n) => out.push_str(&n.to_string()),
+        Value::String(s) => write_json_string(s, out),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(']');
+        }
+        Value::Object(map) => {
+            // Re-sort through a BTreeMap so the output never depends on the
+            // backing store of serde_json::Map (preserve_order or not).
+            let sorted: std::collections::BTreeMap<&String, &Value> = map.iter().collect();
+            out.push('{');
+            for (i, (k, v)) in sorted.into_iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_string(k, out);
+                out.push(':');
+                write_canonical(v, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// Writes `s` as a JSON string literal (serde_json-compatible escaping:
+/// only `"`, `\`, and control characters are escaped).
+fn write_json_string(s: &str, out: &mut String) {
+    use std::fmt::Write as _;
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{8}' => out.push_str("\\b"),
+            '\u{c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                // write! into a String cannot fail; ignore the Ok(()).
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
 }
 
 /// Computes the semantic hash of a sidecar document (§2.5).
@@ -146,6 +222,70 @@ pub fn canonical_json(value: &serde_json::Value) -> String {
 ///
 /// Invalid JSON or a non-object root is an error — never a default.
 pub fn sem_hash(sidecar_json_bytes: &[u8]) -> Result<SemHash, SemHashError> {
-    let _ = sidecar_json_bytes;
-    todo!("P1-U1 green: semantic hashing")
+    use serde_json::{Map, Value};
+
+    let doc: Value = serde_json::from_slice(sidecar_json_bytes)?;
+    let Value::Object(root) = doc else {
+        return Err(SemHashError::NotAnObject);
+    };
+
+    let mut projection = Map::new();
+
+    if let Some(rating) = root.get("rating") {
+        if !rating.is_null() {
+            projection.insert("rating".to_string(), rating.clone());
+        }
+    }
+
+    if let Some(tags) = root.get("tags") {
+        match tags {
+            Value::Null => {}
+            Value::Array(items) => {
+                // Order-insensitive: sort elements by their canonical form.
+                let mut sorted = items.clone();
+                sorted.sort_by_cached_key(canonical_json);
+                projection.insert("tags".to_string(), Value::Array(sorted));
+            }
+            other => {
+                projection.insert("tags".to_string(), other.clone());
+            }
+        }
+    }
+
+    if let Some(adjustments) = root.get("adjustments") {
+        if !adjustments.is_null() {
+            let mut adj = adjustments.clone();
+            if let Value::Object(map) = &mut adj {
+                // lutPath is machine-local and never synced (§1.2).
+                map.remove("lutPath");
+            }
+            strip_null_members(&mut adj);
+            projection.insert("adjustments".to_string(), adj);
+        }
+    }
+
+    let canonical = canonical_json(&serde_json::Value::Object(projection));
+    let hex = blake3::hash(canonical.as_bytes()).to_hex().to_string();
+    Ok(SemHash(hex))
+}
+
+/// Removes `null`-valued object members, recursively (a `null` member and an
+/// absent member are the same edit). `null` *array elements* are positional
+/// content and are kept.
+fn strip_null_members(value: &mut serde_json::Value) {
+    use serde_json::Value;
+    match value {
+        Value::Object(map) => {
+            map.retain(|_, v| !v.is_null());
+            for v in map.values_mut() {
+                strip_null_members(v);
+            }
+        }
+        Value::Array(items) => {
+            for v in items.iter_mut() {
+                strip_null_members(v);
+            }
+        }
+        _ => {}
+    }
 }

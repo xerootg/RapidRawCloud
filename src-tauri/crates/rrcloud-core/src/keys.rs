@@ -74,9 +74,27 @@ impl RelKey {
     /// and `.`/`..`/empty segments. Composed and decomposed spellings of the
     /// same Unicode text normalize to the same [`RelKey`].
     pub fn new(s: impl Into<String>) -> Result<Self, KeyError> {
-        let s = s.into();
-        let _ = s;
-        todo!("P1-U1 green: RelKey validation + NFC")
+        use unicode_normalization::UnicodeNormalization;
+        let raw = s.into();
+        if raw.contains('\\') {
+            return Err(KeyError::Backslash(raw));
+        }
+        if raw.chars().any(|c| c.is_control()) {
+            return Err(KeyError::ControlChar(raw));
+        }
+        let s: String = raw.nfc().collect();
+        if s.is_empty() {
+            return Err(KeyError::Empty);
+        }
+        if s.starts_with('/') {
+            return Err(KeyError::LeadingSlash(s));
+        }
+        if s.split('/')
+            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+        {
+            return Err(KeyError::BadSegment(s));
+        }
+        Ok(RelKey(s))
     }
 
     /// The normalized relative path, `/`-separated.
@@ -111,74 +129,99 @@ impl fmt::Display for RelKey {
 /// lexically inside `sync_root` (no `..` escapes), and the relative part is
 /// validated and NFC-normalized exactly as [`RelKey::new`] does.
 pub fn relkey(path: &Path, sync_root: &Path) -> Result<RelKey, KeyError> {
-    let _ = (path, sync_root);
-    todo!("P1-U1 green: local path -> relkey mapping")
+    let rel = path
+        .strip_prefix(sync_root)
+        .map_err(|_| KeyError::OutsideRoot(path.to_string_lossy().into_owned()))?;
+    let mut joined = String::new();
+    for comp in rel.components() {
+        let seg = match comp {
+            std::path::Component::Normal(os) => os.to_str().ok_or(KeyError::NonUnicode)?,
+            std::path::Component::CurDir => ".",
+            std::path::Component::ParentDir => "..",
+            // Root/prefix components cannot appear in a stripped relative
+            // path, but map them to a rejected spelling rather than panic.
+            _ => "/",
+        };
+        if !joined.is_empty() {
+            joined.push('/');
+        }
+        joined.push_str(seg);
+    }
+    RelKey::new(joined)
 }
 
 /// Joins a [`RelKey`] back onto the local `sync_root` (§1.1 reverse
 /// mapping). Round-trips with [`relkey`] for valid, NFC-normalized paths.
 pub fn local_path(rel: &RelKey, sync_root: &Path) -> PathBuf {
-    let _ = (rel, sync_root);
-    todo!("P1-U1 green: relkey -> local path mapping")
+    let mut p = sync_root.to_path_buf();
+    for seg in rel.as_str().split('/') {
+        p.push(seg);
+    }
+    p
 }
 
 /// `library/<relpath>` — an original (or `.xmp`) byte-identical to local.
 pub fn library_key(rel: &RelKey) -> String {
-    let _ = rel;
-    todo!("P1-U1 green: library key")
+    format!("{LIBRARY_PREFIX}{rel}")
 }
 
 /// `library/<relpath>.rrdata` — the primary sidecar.
 pub fn sidecar_key(rel: &RelKey) -> String {
-    let _ = rel;
-    todo!("P1-U1 green: sidecar key")
+    format!("{LIBRARY_PREFIX}{rel}.rrdata")
 }
 
 /// `library/<relpath>.<6hex>.rrdata` — a virtual-copy sidecar (including
 /// deterministic conflict losers, §2.6). `vc6` must be exactly 6 lowercase
 /// hex characters.
 pub fn vc_sidecar_key(rel: &RelKey, vc6: &str) -> Result<String, KeyError> {
-    let _ = (rel, vc6);
-    todo!("P1-U1 green: virtual-copy sidecar key")
+    if !is_lower_hex(vc6, 6) {
+        return Err(KeyError::BadVcSuffix(vc6.to_string()));
+    }
+    Ok(format!("{LIBRARY_PREFIX}{rel}.{vc6}.rrdata"))
+}
+
+/// `true` when `s` is exactly `len` lowercase hex characters.
+fn is_lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `.rrcloud/v1/journal/<device>/<seq:016x>.v1.ndjson` — a journal segment
 /// (§2.2). The filename part is [`crate::journal::format_segment_filename`].
 pub fn journal_segment_key(device: &DeviceId, seq: u64) -> String {
-    let _ = (device, seq);
-    todo!("P1-U1 green: journal segment key")
+    format!(
+        "{CONTROL_PREFIX}journal/{device}/{}",
+        crate::journal::format_segment_filename(seq)
+    )
 }
 
 /// `.rrcloud/v1/manifests/<device>.json.gz` — the per-writer manifest (§2.3).
 pub fn manifest_key(device: &DeviceId) -> String {
-    let _ = device;
-    todo!("P1-U1 green: manifest key")
+    format!("{CONTROL_PREFIX}manifests/{device}.json.gz")
 }
 
 /// `.rrcloud/v1/devices/<device>.json` — the device registry entry (§1.2).
 pub fn device_registry_key(device: &DeviceId) -> String {
-    let _ = device;
-    todo!("P1-U1 green: device registry key")
+    format!("{CONTROL_PREFIX}devices/{device}.json")
 }
 
 /// `.rrcloud/v1/devices/<device>.retired` — the retirement marker (§2.10).
 pub fn device_retired_key(device: &DeviceId) -> String {
-    let _ = device;
-    todo!("P1-U1 green: device retired key")
+    format!("{CONTROL_PREFIX}devices/{device}.retired")
 }
 
 /// `.rrcloud/v1/tombstones/<blake3(relkey)[..32]>.json` — a deletion marker
 /// (§2.7). The hash prefix is the first 32 lowercase hex chars of
 /// `blake3(relkey bytes)`.
 pub fn tombstone_key(rel: &RelKey) -> String {
-    let _ = rel;
-    todo!("P1-U1 green: tombstone key")
+    let hex = blake3::hash(rel.as_str().as_bytes()).to_hex();
+    format!("{CONTROL_PREFIX}tombstones/{}.json", &hex.as_str()[..32])
 }
 
 /// `.rrcloud/v1/previews/<content_id>.pxy.dng` — a smart preview (§4).
 pub fn preview_key(content_id: &ContentId) -> String {
-    let _ = content_id;
-    todo!("P1-U1 green: preview key")
+    format!("{CONTROL_PREFIX}previews/{content_id}.pxy.dng")
 }
 
 /// Thumb flavor for [`thumb_key`] (§1.2: 480px `_small`, 1280px `_medium`).
@@ -192,15 +235,18 @@ pub enum ThumbSize {
 
 /// `.rrcloud/v1/thumbs/<content_id>_small.jpg` / `_medium.jpg`.
 pub fn thumb_key(content_id: &ContentId, size: ThumbSize) -> String {
-    let _ = (content_id, size);
-    todo!("P1-U1 green: thumb key")
+    let suffix = match size {
+        ThumbSize::Small => "small",
+        ThumbSize::Medium => "medium",
+    };
+    format!("{CONTROL_PREFIX}thumbs/{content_id}_{suffix}.jpg")
 }
 
 /// `.rrcloud/v1/thumbpacks/<blake3(folder relkey)[..16]>.tar` — a per-folder
 /// pack of `_small` thumbs (§4.3). `folder` is the folder's relkey.
 pub fn thumbpack_key(folder: &RelKey) -> String {
-    let _ = folder;
-    todo!("P1-U1 green: thumbpack key")
+    let hex = blake3::hash(folder.as_str().as_bytes()).to_hex();
+    format!("{CONTROL_PREFIX}thumbpacks/{}.tar", &hex.as_str()[..16])
 }
 
 /// The schema role of a bucket key, as parsed back by [`classify_key`].
@@ -288,6 +334,122 @@ pub enum KeyClass {
 /// sidecar classified as a virtual copy of `<stem>`. Matches
 /// `list_images_in_dir` behavior.
 pub fn classify_key(bucket_key: &str) -> KeyClass {
-    let _ = bucket_key;
-    todo!("P1-U1 green: bucket key classification")
+    if let Some(rest) = bucket_key.strip_prefix(LIBRARY_PREFIX) {
+        return classify_library_key(rest);
+    }
+    if let Some(rest) = bucket_key.strip_prefix(CONTROL_PREFIX) {
+        return classify_control_key(rest);
+    }
+    KeyClass::Foreign
+}
+
+/// Classifies the part of a bucket key after `library/`.
+fn classify_library_key(rest: &str) -> KeyClass {
+    if let Some(stem) = rest.strip_suffix(".rrdata") {
+        // Virtual copy: `<relpath>.<6hex>.rrdata` (the documented upstream
+        // 6-hex ambiguity: checked before the primary interpretation).
+        if let Some((base, suffix)) = stem.rsplit_once('.') {
+            if is_lower_hex(suffix, 6) {
+                if let Ok(relkey) = RelKey::new(base) {
+                    return KeyClass::Sidecar {
+                        relkey,
+                        vc: Some(suffix.to_string()),
+                    };
+                }
+            }
+        }
+        return match RelKey::new(stem) {
+            Ok(relkey) => KeyClass::Sidecar { relkey, vc: None },
+            Err(_) => KeyClass::Foreign,
+        };
+    }
+    match RelKey::new(rest) {
+        Ok(relkey) if relkey.as_str().ends_with(".xmp") => KeyClass::Xmp { relkey },
+        Ok(relkey) => KeyClass::Original { relkey },
+        Err(_) => KeyClass::Foreign,
+    }
+}
+
+/// Classifies the part of a bucket key after `.rrcloud/v1/`.
+fn classify_control_key(rest: &str) -> KeyClass {
+    let Some((area, tail)) = rest.split_once('/') else {
+        return KeyClass::Foreign;
+    };
+    match area {
+        "journal" => {
+            let Some((dev, name)) = tail.split_once('/') else {
+                return KeyClass::Foreign;
+            };
+            let (Ok(device), Ok(parsed)) = (
+                DeviceId::new(dev),
+                crate::journal::parse_segment_filename(name),
+            ) else {
+                return KeyClass::Foreign;
+            };
+            KeyClass::Journal {
+                device,
+                seq: parsed.seq,
+            }
+        }
+        "manifests" => match tail
+            .strip_suffix(".json.gz")
+            .and_then(|d| DeviceId::new(d).ok())
+        {
+            Some(device) => KeyClass::Manifest { device },
+            None => KeyClass::Foreign,
+        },
+        "devices" => {
+            if let Some(device) = tail
+                .strip_suffix(".json")
+                .and_then(|d| DeviceId::new(d).ok())
+            {
+                KeyClass::DeviceRegistry { device }
+            } else if let Some(device) = tail
+                .strip_suffix(".retired")
+                .and_then(|d| DeviceId::new(d).ok())
+            {
+                KeyClass::DeviceRetired { device }
+            } else {
+                KeyClass::Foreign
+            }
+        }
+        "tombstones" => match tail.strip_suffix(".json") {
+            Some(h) if is_lower_hex(h, 32) => KeyClass::Tombstone {
+                hash32: h.to_string(),
+            },
+            _ => KeyClass::Foreign,
+        },
+        "previews" => match tail
+            .strip_suffix(".pxy.dng")
+            .and_then(|h| ContentId::parse(h).ok())
+        {
+            Some(content_id) => KeyClass::Preview { content_id },
+            None => KeyClass::Foreign,
+        },
+        "thumbs" => {
+            let (stem, size) = if let Some(s) = tail.strip_suffix("_small.jpg") {
+                (s, ThumbSize::Small)
+            } else if let Some(s) = tail.strip_suffix("_medium.jpg") {
+                (s, ThumbSize::Medium)
+            } else {
+                return KeyClass::Foreign;
+            };
+            match ContentId::parse(stem) {
+                Ok(content_id) => KeyClass::Thumb { content_id, size },
+                Err(_) => KeyClass::Foreign,
+            }
+        }
+        "thumbpacks" => match tail.strip_suffix(".tar") {
+            Some(h) if is_lower_hex(h, 16) => KeyClass::Thumbpack {
+                hash16: h.to_string(),
+            },
+            _ => KeyClass::Foreign,
+        },
+        "meta" => match tail {
+            "albums.json" => KeyClass::MetaAlbums,
+            "presets.json" => KeyClass::MetaPresets,
+            _ => KeyClass::Foreign,
+        },
+        _ => KeyClass::Foreign,
+    }
 }
