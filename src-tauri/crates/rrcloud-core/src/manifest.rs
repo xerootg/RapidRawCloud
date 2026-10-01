@@ -29,14 +29,18 @@
 //! segments.
 
 use std::collections::BTreeMap;
+use std::io::{Read as _, Write as _};
 
 use serde::{Deserialize, Serialize};
 
 use crate::clock::{DeviceId, VersionVector};
-use crate::journal::Kind;
-use crate::keys::RelKey;
+use crate::journal::{JournalEntry, Kind, Op, JOURNAL_VERSION};
+use crate::keys::{
+    library_key, manifest_key, preview_key, sidecar_key, thumbpack_key, RelKey, ALBUMS_META_KEY,
+    PRESETS_META_KEY,
+};
 use crate::reader::{ConsumerError, JournalConsumer};
-use crate::s3::{S3Api, S3Error};
+use crate::s3::{PutObjectOptions, S3Api, S3Error};
 use crate::semhash::{Blake3Hex, ContentId, SemHash};
 use crate::state::{StateError, SyncDb};
 
@@ -195,16 +199,72 @@ pub struct Manifest {
 /// [`crate::state::SyncDb::iter_deleted`] record. Rows come out ascending
 /// by relkey (the scans' order).
 pub fn build_manifest(db: &SyncDb, written_server_ts: i64) -> Result<Manifest, ManifestError> {
-    let _ = (db, written_server_ts);
-    todo!("P1-U3: build_manifest")
+    let header = ManifestHeader {
+        written_server_ts,
+        cursors: db.iter_cursors()?.into_iter().collect(),
+        proto: MANIFEST_PROTO,
+    };
+    let rows = db
+        .iter_items()?
+        .into_iter()
+        .map(|(key, record)| ManifestRow {
+            key,
+            kind: record.kind,
+            size: record.size,
+            blake3: record.blake3,
+            sem_hash: record.sem_hash,
+            vv: record.vv,
+            device: None,
+            content_id: record.content_id,
+            w: record.w,
+            h: record.h,
+            mtime: Some(record.mtime_unix_ns / 1_000_000_000),
+            rating: None,
+            color_label: None,
+        })
+        .collect();
+    let deleted = db
+        .iter_deleted()?
+        .into_iter()
+        .map(|(del, record)| DeletedRow {
+            del,
+            vv: record.vv,
+            server_ts: record.server_ts,
+        })
+        .collect();
+    Ok(Manifest {
+        header,
+        rows,
+        deleted,
+    })
 }
 
 /// Encodes a manifest as gzip NDJSON (module docs): header line first,
 /// then live rows, then deleted rows, one JSON document per line.
 /// Deterministic for the same manifest.
 pub fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
-    let _ = manifest;
-    todo!("P1-U3: encode_manifest")
+    let mut ndjson = Vec::new();
+    let mut push_line = |line: Result<String, serde_json::Error>| -> Result<(), ManifestError> {
+        // Encode-side serialization failures carry no useful line number;
+        // the shared Codec lane (via StateError) is truthful enough.
+        let line = line.map_err(StateError::from)?;
+        ndjson.extend_from_slice(line.as_bytes());
+        ndjson.push(b'\n');
+        Ok(())
+    };
+    push_line(serde_json::to_string(&manifest.header))?;
+    for row in &manifest.rows {
+        push_line(serde_json::to_string(row))?;
+    }
+    for row in &manifest.deleted {
+        push_line(serde_json::to_string(row))?;
+    }
+    // flate2's plain gzip header carries no mtime or filename, so the
+    // encoding is deterministic for the same manifest (ETag read-back
+    // verification depends on byte identity).
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&ndjson).map_err(ManifestError::Gzip)?;
+    encoder.finish().map_err(ManifestError::Gzip)
 }
 
 /// Decodes gzip NDJSON manifest bytes, fail-closed and header-first
@@ -212,8 +272,68 @@ pub fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
 /// malformed rows abort naming their line, relkeys take the strict wire
 /// lane.
 pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ManifestError> {
-    let _ = bytes;
-    todo!("P1-U3: decode_manifest")
+    let mut ndjson = Vec::new();
+    flate2::read::GzDecoder::new(bytes)
+        .read_to_end(&mut ndjson)
+        .map_err(ManifestError::Gzip)?;
+
+    let mut lines = ndjson.split(|&b| b == b'\n').enumerate();
+
+    // Header first, fail closed: the proto gate fires before any row —
+    // including the header's own full schema — decodes.
+    let header = loop {
+        let Some((idx, line)) = lines.next() else {
+            return Err(ManifestError::MissingHeader);
+        };
+        if line.is_empty() {
+            continue;
+        }
+        let line_no = idx + 1;
+        let value: serde_json::Value =
+            serde_json::from_slice(line).map_err(|source| ManifestError::Line {
+                line: line_no,
+                source,
+            })?;
+        // A row where the header belongs is a missing header, not a
+        // malformed one.
+        if value.get("key").is_some() || value.get("del").is_some() {
+            return Err(ManifestError::MissingHeader);
+        }
+        let proto = value.get("proto").and_then(serde_json::Value::as_u64);
+        if proto != Some(u64::from(MANIFEST_PROTO)) {
+            return Err(ManifestError::UnsupportedProto { proto });
+        }
+        break serde_json::from_value::<ManifestHeader>(value).map_err(|source| {
+            ManifestError::Line {
+                line: line_no,
+                source,
+            }
+        })?;
+    };
+
+    let mut rows = Vec::new();
+    let mut deleted = Vec::new();
+    for (idx, line) in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let line_no = idx + 1;
+        let at_line = |source: serde_json::Error| ManifestError::Line {
+            line: line_no,
+            source,
+        };
+        let value: serde_json::Value = serde_json::from_slice(line).map_err(at_line)?;
+        if value.get("del").is_some() {
+            deleted.push(serde_json::from_value::<DeletedRow>(value).map_err(at_line)?);
+        } else {
+            rows.push(serde_json::from_value::<ManifestRow>(value).map_err(at_line)?);
+        }
+    }
+    Ok(Manifest {
+        header,
+        rows,
+        deleted,
+    })
 }
 
 /// Encodes and PUTs `manifest` to `device`'s manifest key
@@ -226,8 +346,16 @@ pub async fn put_manifest(
     device: &DeviceId,
     manifest: &Manifest,
 ) -> Result<String, ManifestError> {
-    let _ = (s3, bucket, device, manifest);
-    todo!("P1-U3: put_manifest")
+    let bytes = encode_manifest(manifest)?;
+    let output = s3
+        .put_object(
+            bucket,
+            &manifest_key(device),
+            bytes::Bytes::from(bytes),
+            &PutObjectOptions::default(),
+        )
+        .await?;
+    Ok(output.e_tag)
 }
 
 /// GETs and decodes `device`'s manifest.
@@ -236,8 +364,9 @@ pub async fn get_manifest(
     bucket: &str,
     device: &DeviceId,
 ) -> Result<Manifest, ManifestError> {
-    let _ = (s3, bucket, device);
-    todo!("P1-U3: get_manifest")
+    let output = s3.get_object(bucket, &manifest_key(device), None).await?;
+    let bytes = output.body.collect().await?;
+    decode_manifest(&bytes)
 }
 
 /// Read-back verification helper: HEADs `device`'s manifest key and
@@ -248,8 +377,8 @@ pub async fn head_manifest_etag(
     bucket: &str,
     device: &DeviceId,
 ) -> Result<String, ManifestError> {
-    let _ = (s3, bucket, device);
-    todo!("P1-U3: head_manifest_etag")
+    let output = s3.head_object(bucket, &manifest_key(device)).await?;
+    Ok(output.e_tag)
 }
 
 /// What one [`merge`] did.
@@ -289,6 +418,136 @@ pub fn merge(
     db: &SyncDb,
     consumer: &mut impl JournalConsumer,
 ) -> Result<MergeReport, ManifestError> {
-    let _ = (manifests, db, consumer);
-    todo!("P1-U3: manifest::merge")
+    // Gather and order BEFORE opening the transaction: all live rows
+    // ascending by relkey across manifests, then all deleted rows
+    // ascending by relkey. (Stable sort: same-relkey rows keep manifest
+    // order.)
+    let mut live: Vec<(&DeviceId, &ManifestHeader, &ManifestRow)> = Vec::new();
+    let mut deleted: Vec<(&DeviceId, &DeletedRow)> = Vec::new();
+    let mut cursors: BTreeMap<DeviceId, u64> = BTreeMap::new();
+    for (owner, manifest) in manifests {
+        for row in &manifest.rows {
+            live.push((owner, &manifest.header, row));
+        }
+        for row in &manifest.deleted {
+            deleted.push((owner, row));
+        }
+        for (device, &seq) in &manifest.header.cursors {
+            let slot = cursors.entry(device.clone()).or_insert(0);
+            *slot = (*slot).max(seq);
+        }
+    }
+    live.sort_by(|a, b| a.2.key.cmp(&b.2.key));
+    deleted.sort_by(|a, b| a.1.del.cmp(&b.1.del));
+
+    // Convert eagerly too, so an unconvertible row refuses the merge
+    // before any consumer side-effect could need rolling back.
+    let mut entries: Vec<JournalEntry> = Vec::with_capacity(live.len() + deleted.len());
+    for (owner, header, row) in &live {
+        entries.push(live_row_entry(owner, header, row)?);
+    }
+    for (owner, row) in &deleted {
+        entries.push(deleted_row_entry(owner, row));
+    }
+
+    // One committed transaction for every row apply AND the cursor
+    // seeding: a failed merge leaves nothing behind.
+    let report = MergeReport {
+        live_rows: live.len() as u64,
+        deleted_rows: deleted.len() as u64,
+        cursors,
+    };
+    db.with_txn_err::<_, ManifestError>(|txn| {
+        for entry in &entries {
+            consumer
+                .apply(txn, entry)
+                .map_err(|source| ManifestError::Consumer {
+                    key: entry.key.clone(),
+                    source,
+                })?;
+        }
+        for (device, &seq) in &report.cursors {
+            txn.set_cursor(device, seq)?;
+        }
+        Ok(())
+    })?;
+    Ok(report)
+}
+
+/// Rebuilds the bucket key a manifest row's `(kind, relkey)` addresses,
+/// through the [`crate::keys`] constructors.
+fn bucket_key_for(row: &ManifestRow) -> Result<String, ManifestError> {
+    let unconvertible = || ManifestError::Unconvertible {
+        relkey: row.key.clone(),
+        kind: row.kind,
+    };
+    Ok(match row.kind {
+        Kind::Original => library_key(&row.key),
+        Kind::Sidecar => sidecar_key(&row.key),
+        // An .xmp projection is a real library file; its relkey carries
+        // the extension.
+        Kind::Xmp => library_key(&row.key),
+        Kind::Preview => preview_key(row.content_id.as_ref().ok_or_else(unconvertible)?),
+        // A thumb's bucket key needs a size this schema does not carry.
+        Kind::Thumb => return Err(unconvertible()),
+        Kind::Thumbpack => thumbpack_key(&row.key),
+        Kind::Albums => ALBUMS_META_KEY.to_string(),
+        Kind::Presets => PRESETS_META_KEY.to_string(),
+    })
+}
+
+/// Converts one live row into its synthetic `put` entry (`seq` 0, never
+/// marked applied; conversion pinned by the merge tests).
+fn live_row_entry(
+    owner: &DeviceId,
+    header: &ManifestHeader,
+    row: &ManifestRow,
+) -> Result<JournalEntry, ManifestError> {
+    Ok(JournalEntry {
+        v: JOURNAL_VERSION,
+        seq: 0,
+        ts: header.written_server_ts,
+        device: row.device.clone().unwrap_or_else(|| owner.clone()),
+        op: Op::Put,
+        kind: row.kind,
+        key: bucket_key_for(row)?,
+        vv: row.vv.clone(),
+        size: Some(row.size),
+        blake3: row.blake3.clone(),
+        sem_hash: row.sem_hash.clone(),
+        rating: row.rating,
+        color_label: row.color_label.clone(),
+        content_id: row.content_id.clone(),
+        w: row.w,
+        h: row.h,
+        mtime: row.mtime,
+        from_key: None,
+    })
+}
+
+/// Converts one deleted-set row into its synthetic `del` entry. A
+/// [`DeletedRow`] carries neither kind nor device: the deletion aims at
+/// the relkey's primary sidecar key (the §2.7 deletion anchor), and the
+/// manifest's owner stamps the entry.
+fn deleted_row_entry(owner: &DeviceId, row: &DeletedRow) -> JournalEntry {
+    JournalEntry {
+        v: JOURNAL_VERSION,
+        seq: 0,
+        ts: row.server_ts,
+        device: owner.clone(),
+        op: Op::Del,
+        kind: Kind::Sidecar,
+        key: sidecar_key(&row.del),
+        vv: row.vv.clone(),
+        size: None,
+        blake3: None,
+        sem_hash: None,
+        rating: None,
+        color_label: None,
+        content_id: None,
+        w: None,
+        h: None,
+        mtime: None,
+        from_key: None,
+    }
 }

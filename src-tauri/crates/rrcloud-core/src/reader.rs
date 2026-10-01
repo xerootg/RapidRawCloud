@@ -40,9 +40,12 @@
 //! [`MidStreamGap`] outcome: application for that device stops at the
 //! gap, its cursor never jumps, and nothing past the gap is applied.
 
+use std::collections::BTreeMap;
+
 use crate::clock::DeviceId;
-use crate::journal::{JournalEntry, JournalError};
-use crate::s3::{S3Api, S3Error};
+use crate::journal::{decode_segment, JournalEntry, JournalError, JOURNAL_VERSION};
+use crate::keys::{classify_key, journal_segment_key, KeyClass, CONTROL_PREFIX};
+use crate::s3::{ListObjectsV2Request, S3Api, S3Error};
 use crate::state::{StateError, StateTxn, SyncDb};
 
 /// A consumer failure: opaque to the reader, which only needs to abort
@@ -193,6 +196,210 @@ pub async fn poll(
     bucket: &str,
     consumer: &mut impl JournalConsumer,
 ) -> Result<PollReport, ReaderError> {
-    let _ = (db, s3, bucket, consumer);
-    todo!("P1-U3: reader::poll")
+    // (1) One paged LIST over the journal prefix: exactly one request in
+    // the single-page steady state.
+    let keys = list_journal_keys(s3, bucket).await?;
+
+    // (2) Classify: foreign devices' segments only, grouped per device in
+    // ascending seq order. Non-journal keys and our own prefix are
+    // ignored. (A seq that appears under several filename versions keeps
+    // the lowest — prefer the readable spelling.)
+    let own = db.device_id();
+    let mut per_device: BTreeMap<DeviceId, BTreeMap<u64, u32>> = BTreeMap::new();
+    for key in &keys {
+        if let KeyClass::Journal {
+            device,
+            seq,
+            version,
+        } = classify_key(key)
+        {
+            if device == *own {
+                continue;
+            }
+            let versions = per_device.entry(device).or_default();
+            let slot = versions.entry(seq).or_insert(version);
+            *slot = (*slot).min(version);
+        }
+    }
+
+    // (3) Per foreign device: strict-ordered application beyond the
+    // cursor, with the pinned gap and min-reader-halt semantics.
+    let mut report = PollReport::default();
+    for (device, segments) in per_device {
+        apply_device_prefix(db, s3, bucket, consumer, &device, &segments, &mut report).await?;
+    }
+    Ok(report)
+}
+
+/// One paged `ListObjectsV2` over `.rrcloud/v1/journal/` (no delimiter),
+/// following continuation tokens. Pages are capped against a backend that
+/// keeps answering truncated pages without advancing.
+async fn list_journal_keys(s3: &impl S3Api, bucket: &str) -> Result<Vec<String>, ReaderError> {
+    const MAX_PAGES: u32 = 10_000;
+    let prefix = format!("{CONTROL_PREFIX}journal/");
+    let mut keys = Vec::new();
+    let mut continuation_token: Option<String> = None;
+    let mut pages = 0u32;
+    loop {
+        if pages >= MAX_PAGES {
+            return Err(ReaderError::S3(S3Error::InvalidResponse(format!(
+                "ListObjectsV2 still truncated after {MAX_PAGES} pages; \
+                 refusing a runaway paging loop"
+            ))));
+        }
+        pages += 1;
+        let page = s3
+            .list_objects_v2(
+                bucket,
+                &ListObjectsV2Request {
+                    prefix: Some(prefix.clone()),
+                    continuation_token: continuation_token.take(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        keys.extend(page.objects.into_iter().map(|o| o.key));
+        if !page.is_truncated {
+            return Ok(keys);
+        }
+        match page.next_continuation_token {
+            Some(token) => continuation_token = Some(token),
+            None => {
+                return Err(ReaderError::S3(S3Error::InvalidResponse(
+                    "truncated ListObjectsV2 page without a NextContinuationToken".to_string(),
+                )))
+            }
+        }
+    }
+}
+
+/// The §2.2 apply composite's error: either a state-store failure or the
+/// consumer's refusal, so both abort the one shared transaction.
+enum ApplyError {
+    State(StateError),
+    Consumer(ConsumerError),
+}
+
+impl From<StateError> for ApplyError {
+    fn from(e: StateError) -> Self {
+        ApplyError::State(e)
+    }
+}
+
+/// Applies one foreign device's present segments beyond its cursor, in
+/// strict seq order, updating `report` with per-device outcomes (module
+/// docs: gap semantics, min-reader halts). Returns `Err` only for
+/// whole-pass failures (S3, state store, consumer refusal).
+async fn apply_device_prefix(
+    db: &SyncDb,
+    s3: &impl S3Api,
+    bucket: &str,
+    consumer: &mut impl JournalConsumer,
+    device: &DeviceId,
+    segments: &BTreeMap<u64, u32>,
+    report: &mut PollReport,
+) -> Result<(), ReaderError> {
+    let mut cursor = db.cursor(device)?;
+    let firsts: Vec<u64> = segments.keys().copied().collect();
+    for (i, &first_seq) in firsts.iter().enumerate() {
+        let next_first = firsts.get(i + 1).copied();
+        // A segment is provably fully covered when the NEXT present
+        // segment starts at or below cursor + 1 (its span ends at the next
+        // segment's first seq minus one). The last segment's span length is
+        // unknown without a GET, so it is fetched even when it starts at or
+        // below the cursor — its tail may be unapplied.
+        if next_first.is_some_and(|nf| nf <= cursor.saturating_add(1)) {
+            continue;
+        }
+        if first_seq > cursor.saturating_add(1) {
+            if cursor == 0 && i == 0 {
+                // Bootstrap gap (§2.3 placeholder): the below-horizon
+                // prefix was compacted away before we ever polled. The
+                // present segments ARE applied; the engine routes this
+                // outcome to manifest catch-up.
+                report.gaps.push(GapDetected {
+                    device: device.clone(),
+                    lowest_seq: first_seq,
+                });
+            } else {
+                // Mid-stream gap: typed, never skipped — application for
+                // this device stops at the gap and the cursor stays put.
+                report.mid_stream_gaps.push(MidStreamGap {
+                    device: device.clone(),
+                    cursor,
+                    next_seq: first_seq,
+                });
+                return Ok(());
+            }
+        }
+        // Min-reader gate on the FILENAME version, before any GET.
+        let version = segments[&first_seq];
+        if version != JOURNAL_VERSION {
+            report.halted.push(PrefixHalted {
+                device: device.clone(),
+                version: u64::from(version),
+            });
+            return Ok(());
+        }
+        let key = journal_segment_key(device, first_seq);
+        let bytes = s3
+            .get_object(bucket, &key, None)
+            .await?
+            .body
+            .collect()
+            .await?;
+        let entries = match decode_segment(&bytes) {
+            Ok(entries) => entries,
+            // Fail closed: an unsupported entry version anywhere in the
+            // segment halts the prefix — nothing from the segment applies,
+            // not even its valid earlier lines.
+            Err(JournalError::UnsupportedVersion { version }) => {
+                report.halted.push(PrefixHalted {
+                    device: device.clone(),
+                    version,
+                });
+                return Ok(());
+            }
+            Err(source) => {
+                return Err(ReaderError::Segment {
+                    device: device.clone(),
+                    seq: first_seq,
+                    source,
+                })
+            }
+        };
+        for entry in &entries {
+            if entry.seq <= cursor {
+                // Covered by the cursor (applied earlier, or attested by a
+                // merged manifest header): never re-applied.
+                continue;
+            }
+            let outcome = db.with_txn_err::<bool, ApplyError>(|txn| {
+                if txn.has_applied(device, entry.seq)? {
+                    return Ok(false);
+                }
+                consumer.apply(txn, entry).map_err(ApplyError::Consumer)?;
+                txn.mark_applied(device, entry.seq)?;
+                txn.set_cursor(device, entry.seq)?;
+                Ok(true)
+            });
+            match outcome {
+                Ok(applied) => {
+                    if applied {
+                        report.entries_applied += 1;
+                    }
+                    cursor = cursor.max(entry.seq);
+                }
+                Err(ApplyError::State(e)) => return Err(e.into()),
+                Err(ApplyError::Consumer(source)) => {
+                    return Err(ReaderError::Consumer {
+                        device: device.clone(),
+                        seq: entry.seq,
+                        source,
+                    })
+                }
+            }
+        }
+    }
+    Ok(())
 }

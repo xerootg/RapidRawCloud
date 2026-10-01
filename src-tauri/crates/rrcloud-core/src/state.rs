@@ -418,7 +418,6 @@ const K_PUBLISHED_CURSOR: &str = "published_cursor";
 /// `freeze_next_segment`) blocks the floor but not correctness.
 const K_PUBLISHED_FLOOR: &str = "published_floor";
 const K_QUEUE_ARRIVAL: &str = "queue_arrival";
-#[allow(dead_code)] // consumed by the P1-U3 green implementation (stage_outbound)
 const K_OUTBOUND_ARRIVAL: &str = "outbound_arrival";
 const K_SERVER_TIME_OFFSET_MS: &str = "server_time_offset_ms";
 
@@ -814,6 +813,12 @@ fn read_upload(
 
 /// Reads all recorded parts for `relkey` from any readable `upload_parts`
 /// table, ascending by part number.
+///
+/// This per-relkey range scan is an enumeration like any other: a corrupt
+/// part row fails typed with [`StateError::CodecAt`] naming its row as
+/// `<relkey>:<part number>` (`:` is illegal in relkeys, so the spelling is
+/// unambiguous), never a bare [`StateError::Codec`] that hides which row
+/// is bad.
 fn read_upload_parts(
     parts: &impl ReadableTable<(&'static str, u32), &'static [u8]>,
     relkey: &RelKey,
@@ -823,7 +828,35 @@ fn read_upload_parts(
     for entry in parts.range((rel, 0u32)..=(rel, u32::MAX)).map_err(db_err)? {
         let (key, value) = entry.map_err(db_err)?;
         let (_, part_no) = key.value();
-        out.push((part_no, from_json(value.value())?));
+        out.push((
+            part_no,
+            from_json_at(&format!("{rel}:{part_no}"), value.value())?,
+        ));
+    }
+    Ok(out)
+}
+
+/// Reads the deleted-set record for `relkey` from any readable
+/// `deleted_set` table.
+fn read_deleted(
+    deleted: &impl ReadableTable<&'static str, &'static [u8]>,
+    relkey: &RelKey,
+) -> Result<Option<DeletedRecord>, StateError> {
+    match deleted.get(relkey.as_str()).map_err(db_err)? {
+        Some(guard) => Ok(Some(from_json(guard.value())?)),
+        None => Ok(None),
+    }
+}
+
+/// Reads every staged outbound record from any readable `outbound_entries`
+/// table, in FIFO (ascending-id) order.
+fn read_outbound(
+    outbound: &impl ReadableTable<u64, &'static [u8]>,
+) -> Result<Vec<(u64, Vec<u8>)>, StateError> {
+    let mut out = Vec::new();
+    for entry in outbound.iter().map_err(db_err)? {
+        let (key, value) = entry.map_err(db_err)?;
+        out.push((key.value(), value.value().to_vec()));
     }
     Ok(out)
 }
@@ -1070,10 +1103,7 @@ impl SyncDb {
         &self,
         f: impl FnOnce(&StateTxn<'_>) -> Result<T, StateError>,
     ) -> Result<T, StateError> {
-        let txn = self.begin_write()?;
-        let out = f(&StateTxn { txn: &txn })?;
-        txn.commit().map_err(db_err)?;
-        Ok(out)
+        self.with_txn_err::<T, StateError>(f)
     }
 
     /// [`SyncDb::with_txn`] generalized over the closure's error type: `f`
@@ -1096,8 +1126,13 @@ impl SyncDb {
     where
         E: From<StateError>,
     {
-        let _ = f;
-        todo!("P1-U3: with_txn_err")
+        // An early `return Err(..)` — and a panic unwinding out of `f` —
+        // drops `txn` before `commit()`, which aborts it: nothing the
+        // closure did is visible. Only the success path commits.
+        let txn = self.begin_write()?;
+        let out = f(&StateTxn { txn: &txn })?;
+        txn.commit().map_err(db_err).map_err(E::from)?;
+        Ok(out)
     }
 
     // -- items ------------------------------------------------------------
@@ -1199,8 +1234,11 @@ impl SyncDb {
     /// valid keys use [`SyncDb::delete_item`], whose doc covers companion
     /// rows.
     pub fn delete_item_raw(&self, raw: &str) -> Result<bool, StateError> {
-        let _ = raw;
-        todo!("P1-U3: delete_item_raw")
+        self.with_txn(|t| {
+            let mut items = t.txn.open_table(T_ITEMS).map_err(db_err)?;
+            let previous = items.remove(raw).map_err(db_err)?;
+            Ok(previous.is_some())
+        })
     }
 
     /// Every item record, ascending by relkey. One consistent snapshot.
@@ -1576,19 +1614,22 @@ impl SyncDb {
     /// (§2.1.5: no outbound record is ever lost to a crash between
     /// staging and freezing).
     pub fn stage_outbound(&self, bytes: &[u8]) -> Result<u64, StateError> {
-        let _ = bytes;
-        todo!("P1-U3: stage_outbound")
+        self.with_txn(|t| t.stage_outbound(bytes))
     }
 
     /// Every staged outbound record as `(staging id, bytes)`, in FIFO
     /// (ascending-id) order — the publisher's drain scan.
     pub fn iter_outbound(&self) -> Result<Vec<(u64, Vec<u8>)>, StateError> {
-        todo!("P1-U3: iter_outbound")
+        let txn = self.begin_read()?;
+        let outbound = txn.open_table(T_OUTBOUND).map_err(db_err)?;
+        read_outbound(&outbound)
     }
 
     /// Number of staged outbound records.
     pub fn outbound_len(&self) -> Result<u64, StateError> {
-        todo!("P1-U3: outbound_len")
+        let txn = self.begin_read()?;
+        let outbound = txn.open_table(T_OUTBOUND).map_err(db_err)?;
+        outbound.len().map_err(db_err)
     }
 
     // -- deleted set (§2.3) ------------------------------------------------
@@ -1602,15 +1643,15 @@ impl SyncDb {
         relkey: &RelKey,
         record: &DeletedRecord,
     ) -> Result<(), StateError> {
-        let _ = (relkey, record);
-        todo!("P1-U3: record_deleted")
+        self.with_txn(|t| t.record_deleted(relkey, record))
     }
 
     /// Reads the deleted-set record for `relkey` (`None` when this device
     /// knows of no deletion).
     pub fn get_deleted(&self, relkey: &RelKey) -> Result<Option<DeletedRecord>, StateError> {
-        let _ = relkey;
-        todo!("P1-U3: get_deleted")
+        let txn = self.begin_read()?;
+        let deleted = txn.open_table(T_DELETED).map_err(db_err)?;
+        read_deleted(&deleted, relkey)
     }
 
     /// Every deleted-set record, ascending by relkey (the manifest
@@ -1618,14 +1659,28 @@ impl SyncDb {
     /// [`StateError::CodecAt`] naming its key, like the other
     /// enumerations.
     pub fn iter_deleted(&self) -> Result<Vec<(RelKey, DeletedRecord)>, StateError> {
-        todo!("P1-U3: iter_deleted")
+        let txn = self.begin_read()?;
+        let deleted = txn.open_table(T_DELETED).map_err(db_err)?;
+        let mut out = Vec::new();
+        for entry in deleted.iter().map_err(db_err)? {
+            let (key, value) = entry.map_err(db_err)?;
+            let raw = key.value();
+            out.push((
+                from_stored_str_at(raw, raw)?,
+                from_json_at(raw, value.value())?,
+            ));
+        }
+        Ok(out)
     }
 
     /// Removes the deleted-set record for `relkey` (§2.10 retention
     /// expiry). `Ok(true)` when a record existed.
     pub fn remove_deleted(&self, relkey: &RelKey) -> Result<bool, StateError> {
-        let _ = relkey;
-        todo!("P1-U3: remove_deleted")
+        self.with_txn(|t| {
+            let mut deleted = t.txn.open_table(T_DELETED).map_err(db_err)?;
+            let previous = deleted.remove(relkey.as_str()).map_err(db_err)?;
+            Ok(previous.is_some())
+        })
     }
 
     // -- multipart upload resume (§2.4) ------------------------------------
@@ -1700,8 +1755,21 @@ impl SyncDb {
     /// name a corrupt stored key). Idempotent. Pass exactly the string
     /// [`StateError::CodecAt`] reported.
     pub fn clear_upload_raw(&self, raw: &str) -> Result<(), StateError> {
-        let _ = raw;
-        todo!("P1-U3: clear_upload_raw")
+        self.with_txn(|t| {
+            let mut uploads = t.txn.open_table(T_UPLOADS).map_err(db_err)?;
+            uploads.remove(raw).map_err(db_err)?;
+            let mut parts = t.txn.open_table(T_UPLOAD_PARTS).map_err(db_err)?;
+            let part_nos: Vec<u32> = parts
+                .range((raw, 0u32)..=(raw, u32::MAX))
+                .map_err(db_err)?
+                .map(|entry| entry.map(|(key, _)| key.value().1))
+                .collect::<Result<_, _>>()
+                .map_err(db_err)?;
+            for part_no in part_nos {
+                parts.remove((raw, part_no)).map_err(db_err)?;
+            }
+            Ok(())
+        })
     }
 
     // -- transfer queues ---------------------------------------------------
@@ -2522,8 +2590,13 @@ impl StateTxn<'_> {
     /// chokepoint's "commit the local version + stage its journal entry"
     /// composite).
     pub fn stage_outbound(&self, bytes: &[u8]) -> Result<u64, StateError> {
-        let _ = bytes;
-        todo!("P1-U3: StateTxn::stage_outbound")
+        let id = {
+            let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
+            bump_counter_by(&mut meta, K_OUTBOUND_ARRIVAL, 1)?
+        };
+        let mut outbound = self.txn.open_table(T_OUTBOUND).map_err(db_err)?;
+        outbound.insert(id, bytes).map_err(db_err)?;
+        Ok(id)
     }
 
     /// Removes one staged outbound record by id; `Ok(true)` when it was
@@ -2533,8 +2606,17 @@ impl StateTxn<'_> {
     /// crash leaves each entry staged or frozen, never both, never
     /// neither.
     pub fn remove_outbound(&self, id: u64) -> Result<bool, StateError> {
-        let _ = id;
-        todo!("P1-U3: StateTxn::remove_outbound")
+        let mut outbound = self.txn.open_table(T_OUTBOUND).map_err(db_err)?;
+        let previous = outbound.remove(id).map_err(db_err)?;
+        Ok(previous.is_some())
+    }
+
+    /// [`SyncDb::iter_outbound`] within this transaction — the publisher's
+    /// drain reads the staged lane inside the same transaction that
+    /// freezes it into segments (§2.1.5), so it sees its own removals.
+    pub fn iter_outbound(&self) -> Result<Vec<(u64, Vec<u8>)>, StateError> {
+        let outbound = self.txn.open_table(T_OUTBOUND).map_err(db_err)?;
+        read_outbound(&outbound)
     }
 
     /// [`SyncDb::record_deleted`] within this transaction — the §2.7
@@ -2545,14 +2627,18 @@ impl StateTxn<'_> {
         relkey: &RelKey,
         record: &DeletedRecord,
     ) -> Result<(), StateError> {
-        let _ = (relkey, record);
-        todo!("P1-U3: StateTxn::record_deleted")
+        let value = to_json(record)?;
+        let mut deleted = self.txn.open_table(T_DELETED).map_err(db_err)?;
+        deleted
+            .insert(relkey.as_str(), value.as_slice())
+            .map_err(db_err)?;
+        Ok(())
     }
 
     /// [`SyncDb::get_deleted`] within this transaction.
     pub fn get_deleted(&self, relkey: &RelKey) -> Result<Option<DeletedRecord>, StateError> {
-        let _ = relkey;
-        todo!("P1-U3: StateTxn::get_deleted")
+        let deleted = self.txn.open_table(T_DELETED).map_err(db_err)?;
+        read_deleted(&deleted, relkey)
     }
 
     /// [`SyncDb::queue_push`] within this transaction — the other half of

@@ -25,8 +25,11 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::clock::DeviceId;
-use crate::journal::{JournalEntry, JournalError};
-use crate::s3::{S3Api, S3Error};
+use crate::journal::{
+    encode_segment, JournalEntry, JournalError, SEGMENT_MAX_BYTES, SEGMENT_MAX_ENTRIES,
+};
+use crate::keys::{device_registry_key, journal_segment_key};
+use crate::s3::{PutObjectOptions, S3Api, S3Error};
 use crate::state::{StateError, SyncDb};
 
 /// The protocol versions this build can read, advertised in the device
@@ -107,8 +110,94 @@ pub struct PublishReport {
 /// ([`PublisherError::ForeignDevice`] otherwise); `entry.v` is likewise
 /// stamped to [`crate::journal::JOURNAL_VERSION`] at publication.
 pub fn enqueue_entry(db: &SyncDb, entry: &JournalEntry) -> Result<u64, PublisherError> {
-    let _ = (db, entry);
-    todo!("P1-U3: enqueue_entry")
+    if entry.device != *db.device_id() {
+        return Err(PublisherError::ForeignDevice {
+            entry_device: entry.device.clone(),
+            ours: db.device_id().clone(),
+        });
+    }
+    // Normalize the stamped-at-publication fields before staging, so the
+    // staged bytes always decode as a v1 entry on drain regardless of what
+    // junk the caller left in `seq`/`v`.
+    let mut staged = entry.clone();
+    staged.v = crate::journal::JOURNAL_VERSION;
+    staged.seq = 0;
+    let line = staged.to_json_line()?;
+    Ok(db.stage_outbound(line.as_bytes())?)
+}
+
+/// Decodes one staged outbound record back into a [`JournalEntry`],
+/// attaching its staging id on failure ([`PublisherError::CorruptStaged`]).
+fn decode_staged(id: u64, bytes: &[u8]) -> Result<JournalEntry, PublisherError> {
+    let line = std::str::from_utf8(bytes).map_err(|e| PublisherError::CorruptStaged {
+        outbound_id: id,
+        source: JournalError::Json(serde_json::Error::io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e,
+        ))),
+    })?;
+    JournalEntry::from_json_line(line).map_err(|source| PublisherError::CorruptStaged {
+        outbound_id: id,
+        source,
+    })
+}
+
+/// Freezes every staged outbound entry into capped segments, consuming the
+/// staged records **in the same transaction** (§2.1.5: staged or frozen,
+/// never neither). No network I/O. The byte cap is enforced through
+/// [`crate::state::StateTxn::freeze_next_segment`]'s shrink-retry contract:
+/// a [`StateError::SegmentBuild`] caught inside the open transaction
+/// consumed no seqs, so the batch shrinks and retries in the same commit.
+fn freeze_staged(db: &SyncDb) -> Result<(), PublisherError> {
+    db.with_txn_err::<_, PublisherError>(|t| {
+        let staged = t.iter_outbound()?;
+        let mut pending = Vec::with_capacity(staged.len());
+        for (id, bytes) in &staged {
+            pending.push((*id, decode_staged(*id, bytes)?));
+        }
+        let mut rest = pending.as_slice();
+        while !rest.is_empty() {
+            let mut take = rest.len().min(SEGMENT_MAX_ENTRIES);
+            loop {
+                let batch = &rest[..take];
+                let build = |first: u64| {
+                    let stamped: Vec<JournalEntry> = batch
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (_, entry))| {
+                            let mut e = entry.clone();
+                            e.seq = first + i as u64;
+                            e
+                        })
+                        .collect();
+                    Ok(encode_segment(&stamped)?)
+                };
+                match t.freeze_next_segment(take as u64, build) {
+                    Ok(_first) => {
+                        for (id, _) in batch {
+                            t.remove_outbound(*id)?;
+                        }
+                        rest = &rest[take..];
+                        break;
+                    }
+                    // Byte cap crossed (only knowable once real seq digits
+                    // are stamped): no seqs were consumed — shrink and
+                    // retry inside the same transaction.
+                    Err(StateError::SegmentBuild(JournalError::SegmentTooLarge { size }))
+                        if take > 1 =>
+                    {
+                        // Proportional estimate from the failed attempt's
+                        // actual size, clamped to a strict decrease so the
+                        // retry loop always terminates.
+                        let estimated = take * SEGMENT_MAX_BYTES / size.max(1);
+                        take = estimated.clamp(1, take - 1);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Drains the outbound lane: freezes every staged entry into segments
@@ -139,8 +228,39 @@ pub async fn publish_pending(
     s3: &impl S3Api,
     bucket: &str,
 ) -> Result<PublishReport, PublisherError> {
-    let _ = (db, s3, bucket);
-    todo!("P1-U3: publish_pending")
+    // Phase 1 — freeze before any network I/O (§2.1.5): every staged
+    // entry becomes frozen segment bytes in one committed transaction.
+    freeze_staged(db)?;
+
+    // Phase 2 — drain every frozen-but-unpublished segment (including
+    // crash-replayed ones from earlier passes/process lives) in strict
+    // ascending seq order. The frozen bytes ARE the segment: a re-PUT is
+    // byte-identical by construction.
+    let mut report = PublishReport::default();
+    let pending = db.unpublished_segments()?;
+    if pending.is_empty() {
+        return Ok(report);
+    }
+    let device = db.device_id().clone();
+    for (first_seq, bytes) in pending {
+        // NDJSON: exactly one newline-terminated line per entry (JSON
+        // strings cannot carry a raw newline), so the count is cheap.
+        let entries = bytes.iter().filter(|&&b| b == b'\n').count() as u64;
+        let key = journal_segment_key(&device, first_seq);
+        // A failure here stops the drain: this segment and every later one
+        // stay frozen and unpublished, and no later PUT is attempted.
+        s3.put_object(
+            bucket,
+            &key,
+            bytes::Bytes::from(bytes),
+            &PutObjectOptions::default(),
+        )
+        .await?;
+        db.mark_published(first_seq)?;
+        report.segments.push(first_seq);
+        report.entries += entries;
+    }
+    Ok(report)
 }
 
 /// The caller-owned identity facts of the device registry entry (§1.2):
@@ -215,8 +335,106 @@ pub async fn put_device_entry(
     bucket: &str,
     profile: &DeviceProfile,
 ) -> Result<DeviceEntry, PublisherError> {
-    let _ = (db, s3, bucket, profile);
-    todo!("P1-U3: put_device_entry")
+    // Best server-time estimate BEFORE this PUT: the previously stored
+    // offset applied to the local clock, or the local clock on a
+    // first-ever heartbeat. This PUT's own measurement corrects the
+    // stored offset for the NEXT heartbeat.
+    let prior_offset_ms = db.server_time_offset_ms()?.unwrap_or(0);
+    let local_before_ms = local_unix_ms();
+    let last_seen_server_ts = (local_before_ms + prior_offset_ms).div_euclid(1000);
+
+    let applied: BTreeMap<DeviceId, u64> = db.iter_cursors()?.into_iter().collect();
+    let entry = DeviceEntry {
+        name: profile.name.clone(),
+        platform: profile.platform.clone(),
+        created: profile.created,
+        last_seen_server_ts,
+        applied,
+        proto: ProtoSupport {
+            read: PROTO_READ.to_vec(),
+            write: PROTO_WRITE,
+        },
+    };
+    let body = serde_json::to_vec(&entry).map_err(StateError::from)?;
+    let output = s3
+        .put_object(
+            bucket,
+            &device_registry_key(db.device_id()),
+            bytes::Bytes::from(body),
+            &PutObjectOptions::default(),
+        )
+        .await?;
+
+    // Measure and durably record the server-time offset (server minus
+    // local, ms). The HTTP Date has 1 s granularity; the midpoint of the
+    // request is approximated by the local clock right after the response.
+    let date = output.date.as_deref().ok_or(PublisherError::NoServerDate {
+        reason: "header absent".to_string(),
+    })?;
+    let server_secs = parse_http_date(date).ok_or_else(|| PublisherError::NoServerDate {
+        reason: format!("unparsable Date header {date:?}"),
+    })?;
+    let offset_ms = server_secs
+        .saturating_mul(1000)
+        .saturating_sub(local_unix_ms());
+    db.set_server_time_offset_ms(offset_ms)?;
+    Ok(entry)
+}
+
+/// The local wall clock as unix milliseconds (negative before the epoch —
+/// no panic on a badly set clock; library paths do not panic).
+fn local_unix_ms() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_millis()).unwrap_or(i64::MAX),
+        Err(e) => i64::try_from(e.duration().as_millis())
+            .map(i64::wrapping_neg)
+            .unwrap_or(i64::MIN),
+    }
+}
+
+/// Parses an RFC 9110 IMF-fixdate (`Sun, 06 Nov 1994 08:49:37 GMT`) into
+/// unix seconds. `None` for anything else — including the two obsolete
+/// HTTP-date forms, which no S3 backend this engine targets emits; the
+/// caller surfaces `None` as the typed [`PublisherError::NoServerDate`].
+fn parse_http_date(s: &str) -> Option<i64> {
+    // "<day-name>, " is exactly 5 bytes; the rest is fixed-width fields.
+    let rest = s.get(5..)?;
+    let mut fields = rest.split(' ');
+    let (day, mon, year, hms, zone) = (
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+        fields.next()?,
+    );
+    if fields.next().is_some() || zone != "GMT" || !s[..5].ends_with(", ") {
+        return None;
+    }
+    let month = match mon {
+        "Jan" => time::Month::January,
+        "Feb" => time::Month::February,
+        "Mar" => time::Month::March,
+        "Apr" => time::Month::April,
+        "May" => time::Month::May,
+        "Jun" => time::Month::June,
+        "Jul" => time::Month::July,
+        "Aug" => time::Month::August,
+        "Sep" => time::Month::September,
+        "Oct" => time::Month::October,
+        "Nov" => time::Month::November,
+        "Dec" => time::Month::December,
+        _ => return None,
+    };
+    let day: u8 = day.parse().ok()?;
+    let year: i32 = year.parse().ok()?;
+    let mut hms_fields = hms.split(':');
+    let (h, m, sec) = (hms_fields.next()?, hms_fields.next()?, hms_fields.next()?);
+    if hms_fields.next().is_some() {
+        return None;
+    }
+    let date = time::Date::from_calendar_date(year, month, day).ok()?;
+    let time = time::Time::from_hms(h.parse().ok()?, m.parse().ok()?, sec.parse().ok()?).ok()?;
+    Some(date.with_time(time).assume_utc().unix_timestamp())
 }
 
 /// GETs and decodes `device`'s registry entry (§1.2). Unknown JSON fields
@@ -227,6 +445,9 @@ pub async fn get_device_entry(
     bucket: &str,
     device: &DeviceId,
 ) -> Result<DeviceEntry, PublisherError> {
-    let _ = (s3, bucket, device);
-    todo!("P1-U3: get_device_entry")
+    let output = s3
+        .get_object(bucket, &device_registry_key(device), None)
+        .await?;
+    let bytes = output.body.collect().await?;
+    Ok(serde_json::from_slice(&bytes).map_err(StateError::from)?)
 }
