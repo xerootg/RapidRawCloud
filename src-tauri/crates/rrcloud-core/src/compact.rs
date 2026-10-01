@@ -33,15 +33,23 @@
 //! by the durable-record rules of §2.10 (§2.1 principle 3): a stale LIST can
 //! delay discovery or delay GC, never cause destruction or resurrection.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
+use bytes::Bytes;
+
 use crate::clock::{compare, DeviceId, VvOrder};
-use crate::keys::RelKey;
-use crate::manifest::ManifestError;
-use crate::publisher::{DeviceEntry, PublisherError};
-use crate::s3::{S3Error, S3TransferApi};
+use crate::journal::{decode_segment, JournalEntry, Kind, Op, Tombstone, SEGMENT_MAX_BYTES};
+use crate::keys::{
+    classify_key, device_retired_key, journal_segment_key, library_key, local_path, manifest_key,
+    preview_key, sidecar_key, thumb_key, tombstone_key, KeyClass, RelKey, ThumbSize,
+    CONTROL_PREFIX,
+};
+use crate::manifest::{build_manifest, get_manifest, put_manifest, ManifestError};
+use crate::publisher::{get_device_entry, DeviceEntry, PublisherError};
+use crate::s3::{ListObjectsV2Request, PutObjectOptions, S3Api, S3Error, S3TransferApi};
 use crate::semhash::ContentId;
-use crate::state::{StateError, SyncDb};
+use crate::state::{DeletedRecord, ItemRecord, ItemState, StateError, StateTxn, SyncDb};
 
 /// Seconds in a day (server-time arithmetic is all in unix seconds).
 const DAY: i64 = 86_400;
@@ -124,6 +132,10 @@ pub enum CompactError {
     /// Manifest build/encode/transfer/merge failure.
     #[error(transparent)]
     Manifest(#[from] ManifestError),
+    /// A journal segment of a retired device's orphaned prefix did not decode
+    /// (corrupt or oversized) while folding it into the runner's manifest.
+    #[error(transparent)]
+    Journal(#[from] crate::journal::JournalError),
     /// Journal publish/registry failure (device entry decode, etc.).
     #[error(transparent)]
     Publisher(#[from] PublisherError),
@@ -138,13 +150,24 @@ pub enum CompactError {
         detail: String,
     },
     /// The GC runner could not prove a tombstone's `del` row is durably
-    /// folded into its own manifest before destroying data keys (§2.10 (c)
-    /// + the crash-safety ordering): destruction is refused so no key is
-    /// ever destroyed without its deleted-set record already durable.
+    /// folded into its own manifest before destroying data keys (§2.10 (c),
+    /// the crash-safety ordering): destruction is refused so no key is ever
+    /// destroyed without its deleted-set record already durable.
     #[error("deleted-set fold not verified before tombstone destruction: {detail}")]
     DeletedSetNotVerified {
         /// What the read-back saw.
         detail: String,
+    },
+    /// A local filesystem operation failed while resolving a §2.3 quarantine
+    /// decision (`Discard` removing the local file). Carries the relkey so
+    /// the caller can surface which item could not be dropped.
+    #[error("local filesystem error for {relkey}: {source}")]
+    Io {
+        /// The relkey whose local file operation failed.
+        relkey: RelKey,
+        /// The underlying I/O failure.
+        #[source]
+        source: std::io::Error,
     },
 }
 
@@ -318,8 +341,37 @@ pub async fn active_devices(
     clock: &ServerClock,
     cfg: &CompactConfig,
 ) -> Result<Vec<ActiveDevice>, CompactError> {
-    let _ = (s3, bucket, clock, cfg);
-    todo!("P1-U6 green: list devices/, GET entries, filter by retired-marker + 30d last_seen")
+    let prefix = format!("{CONTROL_PREFIX}devices/");
+    let keys = list_keys_under(s3, bucket, &prefix).await?;
+    let mut retired: BTreeSet<DeviceId> = BTreeSet::new();
+    let mut registered: BTreeSet<DeviceId> = BTreeSet::new();
+    for key in &keys {
+        match classify_key(key) {
+            KeyClass::DeviceRetired { device } => {
+                retired.insert(device);
+            }
+            KeyClass::DeviceRegistry { device } => {
+                registered.insert(device);
+            }
+            _ => {}
+        }
+    }
+    let now = clock.now_server();
+    // `registered` is a BTreeSet, so iteration — and the output — is
+    // ascending by device id (the documented order).
+    let mut out = Vec::new();
+    for device in registered {
+        // Retirement wins immediately: a retired device drops from the set
+        // the moment its marker exists, so it stops gating horizons (B5/C3).
+        if retired.contains(&device) {
+            continue;
+        }
+        let entry = get_device_entry(s3, bucket, &device).await?;
+        if now.saturating_sub(entry.last_seen_server_ts) <= cfg.active_window_secs {
+            out.push(ActiveDevice { device, entry });
+        }
+    }
+    Ok(out)
 }
 
 /// The §2.10 segment-compaction horizon for `target`'s prefix: the minimum,
@@ -438,8 +490,71 @@ pub async fn compact_own_segments(
     clock: &ServerClock,
     cfg: &CompactConfig,
 ) -> Result<CompactionSummary, CompactError> {
-    let _ = (db, s3, bucket, clock, cfg);
-    todo!("P1-U6 green: the 3-rule gate, read-back verify, own-prefix DELETE, idempotent summary")
+    let owner = db.device_id().clone();
+    let now = clock.now_server();
+
+    // Own segment extents from the LIST of the owner's journal prefix — no
+    // segment GET needed (freeze_next_segment tiles seqs with no holes).
+    let segments = own_segment_extents(db, s3, bucket, &owner).await?;
+    if segments.is_empty() {
+        // Nothing to compact — idempotent no-op (a re-run after a prior pass
+        // deleted every segment lands here).
+        return Ok(CompactionSummary::default());
+    }
+
+    // Rule 1: the owner's own manifest must durably cover the segments, and
+    // its presence is re-confirmed by a read-back HEAD before any DELETE.
+    let (ceiling, manifest_written_ts) = match get_manifest(s3, bucket, &owner).await {
+        Ok(manifest) => {
+            // A manifest is already present: use its coverage as-is. We never
+            // force coverage up to the published cursor here — a segment whose
+            // entries are not provably folded (cursors[owner] < max_seq) must
+            // be *skipped*, never retroactively covered then deleted (§2.10
+            // safety). The read-back HEAD still runs, so a transient anomaly
+            // aborts the whole pass.
+            verify_manifest_present(s3, bucket, &owner, None, db).await?;
+            (
+                manifest.header.cursors.get(&owner).copied().unwrap_or(0),
+                manifest.header.written_server_ts,
+            )
+        }
+        Err(ManifestError::S3(e)) if e.is_no_such_key() => {
+            // Absent: build + PUT a fresh covering manifest and read-back
+            // verify its ETag. Freshly written, so its written_server_ts is
+            // `now` and rule 2 holds every segment back this pass (age 0) —
+            // deletion begins only on a later pass, ≥ 24 h on.
+            let manifest = build_manifest(db, now)?;
+            let etag = put_manifest(s3, bucket, &owner, &manifest).await?;
+            verify_manifest_present(s3, bucket, &owner, Some(&etag), db).await?;
+            (
+                manifest.header.cursors.get(&owner).copied().unwrap_or(0),
+                now,
+            )
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let active = active_devices(s3, bucket, clock, cfg).await?;
+    let horizon = horizon_applied(&active, &owner);
+    let manifest_age = now.saturating_sub(manifest_written_ts);
+
+    let mut summary = CompactionSummary::default();
+    for seg in &segments {
+        match segment_delete_decision(seg, ceiling, manifest_age, horizon, db, cfg, now)? {
+            Decision::Delete => {
+                s3.delete_object(bucket, &journal_segment_key(&owner, seg.first_seq))
+                    .await?;
+                summary.deleted_seqs.push(seg.first_seq);
+            }
+            Decision::Skip(reason) => summary.skipped.push(SkippedSegment {
+                first_seq: seg.first_seq,
+                max_seq: seg.max_seq,
+                reason,
+            }),
+        }
+    }
+    summary.deleted_seqs.sort_unstable();
+    Ok(summary)
 }
 
 // ---------------------------------------------------------------------------
@@ -534,8 +649,169 @@ pub async fn tombstone_gc(
     clock: &ServerClock,
     cfg: &CompactConfig,
 ) -> Result<GcSummary, CompactError> {
-    let _ = (db, s3, bucket, clock, cfg);
-    todo!("P1-U6 green: the 4-condition gate, fold-before-destroy ordering, content-id liveness")
+    let now = clock.now_server();
+    let runner = db.device_id().clone();
+
+    // Gather every tombstone object + the content id of the item it covers
+    // (read from the runner's local item record, which carries the original's
+    // content_id — needed for the content-id liveness check).
+    let prefix = format!("{CONTROL_PREFIX}tombstones/");
+    let keys = list_keys_under(s3, bucket, &prefix).await?;
+    struct Candidate {
+        tomb: Tombstone,
+        content_id: Option<ContentId>,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    for key in &keys {
+        if !matches!(classify_key(key), KeyClass::Tombstone { .. }) {
+            continue;
+        }
+        let body = match s3.get_object(bucket, key, None).await {
+            Ok(output) => output.body.collect_capped(TOMBSTONE_MAX_BYTES).await?,
+            // Vanished between LIST and GET (another runner raced us): a
+            // stale LIST never forces an action, so skip it.
+            Err(e) if e.is_no_such_key() => continue,
+            Err(e) => return Err(e.into()),
+        };
+        // A malformed tombstone object is a foreign/corrupt document — never
+        // destroy on its say-so; skip it (§2.1 principle 3).
+        let Ok(tomb) = serde_json::from_slice::<Tombstone>(&body) else {
+            continue;
+        };
+        let content_id = db.get_item(&tomb.relkey)?.and_then(|r| r.content_id);
+        candidates.push(Candidate { tomb, content_id });
+    }
+
+    let active = active_devices(s3, bucket, clock, cfg).await?;
+
+    // Classify each tombstone against the 4-condition gate.
+    enum Class {
+        Eligible,
+        Retained(GcSkipReason),
+    }
+    let mut classes: Vec<Class> = Vec::with_capacity(candidates.len());
+    for c in &candidates {
+        let age = now.saturating_sub(c.tomb.server_ts);
+        // (b) grace.
+        if age < cfg.grace_secs {
+            classes.push(Class::Retained(GcSkipReason::WithinGrace { age_secs: age }));
+            continue;
+        }
+        // (d) not superseded by a resurrecting put (edits beat deletes).
+        if is_superseded(db, &c.tomb)? {
+            classes.push(Class::Retained(GcSkipReason::Superseded));
+            continue;
+        }
+        // (a) every active device applied past it, or the 14-day cap elapsed.
+        // (Past the 30-day grace the cap trivially holds, so a laggard never
+        // blocks a grace-passed tombstone — but we evaluate it faithfully.)
+        let horizon = horizon_applied(&active, &c.tomb.device);
+        let del_seq = u64::from(c.tomb.vv.get(&c.tomb.device));
+        let cap_elapsed = age > cfg.laggard_cap_secs;
+        if horizon >= del_seq || cap_elapsed {
+            classes.push(Class::Eligible);
+        } else {
+            classes.push(Class::Retained(GcSkipReason::HorizonBlocked));
+        }
+    }
+
+    // Content ids still referenced by an in-grace tombstone (its data keys
+    // survive, so its content must too — content-id liveness).
+    let mut grace_content: Vec<ContentId> = Vec::new();
+    for (i, c) in candidates.iter().enumerate() {
+        if matches!(
+            classes[i],
+            Class::Retained(GcSkipReason::WithinGrace { .. })
+        ) {
+            if let Some(cid) = &c.content_id {
+                grace_content.push(cid.clone());
+            }
+        }
+    }
+
+    let mut summary = GcSummary::default();
+    let any_eligible = classes.iter().any(|c| matches!(c, Class::Eligible));
+    if any_eligible {
+        // (c) deleted-set fold, FIRST. Ensure each eligible tombstone's
+        // {del, vv, server_ts} row is durable in the runner's deleted set,
+        // then PUT the runner's manifest and read-back verify it present
+        // BEFORE any data key is destroyed. A crash after this point leaves
+        // the deletion already learnable from the retained deleted set
+        // (§2.3/A3), never a key destroyed without its record.
+        for (i, c) in candidates.iter().enumerate() {
+            if matches!(classes[i], Class::Eligible) {
+                db.record_deleted(
+                    &c.tomb.relkey,
+                    &DeletedRecord {
+                        vv: c.tomb.vv.clone(),
+                        server_ts: c.tomb.server_ts,
+                    },
+                )?;
+            }
+        }
+        let manifest = build_manifest(db, now)?;
+        let etag = put_manifest(s3, bucket, &runner, &manifest).await?;
+        verify_deleted_set_folded(s3, bucket, &runner, &etag, db).await?;
+
+        for (i, c) in candidates.iter().enumerate() {
+            if !matches!(classes[i], Class::Eligible) {
+                continue;
+            }
+            let relkey = &c.tomb.relkey;
+            // Destroy order (pinned by the crash test): data keys → content
+            // keys → the tombstone object.
+            let mut data_keys = Vec::new();
+            for kind in &c.tomb.kinds {
+                let key = match kind {
+                    Kind::Original | Kind::Xmp => library_key(relkey),
+                    Kind::Sidecar => sidecar_key(relkey),
+                    // Preview/thumb/pack/meta are content-addressed or not
+                    // per-relkey data keys; they are handled by the content
+                    // liveness step (or not owned by this tombstone).
+                    _ => continue,
+                };
+                s3.delete_object(bucket, &key).await?;
+                data_keys.push(key);
+            }
+
+            // Content-id liveness: destroy the content-addressed
+            // preview/thumb objects ONLY when no live relkey and no in-grace
+            // tombstone still references the content_id.
+            let mut content_destroyed = Vec::new();
+            if let Some(content) = &c.content_id {
+                let live_ref = db
+                    .iter_items()?
+                    .into_iter()
+                    .any(|(_, r)| !r.deleted && r.content_id.as_ref() == Some(content));
+                let grace_ref = grace_content.contains(content);
+                if !live_ref && !grace_ref {
+                    s3.delete_object(bucket, &preview_key(content)).await?;
+                    s3.delete_object(bucket, &thumb_key(content, ThumbSize::Small))
+                        .await?;
+                    s3.delete_object(bucket, &thumb_key(content, ThumbSize::Medium))
+                        .await?;
+                    content_destroyed.push(content.clone());
+                }
+            }
+
+            s3.delete_object(bucket, &tombstone_key(relkey)).await?;
+            summary.destroyed.push(DestroyedTombstone {
+                relkey: relkey.clone(),
+                data_keys,
+                content_destroyed,
+            });
+        }
+    }
+
+    for (i, c) in candidates.iter().enumerate() {
+        if let Class::Retained(reason) = &classes[i] {
+            summary.retained.push(RetainedTombstone {
+                relkey: c.tomb.relkey.clone(),
+                reason: reason.clone(),
+            });
+        }
+    }
+    Ok(summary)
 }
 
 // ---------------------------------------------------------------------------
@@ -553,8 +829,14 @@ pub async fn retire_device(
     bucket: &str,
     device: &DeviceId,
 ) -> Result<(), CompactError> {
-    let _ = (s3, bucket, device);
-    todo!("P1-U6 green: PUT devices/<id>.retired (idempotent)")
+    s3.put_object(
+        bucket,
+        &device_retired_key(device),
+        Bytes::new(),
+        &PutObjectOptions::default(),
+    )
+    .await?;
+    Ok(())
 }
 
 /// The §2.10 auto-retire sweep: list `devices/`, GET each entry, and PUT a
@@ -574,8 +856,46 @@ pub async fn auto_retire_sweep(
     clock: &ServerClock,
     cfg: &CompactConfig,
 ) -> Result<Vec<DeviceId>, CompactError> {
-    let _ = (s3, bucket, clock, cfg);
-    todo!("P1-U6 green: 90-day server-time auto-retire, idempotent, first-heartbeat-safe")
+    let now = clock.now_server();
+    let prefix = format!("{CONTROL_PREFIX}devices/");
+    let keys = list_keys_under(s3, bucket, &prefix).await?;
+    let mut retired: BTreeSet<DeviceId> = BTreeSet::new();
+    let mut registered: BTreeSet<DeviceId> = BTreeSet::new();
+    for key in &keys {
+        match classify_key(key) {
+            KeyClass::DeviceRetired { device } => {
+                retired.insert(device);
+            }
+            KeyClass::DeviceRegistry { device } => {
+                registered.insert(device);
+            }
+            _ => {}
+        }
+    }
+    let mut newly = Vec::new();
+    for device in registered {
+        // Idempotent: a device already carrying a `.retired` marker is
+        // skipped, so a re-sweep returns an empty list.
+        if retired.contains(&device) {
+            continue;
+        }
+        let entry = get_device_entry(s3, bucket, &device).await?;
+        let idle = now.saturating_sub(entry.last_seen_server_ts) > cfg.auto_retire_secs;
+        // §2.2 first-heartbeat caveat: never auto-retire on a single,
+        // possibly-skewed `last_seen`. A settled entry has heartbeated more
+        // than once, so its `last_seen` sits well past its `created`; the
+        // span is skew-immune (both are the device's own clock, so the error
+        // cancels). A never-re-heartbeated entry has span ≈ 0 and is left
+        // alone until another device or the UI retires it.
+        let settled =
+            entry.last_seen_server_ts.saturating_sub(entry.created) >= AUTO_RETIRE_MIN_SETTLED_SECS;
+        if idle && settled {
+            retire_device(s3, bucket, &device).await?;
+            newly.push(device);
+        }
+    }
+    // `registered` iterated ascending, so `newly` is ascending.
+    Ok(newly)
 }
 
 /// §2.10 orphaned-prefix GC: the journal segments of **retired** devices,
@@ -595,8 +915,132 @@ pub async fn gc_retired_prefixes(
     clock: &ServerClock,
     cfg: &CompactConfig,
 ) -> Result<Vec<(DeviceId, CompactionSummary)>, CompactError> {
-    let _ = (db, s3, bucket, clock, cfg);
-    todo!("P1-U6 green: fold retired prefixes into runner manifest, delete under compaction rules")
+    let now = clock.now_server();
+    let runner = db.device_id().clone();
+
+    let prefix = format!("{CONTROL_PREFIX}devices/");
+    let keys = list_keys_under(s3, bucket, &prefix).await?;
+    let mut retired: BTreeSet<DeviceId> = BTreeSet::new();
+    for key in &keys {
+        if let KeyClass::DeviceRetired { device } = classify_key(key) {
+            retired.insert(device);
+        }
+    }
+
+    let active = active_devices(s3, bucket, clock, cfg).await?;
+
+    // Fold each retired device's orphaned prefix into the runner's state
+    // (live rows + deleted rows + an attested cursor), so a later
+    // bootstrapper still learns every effect from the runner's manifest.
+    struct Orphan {
+        device: DeviceId,
+        segments: Vec<SegExtent>,
+    }
+    let mut orphans: Vec<Orphan> = Vec::new();
+    for device in retired {
+        if device == runner {
+            continue;
+        }
+        let jprefix = format!("{CONTROL_PREFIX}journal/{device}/");
+        let jkeys = list_keys_under(s3, bucket, &jprefix).await?;
+        let mut firsts: Vec<u64> = jkeys
+            .iter()
+            .filter_map(|k| match classify_key(k) {
+                KeyClass::Journal { device: d, seq, .. } if d == device => Some(seq),
+                _ => None,
+            })
+            .collect();
+        firsts.sort_unstable();
+        firsts.dedup();
+        if firsts.is_empty() {
+            continue;
+        }
+        // GET + decode each segment: an orphaned prefix carries no local
+        // span cache, so the exact per-segment extent comes from the entries.
+        let mut all_entries: Vec<JournalEntry> = Vec::new();
+        let mut segments: Vec<SegExtent> = Vec::new();
+        for &first in &firsts {
+            let body = s3
+                .get_object(bucket, &journal_segment_key(&device, first), None)
+                .await?
+                .body
+                .collect_capped(SEGMENT_MAX_BYTES)
+                .await?;
+            let entries = decode_segment(&body)?;
+            let count = entries.len() as u64;
+            let max_seq = first + count.saturating_sub(1);
+            segments.push(SegExtent {
+                first_seq: first,
+                max_seq,
+            });
+            all_entries.extend(entries);
+        }
+        let overall_max = all_entries.iter().map(|e| e.seq).max().unwrap_or(0);
+        db.with_txn_err::<_, CompactError>(|txn| {
+            for entry in &all_entries {
+                fold_entry(txn, entry)?;
+            }
+            // Attest how far the runner has folded the orphaned prefix, so
+            // the rebuilt runner manifest covers it (cursors[device]).
+            txn.set_cursor(&device, overall_max)?;
+            Ok(())
+        })?;
+        orphans.push(Orphan { device, segments });
+    }
+
+    if orphans.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Fold durable, then verify: PUT the runner manifest (now carrying the
+    // orphans' effects + cursors) and read-back HEAD it present before any
+    // orphaned segment is deleted (§2.1 principle 3).
+    let manifest = build_manifest(db, now)?;
+    let etag = put_manifest(s3, bucket, &runner, &manifest).await?;
+    verify_manifest_present(s3, bucket, &runner, Some(&etag), db).await?;
+
+    let mut out = Vec::new();
+    for orphan in orphans {
+        let horizon = horizon_applied(&active, &orphan.device);
+        let ceiling = manifest
+            .header
+            .cursors
+            .get(&orphan.device)
+            .copied()
+            .unwrap_or(0);
+        let mut summary = CompactionSummary::default();
+        for seg in &orphan.segments {
+            if seg.max_seq > ceiling {
+                summary.skipped.push(SkippedSegment {
+                    first_seq: seg.first_seq,
+                    max_seq: seg.max_seq,
+                    reason: SkipReason::ManifestCoverageBelow { cursor: ceiling },
+                });
+                continue;
+            }
+            // The runner holds no publish stamp for a foreign prefix, so the
+            // 14-day cap is conservative (never fires without a stamp); the
+            // fast path is the normal route for a cleared horizon.
+            let capped = match db.segment_published_server_ts(seg.first_seq)? {
+                Some(ts) => now.saturating_sub(ts) > cfg.laggard_cap_secs,
+                None => false,
+            };
+            if horizon >= seg.max_seq || capped {
+                s3.delete_object(bucket, &journal_segment_key(&orphan.device, seg.first_seq))
+                    .await?;
+                summary.deleted_seqs.push(seg.first_seq);
+            } else {
+                summary.skipped.push(SkippedSegment {
+                    first_seq: seg.first_seq,
+                    max_seq: seg.max_seq,
+                    reason: SkipReason::HorizonBlocked { horizon },
+                });
+            }
+        }
+        summary.deleted_seqs.sort_unstable();
+        out.push((orphan.device, summary));
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -637,8 +1081,29 @@ pub fn detect_local_only_unprovable(
     clock: &ServerClock,
     cfg: &CompactConfig,
 ) -> Result<QuarantineDecision, CompactError> {
-    let _ = (db, clock, cfg);
-    todo!("P1-U6 green: compare applied-proof horizon to retention, collect base_unknown items")
+    let now = clock.now_server();
+    // The device can prove a key was not deleted only while its deletion
+    // knowledge is complete to within the retention window. No measured
+    // proof horizon at all is treated as predating it (it cannot prove
+    // anything).
+    let predates = match db.applied_proof_server_ts()? {
+        Some(ts) => now.saturating_sub(ts) > cfg.retention_secs,
+        None => true,
+    };
+    if !predates {
+        return Ok(QuarantineDecision::Clear);
+    }
+    let mut relkeys: Vec<RelKey> = db
+        .iter_items()?
+        .into_iter()
+        .filter(|(_, record)| record.base_unknown && !record.deleted)
+        .map(|(key, _)| key)
+        .collect();
+    if relkeys.is_empty() {
+        return Ok(QuarantineDecision::Clear);
+    }
+    relkeys.sort();
+    Ok(QuarantineDecision::QuarantineRequired { relkeys })
 }
 
 /// The user's resolution of one quarantined relkey.
@@ -698,18 +1163,363 @@ pub async fn resolve_quarantine(
     relkey: &RelKey,
     resolution: QuarantineResolution,
 ) -> Result<QuarantineOutcome, CompactError> {
-    let _ = (db, s3, bucket, sync_root, relkey, resolution);
-    todo!("P1-U6 green: Keep -> gated re-advertise put; Discard -> local delete + record drop")
+    match resolution {
+        QuarantineResolution::Keep => {
+            // Gate: a cloud tombstone OR a local deleted-set row still
+            // covering this relkey means re-advertising would resurrect a
+            // legitimately-deleted key. Refuse — the §2.7 Recently-Deleted
+            // flow (which mints a vv dominating the tombstone) is the only
+            // lane that may bring it back.
+            let tombstoned = match s3.head_object(bucket, &tombstone_key(relkey)).await {
+                Ok(_) => true,
+                Err(e) if e.is_no_such_key() => false,
+                Err(e) => return Err(e.into()),
+            };
+            if tombstoned || db.get_deleted(relkey)?.is_some() {
+                return Ok(QuarantineOutcome::RefusedResurrection {
+                    relkey: relkey.clone(),
+                });
+            }
+            // Re-advertise: clear `base_unknown` and re-enter the upload lane
+            // (Dirty). No journal entry is published here — that is the
+            // ordinary upload lane's job.
+            if let Some(mut item) = db.get_item(relkey)? {
+                item.base_unknown = false;
+                item.state = ItemState::Dirty;
+                db.replay_put_item(relkey, &item)?;
+            }
+            Ok(QuarantineOutcome::Restored {
+                relkey: relkey.clone(),
+            })
+        }
+        QuarantineResolution::Discard => {
+            let path = local_path(relkey, sync_root);
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(CompactError::Io {
+                        relkey: relkey.clone(),
+                        source,
+                    })
+                }
+            }
+            db.delete_item(relkey)?;
+            Ok(QuarantineOutcome::Discarded {
+                relkey: relkey.clone(),
+            })
+        }
+    }
 }
 
 /// Crate-internal: does `put` (vv `pv`) dominate a tombstone/del at vv `dv`?
 /// A resurrecting put is one that strictly dominates the deletion's vv
 /// (§2.6/§2.7). Exposed to the GC superseded-check; a thin wrapper over
 /// [`crate::clock::compare`] so the one spelling of "resurrects" lives here.
-#[allow(dead_code)]
 pub(crate) fn put_supersedes_del(
     pv: &crate::clock::VersionVector,
     dv: &crate::clock::VersionVector,
 ) -> bool {
     matches!(compare(pv, dv), VvOrder::Greater)
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Fail-closed allocation bound on a fetched tombstone document (a few
+/// hundred bytes in practice; a larger object is corrupt or hostile).
+const TOMBSTONE_MAX_BYTES: usize = 64 * 1024;
+
+/// The minimum join-to-last-seen span a device entry must show before the
+/// auto-retire sweep trusts its `last_seen_server_ts` (§2.2 first-heartbeat
+/// caveat). A never-re-heartbeated entry has a ~zero span and is left alone;
+/// any settled device clears this by orders of magnitude. The span is
+/// skew-immune — `created` and `last_seen` share the device's clock — so a
+/// skewed first heartbeat cannot fake a settled entry.
+const AUTO_RETIRE_MIN_SETTLED_SECS: i64 = DAY;
+
+/// One own/orphaned journal segment's seq extent.
+struct SegExtent {
+    /// The segment's first entry seq (its filename seq).
+    first_seq: u64,
+    /// The segment's highest entry seq.
+    max_seq: u64,
+}
+
+/// A per-segment compaction decision.
+enum Decision {
+    /// Delete the segment object.
+    Delete,
+    /// Keep it, with the reason.
+    Skip(SkipReason),
+}
+
+/// Lists every object key under `prefix` (paginated), bounded like the
+/// reader's journal-listing lane so a hostile bucket cannot force unbounded
+/// key buffering on phone-class targets.
+async fn list_keys_under(
+    s3: &impl S3Api,
+    bucket: &str,
+    prefix: &str,
+) -> Result<Vec<String>, CompactError> {
+    const MAX_PAGES: u32 = 10_000;
+    const MAX_KEYS: usize = 1_000_000;
+    let mut keys = Vec::new();
+    let mut continuation_token: Option<String> = None;
+    let mut pages = 0u32;
+    loop {
+        if pages >= MAX_PAGES {
+            return Err(S3Error::InvalidResponse(format!(
+                "ListObjectsV2 still truncated after {MAX_PAGES} pages under {prefix:?}"
+            ))
+            .into());
+        }
+        pages += 1;
+        let page = s3
+            .list_objects_v2(
+                bucket,
+                &ListObjectsV2Request {
+                    prefix: Some(prefix.to_string()),
+                    continuation_token: continuation_token.take(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        keys.extend(page.objects.into_iter().map(|o| o.key));
+        if keys.len() > MAX_KEYS {
+            return Err(S3Error::InvalidResponse(format!(
+                "ListObjectsV2 returned more than {MAX_KEYS} keys under {prefix:?}"
+            ))
+            .into());
+        }
+        if !page.is_truncated {
+            return Ok(keys);
+        }
+        match page.next_continuation_token {
+            Some(token) => continuation_token = Some(token),
+            None => {
+                return Err(S3Error::InvalidResponse(
+                    "truncated ListObjectsV2 page without a NextContinuationToken".to_string(),
+                )
+                .into())
+            }
+        }
+    }
+}
+
+/// The owner's own journal segments and their seq extents, derived from the
+/// LIST of its prefix: because `freeze_next_segment` tiles seqs with no
+/// holes, each segment's `max_seq` is one below the next segment's
+/// `first_seq`, and the last segment's `max_seq` is the published cursor —
+/// so no segment GET is needed.
+async fn own_segment_extents(
+    db: &SyncDb,
+    s3: &impl S3Api,
+    bucket: &str,
+    owner: &DeviceId,
+) -> Result<Vec<SegExtent>, CompactError> {
+    let prefix = format!("{CONTROL_PREFIX}journal/{owner}/");
+    let keys = list_keys_under(s3, bucket, &prefix).await?;
+    let mut firsts: Vec<u64> = keys
+        .iter()
+        .filter_map(|k| match classify_key(k) {
+            KeyClass::Journal { device, seq, .. } if device == *owner => Some(seq),
+            _ => None,
+        })
+        .collect();
+    firsts.sort_unstable();
+    firsts.dedup();
+    if firsts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let published = db.published_cursor()?;
+    let mut out = Vec::with_capacity(firsts.len());
+    for (i, &first) in firsts.iter().enumerate() {
+        let max_seq = if i + 1 < firsts.len() {
+            firsts[i + 1].saturating_sub(1)
+        } else {
+            published.max(first)
+        };
+        out.push(SegExtent {
+            first_seq: first,
+            max_seq,
+        });
+    }
+    Ok(out)
+}
+
+/// The §2.10 3-rule gate for one segment: coverage (rule 1) → 24 h reconfirm
+/// (rule 2) → fast path or 14-day cap (rule 3). A segment is deleted only
+/// when all three clear.
+fn segment_delete_decision(
+    seg: &SegExtent,
+    ceiling: u64,
+    manifest_age: i64,
+    horizon: u64,
+    db: &SyncDb,
+    cfg: &CompactConfig,
+    now: i64,
+) -> Result<Decision, CompactError> {
+    // Rule 1: the manifest must provably fold the segment's entries.
+    if seg.max_seq > ceiling {
+        return Ok(Decision::Skip(SkipReason::ManifestCoverageBelow {
+            cursor: ceiling,
+        }));
+    }
+    // Rule 2: the covering manifest must have aged ≥ reconfirm_secs.
+    if manifest_age < cfg.reconfirm_secs {
+        return Ok(Decision::Skip(SkipReason::ReconfirmWindowOpen {
+            manifest_age_secs: manifest_age,
+        }));
+    }
+    // Rule 3: fast path (every active peer applied past it) OR the 14-day
+    // cap (server time, from the per-segment publish stamp; an absent stamp
+    // is conservative — never cap-deletes an unaged segment).
+    let fast = horizon >= seg.max_seq;
+    let capped = match db.segment_published_server_ts(seg.first_seq)? {
+        Some(ts) => now.saturating_sub(ts) > cfg.laggard_cap_secs,
+        None => false,
+    };
+    if fast || capped {
+        Ok(Decision::Delete)
+    } else {
+        Ok(Decision::Skip(SkipReason::HorizonBlocked { horizon }))
+    }
+}
+
+/// Read-back HEAD of `device`'s own manifest (§2.10 rule 1/2): requires it
+/// present, and — when `expected_etag` names a PUT this pass — byte-identical
+/// to that PUT. A failed or not-present read-back is
+/// [`CompactError::ManifestNotVerified`] and aborts the whole compaction
+/// pass (no segment deleted). Refreshes the stored server-time offset from
+/// the HEAD's `Date` while here.
+async fn verify_manifest_present(
+    s3: &impl S3Api,
+    bucket: &str,
+    device: &DeviceId,
+    expected_etag: Option<&str>,
+    db: &SyncDb,
+) -> Result<(), CompactError> {
+    match s3.head_object(bucket, &manifest_key(device)).await {
+        Ok(head) => {
+            let _ = record_server_time(db, head.date.as_deref());
+            if let Some(expected) = expected_etag {
+                if head.e_tag != expected {
+                    return Err(CompactError::ManifestNotVerified {
+                        detail: format!(
+                            "manifest ETag after PUT is {:?}, expected {:?}",
+                            head.e_tag, expected
+                        ),
+                    });
+                }
+            }
+            Ok(())
+        }
+        Err(e) => Err(CompactError::ManifestNotVerified {
+            detail: format!("read-back HEAD of {} failed: {e}", manifest_key(device)),
+        }),
+    }
+}
+
+/// Read-back HEAD of the GC runner's manifest after the deleted-set fold PUT
+/// (§2.10 (c)): requires it present and byte-identical to the fold PUT before
+/// any data key is destroyed. A failed read-back is
+/// [`CompactError::DeletedSetNotVerified`].
+async fn verify_deleted_set_folded(
+    s3: &impl S3Api,
+    bucket: &str,
+    device: &DeviceId,
+    expected_etag: &str,
+    db: &SyncDb,
+) -> Result<(), CompactError> {
+    match s3.head_object(bucket, &manifest_key(device)).await {
+        Ok(head) => {
+            let _ = record_server_time(db, head.date.as_deref());
+            if head.e_tag != expected_etag {
+                return Err(CompactError::DeletedSetNotVerified {
+                    detail: format!(
+                        "runner manifest ETag after fold PUT is {:?}, expected {:?}",
+                        head.e_tag, expected_etag
+                    ),
+                });
+            }
+            Ok(())
+        }
+        Err(e) => Err(CompactError::DeletedSetNotVerified {
+            detail: format!("read-back HEAD of {} failed: {e}", manifest_key(device)),
+        }),
+    }
+}
+
+/// The §2.10 (d) superseded check: the runner's converged state is the
+/// result of applying every journal (and merge) through the one unified apply
+/// rule, so a resurrecting `put` shows up as a **live** item record whose vv
+/// dominates the tombstone's. Edits beat deletes survive GC (§2.7/§2.6).
+fn is_superseded(db: &SyncDb, tomb: &Tombstone) -> Result<bool, CompactError> {
+    match db.get_item(&tomb.relkey)? {
+        Some(item) if !item.deleted => Ok(put_supersedes_del(&item.vv, &tomb.vv)),
+        _ => Ok(false),
+    }
+}
+
+/// Folds one orphaned-prefix journal entry into the runner's state inside a
+/// caller-held transaction — the lossless reclamation apply (§2.3 "merge is
+/// the idempotent apply"): a `put` materializes a live row, a `del` a deleted
+/// row, so the rebuilt runner manifest carries the retired device's effects
+/// for every later bootstrapper. Content-level unclassifiable keys are
+/// skipped (the [`crate::reader::JournalConsumer`] error contract).
+fn fold_entry(txn: &StateTxn<'_>, entry: &JournalEntry) -> Result<(), CompactError> {
+    let relkey = match classify_key(&entry.key) {
+        KeyClass::Original { relkey }
+        | KeyClass::Sidecar { relkey, .. }
+        | KeyClass::Xmp { relkey } => relkey,
+        _ => return Ok(()),
+    };
+    match entry.op {
+        Op::Put => {
+            txn.replay_put_item(&relkey, &fold_item_record(entry))?;
+        }
+        Op::Del => {
+            txn.delete_item(&relkey)?;
+            txn.record_deleted(
+                &relkey,
+                &DeletedRecord {
+                    vv: entry.vv.clone(),
+                    server_ts: entry.ts,
+                },
+            )?;
+        }
+        Op::Move | Op::Attest => {}
+    }
+    Ok(())
+}
+
+/// Builds the runner's item record for a folded `put` entry (a `Synced`
+/// snapshot of the advertised version — the manifest row's source).
+fn fold_item_record(entry: &JournalEntry) -> ItemRecord {
+    ItemRecord {
+        kind: entry.kind,
+        state: ItemState::Synced,
+        size: entry.size.unwrap_or(0),
+        mtime_unix_ns: entry.mtime.unwrap_or(0).saturating_mul(1_000_000_000),
+        blake3: entry.blake3.clone(),
+        sem_hash: entry.sem_hash.clone(),
+        vv: entry.vv.clone(),
+        content_id: entry.content_id.clone(),
+        w: entry.w,
+        h: entry.h,
+        pinned: false,
+        last_access_unix: 0,
+        verified_remote: false,
+        attested: false,
+        base_unknown: false,
+        rating: entry.rating,
+        color_label: entry.color_label.clone(),
+        device: Some(entry.device.clone()),
+        head_ts: Some(entry.ts),
+        admitted_vv: None,
+        admitted_ts: None,
+        deleted: false,
+    }
 }

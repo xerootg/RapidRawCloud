@@ -590,10 +590,12 @@ async fn compaction_14_day_cap_deletes_despite_a_laggard() {
     put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 0)])).await;
 
     let clock = ServerClock::pinned(NOW);
-    assert!(
-        LAGGARD_CAP_SECS < 15 * 86_400,
-        "the planted age is past the cap"
-    );
+    const {
+        assert!(
+            LAGGARD_CAP_SECS < 15 * 86_400,
+            "the planted age is past the cap"
+        )
+    };
     let summary = compact_own_segments(&db, &client, &bucket, &clock, &CompactConfig::default())
         .await
         .expect("compact");
@@ -1087,7 +1089,7 @@ async fn tombstone_gc_grace_window_keeps_a_young_tombstone() {
     )
     .await;
 
-    assert!(5 * 86_400 < RECENTLY_DELETED_GRACE_SECS);
+    const { assert!(5 * 86_400 < RECENTLY_DELETED_GRACE_SECS) };
     let clock = ServerClock::pinned(NOW);
     let summary = tombstone_gc(&db, &client, &bucket, &clock, &CompactConfig::default())
         .await
@@ -1254,7 +1256,7 @@ async fn auto_retire_sweep_retires_90_day_idle_device() {
     )
     .await;
 
-    assert!(91 * 86_400 > AUTO_RETIRE_SECS);
+    const { assert!(91 * 86_400 > AUTO_RETIRE_SECS) };
     let clock = ServerClock::pinned(NOW);
     let retired = auto_retire_sweep(&client, &bucket, &clock, &CompactConfig::default())
         .await
