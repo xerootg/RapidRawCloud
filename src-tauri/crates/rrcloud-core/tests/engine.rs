@@ -28,9 +28,9 @@ use common::transfer::CountingS3;
 use rrcloud_core::clock::{compare, VersionVector, VvOrder};
 use rrcloud_core::engine::{
     admit_pending, delete_item, item_local_path, item_relkey_for, loser_vc_suffix,
-    notify_local_change, original_conflict_relkey, recently_deleted, restore_item,
-    sidecar_item_relkey, vc_item_relkey, ChangeOutcome, EngineConsumer, EngineError, EnginePut,
-    LocalScan,
+    notify_local_change, original_conflict_relkey, recently_deleted, reconcile_wholeness,
+    restore_item, sidecar_item_relkey, vc_item_relkey, ChangeOutcome, EngineConsumer, EngineError,
+    EnginePut, LocalScan, ResurrectionIncompleteEvent,
 };
 use rrcloud_core::journal::{JournalEntry, Kind, Op, Tombstone, JOURNAL_VERSION};
 use rrcloud_core::keys::{
@@ -1696,6 +1696,72 @@ fn resurrection_without_a_known_original_surfaces_the_incomplete_edge() {
             "no blind original put may be fabricated"
         );
     }
+}
+
+#[test]
+fn reconcile_wholeness_converse_lane_surfaces_an_unresurrectable_sidecar() {
+    // Round 5 MINOR (observability symmetry): the converse wholeness lane
+    // (live original + tombstoned base sidecar, the §2.11 "resurrection
+    // restores a whole item" case) must mirror the forward lane — when it
+    // CANNOT re-advertise the tombstoned sidecar's develop edits (the
+    // deleted record carries no `blake3`), it mints nothing and must say
+    // so, exactly as the forward lane fires the event for a blake3-less
+    // deleted original.
+    let (_d, _root, db) = scratch(DEV_A);
+    let image = rel(IMG);
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+
+    // A live original.
+    let mut original = rec(Kind::Original, ItemState::Synced);
+    original.blake3 = Some(Blake3Hex::from_bytes(b"raw-bytes"));
+    original.vv = vv(&[(DEV_A, 1)]);
+    db.insert_item(&image, &original).expect("seed original");
+
+    // A tombstoned base sidecar this device never held the content of
+    // (`blake3 == None`): it learned the edits were deleted but cannot
+    // re-advertise them — the converse of the forward lane's
+    // blake3-less-deleted-original case.
+    let mut sidecar = rec(Kind::Sidecar, ItemState::Synced);
+    sidecar.deleted = true;
+    sidecar.vv = vv(&[(DEV_B, 2)]);
+    db.insert_item(&sidecar_rel, &sidecar)
+        .expect("seed sidecar");
+
+    let mut events = RecordedEvents::default();
+    let minted = reconcile_wholeness(&db, &mut events).expect("reconcile");
+
+    assert!(
+        minted.is_empty(),
+        "no blake3: nothing can be minted on this device"
+    );
+    assert_eq!(
+        events.resurrection_incomplete,
+        vec![ResurrectionIncompleteEvent {
+            relkey: sidecar_rel.clone()
+        }],
+        "the converse lane surfaces the un-resurrectable sidecar, mirroring the forward lane"
+    );
+    assert!(
+        item(&db, &sidecar_rel).deleted,
+        "the sidecar stays tombstoned until a holder re-advertises it"
+    );
+    // A live original with NO sidecar record is a normal shape, not a
+    // forbidden half-deleted one: it must NOT fire the event.
+    let (_d2, _root2, db2) = scratch(DEV_A);
+    let lone = rel("p/lone.NEF");
+    let mut lone_orig = rec(Kind::Original, ItemState::Synced);
+    lone_orig.blake3 = Some(Blake3Hex::from_bytes(b"lone"));
+    lone_orig.vv = vv(&[(DEV_A, 1)]);
+    db2.insert_item(&lone, &lone_orig)
+        .expect("seed lone original");
+    let mut events2 = RecordedEvents::default();
+    assert!(reconcile_wholeness(&db2, &mut events2)
+        .expect("reconcile")
+        .is_empty());
+    assert!(
+        events2.resurrection_incomplete.is_empty(),
+        "a live original with no sidecar is not a forbidden shape"
+    );
 }
 
 #[test]

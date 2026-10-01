@@ -708,13 +708,24 @@ pub struct ConflictEvent {
     pub copy_relkey: Option<RelKey>,
 }
 
-/// §2.7 edge event: a concurrent `del` resurrected the sidecar, but the
-/// original could not be re-advertised because this device never knew
-/// it (no record / no `blake3`) — the original stays deleted-side until
-/// a holder re-advertises it.
+/// §2.7/§2.11 edge event: one half of an item survived a concurrent
+/// `del` but its counterpart could not be re-advertised on this device,
+/// so the counterpart stays deleted-side until a holder re-advertises
+/// it. Two symmetric lanes raise it:
+///
+/// - **forward** (§2.7): a resurrected sidecar's original could not be
+///   re-advertised — this device never knew it (no record) or holds no
+///   `blake3` for it. `relkey` is the image.
+/// - **converse** (§2.11, round 5): a live original's tombstoned base
+///   sidecar could not be re-advertised — this device holds a
+///   `blake3`-less deleted sidecar record. `relkey` is the sidecar item.
+///
+/// Either way the sink treats it as advisory: re-derive state and let
+/// any holder (or the §2.10 GC worker) close the gap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResurrectionIncompleteEvent {
-    /// The image whose original resurrection was skipped.
+    /// The item (image for the forward lane, sidecar for the converse)
+    /// whose counterpart's resurrection was skipped on this device.
     pub relkey: RelKey,
 }
 
@@ -2305,6 +2316,21 @@ pub struct DeleteOutcome {
 /// A kind with no item record is skipped (deleting a never-synced kind
 /// is a no-op, not an error); naming no existing item at all is
 /// [`EngineError::UnknownItem`].
+///
+/// # Whole-photo only (round 5)
+///
+/// §2.7/§3.4 model deletion as a WHOLE-PHOTO action — all of an image's
+/// kinds together. Deleting only one half of an otherwise-live image
+/// (e.g. just `Kind::Original` while its base sidecar stays live, or vice
+/// versa) is **not supported**: it leaves the forbidden half-deleted
+/// shape that [`reconcile_wholeness`] exists to heal, so the next
+/// quiescent reconciliation re-advertises the deleted half and the
+/// partial delete is silently undone. (That re-advertisement is the
+/// INTENDED behavior for the shape when it arises from an
+/// overwrite-vs-delete or edit-beats-delete race — reconcile cannot tell
+/// a deliberate partial delete from a half-deleted-by-race state.) Pass
+/// every kind the image holds to delete the photo; a single-kind slice is
+/// honored on the wire but will not persist against a live counterpart.
 pub async fn delete_item(
     db: &SyncDb,
     s3: &impl S3Api,
@@ -2645,7 +2671,24 @@ fn resurrect_tombstoned_item(
 ///   "resurrection restores a whole item") — the sidecar's develop edits
 ///   are re-advertised, the converse lane the engine had no path for: an
 ///   original-overwrite (§2.8) that survives a concurrent whole-photo
-///   delete used to drop the photo's edits silently (MAJOR 3).
+///   delete used to drop the photo's edits silently (MAJOR 3). Symmetric
+///   with the forward lane (round 5): a device that holds the tombstoned
+///   sidecar record but cannot re-advertise its edits (a `blake3`-less
+///   deleted record) mints nothing and re-fires
+///   [`ResurrectionIncompleteEvent`] for the sidecar, so a live original
+///   whose edits no reachable device can resurrect is reported, not
+///   silently dropped. (A live original with NO sidecar record is a
+///   normal shape, not a forbidden half-deleted one, so it fires nothing
+///   — the converse of the forward lane's record-is-`None` arm has no
+///   forbidden shape to signal.)
+///
+/// This heals the shape unconditionally: it cannot distinguish a
+/// half-deleted-by-race state (where re-advertisement is the §2.11
+/// intent) from a deliberate single-kind [`delete_item`] of one half of
+/// a live image. The latter is therefore unsupported — a partial delete
+/// whose counterpart stays live is re-advertised here at the next
+/// quiescence (see [`delete_item`]); whole-photo deletes tombstone both
+/// kinds, so neither lane matches and nothing is undone.
 ///
 /// Holder-based and idempotent: the resurrection put carries the item's
 /// own content hash, so N holders re-advertising the same head emit
@@ -2706,11 +2749,21 @@ pub fn reconcile_wholeness(
                 }
             }
             // §2.11: a live original must never leave its base sidecar's
-            // (edits) tombstoned — the converse lane.
+            // (edits) tombstoned — the converse lane. Symmetric with the
+            // forward lane: when this device holds the tombstoned sidecar
+            // record but cannot re-advertise its edits (no `blake3`), it
+            // mints nothing and surfaces the gap. (The forward lane's
+            // record-is-`None` arm has no converse: a live original with no
+            // sidecar record is a normal shape, not a forbidden one, so an
+            // absent sidecar never fires the event here.)
             if original_live {
                 if let Some(rec) = &sidecar {
-                    if rec.deleted && resurrect_tombstoned_item(t, &own, now, &sidecar_rel, rec)? {
-                        minted.push(sidecar_rel.clone());
+                    if rec.deleted {
+                        if resurrect_tombstoned_item(t, &own, now, &sidecar_rel, rec)? {
+                            minted.push(sidecar_rel.clone());
+                        } else {
+                            incomplete.push(sidecar_rel.clone());
+                        }
                     }
                 }
             }
