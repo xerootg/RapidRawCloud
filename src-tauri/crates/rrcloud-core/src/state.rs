@@ -18,16 +18,41 @@
 //! - Dropping the [`SyncDb`] releases the lock promptly (drop + reopen in
 //!   one process works).
 //!
-//! # Durability — empirically verified
+//! # Durability
 //!
-//! redb's default durability fsyncs at `commit()`; every write API here is
-//! one committed write transaction, so once a call returns, the state
-//! survives process death. SIGKILL loops against a committing writer showed
-//! zero torn or lost committed records (the db may be *ahead* of what the
-//! writer observed returning, never behind). `begin_write` from a second
-//! thread blocks until the open write transaction commits — writers are
-//! serialized, which is what makes [`SyncDb::transition`]'s compare-and-set
-//! semantics race-free.
+//! Every write API here is one write transaction committed with
+//! [`redb::Durability::Immediate`] — pinned explicitly on every write
+//! transaction (not inherited from redb's default, so a future redb default
+//! change cannot silently weaken §3.2). `commit()` fsyncs before returning;
+//! redb's commit is single-phase with a non-cryptographic (xxh3) checksum
+//! that validates the commit slot on recovery. Strict power-loss write
+//! ordering via `WriteTransaction::set_two_phase_commit` exists upstream and
+//! is deliberately not enabled in v1.
+//!
+//! Empirically verified **for process death**: SIGKILL loops against a
+//! committing writer showed zero torn or lost committed records (the db may
+//! be *ahead* of what the writer observed returning, never behind). Scope
+//! honestly stated: SIGKILL cannot distinguish `Immediate` from `Eventual`
+//! durability — the page cache is kernel-owned and survives process death —
+//! so the experiment proves the process-death story only. The power-loss
+//! posture rests on the pinned `Immediate` fsync plus the checksummed
+//! commit slot, not on the experiment.
+//!
+//! `begin_write` from a second thread blocks until the open write
+//! transaction commits — writers are serialized, which is what makes
+//! [`SyncDb::transition`]'s compare-and-set semantics race-free.
+//!
+//! # Composite steps and recovery scans
+//!
+//! Cross-table steps that must be atomic (§2.4 "transition + enqueue",
+//! "freeze journal entry + transition to synced") run inside one scoped
+//! write transaction via [`SyncDb::with_txn`], which exposes the same typed
+//! operations on a [`StateTxn`]; either everything in the closure commits or
+//! nothing does. Crash recovery and hygiene scans (§2.4 stale uploads, §3.5
+//! LRU eviction, §2.3 reconcile) are served by the enumeration accessors
+//! ([`SyncDb::iter_items`], [`SyncDb::items_in_state`],
+//! [`SyncDb::count_in_state`], [`SyncDb::iter_uploads`],
+//! [`SyncDb::queue_peek`]).
 //!
 //! # Encoding
 //!
@@ -84,8 +109,19 @@ pub enum StateError {
         /// The conflicting id the caller passed.
         given: DeviceId,
     },
+    /// The database carries a schema stamp but no device identity record.
+    /// Identity is written in the same transaction as the stamp, so no
+    /// legal history produces this — it is meta corruption (or a future
+    /// layout that moved identity). Never treated as fresh: minting here
+    /// would silently fork identity on — and overwrite the stamp of — a
+    /// file that already had one.
+    #[error("state db has a schema stamp but no device identity (corrupt meta)")]
+    DeviceIdMissing,
     /// The database was written by a newer schema than this build supports.
     /// Fail closed (§2.2 min-reader spirit): never guess at future tables.
+    /// This gate runs **before** any identity logic, so a newer-format file
+    /// can never be mistaken for fresh and re-stamped (see
+    /// [`SyncDb::open`]).
     #[error("state db schema version {found} is newer than supported {supported}")]
     SchemaTooNew {
         /// The version found in `meta`.
@@ -115,9 +151,9 @@ pub enum StateError {
         /// The target state the caller passed.
         to: ItemState,
     },
-    /// `transition`'s `expected_from` did not match the stored state (a
-    /// concurrent transition won, or the item does not exist). Nothing was
-    /// mutated.
+    /// `transition`/`update_item`'s expected state did not match the stored
+    /// state (a concurrent transition won, or the item does not exist).
+    /// Nothing was mutated.
     #[error("stale item state for {relkey}: expected {expected:?}, found {found:?}")]
     StaleState {
         /// The item.
@@ -150,6 +186,18 @@ pub enum StateError {
     NotFrozen {
         /// The offending seq.
         seq: u64,
+    },
+    /// A persisted monotonic counter sits at `u64::MAX` and the next
+    /// increment would wrap. Unreachable by honest operation (2^64
+    /// commits); hitting it means the stored counter was corrupted or
+    /// tampered with, so the store refuses with a typed error instead of a
+    /// debug-build panic or a release-mode silent wrap — a wrapped
+    /// `last_seq` would hand out regressed seqs, the exact §2.2 invariant
+    /// this store exists to protect.
+    #[error("state db counter {key:?} is saturated at u64::MAX (corrupt meta?)")]
+    CounterSaturated {
+        /// The internal meta key of the saturated counter.
+        key: &'static str,
     },
     /// Underlying redb failure (I/O, corruption, poisoned txn). Boxed:
     /// `redb::Error` is ~160 bytes and would dominate every `Result` in
@@ -217,6 +265,14 @@ const K_DEVICE_ID: &str = "device_id";
 const K_SCHEMA_VERSION: &str = "schema_version";
 const K_LAST_SEQ: &str = "last_seq";
 const K_PUBLISHED_CURSOR: &str = "published_cursor";
+/// Highest seq `F` such that every seq in `1..=F` is frozen **and**
+/// published — the contiguous published prefix. `unpublished_segments`
+/// starts its scan at `F + 1`, so a long-lived device's publish pass costs
+/// O(pending), not O(all segments ever frozen). Maintained by
+/// `mark_published`; an allocated-never-frozen hole (possible only via the
+/// legacy `allocate_seq` + `freeze_segment` pair, never via
+/// `freeze_next_segment`) blocks the floor but not correctness.
+const K_PUBLISHED_FLOOR: &str = "published_floor";
 const K_QUEUE_ARRIVAL: &str = "queue_arrival";
 const K_SERVER_TIME_OFFSET_MS: &str = "server_time_offset_ms";
 
@@ -322,7 +378,8 @@ impl ItemState {
 /// [`SyncDb::transition`]; the table exists exactly once, here.
 ///
 /// The legal edges (everything else, including every self-loop, is
-/// illegal):
+/// illegal; state-preserving durable mutations go through
+/// [`SyncDb::update_item`], not a self-transition):
 ///
 /// | From | To | Why |
 /// |---|---|---|
@@ -330,12 +387,15 @@ impl ItemState {
 /// | `Dirty` | `Conflict` | concurrent remote version met local dirt (§2.6) |
 /// | `Queued` | `Uploading` | transfer slot acquired |
 /// | `Queued` | `Dirty` | dequeued (e.g. shutdown drain re-marks) |
+/// | `Queued` | `Conflict` | concurrent remote entry vs the committed queued version (§2.6 case 4; vv bumps at queue admission, §3.7, so a queued version is a committed concurrent version) |
 /// | `Uploading` | `Verifying` | PUT/CompleteMultipartUpload done |
 /// | `Uploading` | `Queued` | transfer failed, requeue with backoff |
 /// | `Uploading` | `Dirty` | upload abandoned (e.g. stale upload hygiene) |
+/// | `Uploading` | `Conflict` | concurrent remote entry arrived mid-transfer (§2.6 case 4) |
 /// | `Verifying` | `Synced` | integrity confirmed; journal entry written |
 /// | `Verifying` | `Queued` | verify failed on our own upload → retry |
 /// | `Verifying` | `CorruptRemote` | backend-accepted-but-wrong (readback mismatch) |
+/// | `Verifying` | `Conflict` | concurrent remote entry arrived during verify (§2.6 case 4) |
 /// | `Synced` | `Dirty` | new local change |
 /// | `Synced` | `Conflict` | concurrent versions discovered |
 /// | `Synced` | `PendingDown` | remote advertised a newer version |
@@ -346,6 +406,8 @@ impl ItemState {
 /// | `Conflict` | `Dirty` | resolved toward local → re-upload |
 /// | `Conflict` | `PendingDown` | resolved toward remote → fetch |
 /// | `PendingDown` | `Downloading` | download slot acquired |
+/// | `PendingDown` | `Dirty` | local edit on a not-yet-downloaded head (§3.4 offline path, flagged `base_unknown`) |
+/// | `PendingDown` | `Conflict` | the §3.4 chokepoint committed a local version concurrent with the advertised head (§2.6 case 4) |
 /// | `Downloading` | `Synced` | sidecar/meta download complete, agree |
 /// | `Downloading` | `Hydrated` | original fully fetched + verified |
 /// | `Downloading` | `PendingDown` | transfer failed, retry later |
@@ -356,6 +418,12 @@ impl ItemState {
 /// | `Hydrated` | `Dirty` | local change to the hydrated item |
 /// | `Hydrated` | `PendingDown` | remote advertised a newer version |
 /// | `Hydrated` | `CorruptRemote` | local verify against journal failed remotely |
+///
+/// Note on `Downloading`: a conflict discovered against an item mid-download
+/// is recorded after the transfer resolves (`Downloading` →
+/// `Synced`/`Hydrated`/`PendingDown` first) — the download slot owns the
+/// item until it releases it, mirroring how `Uploading` → `Conflict` is
+/// taken by the apply loop, not the transfer task.
 pub fn legal(from: ItemState, to: ItemState) -> bool {
     use ItemState::*;
     matches!(
@@ -364,12 +432,15 @@ pub fn legal(from: ItemState, to: ItemState) -> bool {
             | (Dirty, Conflict)
             | (Queued, Uploading)
             | (Queued, Dirty)
+            | (Queued, Conflict)
             | (Uploading, Verifying)
             | (Uploading, Queued)
             | (Uploading, Dirty)
+            | (Uploading, Conflict)
             | (Verifying, Synced)
             | (Verifying, Queued)
             | (Verifying, CorruptRemote)
+            | (Verifying, Conflict)
             | (Synced, Dirty)
             | (Synced, Conflict)
             | (Synced, PendingDown)
@@ -380,6 +451,8 @@ pub fn legal(from: ItemState, to: ItemState) -> bool {
             | (Conflict, Dirty)
             | (Conflict, PendingDown)
             | (PendingDown, Downloading)
+            | (PendingDown, Dirty)
+            | (PendingDown, Conflict)
             | (Downloading, Synced)
             | (Downloading, Hydrated)
             | (Downloading, PendingDown)
@@ -399,8 +472,10 @@ pub struct ItemRecord {
     /// What kind of object this relkey is (original, sidecar, …).
     pub kind: Kind,
     /// Current §2.4 state. Changed **only** through [`SyncDb::transition`]
-    /// after the record exists (a wholesale [`SyncDb::put_item`] of a
-    /// different state is for ingest/replay paths, not the state machine).
+    /// after the record exists; state-preserving mutations go through
+    /// [`SyncDb::update_item`]. The wholesale
+    /// [`SyncDb::replay_put_item`] bypass is reserved for ingest/replay
+    /// paths and is named to be greppable.
     pub state: ItemState,
     /// Size in bytes of the local file (0 when unknown/stub).
     pub size: u64,
@@ -477,6 +552,31 @@ impl Queue {
     }
 }
 
+/// The head of a queue — lowest class, then earliest arrival — without
+/// removing it. Shared by peek (read txn) and pop (write txn).
+fn queue_head(
+    entries: &impl ReadableTable<(u8, u64), &'static str>,
+) -> Result<Option<(u8, u64, String)>, StateError> {
+    match entries.first().map_err(db_err)? {
+        None => Ok(None),
+        Some((key, value)) => {
+            let (class, arrival) = key.value();
+            Ok(Some((class, arrival, value.value().to_owned())))
+        }
+    }
+}
+
+/// Reads an item record from any readable `items` table.
+fn read_item(
+    items: &impl ReadableTable<&'static str, &'static [u8]>,
+    relkey: &RelKey,
+) -> Result<Option<ItemRecord>, StateError> {
+    match items.get(relkey.as_str()).map_err(db_err)? {
+        Some(guard) => Ok(Some(from_json(guard.value())?)),
+        None => Ok(None),
+    }
+}
+
 /// The device's durable sync state database (§3.2).
 ///
 /// One per device, at `app_data_dir/rrcloud/state.redb`. Opening takes the
@@ -486,7 +586,9 @@ impl Queue {
 /// transactions internally (empirical note in the module docs).
 ///
 /// Every mutating method is **one committed write transaction**: when it
-/// returns `Ok`, the change is durable (survives SIGKILL).
+/// returns `Ok`, the change is durable (survives SIGKILL). Steps spanning
+/// several operations that must commit together go through
+/// [`SyncDb::with_txn`].
 #[derive(Debug)]
 pub struct SyncDb {
     db: redb::Database,
@@ -494,23 +596,43 @@ pub struct SyncDb {
     path: PathBuf,
 }
 
+/// A scoped write transaction over the state store (see
+/// [`SyncDb::with_txn`]). Exposes the same typed operations as [`SyncDb`];
+/// everything performed through one `StateTxn` commits atomically, or — when
+/// the closure returns an error — nothing does.
+pub struct StateTxn<'a> {
+    txn: &'a redb::WriteTransaction,
+}
+
 impl SyncDb {
     /// Opens (or creates) the state database at `path`.
     ///
-    /// First open of a fresh file initializes `meta`: it stores
-    /// `schema_version =` [`SCHEMA_VERSION`] and mints the device identity
-    /// from `mint_device_id` — which must be `Some` then
-    /// ([`StateError::DeviceIdRequired`] otherwise; the store never
-    /// generates randomness).
+    /// The open gate is keyed on the **schema stamp first** (fail closed —
+    /// a v1 binary must never mint into, or re-stamp, a file written by any
+    /// other format):
+    ///
+    /// 1. No schema stamp and no device identity → fresh file: stores
+    ///    `schema_version =` [`SCHEMA_VERSION`] and mints the identity from
+    ///    `mint_device_id` — which must be `Some` then
+    ///    ([`StateError::DeviceIdRequired`] otherwise; the store never
+    ///    generates randomness).
+    /// 2. A schema stamp other than exactly [`SCHEMA_VERSION`] (newer,
+    ///    older, or unreadable) → [`StateError::SchemaTooNew`] /
+    ///    [`StateError::SchemaUnsupported`], **before any identity logic
+    ///    runs** — so a newer-format file whose identity lives elsewhere is
+    ///    refused, never treated as fresh.
+    /// 3. A schema stamp without a device identity →
+    ///    [`StateError::DeviceIdMissing`] (meta corruption; never a mint).
+    /// 4. No schema stamp but an identity present →
+    ///    [`StateError::SchemaUnsupported`] (corruption, not "old
+    ///    version").
     ///
     /// Reopening an initialized db ignores a `None` and verifies a
     /// `Some(id)` against the stored identity
     /// ([`StateError::DeviceIdMismatch`] on conflict).
     ///
     /// Fails fast and typed when the db is held elsewhere
-    /// ([`StateError::AlreadyLocked`]) or carries a schema version other
-    /// than exactly [`SCHEMA_VERSION`] ([`StateError::SchemaTooNew`] /
-    /// [`StateError::SchemaUnsupported`]).
+    /// ([`StateError::AlreadyLocked`]).
     pub fn open(
         path: impl AsRef<Path>,
         mint_device_id: Option<DeviceId>,
@@ -527,40 +649,50 @@ impl SyncDb {
         // One write transaction: inspect/initialize meta, then make sure
         // every table exists so read paths never see a missing table. A
         // refusal below drops the txn un-committed, leaving a fresh file
-        // untouched (a later open with an id can still mint).
-        let txn = db.begin_write().map_err(db_err)?;
+        // untouched (a later open with an id can still mint) and an
+        // initialized file byte-for-byte as found (never re-stamped).
+        let mut txn = db.begin_write().map_err(db_err)?;
+        txn.set_durability(redb::Durability::Immediate);
         let device_id = {
             let mut meta = txn.open_table(T_META).map_err(db_err)?;
+            // Schema stamp first. `Some(None)` = present but unreadable.
+            let schema: Option<Option<u32>> = meta
+                .get(K_SCHEMA_VERSION)
+                .map_err(db_err)?
+                .map(|guard| serde_json::from_slice(guard.value()).ok());
             let stored: Option<DeviceId> = match meta.get(K_DEVICE_ID).map_err(db_err)? {
                 Some(guard) => Some(from_json(guard.value())?),
                 None => None,
             };
-            match stored {
-                // Fresh database: mint identity + stamp the schema.
-                None => {
-                    let minted = mint_device_id.ok_or(StateError::DeviceIdRequired)?;
-                    meta.insert(K_SCHEMA_VERSION, to_json(&SCHEMA_VERSION)?.as_slice())
-                        .map_err(db_err)?;
-                    meta.insert(K_DEVICE_ID, to_json(&minted)?.as_slice())
-                        .map_err(db_err)?;
-                    minted
-                }
-                // Initialized database: gate on schema, verify identity.
-                Some(stored) => {
-                    let found: Option<u32> = meta
-                        .get(K_SCHEMA_VERSION)
-                        .map_err(db_err)?
-                        .and_then(|guard| serde_json::from_slice(guard.value()).ok());
-                    match found {
-                        Some(v) if v == SCHEMA_VERSION => {}
-                        Some(v) if v > SCHEMA_VERSION => {
-                            return Err(StateError::SchemaTooNew {
-                                found: v,
-                                supported: SCHEMA_VERSION,
-                            });
-                        }
-                        other => return Err(StateError::SchemaUnsupported { found: other }),
+            match schema {
+                // No stamp at all.
+                None => match stored {
+                    // Identity without a stamp: corruption, not fresh.
+                    Some(_) => return Err(StateError::SchemaUnsupported { found: None }),
+                    // Fresh database: stamp the schema + mint identity.
+                    None => {
+                        let minted = mint_device_id.ok_or(StateError::DeviceIdRequired)?;
+                        meta.insert(K_SCHEMA_VERSION, to_json(&SCHEMA_VERSION)?.as_slice())
+                            .map_err(db_err)?;
+                        meta.insert(K_DEVICE_ID, to_json(&minted)?.as_slice())
+                            .map_err(db_err)?;
+                        minted
                     }
+                },
+                // Stamp present but unreadable.
+                Some(None) => return Err(StateError::SchemaUnsupported { found: None }),
+                Some(Some(v)) if v > SCHEMA_VERSION => {
+                    return Err(StateError::SchemaTooNew {
+                        found: v,
+                        supported: SCHEMA_VERSION,
+                    });
+                }
+                Some(Some(v)) if v < SCHEMA_VERSION => {
+                    return Err(StateError::SchemaUnsupported { found: Some(v) });
+                }
+                // Exact match: identity must exist; verify a supplied id.
+                Some(Some(_)) => {
+                    let stored = stored.ok_or(StateError::DeviceIdMissing)?;
                     if let Some(given) = mint_device_id {
                         if given != stored {
                             return Err(StateError::DeviceIdMismatch { stored, given });
@@ -607,25 +739,54 @@ impl SyncDb {
         self.db.begin_read().map_err(db_err)
     }
 
+    /// Begins a write transaction with durability pinned to
+    /// [`redb::Durability::Immediate`] (module docs: pinned explicitly so a
+    /// future redb default change cannot weaken §3.2).
     fn begin_write(&self) -> Result<redb::WriteTransaction, StateError> {
-        self.db.begin_write().map_err(db_err)
+        let mut txn = self.db.begin_write().map_err(db_err)?;
+        txn.set_durability(redb::Durability::Immediate);
+        Ok(txn)
+    }
+
+    /// Runs `f` inside **one** write transaction and commits iff it returns
+    /// `Ok`. On `Err`, the transaction is dropped and **nothing** `f` did is
+    /// visible — this is the §2.4 composite-step primitive ("transition +
+    /// enqueue", "freeze journal entry + transition", "pop + transition")
+    /// that closes the torn-cross-table crash windows a sequence of
+    /// single-operation commits would leave.
+    ///
+    /// The closure must not call back into `self`'s own single-operation
+    /// methods (they would block on the open transaction); it uses the
+    /// [`StateTxn`] it is handed.
+    pub fn with_txn<T>(
+        &self,
+        f: impl FnOnce(&StateTxn<'_>) -> Result<T, StateError>,
+    ) -> Result<T, StateError> {
+        let txn = self.begin_write()?;
+        let out = f(&StateTxn { txn: &txn })?;
+        txn.commit().map_err(db_err)?;
+        Ok(out)
     }
 
     // -- items ------------------------------------------------------------
 
-    /// Inserts or wholesale-replaces an item record. For ingest/replay
-    /// paths; state-machine steps go through [`SyncDb::transition`].
-    pub fn put_item(&self, relkey: &RelKey, record: &ItemRecord) -> Result<(), StateError> {
-        let value = to_json(record)?;
-        let txn = self.begin_write()?;
-        {
-            let mut items = txn.open_table(T_ITEMS).map_err(db_err)?;
-            items
-                .insert(relkey.as_str(), value.as_slice())
-                .map_err(db_err)?;
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
+    /// Inserts an item record **only if none exists** for `relkey`.
+    /// Returns `Ok(true)` when inserted, `Ok(false)` (nothing changed) when
+    /// a record already exists. This is the creation path for the state
+    /// machine; existing records change only through
+    /// [`SyncDb::transition`] / [`SyncDb::update_item`].
+    pub fn insert_item(&self, relkey: &RelKey, record: &ItemRecord) -> Result<bool, StateError> {
+        self.with_txn(|t| t.insert_item(relkey, record))
+    }
+
+    /// Wholesale-replaces (or inserts) an item record **including its
+    /// state, bypassing the §2.4 legality table**. Reserved for
+    /// ingest/replay paths (manifest bootstrap, journal replay) — named to
+    /// be greppable, so every bypass of the state machine is visible and
+    /// intentional. State-machine steps go through [`SyncDb::transition`];
+    /// creation goes through [`SyncDb::insert_item`].
+    pub fn replay_put_item(&self, relkey: &RelKey, record: &ItemRecord) -> Result<(), StateError> {
+        self.with_txn(|t| t.replay_put_item(relkey, record))
     }
 
     /// Reads an item record (`None` when absent). A stored value that does
@@ -633,22 +794,67 @@ impl SyncDb {
     pub fn get_item(&self, relkey: &RelKey) -> Result<Option<ItemRecord>, StateError> {
         let txn = self.begin_read()?;
         let items = txn.open_table(T_ITEMS).map_err(db_err)?;
-        match items.get(relkey.as_str()).map_err(db_err)? {
-            Some(guard) => Ok(Some(from_json(guard.value())?)),
-            None => Ok(None),
-        }
+        read_item(&items, relkey)
     }
 
     /// Deletes an item record; `Ok(true)` when it existed.
     pub fn delete_item(&self, relkey: &RelKey) -> Result<bool, StateError> {
-        let txn = self.begin_write()?;
-        let existed = {
-            let mut items = txn.open_table(T_ITEMS).map_err(db_err)?;
-            let previous = items.remove(relkey.as_str()).map_err(db_err)?;
-            previous.is_some()
-        };
-        txn.commit().map_err(db_err)?;
-        Ok(existed)
+        self.with_txn(|t| t.delete_item(relkey))
+    }
+
+    /// Every item record, ascending by relkey. One consistent snapshot.
+    ///
+    /// This (with [`SyncDb::items_in_state`]) is the crash-recovery and
+    /// hygiene scan surface: after a crash, items that were popped from a
+    /// queue and transitioned (e.g. to `Uploading`) sit in no queue and are
+    /// findable only by scanning. v1 materializes the result (libraries are
+    /// bounded; records are small); a streaming iterator can replace this
+    /// without changing callers' logic.
+    pub fn iter_items(&self) -> Result<Vec<(RelKey, ItemRecord)>, StateError> {
+        let txn = self.begin_read()?;
+        let items = txn.open_table(T_ITEMS).map_err(db_err)?;
+        let mut out = Vec::new();
+        for entry in items.iter().map_err(db_err)? {
+            let (key, value) = entry.map_err(db_err)?;
+            out.push((from_stored_str(key.value())?, from_json(value.value())?));
+        }
+        Ok(out)
+    }
+
+    /// Every item currently in `state`, ascending by relkey (e.g. the §3.5
+    /// LRU evictor's candidate scan, or post-crash "find everything stuck
+    /// in `Uploading`").
+    pub fn items_in_state(
+        &self,
+        state: ItemState,
+    ) -> Result<Vec<(RelKey, ItemRecord)>, StateError> {
+        let txn = self.begin_read()?;
+        let items = txn.open_table(T_ITEMS).map_err(db_err)?;
+        let mut out = Vec::new();
+        for entry in items.iter().map_err(db_err)? {
+            let (key, value) = entry.map_err(db_err)?;
+            let record: ItemRecord = from_json(value.value())?;
+            if record.state == state {
+                out.push((from_stored_str(key.value())?, record));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Number of items currently in `state` (§3.3/§3.8 "N edits not backed
+    /// up" / `dirty_unbacked` feed).
+    pub fn count_in_state(&self, state: ItemState) -> Result<u64, StateError> {
+        let txn = self.begin_read()?;
+        let items = txn.open_table(T_ITEMS).map_err(db_err)?;
+        let mut count = 0u64;
+        for entry in items.iter().map_err(db_err)? {
+            let (_, value) = entry.map_err(db_err)?;
+            let record: ItemRecord = from_json(value.value())?;
+            if record.state == state {
+                count += 1;
+            }
+        }
+        Ok(count)
     }
 
     /// Performs one §2.4 state transition as a single committed write
@@ -682,47 +888,34 @@ impl SyncDb {
         to: ItemState,
         mutate: impl FnOnce(&mut ItemRecord),
     ) -> Result<ItemRecord, StateError> {
-        // (1) Static legality — before any storage is consulted.
-        if !legal(expected_from, to) {
-            return Err(StateError::IllegalTransition {
-                relkey: relkey.clone(),
-                from: expected_from,
-                to,
-            });
-        }
-        let txn = self.begin_write()?;
-        let record = {
-            let mut items = txn.open_table(T_ITEMS).map_err(db_err)?;
-            // (2) + (3) Compare-and-set against the stored state. An early
-            // return drops the un-committed txn: nothing is mutated.
-            let stored: ItemRecord = match items.get(relkey.as_str()).map_err(db_err)? {
-                None => {
-                    return Err(StateError::StaleState {
-                        relkey: relkey.clone(),
-                        expected: expected_from,
-                        found: None,
-                    });
-                }
-                Some(guard) => from_json(guard.value())?,
-            };
-            if stored.state != expected_from {
-                return Err(StateError::StaleState {
-                    relkey: relkey.clone(),
-                    expected: expected_from,
-                    found: Some(stored.state),
-                });
-            }
-            let mut record = stored;
-            mutate(&mut record);
-            record.state = to; // the transition owns the state field
-            let value = to_json(&record)?;
-            items
-                .insert(relkey.as_str(), value.as_slice())
-                .map_err(db_err)?;
-            record
-        };
-        txn.commit().map_err(db_err)?;
-        Ok(record)
+        self.with_txn(|t| t.transition(relkey, expected_from, to, mutate))
+    }
+
+    /// Durably mutates an item record **without changing its state**, with
+    /// the same compare-and-set protection as [`SyncDb::transition`]: the
+    /// stored state must equal `expected_state` or
+    /// [`StateError::StaleState`] is returned and nothing is mutated.
+    ///
+    /// This is the §2.6/§3.5 state-preserving write path — converged-apply
+    /// vv max + metadata adoption on a `Synced` item, setting `attested`
+    /// when an attest entry arrives, bumping `last_access_unix`, setting
+    /// `base_unknown` — which a bare `get_item` + `replay_put_item` pair
+    /// would expose to lost updates (a concurrent legal transition landing
+    /// between the read and the write would be silently stomped; with this
+    /// method the stale writer gets [`StateError::StaleState`] instead and
+    /// re-reads).
+    ///
+    /// `mutate` may touch **any field except `state`** — a `state` written
+    /// by `mutate` is overridden back to `expected_state` (state changes go
+    /// through [`SyncDb::transition`], the single legality authority).
+    /// Returns the committed record.
+    pub fn update_item(
+        &self,
+        relkey: &RelKey,
+        expected_state: ItemState,
+        mutate: impl FnOnce(&mut ItemRecord),
+    ) -> Result<ItemRecord, StateError> {
+        self.with_txn(|t| t.update_item(relkey, expected_state, mutate))
     }
 
     // -- applied / cursors (§2.2 idempotent apply) -------------------------
@@ -740,13 +933,7 @@ impl SyncDb {
     /// Records `(device, seq)` as applied. Idempotent: re-marking is a
     /// committed no-op, not an error.
     pub fn mark_applied(&self, device: &DeviceId, seq: u64) -> Result<(), StateError> {
-        let txn = self.begin_write()?;
-        {
-            let mut applied = txn.open_table(T_APPLIED).map_err(db_err)?;
-            applied.insert((device.as_str(), seq), ()).map_err(db_err)?;
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
+        self.with_txn(|t| t.mark_applied(device, seq))
     }
 
     /// The highest contiguously-applied seq recorded for `device`'s journal
@@ -763,80 +950,89 @@ impl SyncDb {
 
     /// Sets `device`'s cursor.
     pub fn set_cursor(&self, device: &DeviceId, seq: u64) -> Result<(), StateError> {
-        let txn = self.begin_write()?;
-        {
-            let mut cursors = txn.open_table(T_CURSORS).map_err(db_err)?;
-            cursors.insert(device.as_str(), seq).map_err(db_err)?;
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
+        self.with_txn(|t| t.set_cursor(device, seq))
     }
 
     // -- journal publication (§2.1.5) --------------------------------------
 
-    /// Allocates and durably commits the next journal seq for this device.
+    /// Allocates the next seq and freezes `build(seq)` as its segment bytes
+    /// **in one committed transaction** — the §2.1.5 "persisted
+    /// transactionally with the serialized segment bytes" primitive, and
+    /// the engine's publication path. Because the counter increment and the
+    /// bytes commit together, a crash can never leave an
+    /// allocated-but-never-frozen seq: **holes are impossible by
+    /// construction**, so a remote reader's contiguity cursor (§2.2/§3.2)
+    /// can always eventually advance past every seq this device publishes.
+    ///
+    /// The builder receives the seq (entries embed it, §2.2) and must be
+    /// infallible and side-effect-free — it runs inside the open
+    /// transaction. Returns the allocated seq. Seqs are strictly
+    /// increasing, starting at 1, across threads **and** across
+    /// crash/reopen.
+    pub fn freeze_next_segment(
+        &self,
+        build: impl FnOnce(u64) -> Vec<u8>,
+    ) -> Result<u64, StateError> {
+        self.with_txn(|t| t.freeze_next_segment(build))
+    }
+
+    /// Allocates and durably commits the next journal seq for this device,
+    /// **without** freezing bytes.
     ///
     /// Strictly increasing, starting at 1; the allocation itself is a
     /// committed transaction, so a seq this method returned is never handed
     /// out again — across threads **and** across crash/reopen (§2.2
-    /// monotonicity). Gaps are allowed (an allocated seq whose segment was
-    /// never frozen stays a hole; readers dedup by `(device, seq)`).
+    /// monotonicity).
+    ///
+    /// **Prefer [`SyncDb::freeze_next_segment`]**: a crash between this
+    /// allocation and the matching [`SyncDb::freeze_segment`] leaves the
+    /// seq a permanent hole, which stalls remote contiguity cursors. This
+    /// two-step pair exists for tests and for callers that genuinely need a
+    /// seq with no segment; the engine's publication path must use the
+    /// single-transaction form.
     pub fn allocate_seq(&self) -> Result<u64, StateError> {
-        let txn = self.begin_write()?;
-        let next = {
-            let mut meta = txn.open_table(T_META).map_err(db_err)?;
-            let last: u64 = meta_get(&meta, K_LAST_SEQ)?.unwrap_or(0);
-            let next = last + 1;
-            meta.insert(K_LAST_SEQ, to_json(&next)?.as_slice())
-                .map_err(db_err)?;
-            next
-        };
-        txn.commit().map_err(db_err)?;
-        Ok(next)
+        self.with_txn(|t| t.allocate_seq())
     }
 
-    /// The highest seq [`SyncDb::allocate_seq`] has returned (0 when none).
+    /// The highest seq allocated so far (0 when none).
     pub fn last_allocated_seq(&self) -> Result<u64, StateError> {
         let txn = self.begin_read()?;
         let meta = txn.open_table(T_META).map_err(db_err)?;
         Ok(meta_get(&meta, K_LAST_SEQ)?.unwrap_or(0))
     }
 
-    /// Durably freezes `bytes` as the segment for `seq` — the §2.1.5 step
-    /// that must commit **before** any network PUT. The stored bytes are
-    /// the segment's identity: a crash-replayed publish re-reads them via
+    /// Durably freezes `bytes` as the segment for an already-allocated
+    /// `seq` — the second half of the legacy two-step pair (see
+    /// [`SyncDb::allocate_seq`]; new code uses
+    /// [`SyncDb::freeze_next_segment`]). The stored bytes are the segment's
+    /// identity: a crash-replayed publish re-reads them via
     /// [`SyncDb::unpublished_segments`] byte-identically.
     ///
     /// `seq` must have been allocated ([`StateError::SeqNotAllocated`]) and
     /// not already frozen ([`StateError::AlreadyFrozen`] — a segment is
     /// frozen exactly once, replay never re-freezes).
     pub fn freeze_segment(&self, seq: u64, bytes: &[u8]) -> Result<(), StateError> {
-        let txn = self.begin_write()?;
-        {
-            let meta = txn.open_table(T_META).map_err(db_err)?;
-            let last: u64 = meta_get(&meta, K_LAST_SEQ)?.unwrap_or(0);
-            if seq == 0 || seq > last {
-                return Err(StateError::SeqNotAllocated { seq });
-            }
-            let mut segments = txn.open_table(T_SEGMENTS).map_err(db_err)?;
-            if segments.get(seq).map_err(db_err)?.is_some() {
-                return Err(StateError::AlreadyFrozen { seq });
-            }
-            segments.insert(seq, bytes).map_err(db_err)?;
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
+        self.with_txn(|t| t.freeze_segment(seq, bytes))
     }
 
     /// All frozen-but-unpublished segments, in ascending seq order, each
-    /// with the exact bytes passed to [`SyncDb::freeze_segment`] (byte
-    /// identity is the §2.1.5 republish guarantee).
+    /// with the exact bytes passed to [`SyncDb::freeze_segment`] /
+    /// [`SyncDb::freeze_next_segment`] (byte identity is the §2.1.5
+    /// republish guarantee).
+    ///
+    /// The scan starts at the contiguous published prefix (the "published
+    /// floor" maintained by [`SyncDb::mark_published`]), not at seq 1, so a
+    /// publish pass costs O(pending), not O(every segment ever frozen) —
+    /// published bytes are retained in v1 (pruning is a later unit's GC
+    /// concern) but are not rescanned.
     pub fn unpublished_segments(&self) -> Result<Vec<(u64, Vec<u8>)>, StateError> {
         let txn = self.begin_read()?;
+        let meta = txn.open_table(T_META).map_err(db_err)?;
+        let floor: u64 = meta_get(&meta, K_PUBLISHED_FLOOR)?.unwrap_or(0);
         let segments = txn.open_table(T_SEGMENTS).map_err(db_err)?;
         let published = txn.open_table(T_PUBLISHED).map_err(db_err)?;
         let mut out = Vec::new();
-        for entry in segments.iter().map_err(db_err)? {
+        for entry in segments.range(floor.saturating_add(1)..).map_err(db_err)? {
             let (key, value) = entry.map_err(db_err)?;
             let seq = key.value();
             if published.get(seq).map_err(db_err)?.is_none() {
@@ -856,23 +1052,7 @@ impl SyncDb {
     /// [`SyncDb::unpublished_segments`]. Frozen bytes are retained after
     /// publish in v1 (pruning is a later unit's GC concern).
     pub fn mark_published(&self, seq: u64) -> Result<(), StateError> {
-        let txn = self.begin_write()?;
-        {
-            let segments = txn.open_table(T_SEGMENTS).map_err(db_err)?;
-            if segments.get(seq).map_err(db_err)?.is_none() {
-                return Err(StateError::NotFrozen { seq });
-            }
-            let mut published = txn.open_table(T_PUBLISHED).map_err(db_err)?;
-            published.insert(seq, ()).map_err(db_err)?;
-            let mut meta = txn.open_table(T_META).map_err(db_err)?;
-            let cursor: u64 = meta_get(&meta, K_PUBLISHED_CURSOR)?.unwrap_or(0);
-            if seq > cursor {
-                meta.insert(K_PUBLISHED_CURSOR, to_json(&seq)?.as_slice())
-                    .map_err(db_err)?;
-            }
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
+        self.with_txn(|t| t.mark_published(seq))
     }
 
     /// The highest published seq (0 when nothing published yet).
@@ -890,16 +1070,7 @@ impl SyncDb {
         relkey: &RelKey,
         upload: &MultipartUploadState,
     ) -> Result<(), StateError> {
-        let value = to_json(upload)?;
-        let txn = self.begin_write()?;
-        {
-            let mut uploads = txn.open_table(T_UPLOADS).map_err(db_err)?;
-            uploads
-                .insert(relkey.as_str(), value.as_slice())
-                .map_err(db_err)?;
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
+        self.with_txn(|t| t.set_upload(relkey, upload))
     }
 
     /// Reads the multipart state for `relkey`.
@@ -912,6 +1083,20 @@ impl SyncDb {
         }
     }
 
+    /// Every in-flight multipart upload, ascending by relkey — the §2.4
+    /// stale-upload hygiene scan ("engine aborts its own `upload_id`s older
+    /// than 7 days") and the post-crash resume scan.
+    pub fn iter_uploads(&self) -> Result<Vec<(RelKey, MultipartUploadState)>, StateError> {
+        let txn = self.begin_read()?;
+        let uploads = txn.open_table(T_UPLOADS).map_err(db_err)?;
+        let mut out = Vec::new();
+        for entry in uploads.iter().map_err(db_err)? {
+            let (key, value) = entry.map_err(db_err)?;
+            out.push((from_stored_str(key.value())?, from_json(value.value())?));
+        }
+        Ok(out)
+    }
+
     /// Records a completed part. Re-recording a part number replaces it
     /// (a part re-uploaded after a resume has a new ETag).
     pub fn record_upload_part(
@@ -920,16 +1105,7 @@ impl SyncDb {
         part_no: u32,
         part: &UploadPart,
     ) -> Result<(), StateError> {
-        let value = to_json(part)?;
-        let txn = self.begin_write()?;
-        {
-            let mut parts = txn.open_table(T_UPLOAD_PARTS).map_err(db_err)?;
-            parts
-                .insert((relkey.as_str(), part_no), value.as_slice())
-                .map_err(db_err)?;
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
+        self.with_txn(|t| t.record_upload_part(relkey, part_no, part))
     }
 
     /// All recorded parts for `relkey`, ascending by part number.
@@ -949,24 +1125,7 @@ impl SyncDb {
     /// Removes the multipart state **and all recorded parts** for `relkey`
     /// in one transaction (upload completed or aborted). Idempotent.
     pub fn clear_upload(&self, relkey: &RelKey) -> Result<(), StateError> {
-        let rel = relkey.as_str();
-        let txn = self.begin_write()?;
-        {
-            let mut uploads = txn.open_table(T_UPLOADS).map_err(db_err)?;
-            uploads.remove(rel).map_err(db_err)?;
-            let mut parts = txn.open_table(T_UPLOAD_PARTS).map_err(db_err)?;
-            let part_nos: Vec<u32> = parts
-                .range((rel, 0u32)..=(rel, u32::MAX))
-                .map_err(db_err)?
-                .map(|entry| entry.map(|(key, _)| key.value().1))
-                .collect::<Result<_, _>>()
-                .map_err(db_err)?;
-            for part_no in part_nos {
-                parts.remove((rel, part_no)).map_err(db_err)?;
-            }
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
+        self.with_txn(|t| t.clear_upload(relkey))
     }
 
     // -- transfer queues ---------------------------------------------------
@@ -980,88 +1139,56 @@ impl SyncDb {
     /// scan pops in order).
     ///
     /// Idempotent per relkey: re-pushing an already-queued relkey is a
-    /// complete no-op returning `Ok(false)` — it keeps its original class
-    /// **and** position even when a different `class` is passed (callers
-    /// that want to re-prioritize must [`SyncDb::queue_remove`] first).
-    /// Returns `Ok(true)` when newly enqueued.
+    /// no-op returning `Ok(false)` — it keeps its original class **and**
+    /// position even when a different `class` is passed; use
+    /// [`SyncDb::queue_reprioritize`] to change the class of a queued
+    /// entry atomically. Returns `Ok(true)` when newly enqueued.
     pub fn queue_push(&self, q: Queue, relkey: &RelKey, class: u8) -> Result<bool, StateError> {
-        let (entries_def, idx_def) = q.tables();
-        let rel = relkey.as_str();
-        let txn = self.begin_write()?;
-        let pushed = {
-            let mut idx = txn.open_table(idx_def).map_err(db_err)?;
-            if idx.get(rel).map_err(db_err)?.is_some() {
-                false
-            } else {
-                let mut meta = txn.open_table(T_META).map_err(db_err)?;
-                let arrival: u64 = meta_get(&meta, K_QUEUE_ARRIVAL)?.unwrap_or(0) + 1;
-                meta.insert(K_QUEUE_ARRIVAL, to_json(&arrival)?.as_slice())
-                    .map_err(db_err)?;
-                let mut entries = txn.open_table(entries_def).map_err(db_err)?;
-                entries.insert((class, arrival), rel).map_err(db_err)?;
-                idx.insert(rel, (class, arrival)).map_err(db_err)?;
-                true
-            }
-        };
-        if pushed {
-            txn.commit().map_err(db_err)?;
+        self.with_txn(|t| t.queue_push(q, relkey, class))
+    }
+
+    /// The head of queue `q` — lowest class, then earliest arrival —
+    /// **without removing it** (`None` when empty). The §3.3 exit-flush
+    /// inspection path: peeking costs no commit and loses no position.
+    pub fn queue_peek(&self, q: Queue) -> Result<Option<(RelKey, u8)>, StateError> {
+        let (entries_def, _) = q.tables();
+        let txn = self.begin_read()?;
+        let entries = txn.open_table(entries_def).map_err(db_err)?;
+        match queue_head(&entries)? {
+            None => Ok(None),
+            Some((class, _, rel)) => Ok(Some((from_stored_str::<RelKey>(&rel)?, class))),
         }
-        Ok(pushed)
     }
 
     /// Removes and returns the head of queue `q` — lowest class, then
     /// earliest arrival — or `None` when empty.
     pub fn queue_pop(&self, q: Queue) -> Result<Option<(RelKey, u8)>, StateError> {
-        let (entries_def, idx_def) = q.tables();
-        let txn = self.begin_write()?;
-        let popped = {
-            let mut entries = txn.open_table(entries_def).map_err(db_err)?;
-            let head = match entries.first().map_err(db_err)? {
-                None => None,
-                Some((key, value)) => {
-                    let (class, arrival) = key.value();
-                    let rel = value.value().to_owned();
-                    Some((class, arrival, rel))
-                }
-            };
-            match head {
-                None => None,
-                Some((class, arrival, rel)) => {
-                    entries.remove((class, arrival)).map_err(db_err)?;
-                    let mut idx = txn.open_table(idx_def).map_err(db_err)?;
-                    idx.remove(rel.as_str()).map_err(db_err)?;
-                    Some((from_stored_str::<RelKey>(&rel)?, class))
-                }
-            }
-        };
-        if popped.is_some() {
-            txn.commit().map_err(db_err)?;
-        }
-        Ok(popped)
+        self.with_txn(|t| t.queue_pop(q))
+    }
+
+    /// Atomically moves an already-queued `relkey` to priority `class` (at
+    /// the **back** of that class), in one committed transaction — the §3.5
+    /// "thumbs became visible" bump, without the crash window a
+    /// `queue_remove` + `queue_push` pair would leave (durably absent from
+    /// the queue while the item's state still says queued).
+    ///
+    /// Returns `Ok(true)` when the relkey is queued afterwards (including
+    /// the no-op case where it already had `class` — its position is then
+    /// kept), `Ok(false)` when it was not queued at all (nothing changed;
+    /// the caller decides whether to push).
+    pub fn queue_reprioritize(
+        &self,
+        q: Queue,
+        relkey: &RelKey,
+        class: u8,
+    ) -> Result<bool, StateError> {
+        self.with_txn(|t| t.queue_reprioritize(q, relkey, class))
     }
 
     /// Removes `relkey` from queue `q` wherever it sits; `Ok(true)` when it
     /// was queued.
     pub fn queue_remove(&self, q: Queue, relkey: &RelKey) -> Result<bool, StateError> {
-        let (entries_def, idx_def) = q.tables();
-        let rel = relkey.as_str();
-        let txn = self.begin_write()?;
-        let removed = {
-            let mut idx = txn.open_table(idx_def).map_err(db_err)?;
-            let slot = idx.remove(rel).map_err(db_err)?.map(|guard| guard.value());
-            match slot {
-                None => false,
-                Some((class, arrival)) => {
-                    let mut entries = txn.open_table(entries_def).map_err(db_err)?;
-                    entries.remove((class, arrival)).map_err(db_err)?;
-                    true
-                }
-            }
-        };
-        if removed {
-            txn.commit().map_err(db_err)?;
-        }
-        Ok(removed)
+        self.with_txn(|t| t.queue_remove(q, relkey))
     }
 
     /// Number of entries in queue `q`.
@@ -1090,14 +1217,14 @@ impl SyncDb {
 
     /// Records the imported XMP hash for `relkey`.
     pub fn set_xmp_seen(&self, relkey: &RelKey, hash: &Blake3Hex) -> Result<(), StateError> {
-        let txn = self.begin_write()?;
-        {
-            let mut seen = txn.open_table(T_XMP_SEEN).map_err(db_err)?;
-            seen.insert(relkey.as_str(), hash.as_str())
-                .map_err(db_err)?;
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
+        self.with_txn(|t| t.set_xmp_seen(relkey, hash))
+    }
+
+    /// Removes the XMP-seen row for `relkey` (item deleted; keeps the
+    /// cache from growing beyond the live library). `Ok(true)` when a row
+    /// existed.
+    pub fn remove_xmp_seen(&self, relkey: &RelKey) -> Result<bool, StateError> {
+        self.with_txn(|t| t.remove_xmp_seen(relkey))
     }
 
     /// DCIM import cache: the content id previously computed for a source
@@ -1117,7 +1244,11 @@ impl SyncDb {
         }
     }
 
-    /// Records a DCIM scan result.
+    /// Records a DCIM scan result. Any previous rows for the **same source
+    /// path** (older `(size, mtime)` observations) are pruned in the same
+    /// transaction — a modified watched file replaces its cache row rather
+    /// than stranding the old one, so the table stays bounded by the number
+    /// of watched files, not by their modification history.
     pub fn set_dcim_seen(
         &self,
         path: &str,
@@ -1125,14 +1256,13 @@ impl SyncDb {
         mtime_unix: i64,
         content_id: &ContentId,
     ) -> Result<(), StateError> {
-        let txn = self.begin_write()?;
-        {
-            let mut seen = txn.open_table(T_DCIM_SEEN).map_err(db_err)?;
-            seen.insert((path, size, mtime_unix), content_id.as_str())
-                .map_err(db_err)?;
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
+        self.with_txn(|t| t.set_dcim_seen(path, size, mtime_unix, content_id))
+    }
+
+    /// Removes every DCIM-seen row for `path` (source file gone). Returns
+    /// the number of rows removed.
+    pub fn remove_dcim_seen(&self, path: &str) -> Result<u64, StateError> {
+        self.with_txn(|t| t.remove_dcim_seen(path))
     }
 
     // -- meta --------------------------------------------------------------
@@ -1148,24 +1278,23 @@ impl SyncDb {
 
     /// Stores the server-time offset.
     pub fn set_server_time_offset_ms(&self, offset_ms: i64) -> Result<(), StateError> {
-        let txn = self.begin_write()?;
-        {
-            let mut meta = txn.open_table(T_META).map_err(db_err)?;
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
             meta.insert(K_SERVER_TIME_OFFSET_MS, to_json(&offset_ms)?.as_slice())
                 .map_err(db_err)?;
-        }
-        txn.commit().map_err(db_err)?;
-        Ok(())
+            Ok(())
+        })
     }
+
+    // -- test support (not part of the supported API) ----------------------
 
     /// Test support only: overwrite (or remove, with `None`) the stored
     /// schema version so the open-time gates can be exercised. Not part of
     /// the supported API.
     #[doc(hidden)]
     pub fn force_schema_version(&self, version: Option<u32>) -> Result<(), StateError> {
-        let txn = self.begin_write()?;
-        {
-            let mut meta = txn.open_table(T_META).map_err(db_err)?;
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
             match version {
                 Some(v) => {
                     meta.insert(K_SCHEMA_VERSION, to_json(&v)?.as_slice())
@@ -1175,8 +1304,474 @@ impl SyncDb {
                     meta.remove(K_SCHEMA_VERSION).map_err(db_err)?;
                 }
             }
+            Ok(())
+        })
+    }
+
+    /// Test support only: remove the stored device identity, modeling meta
+    /// corruption / a future layout that moved identity, so the open gate's
+    /// schema-first ordering can be exercised.
+    #[doc(hidden)]
+    pub fn force_remove_device_id(&self) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.remove(K_DEVICE_ID).map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// Test support only: overwrite the persisted last-allocated seq
+    /// counter (corruption/tamper modeling for the overflow guard).
+    #[doc(hidden)]
+    pub fn force_last_seq(&self, value: u64) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(K_LAST_SEQ, to_json(&value)?.as_slice())
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// Test support only: overwrite the persisted queue arrival counter
+    /// (corruption/tamper modeling for the overflow guard).
+    #[doc(hidden)]
+    pub fn force_queue_arrival(&self, value: u64) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(K_QUEUE_ARRIVAL, to_json(&value)?.as_slice())
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// Test support only: store raw (typically unparseable) bytes as the
+    /// item record for `relkey`, so the documented
+    /// [`StateError::Codec`]-not-panic read behavior can be pinned.
+    #[doc(hidden)]
+    pub fn force_corrupt_item(&self, relkey: &RelKey, bytes: &[u8]) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut items = t.txn.open_table(T_ITEMS).map_err(db_err)?;
+            items.insert(relkey.as_str(), bytes).map_err(db_err)?;
+            Ok(())
+        })
+    }
+}
+
+/// Increments a persisted u64 meta counter, refusing to wrap
+/// ([`StateError::CounterSaturated`]).
+fn bump_counter(
+    meta: &mut redb::Table<'_, &'static str, &'static [u8]>,
+    key: &'static str,
+) -> Result<u64, StateError> {
+    let last: u64 = meta_get(meta, key)?.unwrap_or(0);
+    let next = last
+        .checked_add(1)
+        .ok_or(StateError::CounterSaturated { key })?;
+    meta.insert(key, to_json(&next)?.as_slice())
+        .map_err(db_err)?;
+    Ok(next)
+}
+
+impl StateTxn<'_> {
+    /// [`SyncDb::get_item`] within this transaction (sees the
+    /// transaction's own uncommitted writes).
+    pub fn get_item(&self, relkey: &RelKey) -> Result<Option<ItemRecord>, StateError> {
+        let items = self.txn.open_table(T_ITEMS).map_err(db_err)?;
+        read_item(&items, relkey)
+    }
+
+    /// [`SyncDb::insert_item`] within this transaction.
+    pub fn insert_item(&self, relkey: &RelKey, record: &ItemRecord) -> Result<bool, StateError> {
+        let mut items = self.txn.open_table(T_ITEMS).map_err(db_err)?;
+        if items.get(relkey.as_str()).map_err(db_err)?.is_some() {
+            return Ok(false);
         }
-        txn.commit().map_err(db_err)?;
+        let value = to_json(record)?;
+        items
+            .insert(relkey.as_str(), value.as_slice())
+            .map_err(db_err)?;
+        Ok(true)
+    }
+
+    /// [`SyncDb::replay_put_item`] within this transaction.
+    pub fn replay_put_item(&self, relkey: &RelKey, record: &ItemRecord) -> Result<(), StateError> {
+        let value = to_json(record)?;
+        let mut items = self.txn.open_table(T_ITEMS).map_err(db_err)?;
+        items
+            .insert(relkey.as_str(), value.as_slice())
+            .map_err(db_err)?;
         Ok(())
+    }
+
+    /// [`SyncDb::delete_item`] within this transaction.
+    pub fn delete_item(&self, relkey: &RelKey) -> Result<bool, StateError> {
+        let mut items = self.txn.open_table(T_ITEMS).map_err(db_err)?;
+        let previous = items.remove(relkey.as_str()).map_err(db_err)?;
+        Ok(previous.is_some())
+    }
+
+    /// [`SyncDb::transition`] within this transaction — the composite
+    /// building block ("transition + enqueue" etc.). Semantics, check
+    /// order, and errors are identical; an `Err` from here aborts the whole
+    /// transaction when propagated out of the closure.
+    pub fn transition(
+        &self,
+        relkey: &RelKey,
+        expected_from: ItemState,
+        to: ItemState,
+        mutate: impl FnOnce(&mut ItemRecord),
+    ) -> Result<ItemRecord, StateError> {
+        // (1) Static legality — before any storage is consulted.
+        if !legal(expected_from, to) {
+            return Err(StateError::IllegalTransition {
+                relkey: relkey.clone(),
+                from: expected_from,
+                to,
+            });
+        }
+        let mut items = self.txn.open_table(T_ITEMS).map_err(db_err)?;
+        // (2) + (3) Compare-and-set against the stored state.
+        let stored = match read_item(&items, relkey)? {
+            None => {
+                return Err(StateError::StaleState {
+                    relkey: relkey.clone(),
+                    expected: expected_from,
+                    found: None,
+                });
+            }
+            Some(record) => record,
+        };
+        if stored.state != expected_from {
+            return Err(StateError::StaleState {
+                relkey: relkey.clone(),
+                expected: expected_from,
+                found: Some(stored.state),
+            });
+        }
+        let mut record = stored;
+        mutate(&mut record);
+        record.state = to; // the transition owns the state field
+        let value = to_json(&record)?;
+        items
+            .insert(relkey.as_str(), value.as_slice())
+            .map_err(db_err)?;
+        Ok(record)
+    }
+
+    /// [`SyncDb::update_item`] within this transaction.
+    pub fn update_item(
+        &self,
+        relkey: &RelKey,
+        expected_state: ItemState,
+        mutate: impl FnOnce(&mut ItemRecord),
+    ) -> Result<ItemRecord, StateError> {
+        let mut items = self.txn.open_table(T_ITEMS).map_err(db_err)?;
+        let stored = match read_item(&items, relkey)? {
+            None => {
+                return Err(StateError::StaleState {
+                    relkey: relkey.clone(),
+                    expected: expected_state,
+                    found: None,
+                });
+            }
+            Some(record) => record,
+        };
+        if stored.state != expected_state {
+            return Err(StateError::StaleState {
+                relkey: relkey.clone(),
+                expected: expected_state,
+                found: Some(stored.state),
+            });
+        }
+        let mut record = stored;
+        mutate(&mut record);
+        record.state = expected_state; // state-preserving by contract
+        let value = to_json(&record)?;
+        items
+            .insert(relkey.as_str(), value.as_slice())
+            .map_err(db_err)?;
+        Ok(record)
+    }
+
+    /// [`SyncDb::mark_applied`] within this transaction.
+    pub fn mark_applied(&self, device: &DeviceId, seq: u64) -> Result<(), StateError> {
+        let mut applied = self.txn.open_table(T_APPLIED).map_err(db_err)?;
+        applied.insert((device.as_str(), seq), ()).map_err(db_err)?;
+        Ok(())
+    }
+
+    /// [`SyncDb::set_cursor`] within this transaction.
+    pub fn set_cursor(&self, device: &DeviceId, seq: u64) -> Result<(), StateError> {
+        let mut cursors = self.txn.open_table(T_CURSORS).map_err(db_err)?;
+        cursors.insert(device.as_str(), seq).map_err(db_err)?;
+        Ok(())
+    }
+
+    /// [`SyncDb::freeze_next_segment`] within this transaction — e.g. the
+    /// §2.4 `verifying → synced` step, which freezes the journal entry and
+    /// transitions the item in one commit.
+    pub fn freeze_next_segment(
+        &self,
+        build: impl FnOnce(u64) -> Vec<u8>,
+    ) -> Result<u64, StateError> {
+        let seq = {
+            let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
+            bump_counter(&mut meta, K_LAST_SEQ)?
+        };
+        let bytes = build(seq);
+        let mut segments = self.txn.open_table(T_SEGMENTS).map_err(db_err)?;
+        // Defensive: a freshly allocated seq cannot be frozen unless the
+        // counter was tampered backwards; refuse rather than overwrite.
+        if segments.get(seq).map_err(db_err)?.is_some() {
+            return Err(StateError::AlreadyFrozen { seq });
+        }
+        segments.insert(seq, bytes.as_slice()).map_err(db_err)?;
+        Ok(seq)
+    }
+
+    /// [`SyncDb::allocate_seq`] within this transaction.
+    pub fn allocate_seq(&self) -> Result<u64, StateError> {
+        let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
+        bump_counter(&mut meta, K_LAST_SEQ)
+    }
+
+    /// [`SyncDb::freeze_segment`] within this transaction.
+    pub fn freeze_segment(&self, seq: u64, bytes: &[u8]) -> Result<(), StateError> {
+        let meta = self.txn.open_table(T_META).map_err(db_err)?;
+        let last: u64 = meta_get(&meta, K_LAST_SEQ)?.unwrap_or(0);
+        if seq == 0 || seq > last {
+            return Err(StateError::SeqNotAllocated { seq });
+        }
+        let mut segments = self.txn.open_table(T_SEGMENTS).map_err(db_err)?;
+        if segments.get(seq).map_err(db_err)?.is_some() {
+            return Err(StateError::AlreadyFrozen { seq });
+        }
+        segments.insert(seq, bytes).map_err(db_err)?;
+        Ok(())
+    }
+
+    /// [`SyncDb::mark_published`] within this transaction.
+    pub fn mark_published(&self, seq: u64) -> Result<(), StateError> {
+        let segments = self.txn.open_table(T_SEGMENTS).map_err(db_err)?;
+        if segments.get(seq).map_err(db_err)?.is_none() {
+            return Err(StateError::NotFrozen { seq });
+        }
+        let mut published = self.txn.open_table(T_PUBLISHED).map_err(db_err)?;
+        published.insert(seq, ()).map_err(db_err)?;
+        let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
+        let cursor: u64 = meta_get(&meta, K_PUBLISHED_CURSOR)?.unwrap_or(0);
+        if seq > cursor {
+            meta.insert(K_PUBLISHED_CURSOR, to_json(&seq)?.as_slice())
+                .map_err(db_err)?;
+        }
+        // Advance the contiguous published floor (the unpublished-scan
+        // start). It only ever crosses published seqs, so a frozen or
+        // allocated-but-unfrozen seq below it is impossible by induction.
+        let mut floor: u64 = meta_get(&meta, K_PUBLISHED_FLOOR)?.unwrap_or(0);
+        let start = floor;
+        while let Some(next) = floor.checked_add(1) {
+            if published.get(next).map_err(db_err)?.is_some() {
+                floor = next;
+            } else {
+                break;
+            }
+        }
+        if floor != start {
+            meta.insert(K_PUBLISHED_FLOOR, to_json(&floor)?.as_slice())
+                .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// [`SyncDb::set_upload`] within this transaction.
+    pub fn set_upload(
+        &self,
+        relkey: &RelKey,
+        upload: &MultipartUploadState,
+    ) -> Result<(), StateError> {
+        let value = to_json(upload)?;
+        let mut uploads = self.txn.open_table(T_UPLOADS).map_err(db_err)?;
+        uploads
+            .insert(relkey.as_str(), value.as_slice())
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// [`SyncDb::record_upload_part`] within this transaction.
+    pub fn record_upload_part(
+        &self,
+        relkey: &RelKey,
+        part_no: u32,
+        part: &UploadPart,
+    ) -> Result<(), StateError> {
+        let value = to_json(part)?;
+        let mut parts = self.txn.open_table(T_UPLOAD_PARTS).map_err(db_err)?;
+        parts
+            .insert((relkey.as_str(), part_no), value.as_slice())
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// [`SyncDb::clear_upload`] within this transaction.
+    pub fn clear_upload(&self, relkey: &RelKey) -> Result<(), StateError> {
+        let rel = relkey.as_str();
+        let mut uploads = self.txn.open_table(T_UPLOADS).map_err(db_err)?;
+        uploads.remove(rel).map_err(db_err)?;
+        let mut parts = self.txn.open_table(T_UPLOAD_PARTS).map_err(db_err)?;
+        let part_nos: Vec<u32> = parts
+            .range((rel, 0u32)..=(rel, u32::MAX))
+            .map_err(db_err)?
+            .map(|entry| entry.map(|(key, _)| key.value().1))
+            .collect::<Result<_, _>>()
+            .map_err(db_err)?;
+        for part_no in part_nos {
+            parts.remove((rel, part_no)).map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    /// [`SyncDb::queue_push`] within this transaction — the other half of
+    /// the "transition to `Queued` + enqueue" composite.
+    pub fn queue_push(&self, q: Queue, relkey: &RelKey, class: u8) -> Result<bool, StateError> {
+        let (entries_def, idx_def) = q.tables();
+        let rel = relkey.as_str();
+        let mut idx = self.txn.open_table(idx_def).map_err(db_err)?;
+        if idx.get(rel).map_err(db_err)?.is_some() {
+            return Ok(false);
+        }
+        let arrival = {
+            let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
+            bump_counter(&mut meta, K_QUEUE_ARRIVAL)?
+        };
+        let mut entries = self.txn.open_table(entries_def).map_err(db_err)?;
+        entries.insert((class, arrival), rel).map_err(db_err)?;
+        idx.insert(rel, (class, arrival)).map_err(db_err)?;
+        Ok(true)
+    }
+
+    /// [`SyncDb::queue_pop`] within this transaction — enables the atomic
+    /// "pop + transition to `Uploading`/`Downloading`" step.
+    pub fn queue_pop(&self, q: Queue) -> Result<Option<(RelKey, u8)>, StateError> {
+        let (entries_def, idx_def) = q.tables();
+        let mut entries = self.txn.open_table(entries_def).map_err(db_err)?;
+        match queue_head(&entries)? {
+            None => Ok(None),
+            Some((class, arrival, rel)) => {
+                entries.remove((class, arrival)).map_err(db_err)?;
+                let mut idx = self.txn.open_table(idx_def).map_err(db_err)?;
+                idx.remove(rel.as_str()).map_err(db_err)?;
+                Ok(Some((from_stored_str::<RelKey>(&rel)?, class)))
+            }
+        }
+    }
+
+    /// [`SyncDb::queue_reprioritize`] within this transaction.
+    pub fn queue_reprioritize(
+        &self,
+        q: Queue,
+        relkey: &RelKey,
+        class: u8,
+    ) -> Result<bool, StateError> {
+        let (entries_def, idx_def) = q.tables();
+        let rel = relkey.as_str();
+        let mut idx = self.txn.open_table(idx_def).map_err(db_err)?;
+        let slot = idx.get(rel).map_err(db_err)?.map(|guard| guard.value());
+        match slot {
+            None => Ok(false),
+            Some((old_class, _)) if old_class == class => Ok(true),
+            Some((old_class, old_arrival)) => {
+                let mut entries = self.txn.open_table(entries_def).map_err(db_err)?;
+                entries.remove((old_class, old_arrival)).map_err(db_err)?;
+                let arrival = {
+                    let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
+                    bump_counter(&mut meta, K_QUEUE_ARRIVAL)?
+                };
+                entries.insert((class, arrival), rel).map_err(db_err)?;
+                idx.insert(rel, (class, arrival)).map_err(db_err)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// [`SyncDb::queue_remove`] within this transaction.
+    pub fn queue_remove(&self, q: Queue, relkey: &RelKey) -> Result<bool, StateError> {
+        let (entries_def, idx_def) = q.tables();
+        let rel = relkey.as_str();
+        let mut idx = self.txn.open_table(idx_def).map_err(db_err)?;
+        let slot = idx.remove(rel).map_err(db_err)?.map(|guard| guard.value());
+        match slot {
+            None => Ok(false),
+            Some((class, arrival)) => {
+                let mut entries = self.txn.open_table(entries_def).map_err(db_err)?;
+                entries.remove((class, arrival)).map_err(db_err)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// [`SyncDb::set_xmp_seen`] within this transaction.
+    pub fn set_xmp_seen(&self, relkey: &RelKey, hash: &Blake3Hex) -> Result<(), StateError> {
+        let mut seen = self.txn.open_table(T_XMP_SEEN).map_err(db_err)?;
+        seen.insert(relkey.as_str(), hash.as_str())
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// [`SyncDb::remove_xmp_seen`] within this transaction.
+    pub fn remove_xmp_seen(&self, relkey: &RelKey) -> Result<bool, StateError> {
+        let mut seen = self.txn.open_table(T_XMP_SEEN).map_err(db_err)?;
+        let removed = seen.remove(relkey.as_str()).map_err(db_err)?.is_some();
+        Ok(removed)
+    }
+
+    /// [`SyncDb::set_dcim_seen`] within this transaction.
+    pub fn set_dcim_seen(
+        &self,
+        path: &str,
+        size: u64,
+        mtime_unix: i64,
+        content_id: &ContentId,
+    ) -> Result<(), StateError> {
+        let mut seen = self.txn.open_table(T_DCIM_SEEN).map_err(db_err)?;
+        // Prune stale observations of the same source path (doc on
+        // `SyncDb::set_dcim_seen`).
+        let stale: Vec<(u64, i64)> = seen
+            .range((path, 0u64, i64::MIN)..=(path, u64::MAX, i64::MAX))
+            .map_err(db_err)?
+            .map(|entry| {
+                entry.map(|(key, _)| {
+                    let (_, s, m) = key.value();
+                    (s, m)
+                })
+            })
+            .collect::<Result<_, _>>()
+            .map_err(db_err)?;
+        for (s, m) in stale {
+            seen.remove((path, s, m)).map_err(db_err)?;
+        }
+        seen.insert((path, size, mtime_unix), content_id.as_str())
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// [`SyncDb::remove_dcim_seen`] within this transaction.
+    pub fn remove_dcim_seen(&self, path: &str) -> Result<u64, StateError> {
+        let mut seen = self.txn.open_table(T_DCIM_SEEN).map_err(db_err)?;
+        let rows: Vec<(u64, i64)> = seen
+            .range((path, 0u64, i64::MIN)..=(path, u64::MAX, i64::MAX))
+            .map_err(db_err)?
+            .map(|entry| {
+                entry.map(|(key, _)| {
+                    let (_, s, m) = key.value();
+                    (s, m)
+                })
+            })
+            .collect::<Result<_, _>>()
+            .map_err(db_err)?;
+        let removed = rows.len() as u64;
+        for (s, m) in rows {
+            seen.remove((path, s, m)).map_err(db_err)?;
+        }
+        Ok(removed)
     }
 }

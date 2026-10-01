@@ -5,12 +5,14 @@
 //! `harness = false`: this binary re-execs itself (`current_exe`) as a
 //! child, dispatched on `RRCLOUD_STATE_CRASH_CHILD`:
 //!
-//! - `writer` — opens the db and loops forever: allocate seq → freeze
-//!   segment → one item transition → mark applied → set cursor, printing an
-//!   ACK line to stdout strictly **after** each commit returns. The parent
-//!   SIGKILLs it at a random moment and then asserts the reopened db's
-//!   invariants against the ACK log (db state ≥ every ACKed commit, every
-//!   record parses, frozen bytes byte-identical).
+//! - `writer` — opens the db and loops forever: freeze_next_segment
+//!   (single-txn seq allocation + frozen bytes) → one item transition →
+//!   mark applied → set cursor, printing an ACK line to stdout strictly
+//!   **after** each commit returns. The parent SIGKILLs it at a random
+//!   moment and then asserts the reopened db's invariants against the ACK
+//!   log (db state ≥ every ACKed commit, every record parses, frozen bytes
+//!   byte-identical, and — because allocation and freeze commit together —
+//!   **no seq holes**, ever, regardless of where the kill landed).
 //! - `locker` — attempts to open a db the parent holds and must exit
 //!   quickly with a code describing the typed outcome (the §5.1
 //!   non-blocking refusal).
@@ -145,39 +147,52 @@ mod linux {
             writeln!(out, "{line}").expect("write ack");
             out.flush().expect("flush ack");
         };
-        // Ensure the item set exists (idempotent across child restarts).
-        for idx in 0..ITEM_COUNT {
-            let rel = item_rel(idx);
-            if db.get_item(&rel).expect("get item").is_none() {
-                db.put_item(
-                    &rel,
-                    &ItemRecord {
-                        kind: rrcloud_core::journal::Kind::Sidecar,
-                        state: ItemState::Dirty,
-                        size: 0,
-                        mtime_unix_ns: 0,
-                        blake3: None,
-                        sem_hash: None,
-                        vv: rrcloud_core::clock::VersionVector::new(),
-                        content_id: None,
-                        w: None,
-                        h: None,
-                        pinned: false,
-                        last_access_unix: 0,
-                        verified_remote: false,
-                        attested: false,
-                        base_unknown: false,
-                    },
-                )
-                .expect("put item");
-                ack(format!("PUT {idx}"));
-            }
+        // Ensure the item set exists: insert-only (idempotent across child
+        // restarts) and ONE committed transaction for all items, so the
+        // parent's kill window reliably lands in the main loop rather than
+        // in a 20-commit seeding phase. ACKs are printed strictly after the
+        // batch commit returned.
+        let inserted: Vec<u64> = db
+            .with_txn(|t| {
+                let mut inserted = Vec::new();
+                for idx in 0..ITEM_COUNT {
+                    let fresh = t.insert_item(
+                        &item_rel(idx),
+                        &ItemRecord {
+                            kind: rrcloud_core::journal::Kind::Sidecar,
+                            state: ItemState::Dirty,
+                            size: 0,
+                            mtime_unix_ns: 0,
+                            blake3: None,
+                            sem_hash: None,
+                            vv: rrcloud_core::clock::VersionVector::new(),
+                            content_id: None,
+                            w: None,
+                            h: None,
+                            pinned: false,
+                            last_access_unix: 0,
+                            verified_remote: false,
+                            attested: false,
+                            base_unknown: false,
+                        },
+                    )?;
+                    if fresh {
+                        inserted.push(idx);
+                    }
+                }
+                Ok(inserted)
+            })
+            .expect("insert items");
+        for idx in inserted {
+            ack(format!("PUT {idx}"));
         }
         loop {
-            let seq = db.allocate_seq().expect("allocate_seq");
+            // Seq allocation + frozen bytes in ONE committed transaction
+            // (§2.1.5): the parent asserts no-holes on the strength of this.
+            let seq = db
+                .freeze_next_segment(seg_bytes)
+                .expect("freeze_next_segment");
             ack(format!("SEQ {seq}"));
-            db.freeze_segment(seq, &seg_bytes(seq))
-                .expect("freeze_segment");
             ack(format!("FROZE {seq}"));
             let idx = seq % ITEM_COUNT;
             let rel = item_rel(idx);
@@ -292,7 +307,7 @@ mod linux {
                 .expect("spawn writer child");
             let mut guard = KillOnDrop(Some(child));
 
-            std::thread::sleep(Duration::from_millis(pseudo_random_ms(80, 400)));
+            std::thread::sleep(Duration::from_millis(pseudo_random_ms(120, 450)));
 
             let mut child = guard.0.take().expect("child present");
             child.kill().expect("SIGKILL writer child"); // SIGKILL on unix
@@ -366,31 +381,37 @@ mod linux {
                 last >= max_acked_seq,
                 "iteration {iteration}: last allocated seq {last} < last ACKed {max_acked_seq}"
             );
-            let next = db.allocate_seq().expect("allocate after crash");
+            let next = db
+                .freeze_next_segment(seg_bytes)
+                .expect("freeze_next_segment after crash");
             assert!(
                 next > max_acked_seq,
                 "iteration {iteration}: post-crash allocation {next} <= ACKed {max_acked_seq}"
             );
-            max_acked_seq = next; // the probe allocation is itself committed
+            max_acked_seq = next; // the probe freeze is itself committed
+            acked_frozen.push(next);
 
-            // (2) §2.1.5: every ACKed frozen segment is present
-            // byte-identically, in seq order; and every stored segment
-            // (ACKed or committed-but-unACKed) carries exactly the bytes
-            // frozen for its seq.
+            // (2) §2.1.5: the single-txn freeze means an allocated seq
+            // ALWAYS has frozen bytes, wherever the SIGKILL landed — the
+            // stored segments must be exactly 1..=last_allocated (no holes,
+            // nothing extra, ascending), every ACKed frozen segment among
+            // them, and every one byte-identical to what was frozen for its
+            // seq (nothing is published in this scenario, so
+            // unpublished_segments sees them all).
+            let last_alloc = db.last_allocated_seq().expect("last_allocated_seq");
             let segs = db.unpublished_segments().expect("unpublished_segments");
             let seq_order: Vec<u64> = segs.iter().map(|(s, _)| *s).collect();
-            let mut sorted = seq_order.clone();
-            sorted.sort_unstable();
-            assert_eq!(seq_order, sorted, "segments must come back in seq order");
-            let by_seq: BTreeMap<u64, &Vec<u8>> = segs.iter().map(|(s, b)| (*s, b)).collect();
+            assert_eq!(
+                seq_order,
+                (1..=last_alloc).collect::<Vec<u64>>(),
+                "iteration {iteration}: allocated seqs and frozen segments must \
+                 correspond one-to-one, in order (a hole would stall every \
+                 remote contiguity cursor forever)"
+            );
             for &seq in &acked_frozen {
-                let bytes = by_seq.get(&seq).unwrap_or_else(|| {
-                    panic!("iteration {iteration}: ACKed frozen seq {seq} missing after crash")
-                });
-                assert_eq!(
-                    **bytes,
-                    seg_bytes(seq),
-                    "iteration {iteration}: frozen seq {seq} not byte-identical"
+                assert!(
+                    seq <= last_alloc,
+                    "iteration {iteration}: ACKed frozen seq {seq} missing after crash"
                 );
             }
             for (seq, bytes) in &segs {
@@ -402,23 +423,38 @@ mod linux {
             }
 
             // (3) No torn ItemRecord: every item parses, and its state is
-            // the last ACKed one or one legal (unACKed committed) step past
-            // it.
+            // the last known-committed one or one legal (unACKed committed)
+            // step past it. After asserting, re-baseline on the OBSERVED
+            // stored state — the committed ground truth the next iteration's
+            // child starts from — so a kill inside the commit→ACK window
+            // can leave the baseline stale by at most the current
+            // iteration's one unACKed step, never accumulate across
+            // iterations (which could make a correct store fail the
+            // one-legal-step bound).
             for idx in 0..ITEM_COUNT {
                 let rel = item_rel(idx);
                 let record = db.get_item(&rel).unwrap_or_else(|e| {
                     panic!("iteration {iteration}: item {idx} failed to parse: {e:?}")
                 });
-                if let Some(&acked) = acked_item_state.get(&idx) {
-                    let record = record.unwrap_or_else(|| {
+                match (acked_item_state.get(&idx).copied(), record) {
+                    (Some(_), None) => {
                         panic!("iteration {iteration}: ACKed item {idx} vanished")
-                    });
-                    assert!(
-                        record.state == acked || legal(acked, record.state),
-                        "iteration {iteration}: item {idx} state {:?} unreachable from \
-                         last ACKed {acked:?}",
-                        record.state
-                    );
+                    }
+                    (Some(acked), Some(record)) => {
+                        assert!(
+                            record.state == acked || legal(acked, record.state),
+                            "iteration {iteration}: item {idx} state {:?} unreachable from \
+                             last known-committed {acked:?}",
+                            record.state
+                        );
+                        acked_item_state.insert(idx, record.state);
+                    }
+                    // PUT committed but its ACK was torn: adopt the
+                    // observed committed state as the baseline.
+                    (None, Some(record)) => {
+                        acked_item_state.insert(idx, record.state);
+                    }
+                    (None, None) => {}
                 }
             }
 

@@ -15,11 +15,13 @@ publish = false
 [dependencies]
 blake3 = "1"
 # State store (§3.2). The only runtime dependency added by the state-store
-# unit: pure Rust, shadow-paging B-tree, commits durable at commit() with the
-# default durability — empirically verified (P1-U2): cross-process second
-# open FAILS immediately (~µs) with DatabaseError::DatabaseAlreadyOpen (no
-# blocking), which is exactly the §5.1 app/worker mutual exclusion; the file
-# lock is kernel-released on SIGKILL so crash reopen works.
+# unit: pure Rust, shadow-paging B-tree, commits durable at commit() —
+# durability is pinned to Durability::Immediate on every write transaction
+# (src/state.rs module docs; not left to redb's default, so a future default
+# change cannot weaken §3.2). Empirically verified (P1-U2): cross-process
+# second open FAILS immediately (~µs) with DatabaseError::DatabaseAlreadyOpen
+# (no blocking), which is exactly the §5.1 app/worker mutual exclusion; the
+# file lock is kernel-released on SIGKILL so crash reopen works.
 redb = "2"
 bytes = "1"
 futures = "0.3"
