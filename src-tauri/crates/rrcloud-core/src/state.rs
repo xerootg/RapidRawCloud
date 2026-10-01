@@ -672,9 +672,23 @@ pub struct ItemRecord {
     /// [`SyncDb::replay_put_item`] bypass is reserved for ingest/replay
     /// paths and is named to be greppable.
     pub state: ItemState,
-    /// Size in bytes of the local file (0 when unknown/stub).
+    /// Size in bytes of the file (0 when unknown/stub).
+    ///
+    /// **§2.6 coordination note**: the manifest advertise gate
+    /// ([`crate::manifest`] `build_manifest`) emits in-flight rows whose
+    /// `blake3`/`size` pair must keep describing the last **published**
+    /// version — a peer's §2.3 reconcile flags a `blake3`/`size`
+    /// mismatch as `corrupt_remote`. So until a last-published snapshot
+    /// mechanism lands, the chokepoint/§3.4 unit must NOT refresh `size`
+    /// to current-local facts while marking an item `Dirty` with a
+    /// published `blake3` still advertised; it stays naming the
+    /// published bytes.
     pub size: u64,
-    /// Local file mtime, unix **nanoseconds** (change pre-check, §2.5).
+    /// File mtime, unix **nanoseconds** (change pre-check, §2.5). Same
+    /// §2.6 coordination note as `size`: not refreshed in flight until a
+    /// last-published snapshot exists (mtime itself is not advertised
+    /// with reconcile weight, but it travels in the manifest row and
+    /// must not imply a version the `blake3` does not name).
     pub mtime_unix_ns: i64,
     /// blake3 of the last uploaded/verified bytes (journal `blake3`, §2.2).
     pub blake3: Option<Blake3Hex>,

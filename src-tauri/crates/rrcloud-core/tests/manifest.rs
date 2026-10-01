@@ -11,8 +11,8 @@ use std::io::{Read as _, Write as _};
 
 use common::garage;
 use common::sync::{
-    apply_entries_locally, dev, entry, open_db, rel, RecordingConsumer, ReplayConsumer, DEV_A,
-    DEV_B, DEV_C, DEV_Y,
+    apply_entries_locally, dev, entry, open_db, rel, FakeS3, RecordingConsumer, ReplayConsumer,
+    DEV_A, DEV_B, DEV_C, DEV_Y,
 };
 use rrcloud_core::clock::{DeviceId, VersionVector};
 use rrcloud_core::journal::{Kind, Op};
@@ -20,7 +20,7 @@ use rrcloud_core::keys::{journal_segment_key, library_key, manifest_key, sidecar
 use rrcloud_core::manifest::{
     build_manifest, decode_manifest, encode_manifest, get_manifest, head_manifest_etag, merge,
     put_manifest, DeletedRow, Manifest, ManifestError, ManifestHeader, ManifestRow,
-    MANIFEST_MAX_DECODED_BYTES, MANIFEST_PROTO,
+    MANIFEST_MAX_DECODED_BYTES, MANIFEST_MAX_FETCH_BYTES, MANIFEST_PROTO,
 };
 use rrcloud_core::publisher::{enqueue_entry, publish_pending};
 use rrcloud_core::reader::poll;
@@ -1123,4 +1123,63 @@ async fn bootstrap_merge_cannot_drop_an_item_whose_re_edit_is_in_flight() {
     assert_eq!(item.vv, e.vv, "the row carried the published version");
     assert_eq!(item.blake3, e.blake3);
     assert_eq!(db_c.cursor(&a).expect("cursor"), 1);
+}
+
+#[tokio::test]
+async fn an_oversized_manifest_object_is_refused_on_both_fetch_lanes() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("man-too-large");
+    let client = g.client();
+    let a = dev(DEV_A);
+    let (_dir, _path, db) = open_db(&a);
+
+    // Lane 1: a declared Content-Length over the cap is refused BEFORE
+    // buffering. The stored object is tiny and valid — only the hostile
+    // declared length (injected) triggers the pre-check, proving the
+    // refusal cannot have come from the capped collect.
+    let manifest = build_manifest(&db, 12345).expect("build");
+    put_manifest(&client, &bucket, &a, &manifest)
+        .await
+        .expect("put");
+    let mut fake = FakeS3::new(g.client());
+    fake.declared_lengths.insert(
+        rrcloud_core::keys::manifest_key(&a),
+        MANIFEST_MAX_FETCH_BYTES as u64 + 1,
+    );
+    let err = get_manifest(&fake, &bucket, &a)
+        .await
+        .expect_err("declared-oversized manifest must be refused");
+    match err {
+        ManifestError::ObjectTooLarge { size, limit } => {
+            assert_eq!(size, MANIFEST_MAX_FETCH_BYTES as u64 + 1);
+            assert_eq!(limit, MANIFEST_MAX_FETCH_BYTES);
+        }
+        other => panic!("expected ObjectTooLarge, got {other:?}"),
+    }
+
+    // Lane 2: the body overruns the cap behind a LYING Content-Length
+    // (reported as 1 byte), so only the capped collect can catch it.
+    // Same typed outcome: a persistent oversized-object condition, not a
+    // transport failure.
+    let b = dev(DEV_B);
+    let oversized = vec![0u8; MANIFEST_MAX_FETCH_BYTES + 1];
+    let key = rrcloud_core::keys::manifest_key(&b);
+    client
+        .put_object(
+            &bucket,
+            &key,
+            bytes::Bytes::from(oversized),
+            &rrcloud_core::s3::PutObjectOptions::default(),
+        )
+        .await
+        .expect("oversized put");
+    let mut fake = FakeS3::new(g.client());
+    fake.lie_content_length.insert(key);
+    let err = get_manifest(&fake, &bucket, &b)
+        .await
+        .expect_err("actually-oversized manifest must be refused");
+    assert!(
+        matches!(err, ManifestError::ObjectTooLarge { .. }),
+        "expected ObjectTooLarge, got {err:?}"
+    );
 }

@@ -2,7 +2,7 @@
 //! manifest): consumer test doubles, a counting/fault-injecting [`S3Api`]
 //! wrapper, entry builders, and db scaffolding.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
@@ -289,6 +289,10 @@ pub struct FakeS3 {
     /// the true body size (modeling a lying `Content-Length`, so capped
     /// collects must catch what the declared-length pre-check cannot).
     pub lie_content_length: HashSet<String>,
+    /// GETs of these keys report this `content_length` regardless of the
+    /// true body size (modeling a hostile declared length, so declared-
+    /// length pre-checks can be exercised without storing huge bodies).
+    pub declared_lengths: HashMap<String, u64>,
 }
 
 impl FakeS3 {
@@ -302,6 +306,7 @@ impl FakeS3 {
             put_then_fail: HashSet::new(),
             fail_gets: HashSet::new(),
             lie_content_length: HashSet::new(),
+            declared_lengths: HashMap::new(),
         }
     }
 
@@ -359,6 +364,9 @@ impl S3Api for FakeS3 {
         let mut output = self.inner.get_object(bucket, key, range).await?;
         if self.lie_content_length.contains(key) {
             output.content_length = 1;
+        }
+        if let Some(&declared) = self.declared_lengths.get(key) {
+            output.content_length = declared;
         }
         Ok(output)
     }

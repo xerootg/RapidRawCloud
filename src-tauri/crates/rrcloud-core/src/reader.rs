@@ -166,7 +166,11 @@ pub struct PrefixHalted {
 /// failed manifest GET — between this report and the completed merge
 /// loses nothing. The signal is durable because it is re-derived, never
 /// because anyone remembered it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "journal of device {device} starts at seq {lowest_seq} with cursor 0: \
+     below-horizon prefix compacted (bootstrap gap; route to §2.3 manifest merge)"
+)]
 pub struct GapDetected {
     /// The device whose journal is gapped at the bottom.
     pub device: DeviceId,
@@ -347,9 +351,18 @@ pub async fn poll(
 
 /// One paged `ListObjectsV2` over `.rrcloud/v1/journal/` (no delimiter),
 /// following continuation tokens. Pages are capped against a backend that
-/// keeps answering truncated pages without advancing.
+/// keeps answering truncated pages without advancing, and the collected
+/// key count is capped so the LIST lane's allocation is bounded like
+/// every GET lane's.
 async fn list_journal_keys(s3: &impl S3Api, bucket: &str) -> Result<Vec<String>, ReaderError> {
     const MAX_PAGES: u32 = 10_000;
+    // Allocation bound for the LIST lane, matching the typed caps on
+    // every fetch lane (segment/manifest/registry GETs): a conforming
+    // fleet is compaction-bounded to a few thousand journal keys, so a
+    // listing past this count is a hostile bucket or a badly broken
+    // writer — refuse before buffering order-of-GB of key Strings on
+    // phone-class targets.
+    const MAX_KEYS: usize = 100_000;
     let prefix = format!("{CONTROL_PREFIX}journal/");
     let mut keys = Vec::new();
     let mut continuation_token: Option<String> = None;
@@ -373,6 +386,12 @@ async fn list_journal_keys(s3: &impl S3Api, bucket: &str) -> Result<Vec<String>,
             )
             .await?;
         keys.extend(page.objects.into_iter().map(|o| o.key));
+        if keys.len() > MAX_KEYS {
+            return Err(ReaderError::S3(S3Error::InvalidResponse(format!(
+                "ListObjectsV2 returned more than {MAX_KEYS} journal keys; \
+                 refusing unbounded key buffering (hostile bucket or runaway writer)"
+            ))));
+        }
         if !page.is_truncated {
             return Ok(keys);
         }
@@ -640,7 +659,19 @@ fn validate_segment_body(
         ));
     }
     for (i, entry) in entries.iter().enumerate() {
-        let expected = first_seq.saturating_add(i as u64);
+        // checked, not saturating: at the top of the seq space a
+        // saturating expected value would make the contiguity check
+        // vacuous (every duplicate u64::MAX entry "matches"), turning
+        // refuse-whole into skip-and-continue. Conforming writers can
+        // never allocate here (counter overflow is a typed refusal at
+        // freeze time), so any segment whose span would overflow is
+        // forged or buggy and is refused whole.
+        let Some(expected) = first_seq.checked_add(i as u64) else {
+            return Err(format!(
+                "segment span {first_seq} + {i} overflows the u64 seq space \
+                 (conforming writers refuse allocation before saturation)"
+            ));
+        };
         if entry.seq != expected {
             return Err(format!(
                 "entry seq {} where {expected} was required (seqs must be +1 contiguous \

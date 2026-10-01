@@ -278,7 +278,12 @@ pub struct Manifest {
 /// item (the skip-and-diverge §2.1 principle 2 forbids; pinned by the
 /// bootstrap regression tests). The emitted row truthfully describes the
 /// published version: in [`crate::state::ItemRecord`] v1 its `vv`,
-/// `blake3` and hashes still name it at these states.
+/// `blake3`, `size` and hashes still name it at these states — `size`
+/// included, because a peer's §2.3 reconcile pairs the row's `blake3`
+/// with its `size` and flags a mismatch as `corrupt_remote` (which is
+/// why [`crate::state::ItemRecord`]'s `size`/`mtime_unix_ns` field
+/// contracts pin last-published semantics until a snapshot mechanism
+/// lands).
 ///
 /// Two invariants this gate leans on, owed by the engine units around it:
 ///
@@ -725,6 +730,25 @@ fn state_is_remotely_visible(state: ItemState) -> bool {
 
 /// Rebuilds the bucket key a manifest row's `(kind, relkey)` addresses,
 /// through the [`crate::keys`] constructors.
+///
+/// **§2.6 coordination note (virtual-copy keys)**: a conflict loser
+/// lives at `library/<rel>.<6hex>.rrdata` — a distinct live bucket key
+/// with its own journal entry and fresh single-component vv — but
+/// [`crate::keys::classify_key`] folds it to `Sidecar { relkey: base,
+/// vc: Some(hex) }` and [`ManifestRow`] carries only `(kind, key)`, so
+/// this function can only ever rebuild the PRIMARY sidecar key. When
+/// loser materialization lands, vc live keys will have no representable
+/// proto-1 row, and [`build_manifest`]'s own-cursor attestation
+/// invariant ("every live effect of a published entry is advertised")
+/// silently breaks for compacted vc entries: a bootstrapping device
+/// learns of loser copies only via full-reconcile foreign adoption.
+/// The obvious extension is a trap: an optional `vc` field on
+/// [`ManifestRow`] is unsafe WITHOUT a proto bump, because proto-1
+/// readers ignore unknown fields (§2.2 min-reader rule) and would
+/// re-aim such a row at the primary sidecar key, clobbering the
+/// primary's vv/hashes with the loser's. The vv-engine unit that first
+/// writes vc rows must bump the manifest proto (or carve a new kind)
+/// before emitting them. No writer of vc rows exists today.
 fn bucket_key_for(row: &ManifestRow) -> Result<String, ManifestError> {
     let unconvertible = || ManifestError::Unconvertible {
         relkey: row.key.clone(),

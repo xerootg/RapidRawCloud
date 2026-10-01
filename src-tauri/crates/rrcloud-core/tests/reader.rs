@@ -1070,3 +1070,132 @@ async fn idle_polls_cost_no_gets_per_caught_up_device() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_forged_segment_at_the_top_of_the_seq_space_is_refused_whole() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-seq-max");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let x = dev(DEV_X);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // A forged segment at filename seq u64::MAX whose entries ALL carry
+    // seq u64::MAX. A saturating contiguity check would accept the
+    // duplicates (expected saturates at MAX for every i), apply the
+    // first entry and silently skip the rest — skip-and-continue where
+    // the contract pins refuse-whole. Conforming writers can never
+    // allocate here (counter overflow is a typed refusal at freeze
+    // time), so the whole segment is corrupt by construction.
+    let mut entries = sidecar_entries(&x, "fx", 3);
+    for e in &mut entries {
+        e.seq = u64::MAX;
+    }
+    put_raw_segment(&client, &bucket, &x, u64::MAX, &entries).await;
+
+    // The cursor must sit just below the forged segment to get past the
+    // bootstrap-gap shield (at cursor 0 the segment is never fetched);
+    // reachable only via a forged owner's manifest self-attestation.
+    db_b.set_cursor(&x, u64::MAX - 1).expect("seed cursor");
+
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_one_corrupt(&report.corrupt, &x, u64::MAX);
+    assert!(
+        report.corrupt[0].detail.contains("overflow"),
+        "refusal names the span overflow: {}",
+        report.corrupt[0].detail
+    );
+    assert!(
+        consumer.transcript.is_empty(),
+        "refuse-whole: not even the first entry applies"
+    );
+    assert_eq!(
+        db_b.cursor(&x).expect("cursor"),
+        u64::MAX - 1,
+        "the cursor must not move past a refused segment"
+    );
+}
+
+/// An [`rrcloud_core::s3::S3Api`] stub whose LIST fabricates endless
+/// truncated pages of journal keys, modeling a hostile bucket trying to
+/// run the reader out of memory before the page cap fires. Nothing else
+/// is ever called (listing refuses before any GET).
+struct FloodingList;
+
+impl rrcloud_core::s3::S3Api for FloodingList {
+    async fn put_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _body: Bytes,
+        _opts: &PutObjectOptions,
+    ) -> Result<rrcloud_core::s3::PutObjectOutput, rrcloud_core::s3::S3Error> {
+        unreachable!("the listing refusal must fire before any other call")
+    }
+
+    async fn get_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+        _range: Option<rrcloud_core::s3::ByteRange>,
+    ) -> Result<rrcloud_core::s3::GetObjectOutput, rrcloud_core::s3::S3Error> {
+        unreachable!("the listing refusal must fire before any GET")
+    }
+
+    async fn head_object(
+        &self,
+        _bucket: &str,
+        _key: &str,
+    ) -> Result<rrcloud_core::s3::HeadObjectOutput, rrcloud_core::s3::S3Error> {
+        unreachable!("the listing refusal must fire before any HEAD")
+    }
+
+    async fn list_objects_v2(
+        &self,
+        _bucket: &str,
+        request: &rrcloud_core::s3::ListObjectsV2Request,
+    ) -> Result<rrcloud_core::s3::ListObjectsV2Output, rrcloud_core::s3::S3Error> {
+        let page: u64 = request
+            .continuation_token
+            .as_deref()
+            .map_or(0, |t| t.parse().expect("our own token"));
+        let x = dev(DEV_X);
+        let objects = (0..1000u64)
+            .map(|i| rrcloud_core::s3::ObjectSummary {
+                key: journal_segment_key(&x, page * 1000 + i + 1),
+                size: 100,
+                e_tag: String::new(),
+                last_modified: None,
+            })
+            .collect();
+        Ok(rrcloud_core::s3::ListObjectsV2Output {
+            objects,
+            common_prefixes: Vec::new(),
+            is_truncated: true,
+            next_continuation_token: Some((page + 1).to_string()),
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_flooding_listing_is_refused_with_bounded_key_buffering() {
+    // No Garage: the hostile backend is the stub itself. The LIST lane
+    // must be allocation-bounded like every GET lane — the refusal fires
+    // on key count, far below the page cap's order-of-GB worst case.
+    let b = dev(DEV_B);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+    let mut consumer = RecordingConsumer::default();
+    let err = poll(&db_b, &FloodingList, "any-bucket", &mut consumer)
+        .await
+        .expect_err("an unbounded listing must be refused");
+    match err {
+        ReaderError::S3(rrcloud_core::s3::S3Error::InvalidResponse(detail)) => {
+            assert!(detail.contains("journal keys"), "{detail}");
+        }
+        other => panic!("expected the typed listing refusal, got {other:?}"),
+    }
+    assert!(consumer.transcript.is_empty());
+}
