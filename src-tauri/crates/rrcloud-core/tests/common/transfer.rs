@@ -285,6 +285,14 @@ pub struct CountingS3 {
     /// Remaining times `list_multipart_uploads` fails transport-style
     /// without reaching the backend.
     pub fail_list_uploads: AtomicU32,
+    /// `key` → ETag `put_object`'s *response* reports instead of the
+    /// backend's (the stored object is untouched) — models a backend
+    /// whose single-PUT ETag is not the body's MD5 (SSE-KMS/SSE-C, some
+    /// gateways), for the §2.4 `ETag == md5hex` guard.
+    pub fake_put_etags: Mutex<HashMap<String, String>>,
+    /// `delete_object` of these keys fails (typed, without reaching the
+    /// backend).
+    pub fail_deletes: HashSet<String>,
     /// `key` → ETag `head_object` reports instead of the backend's — a
     /// deterministic stand-in for "the key no longer holds the object we
     /// stored" (e.g. a sibling device replaced the shared key between
@@ -354,6 +362,8 @@ impl CountingS3 {
             ignore_range: false,
             shift_resume_ranges: Mutex::new(HashMap::new()),
             fail_list_uploads: AtomicU32::new(0),
+            fake_put_etags: Mutex::new(HashMap::new()),
+            fail_deletes: HashSet::new(),
             fake_head_etags: Mutex::new(HashMap::new()),
             fail_heads: Mutex::new(HashMap::new()),
             fail_aborts: Mutex::new(HashMap::new()),
@@ -483,7 +493,11 @@ impl S3Api for CountingS3 {
         };
         let _g = self.enter();
         self.await_put_gate().await;
-        self.inner.put_object(bucket, key, body, &opts).await
+        let mut out = self.inner.put_object(bucket, key, body, &opts).await?;
+        if let Some(etag) = self.fake_put_etags.lock().expect("lock").get(key) {
+            out.e_tag = etag.clone();
+        }
+        Ok(out)
     }
 
     async fn get_object(
@@ -582,6 +596,11 @@ impl S3Api for CountingS3 {
 
 impl S3TransferApi for CountingS3 {
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
+        if self.fail_deletes.contains(key) {
+            return Err(S3Error::InvalidRequest(format!(
+                "injected DELETE failure for {key}"
+            )));
+        }
         self.inner.delete_object(bucket, key).await
     }
 

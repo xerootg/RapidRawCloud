@@ -270,6 +270,36 @@ async fn probe_detects_a_digest_accepting_backend_and_cleans_up() {
     );
 }
 
+#[tokio::test]
+async fn probe_cleanup_failure_propagates_and_persists_no_outcome() {
+    let (g, bucket, _root, _dbdir, db) = scaffold!("tr-probe-del-fail");
+    // The accept path stores the probe object, then its cleanup DELETE
+    // fails: the error must propagate (never silently classified as a
+    // probe outcome) and nothing may be persisted — a re-probe decides.
+    let mut s3 = CountingS3::new(g.client());
+    s3.strip_digests = true;
+    s3.fail_deletes.insert(PROBE_KEY.to_string());
+
+    let err = probe_backend(&db, &s3, &bucket)
+        .await
+        .expect_err("cleanup failure must propagate");
+    assert!(
+        matches!(err, TransferError::S3(_)),
+        "typed transport error, got {err:?}"
+    );
+    assert_eq!(
+        db.backend_digest_rejection().expect("read"),
+        None,
+        "a probe that could not clean up persists no outcome"
+    );
+    // Documented residue of this failure mode: the probe object is left
+    // behind (the next successful probe overwrites and deletes it).
+    g.client()
+        .head_object(&bucket, PROBE_KEY)
+        .await
+        .expect("probe object left behind on the failed-cleanup path");
+}
+
 // ===========================================================================
 // Upload: single PUT
 // ===========================================================================
@@ -570,6 +600,58 @@ async fn journal_blake3_hashes_exactly_the_sent_bytes_not_the_file() {
         Some(Blake3Hex::from_bytes(&stored)),
         "journal blake3 == blake3 of what Garage stores == sent bytes"
     );
+}
+
+#[tokio::test]
+async fn single_put_etag_mismatch_fails_typed_with_nothing_journaled() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-single-etag-mismatch");
+    let r = rel("etag/weird.NEF");
+    let key = sidecar_key(&r);
+    // A backend whose single-PUT response ETag is not the body's MD5
+    // (SSE-KMS/SSE-C-shaped) while digest_rejection_works=true: the §2.4
+    // `ETag == md5hex` guard must fail typed, re-queued, nothing
+    // journaled, no multipart record left behind.
+    let s3 = CountingS3::new(g.client());
+    s3.fake_put_etags
+        .lock()
+        .unwrap()
+        .insert(key.clone(), "\"not-an-md5-shaped-etag\"".to_string());
+    let cfg = h::test_cfg(&bucket, root.path());
+
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sidecar_full.json"
+    ))
+    .expect("fixture");
+    let src = h::under(root.path(), "weird.NEF.rrdata");
+    h::write_file(&src, &bytes);
+    h::seed_queued(&db, &r, Kind::Sidecar, &src);
+
+    let err = upload_item(&db, &s3, &cfg, &r, &src)
+        .await
+        .expect_err("non-MD5 response ETag must fail the §2.4 guard");
+    match err {
+        TransferError::EtagMismatch {
+            relkey,
+            expected,
+            actual,
+        } => {
+            assert_eq!(relkey, r);
+            assert_eq!(expected, h::md5_hex(&bytes));
+            assert_eq!(actual, "\"not-an-md5-shaped-etag\"");
+        }
+        other => panic!("expected EtagMismatch, got {other:?}"),
+    }
+    assert_eq!(
+        h::state_of(&db, &r),
+        ItemState::Queued,
+        "re-queued, resumable"
+    );
+    assert!(
+        db.get_upload(&r).expect("get_upload").is_none(),
+        "a single PUT leaves no multipart record"
+    );
+    assert_eq!(outbound_len(&db), 0, "nothing journaled");
 }
 
 #[tokio::test]
@@ -1527,6 +1609,46 @@ async fn pump_uploads_caps_concurrency_and_isolates_a_failing_item() {
         failing_rel
     );
     assert_eq!(outbound_len(&db), 5, "nothing journaled for the failure");
+}
+
+#[tokio::test]
+async fn pump_parks_an_invalid_config_item_instead_of_requeueing_it() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-pump-park-cfg");
+    let s3 = CountingS3::new(g.client());
+    // A statically unusable config (part_size below the S3 floor) fails
+    // identically every pass: the pump must park the item — recorded in
+    // the summary, left queueable, NOT re-pushed — instead of storming
+    // the same InvalidConfig once per pass forever.
+    let mut cfg = h::test_cfg(&bucket, root.path());
+    cfg.part_size = 1024;
+
+    let r = rel("park/cfg.NEF");
+    let src = local_target_path(root.path(), &r, Kind::Original);
+    h::write_file(&src, b"small body");
+    h::seed_queued(&db, &r, Kind::Original, &src);
+    assert!(db.queue_push(Queue::Up, &r, 0).expect("queue_push"));
+
+    let summary = pump_uploads(&db, &s3, &cfg, 1, &CancelFlag::new())
+        .await
+        .expect("pump");
+    assert!(summary.completed.is_empty());
+    assert_eq!(summary.failed.len(), 1);
+    assert!(
+        matches!(summary.failed[0].1, TransferError::InvalidConfig(_)),
+        "typed InvalidConfig preserved, got {:?}",
+        summary.failed[0].1
+    );
+    assert_eq!(
+        h::state_of(&db, &r),
+        ItemState::Queued,
+        "parked in its queueable state (a fixed config re-queues it)"
+    );
+    assert_eq!(
+        db.queue_len(Queue::Up).expect("queue_len"),
+        0,
+        "an InvalidConfig item is parked, never re-pushed"
+    );
+    assert_eq!(outbound_len(&db), 0);
 }
 
 #[tokio::test]

@@ -171,6 +171,17 @@
 //! and untransferable kinds). [`recover_interrupted_with`] takes a
 //! per-item class so the §3.5 priority lanes survive the rebuild.
 //!
+//! **`stub` is deliberately outside both recovery halves**: the sweep
+//! cannot tell "stub awaiting hydration" from the library's thousands of
+//! at-rest stubs, and the pump's end-of-pass requeue likewise ignores
+//! it. A queued hydration request is therefore only crash-durable when
+//! its enqueuer CASes `stub → pending_down` ("hydration requested",
+//! the legal §3.5 edge) **before** pushing the queue row — a raw `stub`
+//! row dropped between the pop commit and the entry CAS is silently
+//! lost until re-requested. [`download_item`]'s `stub` entry state
+//! exists for *synchronous* drivers (the `ensure_local` guard sites)
+//! that re-request on failure, not for queued work.
+//!
 //! The matching **no-crash** hole is closed by the pump itself: when its
 //! popped row loses the entry CAS to a live external driver (the §3.5
 //! `ensure_local` race) the end-of-pass requeue keeps the row while the
@@ -866,9 +877,15 @@ async fn transfer_object(
         let out = s3
             .put_object(&cfg.bucket, key, bytes.clone(), &opts)
             .await?;
-        // ETag == md5hex (§2.4) — meaningful only on a backend whose ETag
-        // convention the digest probe validated; a non-verifying backend
-        // is caught by the read-back re-hash instead.
+        // ETag == md5hex (§2.4). NOTE the gate is a proxy: the digest
+        // probe tests Content-MD5 *rejection* only, never the ETag shape
+        // — digest verification and MD5-shaped ETags are independent
+        // backend properties. The convention is proven by the §8 harness
+        // on Garage/MinIO and *assumed* elsewhere; a verifying backend
+        // with non-MD5 ETags (SSE-KMS/SSE-C, some gateways) fails here
+        // typed and re-queues — a visible fail-safe livelock, never
+        // corruption. A non-verifying backend skips this and is caught
+        // by the read-back re-hash instead.
         if cfg.backend.digest_rejection_works && out.e_tag != md5_hex {
             return Err(TransferError::EtagMismatch {
                 relkey: relkey.clone(),
@@ -890,6 +907,25 @@ async fn transfer_object(
 
     // --- multipart ---
     let resuming = resume.is_some();
+    // The 10,000-part S3 cap is a static property of (size, part_size):
+    // checked BEFORE CreateMultipartUpload so an oversized object errors
+    // without creating a backend upload or a durable record — it can
+    // never heal by retrying, and the pump parks `InvalidConfig` rather
+    // than re-queueing it (review finding, round 4).
+    {
+        let planned_part_size = resume
+            .as_ref()
+            .map(|u| u.part_size)
+            .unwrap_or(cfg.part_size)
+            .max(1);
+        let planned_parts = size.div_ceil(planned_part_size).max(1);
+        if planned_parts > 10_000 {
+            return Err(TransferError::InvalidConfig(format!(
+                "{size}-byte object needs {planned_parts} parts of {planned_part_size}; \
+                 S3 allows at most 10000"
+            )));
+        }
+    }
     let upload = match resume {
         Some(up) => {
             // §2.4 mid-resume source-change recheck: size + mtime against
@@ -926,11 +962,6 @@ async fn transfer_object(
 
     let part_size = upload.part_size.max(1);
     let part_count = size.div_ceil(part_size).max(1);
-    if part_count > 10_000 {
-        return Err(TransferError::InvalidConfig(format!(
-            "{size}-byte object needs {part_count} parts of {part_size}; S3 allows at most 10000"
-        )));
-    }
     let recorded: BTreeMap<u32, UploadPart> = db.upload_parts(relkey)?.into_iter().collect();
     // ListParts, opportunistically (resume only): a part is trusted as
     // done only when its durable record exists AND the backend lists it
@@ -1360,6 +1391,12 @@ pub fn commit_verified(
     db.with_txn_err::<u64, TransferError>(|t| {
         let record = t.transition(relkey, ItemState::Verifying, ItemState::Synced, |r| {
             r.verified_remote = true;
+            // `attested` means "an attest entry covers the CURRENT
+            // version" (§3.5 eviction gate). This commit records a new
+            // version's blake3, so any flag set for the superseded
+            // version is stale here — cleared before `mutate`, which may
+            // legitimately re-set it if the caller attests in-line.
+            r.attested = false;
             mutate(r);
         })?;
         t.clear_upload(relkey)?;
@@ -1603,7 +1640,11 @@ pub fn recover_interrupted(db: &SyncDb, class: u8) -> Result<RecoveryReport, Tra
 ///    ([`TransferError::MissingExpectedHash`]) and queueable items of a
 ///    kind this engine cannot transfer
 ///    ([`TransferError::UnsupportedKind`]) — re-pushing either would
-///    only re-fail it once per startup.
+///    only re-fail it once per startup. `stub` items are NOT scanned
+///    either — recovery cannot distinguish a stub awaiting hydration
+///    from the library's at-rest stubs — so a queued hydration request
+///    survives a crash only if its enqueuer CASed `stub → pending_down`
+///    before pushing the row (see the module docs).
 ///
 /// `classify` names the priority class for each recovered row (e.g. the
 /// §3.5 lane by kind), so lane ordering survives a crash. Idempotent
@@ -2244,7 +2285,8 @@ type TaggedPumpFuture<'a> =
 /// (`corrupt_remote`, re-marked `dirty`) never loops, and never when the
 /// failure can never heal inside the engine
 /// ([`TransferError::MissingExpectedHash`],
-/// [`TransferError::UnsupportedKind`] — such an item is parked off the
+/// [`TransferError::UnsupportedKind`],
+/// [`TransferError::InvalidConfig`] — such an item is parked off the
 /// queue in its queueable state). A fired [`CancelFlag`] stops
 /// admission; in-flight items are always awaited.
 ///
@@ -2318,16 +2360,20 @@ where
             Err(e) => {
                 // A failure the engine can never heal on its own — a
                 // record with no expected hash stays hashless however
-                // often it is popped, and a kind with no transfer mapping
-                // never grows one — is parked: recorded in the summary,
-                // left in its queueable state, but NOT re-pushed
-                // (whatever supplies the hash / fixes the enqueue later
-                // re-queues it). Every other failure goes back for a
-                // later pass.
+                // often it is popped, a kind with no transfer mapping
+                // never grows one, and an `InvalidConfig` (part_size
+                // below the S3 floor, an object over the 10,000-part
+                // cap) is a static property of file + config that fails
+                // identically every pass — is parked: recorded in the
+                // summary, left in its queueable state, but NOT
+                // re-pushed (whatever supplies the hash / fixes the
+                // enqueue or config later re-queues it). Every other
+                // failure goes back for a later pass.
                 let never_heals = matches!(
                     e,
                     TransferError::MissingExpectedHash { .. }
                         | TransferError::UnsupportedKind { .. }
+                        | TransferError::InvalidConfig(_)
                 );
                 if !never_heals {
                     requeue.push((relkey.clone(), class));
