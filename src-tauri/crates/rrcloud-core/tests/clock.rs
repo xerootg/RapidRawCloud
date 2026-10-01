@@ -58,6 +58,25 @@ fn device_id_rejects_non_canonical_forms() {
 }
 
 #[test]
+fn device_id_requires_rfc4122_variant_nibble() {
+    // Review finding (round 0): position 19 must be 8/9/a/b (RFC 4122
+    // variant), or the "canonical UUIDv4" claim is wider than documented.
+    let bad = [
+        "d1f0c2aa-9d2b-4a6e-cf1c-3b7d5e9a0c42",
+        "d1f0c2aa-9d2b-4a6e-0f1c-3b7d5e9a0c42",
+        "d1f0c2aa-9d2b-4a6e-7f1c-3b7d5e9a0c42",
+        "d1f0c2aa-9d2b-4a6e-ff1c-3b7d5e9a0c42",
+    ];
+    for s in bad {
+        assert!(DeviceId::new(s).is_err(), "{s:?} must be rejected");
+    }
+    for variant in ['8', '9', 'a', 'b'] {
+        let s = format!("d1f0c2aa-9d2b-4a6e-{variant}f1c-3b7d5e9a0c42");
+        assert!(DeviceId::new(&s).is_ok(), "{s:?} must be accepted");
+    }
+}
+
+#[test]
 fn device_id_serde_round_trip_validates() {
     let d = dev(DEV1);
     let json = serde_json::to_string(&d).expect("serialize");
@@ -224,6 +243,31 @@ fn version_vector_serializes_as_plain_map() {
     let wire = format!("{{\"{DEV2}\":4,\"{DEV1}\":9}}");
     let from_wire: VersionVector = serde_json::from_str(&wire).expect("wire shape");
     assert_eq!(from_wire, v);
+}
+
+#[test]
+fn version_vector_deserialize_normalizes_explicit_zeros() {
+    // Review finding (round 0): wire bytes from a foreign or buggy writer
+    // may carry explicit zero components. Deserialize must normalize them
+    // away like every other constructor, or structural `==` and
+    // `compare() == Equal` diverge — and §2.6 apply rule case 1
+    // ("remote.vv == local.vv → converged") misclassifies depending on
+    // which wire spelling a device happened to see.
+    let wire = format!("{{\"{DEV1}\":1,\"{DEV2}\":0}}");
+    let v: VersionVector = serde_json::from_str(&wire).expect("wire vv parses");
+    assert_eq!(v.len(), 1, "explicit zero must not be stored");
+    assert_eq!(v, vv(&[(DEV1, 1)]));
+    assert_eq!(compare(&v, &vv(&[(DEV1, 1)])), VvOrder::Equal);
+    // Re-serialization yields the normalized spelling, not the zero.
+    assert_eq!(
+        serde_json::to_string(&v).expect("serialize"),
+        format!("{{\"{DEV1}\":1}}")
+    );
+
+    // An all-zero wire vv is the empty vector.
+    let zeros: VersionVector = serde_json::from_str(&format!("{{\"{DEV2}\":0}}")).expect("parses");
+    assert!(zeros.is_empty());
+    assert_eq!(zeros, VersionVector::new());
 }
 
 // ---------------------------------------------------------------------------

@@ -190,6 +190,22 @@ fn missing_version_is_an_error_never_a_default() {
 }
 
 #[test]
+fn non_integer_version_is_a_distinct_malformed_error() {
+    // Review finding (round 0): {"v":"2"} is not a *missing* version — a
+    // sloppy future writer emitting a stringified version must not surface
+    // as "no v field" (which reads as corruption). Still fail-closed,
+    // but with a distinct, truthful error.
+    for spelling in ["\"v\":\"2\",", "\"v\":2.5,", "\"v\":-1,", "\"v\":true,"] {
+        let line = doc_example_line().replacen("\"v\":1,", spelling, 1);
+        assert!(line.contains(spelling), "test premise for {spelling:?}");
+        match JournalEntry::from_json_line(&line) {
+            Err(JournalError::MalformedVersion { .. }) => {}
+            other => panic!("{spelling:?} must be MalformedVersion, got {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn garbage_lines_are_errors() {
     for bad in ["", "not json", "[1,2]", "{\"v\":1}"] {
         assert!(JournalEntry::from_json_line(bad).is_err(), "{bad:?}");
@@ -284,6 +300,57 @@ fn segment_byte_cap_enforced_on_encode() {
         .collect();
     match encode_segment(&entries) {
         Err(JournalError::SegmentTooLarge { size }) => assert!(size > SEGMENT_MAX_BYTES),
+        other => panic!("oversized segment must be SegmentTooLarge, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_enforces_the_entry_cap() {
+    // Review finding (round 0): a v1 writer never produces more than 1000
+    // entries per segment, so a larger one is malformed — and an unbounded
+    // decode is a reader-side allocation hole for hostile segments.
+    let line = entry(1, "library/a.NEF.rrdata")
+        .to_json_line()
+        .expect("encode");
+    let mut at_cap = String::new();
+    for _ in 0..SEGMENT_MAX_ENTRIES {
+        at_cap.push_str(&line);
+        at_cap.push('\n');
+    }
+    assert!(at_cap.len() <= SEGMENT_MAX_BYTES, "test premise");
+    assert_eq!(
+        decode_segment(at_cap.as_bytes())
+            .expect("1000 entries fine")
+            .len(),
+        SEGMENT_MAX_ENTRIES
+    );
+
+    let mut over = at_cap.clone();
+    over.push_str(&line);
+    over.push('\n');
+    match decode_segment(over.as_bytes()) {
+        Err(JournalError::TooManyEntries { count }) => assert!(count > SEGMENT_MAX_ENTRIES),
+        other => panic!("1001-entry segment must be TooManyEntries, got {other:?}"),
+    }
+}
+
+#[test]
+fn decode_enforces_the_byte_cap() {
+    // Mirror of the encode-side cap: a multi-MB "segment" is rejected
+    // before any per-line parsing or Vec growth.
+    let long_dir = "d".repeat(1700);
+    let mut seg = String::new();
+    for i in 0..700u64 {
+        seg.push_str(
+            &entry(i, &format!("library/{long_dir}/{i}.NEF.rrdata"))
+                .to_json_line()
+                .expect("encode"),
+        );
+        seg.push('\n');
+    }
+    assert!(seg.len() > SEGMENT_MAX_BYTES, "test premise");
+    match decode_segment(seg.as_bytes()) {
+        Err(JournalError::SegmentTooLarge { size }) => assert_eq!(size, seg.len()),
         other => panic!("oversized segment must be SegmentTooLarge, got {other:?}"),
     }
 }

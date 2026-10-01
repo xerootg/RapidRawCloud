@@ -23,3 +23,19 @@ pub mod journal;
 pub mod keys;
 pub mod s3;
 pub mod semhash;
+
+/// Crate-private helpers shared across modules.
+pub(crate) mod hexutil {
+    /// `true` when `s` is exactly `len` lowercase hex characters.
+    ///
+    /// The single spelling of this predicate for the whole crate — key
+    /// classification (`keys`), hash validation (`semhash`), and segment
+    /// filename parsing (`journal`) must never drift apart on what counts
+    /// as hex (e.g. one of them accepting uppercase would silently widen
+    /// `classify_key`'s Foreign boundary).
+    pub(crate) fn is_lower_hex(s: &str, len: usize) -> bool {
+        s.len() == len
+            && s.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+}

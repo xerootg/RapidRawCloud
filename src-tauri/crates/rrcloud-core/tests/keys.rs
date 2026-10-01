@@ -75,6 +75,27 @@ fn relkey_rejects_traversal_and_junk() {
 }
 
 #[test]
+fn relkey_rejects_colon_segments() {
+    // Review finding (round 0, blocker): on Windows, PathBuf::push of a
+    // "C:"-style drive-relative segment REPLACES the accumulated path, so a
+    // remote-controlled key like `library/C:/Users/victim/evil` would make
+    // local_path() discard the sync root and write anywhere on C:. ':' is
+    // illegal in Windows filenames anyway, so it is rejected outright.
+    let bad = [
+        "C:/Windows/evil.dll",
+        "C:evil",
+        "a/C:/b",
+        "C:",
+        "x/C:",
+        "a:b",
+        "z:/x",
+    ];
+    for s in bad {
+        assert!(RelKey::new(s).is_err(), "{s:?} must be rejected");
+    }
+}
+
+#[test]
 fn relkey_nfc_normalizes_composed_and_decomposed_to_same_key() {
     // "Käch.jpg": composed U+00E4 vs decomposed 'a' + U+0308.
     let composed = "K\u{e4}ch.jpg";
@@ -360,13 +381,40 @@ fn classify_inverts_journal_keys() {
         let d = dev(ds);
         for seq in [0u64, 1, 0x19a, 1_000_000, u64::MAX] {
             match classify_key(&journal_segment_key(&d, seq)) {
-                KeyClass::Journal { device, seq: s } => {
+                KeyClass::Journal {
+                    device,
+                    seq: s,
+                    version,
+                } => {
                     assert_eq!(device, d);
                     assert_eq!(s, seq);
+                    assert_eq!(version, 1, "constructor emits v1 segments");
                 }
                 other => panic!("journal key ({ds}, {seq}) classified as {other:?}"),
             }
         }
+    }
+}
+
+#[test]
+fn classify_journal_carries_the_segment_format_version() {
+    // Review finding (round 0): the filename carries the format version
+    // precisely so the apply loop can halt-and-surface "app update
+    // required" (§2.2 min-reader rule) BEFORE GET+decode. Dropping it from
+    // KeyClass::Journal would route a future-version segment to an opaque
+    // JSON/corruption error instead.
+    let key = format!(".rrcloud/v1/journal/{DEV1}/000000000000019a.v2.ndjson");
+    match classify_key(&key) {
+        KeyClass::Journal {
+            device,
+            seq,
+            version,
+        } => {
+            assert_eq!(device, dev(DEV1));
+            assert_eq!(seq, 0x19a);
+            assert_eq!(version, 2);
+        }
+        other => panic!("v2 journal key classified as {other:?}"),
     }
 }
 
@@ -468,13 +516,68 @@ fn classify_rejects_foreign_and_malformed_keys() {
 }
 
 #[test]
-fn classify_normalizes_relkey_text() {
-    // A bucket key written with decomposed Unicode classifies to the same
-    // RelKey as the composed spelling (same NFC normalization as RelKey::new).
-    let composed = rk("K\u{e4}ch.jpg");
-    let decomposed_key = "library/Ka\u{308}ch.jpg";
-    match classify_key(decomposed_key) {
-        KeyClass::Original { relkey } => assert_eq!(relkey, composed),
-        other => panic!("decomposed library key classified as {other:?}"),
+fn classify_treats_non_nfc_library_keys_as_foreign() {
+    // Review finding (round 0): rclone-synced buckets can hold NFD keys
+    // (macOS stores NFD filenames, and §1.2 advertises rclone interop).
+    // Silently NFC-normalizing inside classify_key would conflate two
+    // coexisting NFD/NFC bucket objects into one relkey and break the
+    // classify→constructor round trip (GET/PUT/tombstone would target the
+    // NFC spelling while the object lives at the NFD key). A key whose
+    // relpath is not already NFC is therefore adopted as Foreign — the
+    // §2.3 safe lane.
+    //
+    // (This replaces the red-stage `classify_normalizes_relkey_text` test,
+    // which pinned the conflating behavior and was objectively wrong.)
+    let nfd = [
+        "library/Ka\u{308}ch.jpg",
+        "library/Ka\u{308}ch.NEF.rrdata",
+        "library/Ka\u{308}ch.NEF.ab12cd.rrdata",
+        "library/Ka\u{308}ch.xmp",
+        "library/2026/Mu\u{308}nchen/IMG.NEF",
+    ];
+    for k in nfd {
+        assert_eq!(classify_key(k), KeyClass::Foreign, "{k:?} must be Foreign");
+    }
+    // The NFC spelling still round-trips exactly through the constructors.
+    match classify_key("library/K\u{e4}ch.jpg") {
+        KeyClass::Original { relkey } => {
+            assert_eq!(relkey, rk("K\u{e4}ch.jpg"));
+            assert_eq!(library_key(&relkey), "library/K\u{e4}ch.jpg");
+        }
+        other => panic!("NFC library key classified as {other:?}"),
+    }
+}
+
+#[test]
+fn classify_treats_drive_relative_library_keys_as_foreign() {
+    // Companion to `relkey_rejects_colon_segments`: no remote-controlled
+    // bucket key with a colon segment may reach local_path().
+    let keys = [
+        "library/C:/Users/victim/evil",
+        "library/C:evil.dll",
+        "library/a/C:/b.NEF",
+        "library/C:/Users/victim/evil.rrdata",
+        "library/C:/x.xmp",
+    ];
+    for k in keys {
+        assert_eq!(classify_key(k), KeyClass::Foreign, "{k:?} must be Foreign");
+    }
+}
+
+#[test]
+fn classify_recognizes_uppercase_xmp() {
+    // Review finding (round 0): upstream probes both with_extension("xmp")
+    // and with_extension("XMP") (file_management.rs), so uppercase .XMP
+    // interop files exist in real libraries and must get the §2.8
+    // projection semantics, not Original treatment.
+    for k in [
+        "library/IMG_0042.XMP",
+        "library/2026/10/IMG_0042.Xmp",
+        "library/a.xMp",
+    ] {
+        match classify_key(k) {
+            KeyClass::Xmp { relkey } => assert_eq!(library_key(&relkey), k),
+            other => panic!("{k:?} classified as {other:?}, want Xmp"),
+        }
     }
 }

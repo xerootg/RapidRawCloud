@@ -3,10 +3,12 @@
 //!
 //! The cloud namespace is **library-relative**: a [`RelKey`] is a path
 //! relative to the sync root, `/`-separated, Unicode NFC-normalized, with no
-//! leading slash and no `.`/`..` segments, backslashes, or control
+//! leading slash and no `.`/`..` segments, backslashes, colons, or control
 //! characters. All bucket keys are built from typed constructors in this
 //! module, and [`classify_key`] parses any bucket key back into its schema
-//! role — the reconcile loop (§2.3) depends on that being an exact inverse.
+//! role — the reconcile loop (§2.3) depends on that being an exact inverse,
+//! which is why a library key whose relpath is not already NFC classifies
+//! as [`KeyClass::Foreign`] rather than being silently normalized.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -14,6 +16,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::clock::DeviceId;
+use crate::hexutil::is_lower_hex;
 use crate::semhash::ContentId;
 
 /// Prefix of the byte-faithful mirror of the on-disk library tree (§1.2).
@@ -38,6 +41,12 @@ pub enum KeyError {
     /// A backslash — never a valid separator in the cloud namespace.
     #[error("backslash in relkey: {0:?}")]
     Backslash(String),
+    /// A colon — illegal in Windows filenames, and a `C:`-style segment
+    /// pushed onto a `PathBuf` on Windows *replaces* the accumulated path
+    /// (drive-relative), which would let a remote-controlled key escape
+    /// the sync root in [`local_path`].
+    #[error("colon in relkey: {0:?}")]
+    Colon(String),
     /// An ASCII control character (including NUL).
     #[error("control character in relkey: {0:?}")]
     ControlChar(String),
@@ -70,14 +79,17 @@ pub struct RelKey(String);
 impl RelKey {
     /// Validates and NFC-normalizes a relative path string into a [`RelKey`].
     ///
-    /// Rejects empty strings, leading `/`, backslashes, control characters,
-    /// and `.`/`..`/empty segments. Composed and decomposed spellings of the
-    /// same Unicode text normalize to the same [`RelKey`].
+    /// Rejects empty strings, leading `/`, backslashes, colons, control
+    /// characters, and `.`/`..`/empty segments. Composed and decomposed
+    /// spellings of the same Unicode text normalize to the same [`RelKey`].
     pub fn new(s: impl Into<String>) -> Result<Self, KeyError> {
         use unicode_normalization::UnicodeNormalization;
         let raw = s.into();
         if raw.contains('\\') {
             return Err(KeyError::Backslash(raw));
+        }
+        if raw.contains(':') {
+            return Err(KeyError::Colon(raw));
         }
         if raw.chars().any(|c| c.is_control()) {
             return Err(KeyError::ControlChar(raw));
@@ -152,6 +164,11 @@ pub fn relkey(path: &Path, sync_root: &Path) -> Result<RelKey, KeyError> {
 
 /// Joins a [`RelKey`] back onto the local `sync_root` (§1.1 reverse
 /// mapping). Round-trips with [`relkey`] for valid, NFC-normalized paths.
+///
+/// Every pushed segment is a plain relative path component on both Unix and
+/// Windows: [`RelKey`] validation rejects `/`-in-segment (by construction),
+/// backslashes, colons (so no `C:`-style drive-relative segment can make
+/// `PathBuf::push` discard the root), and dot segments.
 pub fn local_path(rel: &RelKey, sync_root: &Path) -> PathBuf {
     let mut p = sync_root.to_path_buf();
     for seg in rel.as_str().split('/') {
@@ -178,13 +195,6 @@ pub fn vc_sidecar_key(rel: &RelKey, vc6: &str) -> Result<String, KeyError> {
         return Err(KeyError::BadVcSuffix(vc6.to_string()));
     }
     Ok(format!("{LIBRARY_PREFIX}{rel}.{vc6}.rrdata"))
-}
-
-/// `true` when `s` is exactly `len` lowercase hex characters.
-fn is_lower_hex(s: &str, len: usize) -> bool {
-    s.len() == len
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// `.rrcloud/v1/journal/<device>/<seq:016x>.v1.ndjson` — a journal segment
@@ -265,8 +275,10 @@ pub enum KeyClass {
         /// The 6-lowercase-hex virtual-copy suffix, if any.
         vc: Option<String>,
     },
-    /// `library/<relpath>.xmp` — an interop XMP projection (§2.8). The
-    /// relkey includes the `.xmp` extension (it is a real library file).
+    /// `library/<relpath>.xmp` (any ASCII case of the extension; upstream
+    /// writes and probes both `.xmp` and `.XMP`) — an interop XMP
+    /// projection (§2.8). The relkey includes the extension as spelled
+    /// (it is a real library file).
     Xmp {
         /// The library-relative path of the `.xmp` file itself.
         relkey: RelKey,
@@ -277,6 +289,11 @@ pub enum KeyClass {
         device: DeviceId,
         /// The segment's starting sequence number.
         seq: u64,
+        /// The segment format version from the filename. The apply loop's
+        /// min-reader gate (§2.2) runs on this *before* GET+decode: a
+        /// version the reader does not support must halt feed application
+        /// and surface "app update required", never read as corruption.
+        version: u32,
     },
     /// `.rrcloud/v1/manifests/<device>.json.gz`.
     Manifest {
@@ -344,7 +361,17 @@ pub fn classify_key(bucket_key: &str) -> KeyClass {
 }
 
 /// Classifies the part of a bucket key after `library/`.
+///
+/// A relpath that is not already NFC is [`KeyClass::Foreign`]: rclone-synced
+/// buckets can legitimately hold NFD keys (macOS filenames, §1.2 interop),
+/// and silently normalizing here would conflate distinct bucket objects into
+/// one relkey and break the classify→constructor round trip — the engine
+/// would GET/PUT/tombstone the NFC spelling while the object lives at the
+/// NFD key. Adopt-as-foreign is the safe lane (§2.3).
 fn classify_library_key(rest: &str) -> KeyClass {
+    if !unicode_normalization::is_nfc(rest) {
+        return KeyClass::Foreign;
+    }
     if let Some(stem) = rest.strip_suffix(".rrdata") {
         // Virtual copy: `<relpath>.<6hex>.rrdata` (the documented upstream
         // 6-hex ambiguity: checked before the primary interpretation).
@@ -364,10 +391,20 @@ fn classify_library_key(rest: &str) -> KeyClass {
         };
     }
     match RelKey::new(rest) {
-        Ok(relkey) if relkey.as_str().ends_with(".xmp") => KeyClass::Xmp { relkey },
+        Ok(relkey) if has_xmp_extension(relkey.as_str()) => KeyClass::Xmp { relkey },
         Ok(relkey) => KeyClass::Original { relkey },
         Err(_) => KeyClass::Foreign,
     }
+}
+
+/// `true` when the path's final extension is `xmp` in any ASCII case.
+/// Upstream explicitly probes both `with_extension("xmp")` and
+/// `with_extension("XMP")` (`file_management.rs`), so uppercase `.XMP`
+/// interop files exist in real libraries and must get the §2.8 projection
+/// semantics.
+fn has_xmp_extension(path: &str) -> bool {
+    path.rsplit_once('.')
+        .is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("xmp"))
 }
 
 /// Classifies the part of a bucket key after `.rrcloud/v1/`.
@@ -389,6 +426,7 @@ fn classify_control_key(rest: &str) -> KeyClass {
             KeyClass::Journal {
                 device,
                 seq: parsed.seq,
+                version: parsed.version,
             }
         }
         "manifests" => match tail

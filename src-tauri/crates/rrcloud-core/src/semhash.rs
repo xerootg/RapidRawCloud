@@ -61,9 +61,7 @@ impl SemHash {
 
 /// `true` when `s` is exactly 64 lowercase hex characters.
 fn is_lower_hex64(s: &str) -> bool {
-    s.len() == 64
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    crate::hexutil::is_lower_hex(s, 64)
 }
 
 impl TryFrom<String> for SemHash {
@@ -214,9 +212,16 @@ fn write_json_string(s: &str, out: &mut String) {
 ///
 /// Parses `sidecar_json_bytes`, projects `{rating, tags: sorted,
 /// adjustments'}` (where `adjustments'` strips `lutPath` and normalizes
-/// `null` — a `null` adjustments value, a missing one, and `null`-valued
-/// members inside it are all equivalent; `exif` and `version` are excluded),
-/// canonicalizes, and hashes with blake3.
+/// `null`; `exif` and `version` are excluded), canonicalizes, and hashes
+/// with blake3.
+///
+/// The equivalence classes are **closed**: a `null` adjustments value, a
+/// missing one, `null`-valued members inside it, an empty `{}` — including
+/// one left empty after stripping `lutPath` and `null` members — are all
+/// equivalent to an absent `adjustments`; likewise `tags: []`, `tags: null`
+/// and a missing `tags`. A writer that spells "no edits" any of these ways
+/// must produce the same hash, or the spurious-dirty churn §2.5 kills comes
+/// back as spurious version bumps and junk conflict copies.
 ///
 /// # Errors
 ///
@@ -240,6 +245,8 @@ pub fn sem_hash(sidecar_json_bytes: &[u8]) -> Result<SemHash, SemHashError> {
     if let Some(tags) = root.get("tags") {
         match tags {
             Value::Null => {}
+            // An empty tags array is the same statement as no tags field.
+            Value::Array(items) if items.is_empty() => {}
             Value::Array(items) => {
                 // Order-insensitive: sort elements by their canonical form.
                 let mut sorted = items.clone();
@@ -260,7 +267,12 @@ pub fn sem_hash(sidecar_json_bytes: &[u8]) -> Result<SemHash, SemHashError> {
                 map.remove("lutPath");
             }
             strip_null_members(&mut adj);
-            projection.insert("adjustments".to_string(), adj);
+            // A semantically empty residue ({} — possibly left over after
+            // stripping lutPath/null members) equals absent adjustments.
+            let empty_object = adj.as_object().is_some_and(serde_json::Map::is_empty);
+            if !empty_object {
+                projection.insert("adjustments".to_string(), adj);
+            }
         }
     }
 

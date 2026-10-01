@@ -30,7 +30,8 @@ pub enum DeviceIdError {
 /// persisted in the device's sync state DB (§1.2).
 ///
 /// Only the canonical string form is accepted: 36 characters, lowercase hex,
-/// hyphens at positions 8/13/18/23, version nibble `4`. Device ids appear in
+/// hyphens at positions 8/13/18/23, version nibble `4`, RFC 4122 variant
+/// nibble (`8`/`9`/`a`/`b`). Device ids appear in
 /// bucket keys and are compared lexicographically as the conflict tiebreak
 /// (§2.6), so a single canonical spelling is load-bearing.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -55,7 +56,8 @@ impl DeviceId {
 }
 
 /// `true` when `s` is a canonical lowercase hyphenated UUIDv4: 36 bytes,
-/// hyphens at 8/13/18/23, lowercase hex elsewhere, version nibble `4`.
+/// hyphens at 8/13/18/23, lowercase hex elsewhere, version nibble `4`, and
+/// RFC 4122 variant nibble (`8`/`9`/`a`/`b` at position 19).
 fn is_canonical_uuidv4(s: &str) -> bool {
     let b = s.as_bytes();
     if b.len() != 36 {
@@ -70,6 +72,11 @@ fn is_canonical_uuidv4(s: &str) -> bool {
             }
             14 => {
                 if c != b'4' {
+                    return false;
+                }
+            }
+            19 => {
+                if !matches!(c, b'8' | b'9' | b'a' | b'b') {
                     return false;
                 }
             }
@@ -106,12 +113,14 @@ impl fmt::Display for DeviceId {
 /// A per-relkey version vector: `{device_id: counter}` (§2.6).
 ///
 /// Missing components read as `0`, and zero components are **never stored**
-/// (construction normalizes them away), so structural equality coincides
-/// with [`compare`] returning [`VvOrder::Equal`]. Serializes as a plain
-/// JSON map, matching the `vv` field of journal entries, manifests, and
-/// tombstones.
+/// — every construction path, *including `Deserialize`*, normalizes them
+/// away — so structural equality coincides with [`compare`] returning
+/// [`VvOrder::Equal`]. Serializes as a plain JSON map, matching the `vv`
+/// field of journal entries, manifests, and tombstones; wire bytes carrying
+/// explicit zero components (from a foreign or buggy writer) decode equal
+/// to their normalized spelling.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
+#[serde(from = "BTreeMap<DeviceId, u32>", into = "BTreeMap<DeviceId, u32>")]
 pub struct VersionVector(BTreeMap<DeviceId, u32>);
 
 impl VersionVector {
@@ -127,8 +136,17 @@ impl VersionVector {
 
     /// Increments `device`'s component by one (one admitted upload = one
     /// version, §2.6).
+    ///
+    /// Saturates at `u32::MAX` — practically unreachable (2³² admitted
+    /// uploads from one device), but a saturated bump would silently
+    /// produce a "new" version comparing [`VvOrder::Equal`] to the old, so
+    /// debug builds assert loudly instead.
     pub fn bump(&mut self, device: &DeviceId) {
         let slot = self.0.entry(device.clone()).or_insert(0);
+        debug_assert!(
+            *slot < u32::MAX,
+            "version vector component overflow for {device}: bump would not be monotonic"
+        );
         *slot = slot.saturating_add(1);
     }
 
@@ -157,6 +175,21 @@ impl VersionVector {
     /// Iterates `(device, counter)` pairs in device order.
     pub fn iter(&self) -> std::collections::btree_map::Iter<'_, DeviceId, u32> {
         self.0.iter()
+    }
+}
+
+impl From<BTreeMap<DeviceId, u32>> for VersionVector {
+    /// Normalizes a raw map: zero components are dropped (see the type
+    /// docs). This is the `Deserialize` path, so decoded cross-device
+    /// bytes uphold the same invariant as every in-process constructor.
+    fn from(map: BTreeMap<DeviceId, u32>) -> Self {
+        map.into_iter().collect()
+    }
+}
+
+impl From<VersionVector> for BTreeMap<DeviceId, u32> {
+    fn from(vv: VersionVector) -> Self {
+        vv.0
     }
 }
 

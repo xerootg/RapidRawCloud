@@ -39,6 +39,15 @@ pub enum JournalError {
     /// An entry has no `"v"` field at all (equally unreadable: fail closed).
     #[error("journal entry has no \"v\" field")]
     MissingVersion,
+    /// An entry's `"v"` field is present but not an unsigned integer (e.g.
+    /// `"2"`, `2.5`, `-1`). Distinct from [`JournalError::MissingVersion`]
+    /// so a sloppy writer's stringified version surfaces truthfully rather
+    /// than as "no v field" (which reads as corruption). Fail closed.
+    #[error("journal entry \"v\" field is not an unsigned integer: {value}")]
+    MalformedVersion {
+        /// The JSON spelling of the offending `"v"` value.
+        value: String,
+    },
     /// Malformed JSON, or JSON that does not match the v1 entry schema.
     #[error("invalid journal JSON: {0}")]
     Json(#[from] serde_json::Error),
@@ -123,7 +132,10 @@ pub struct JournalEntry {
     pub kind: Kind,
     /// Full bucket key the entry is about.
     pub key: String,
-    /// Per-relkey version vector snapshot (§2.6).
+    /// Per-relkey version vector snapshot (§2.6). Required on **every**
+    /// entry, including `attest` (where it snapshots the version whose
+    /// bytes the attesting device verified) — §2.2 defines a single v1
+    /// envelope, never a reduced per-op shape.
     pub vv: VersionVector,
     /// Uploaded object size in bytes (`put` entries).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,7 +188,9 @@ impl JournalEntry {
         let value: serde_json::Value = serde_json::from_slice(bytes)?;
         let version = match value.get("v") {
             None => return Err(JournalError::MissingVersion),
-            Some(v) => v.as_u64().ok_or(JournalError::MissingVersion)?,
+            Some(v) => v.as_u64().ok_or_else(|| JournalError::MalformedVersion {
+                value: v.to_string(),
+            })?,
         };
         if version != u64::from(JOURNAL_VERSION) {
             return Err(JournalError::UnsupportedVersion { version });
@@ -219,11 +233,25 @@ pub fn encode_segment(entries: &[JournalEntry]) -> Result<Vec<u8>, JournalError>
 /// unsupported `"v"` aborts the whole decode with
 /// [`JournalError::UnsupportedVersion`] — no partial results, so a reader
 /// can never apply half a segment it only partly understands.
+///
+/// The §2.2 caps are enforced on the read side too: no conforming v1
+/// writer produces a segment over [`SEGMENT_MAX_BYTES`] or
+/// [`SEGMENT_MAX_ENTRIES`], so a larger one is malformed, and rejecting it
+/// up front bounds reader-side allocation against corrupt or hostile
+/// segments.
 pub fn decode_segment(bytes: &[u8]) -> Result<Vec<JournalEntry>, JournalError> {
+    if bytes.len() > SEGMENT_MAX_BYTES {
+        return Err(JournalError::SegmentTooLarge { size: bytes.len() });
+    }
     let mut entries = Vec::new();
     for line in bytes.split(|&b| b == b'\n') {
         if line.is_empty() {
             continue;
+        }
+        if entries.len() == SEGMENT_MAX_ENTRIES {
+            return Err(JournalError::TooManyEntries {
+                count: entries.len() + 1,
+            });
         }
         entries.push(JournalEntry::from_json_slice(line)?);
     }
@@ -257,11 +285,7 @@ pub fn parse_segment_filename(name: &str) -> Result<SegmentFilename, JournalErro
     };
     let stem = name.strip_suffix(".ndjson").ok_or_else(bad)?;
     let (hex, ver) = stem.split_once('.').ok_or_else(bad)?;
-    if hex.len() != 16
-        || !hex
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    {
+    if !crate::hexutil::is_lower_hex(hex, 16) {
         return Err(bad());
     }
     let seq = u64::from_str_radix(hex, 16).map_err(|_| bad())?;

@@ -192,6 +192,40 @@ fn null_member_inside_adjustments_equals_absent_member() {
     assert_eq!(hash_value(&with_null), hash_value(&absent));
 }
 
+#[test]
+fn semantically_empty_adjustments_equals_absent_adjustments() {
+    // Review finding (round 0): the §2.5 equivalence classes must be
+    // closed. A writer that emits `adjustments:{}`, or whose only
+    // adjustment member is machine-local `lutPath` or a null, is making no
+    // user-visible statement — hashing it differently from an absent
+    // `adjustments` produces spurious dirties, spurious version bumps, and
+    // junk conflict virtual-copies: exactly the churn class §2.5 exists to
+    // kill.
+    let h0 = hash_bytes(br#"{"rating":3}"#);
+    for spelled in [
+        r#"{"rating":3,"adjustments":null}"#,
+        r#"{"rating":3,"adjustments":{}}"#,
+        r#"{"rating":3,"adjustments":{"foo":null}}"#,
+        r#"{"rating":3,"adjustments":{"lutPath":"/x.cube"}}"#,
+        r#"{"rating":3,"adjustments":{"lutPath":"/x.cube","foo":null}}"#,
+    ] {
+        assert_eq!(
+            h0,
+            hash_bytes(spelled.as_bytes()),
+            "{spelled} must hash like absent adjustments"
+        );
+    }
+}
+
+#[test]
+fn empty_tags_equals_absent_tags() {
+    // Same closure requirement for tags: `[]`, `null`, and absent are one
+    // equivalence class.
+    let h0 = hash_bytes(br#"{"rating":3}"#);
+    assert_eq!(h0, hash_bytes(br#"{"rating":3,"tags":[]}"#));
+    assert_eq!(h0, hash_bytes(br#"{"rating":3,"tags":null}"#));
+}
+
 // ---------------------------------------------------------------------------
 // Real changes must change the hash
 // ---------------------------------------------------------------------------
