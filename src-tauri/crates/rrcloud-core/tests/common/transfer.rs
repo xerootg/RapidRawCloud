@@ -6,7 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use bytes::Bytes;
@@ -245,10 +245,10 @@ pub struct CountingS3 {
     pub abort_calls: AtomicU32,
     pub list_parts_calls: AtomicU32,
     pub list_uploads_calls: AtomicU32,
-    /// Concurrent transfer operations (put/get/upload_part) right now.
-    pub in_flight: AtomicU32,
-    /// High-water mark of `in_flight` (pins the §2.4 concurrency cap).
-    pub max_in_flight: AtomicU32,
+    /// Concurrency gauge for transfer operations (put/get/upload_part).
+    /// A GET's guard lives inside the returned body stream, so streaming
+    /// consumption counts as in-flight (not just the header exchange).
+    gauge: Arc<InFlightGauge>,
 
     // -- fault injection ---------------------------------------------------
     /// `put_object` of these keys fails (typed, without reaching the
@@ -272,10 +272,44 @@ pub struct CountingS3 {
     /// bytes and then a stream error (modeling a cut connection that
     /// leaves a partial on disk).
     pub cut_get_after: Mutex<HashMap<String, u64>>,
+    /// Model a backend/intermediary that ignores the `Range` header:
+    /// every GET is forwarded rangeless and the response carries no
+    /// `Content-Range` (a plain 200 with the full object).
+    pub ignore_range: bool,
     /// Hook run at every `put_object` entry (e.g. to fire a cancel flag
     /// deterministically mid-pump).
     #[allow(clippy::type_complexity)]
     pub on_put: Mutex<Option<Box<dyn FnMut(&str) + Send>>>,
+    /// When non-zero: the FIRST `put_object` to enter holds (async, with
+    /// a 10s safety cap) until this many transfers are in flight at once
+    /// — makes a `max_in_flight == N` assertion deterministic instead of
+    /// timing-dependent (a pump silently degraded to serial admission
+    /// never reaches N, trips the cap, and fails the assertion).
+    pub gate_first_put_until: AtomicU32,
+}
+
+/// Shared in-flight gauge; `Arc`-owned so a GET's guard can live inside
+/// the returned (`'static`) body stream.
+#[derive(Default)]
+pub struct InFlightGauge {
+    in_flight: AtomicU32,
+    max_in_flight: AtomicU32,
+}
+
+impl InFlightGauge {
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
+        InFlightGuard(Arc::clone(self))
+    }
+}
+
+pub struct InFlightGuard(Arc<InFlightGauge>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl CountingS3 {
@@ -290,15 +324,16 @@ impl CountingS3 {
             abort_calls: AtomicU32::new(0),
             list_parts_calls: AtomicU32::new(0),
             list_uploads_calls: AtomicU32::new(0),
-            in_flight: AtomicU32::new(0),
-            max_in_flight: AtomicU32::new(0),
+            gauge: Arc::new(InFlightGauge::default()),
             fail_puts: HashSet::new(),
             fail_parts: Mutex::new(HashMap::new()),
             corrupt_parts: Mutex::new(HashMap::new()),
             strip_digests: false,
             corrupt_put_bodies: HashSet::new(),
             cut_get_after: Mutex::new(HashMap::new()),
+            ignore_range: false,
             on_put: Mutex::new(None),
+            gate_first_put_until: AtomicU32::new(0),
         }
     }
 
@@ -334,13 +369,28 @@ impl CountingS3 {
     }
 
     pub fn max_in_flight(&self) -> u32 {
-        self.max_in_flight.load(Ordering::SeqCst)
+        self.gauge.max_in_flight.load(Ordering::SeqCst)
     }
 
-    fn enter(&self) -> InFlightGuard<'_> {
-        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_in_flight.fetch_max(now, Ordering::SeqCst);
-        InFlightGuard(self)
+    fn enter(&self) -> InFlightGuard {
+        self.gauge.enter()
+    }
+
+    /// The `gate_first_put_until` hold (see the field doc): called with
+    /// the guard already held, after which the first gated entrant waits
+    /// for the target concurrency (10s cap — on a degraded pump the cap
+    /// elapses and the caller's `== N` assertion fails).
+    async fn await_put_gate(&self) {
+        let target = self.gate_first_put_until.swap(0, Ordering::SeqCst);
+        if target == 0 {
+            return;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self.gauge.in_flight.load(Ordering::SeqCst) < target
+            && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
     }
 
     /// Takes a pending fault count from `map` for `(key, part)`.
@@ -355,14 +405,6 @@ impl CountingS3 {
                 true
             }
         }
-    }
-}
-
-struct InFlightGuard<'a>(&'a CountingS3);
-
-impl Drop for InFlightGuard<'_> {
-    fn drop(&mut self) {
-        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -401,6 +443,7 @@ impl S3Api for CountingS3 {
             body
         };
         let _g = self.enter();
+        self.await_put_gate().await;
         self.inner.put_object(bucket, key, body, &opts).await
     }
 
@@ -415,8 +458,16 @@ impl S3Api for CountingS3 {
             .expect("lock")
             .push((key.to_string(), range));
         let cut = self.cut_get_after.lock().expect("lock").remove(key);
-        let _g = self.enter();
-        let mut out = self.inner.get_object(bucket, key, range).await?;
+        // The guard rides inside the returned body stream: a GET is
+        // in-flight until its bytes are consumed (or the stream dropped),
+        // not merely until the response headers arrive — otherwise a
+        // max_in_flight assertion over downloads would be vacuous.
+        let guard = self.enter();
+        let effective_range = if self.ignore_range { None } else { range };
+        let mut out = self.inner.get_object(bucket, key, effective_range).await?;
+        if self.ignore_range {
+            out.content_range = None;
+        }
         if let Some(limit) = cut {
             let body = out.body;
             let stream = futures::stream::unfold(
@@ -446,6 +497,14 @@ impl S3Api for CountingS3 {
             );
             out.body = ByteStream::new(stream.boxed());
         }
+        let body = out.body;
+        out.body = ByteStream::new(
+            body.map(move |item| {
+                let _held = &guard;
+                item
+            })
+            .boxed(),
+        );
         Ok(out)
     }
 

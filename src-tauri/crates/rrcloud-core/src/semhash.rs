@@ -421,6 +421,55 @@ pub fn sem_hash(sidecar_json_bytes: &[u8]) -> Result<SemHash, SemHashError> {
     Ok(SemHash(hex))
 }
 
+/// The grid-badge facts a sidecar document carries (§2.2: sidecar journal
+/// entries advertise `rating` and `color_label` so §3.5's `pending_down`
+/// grid can badge before the sidecar bytes download).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SidecarBadges {
+    /// Star rating (the root `rating` field, when it is an integer that
+    /// fits a `u8`).
+    pub rating: Option<u8>,
+    /// Color label. Upstream RapidRAW stores it as a `color:<name>` entry
+    /// in the root `tags` array (tagging.rs `COLOR_TAG_PREFIX`); this is
+    /// the first such tag's `<name>`.
+    pub color_label: Option<String>,
+}
+
+/// Upstream's color-label tag prefix (`set_color_label_for_paths` writes
+/// the label as a `color:<name>` tag).
+const COLOR_TAG_PREFIX: &str = "color:";
+
+/// Extracts the §2.2 badge fields from a sidecar document.
+///
+/// Same fail-closed parse posture as [`sem_hash`] (invalid JSON or a
+/// non-object root is an error), but *within* a valid document the
+/// extraction is lenient: a missing/`null`/non-integer `rating` and a
+/// missing color tag are simply `None` — badges are advisory display
+/// facts, not integrity facts.
+pub fn sidecar_badges(sidecar_json_bytes: &[u8]) -> Result<SidecarBadges, SemHashError> {
+    use serde_json::Value;
+    let doc: Value = serde_json::from_slice(sidecar_json_bytes)?;
+    let Value::Object(root) = doc else {
+        return Err(SemHashError::NotAnObject);
+    };
+    let rating = root
+        .get("rating")
+        .and_then(Value::as_u64)
+        .and_then(|n| u8::try_from(n).ok());
+    let color_label = root.get("tags").and_then(Value::as_array).and_then(|tags| {
+        tags.iter().find_map(|t| {
+            t.as_str()
+                .and_then(|s| s.strip_prefix(COLOR_TAG_PREFIX))
+                .filter(|label| !label.is_empty())
+                .map(str::to_owned)
+        })
+    });
+    Ok(SidecarBadges {
+        rating,
+        color_label,
+    })
+}
+
 /// Removes semantic residue from an adjustments subtree, **bottom-up**: an
 /// object member whose value is `null`, or collapses (after its own
 /// stripping) to an empty `{}` or `[]`, is removed — a writer spelling

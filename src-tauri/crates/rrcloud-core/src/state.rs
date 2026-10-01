@@ -728,6 +728,21 @@ pub struct MultipartUploadState {
     /// When the upload started, unix seconds (stale-upload hygiene: abort
     /// after 7 days, §2.4).
     pub started_unix: i64,
+    /// Source file size in bytes **observed when the upload was created**
+    /// — the baseline for the §2.4 mid-resume source-change recheck. The
+    /// [`ItemRecord`]'s own `size`/`mtime_unix_ns` cannot serve here: per
+    /// the §2.6 coordination note they keep naming the last *published*
+    /// version while a newer version is in flight, so a resume comparing
+    /// against them would spuriously abort every re-upload of a changed
+    /// item. `#[serde(default)]`: a row written before this field existed
+    /// decodes as `0`, which reads as "source changed" — the safe
+    /// direction (abort + restart, never a wrong hash).
+    #[serde(default)]
+    pub size: u64,
+    /// Source file mtime (unix nanoseconds) observed when the upload was
+    /// created — same purpose and same default posture as `size`.
+    #[serde(default)]
+    pub mtime_unix_ns: i64,
 }
 
 /// One completed part of a multipart upload (the `upload_parts` value).

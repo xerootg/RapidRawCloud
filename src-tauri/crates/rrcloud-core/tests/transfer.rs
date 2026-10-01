@@ -27,12 +27,12 @@ use rrcloud_core::s3::{
     PutObjectOptions, S3TransferApi,
 };
 use rrcloud_core::semhash::{sem_hash, Blake3Hex, ContentId};
-use rrcloud_core::state::{ItemState, MultipartUploadState, Queue, SyncDb};
+use rrcloud_core::state::{ItemState, MultipartUploadState, Queue, SyncDb, UploadPart};
 use rrcloud_core::transfer::{
     abort_stale_uploads, bucket_key_for, commit_verified, download_item, local_target_path,
-    partial_path, probe_backend, pump_downloads, pump_uploads, stored_backend_profile, upload_item,
-    upload_item_from, BackendProfile, CancelFlag, ExpectedDownload, TransferConfig, TransferError,
-    PROBE_KEY,
+    partial_path, probe_backend, pump_downloads, pump_uploads, recover_interrupted,
+    stored_backend_profile, upload_item, upload_item_from, BackendProfile, CancelFlag, ChunkSource,
+    ExpectedDownload, SourceStream, TransferConfig, TransferError, PROBE_KEY,
 };
 
 /// Decodes every staged outbound journal entry.
@@ -724,6 +724,8 @@ async fn abort_stale_uploads_aborts_aged_own_uploads_and_re_marks_dirty() {
             upload_id: created.upload_id.clone(),
             part_size: cfg.part_size,
             started_unix: now - 8 * 24 * 60 * 60,
+            size: std::fs::metadata(&src).expect("metadata").len(),
+            mtime_unix_ns: h::mtime_unix_ns(&src),
         },
     )
     .expect("set_upload");
@@ -745,14 +747,14 @@ async fn abort_stale_uploads_aborts_aged_own_uploads_and_re_marks_dirty() {
 }
 
 #[tokio::test]
-async fn abort_stale_uploads_keeps_fresh_uploads_and_aborts_own_key_orphans() {
+async fn abort_stale_uploads_age_gates_own_key_orphans_and_leaves_live_uploads_alone() {
     let (g, bucket, root, _dbdir, db) = scaffold!("tr-stale-orphan");
     let client = g.client();
     let cfg = h::test_cfg(&bucket, root.path());
     let r = rel("stale/orphan.NEF");
     let key = library_key(&r);
 
-    // Two backend uploads on our key; we hold a FRESH record for `ours`.
+    // Two backend uploads on our key; we hold a record for `ours`.
     let ours = client
         .create_multipart_upload(&bucket, &key, &PutObjectOptions::default())
         .await
@@ -762,41 +764,119 @@ async fn abort_stale_uploads_keeps_fresh_uploads_and_aborts_own_key_orphans() {
         .await
         .expect("create orphan");
     // And one upload on a key we hold NO record for (another device's):
-    // it must be left alone.
+    // it must be left alone whatever its age.
     let foreign_key = library_key(&rel("stale/other-device.NEF"));
     let foreign = client
         .create_multipart_upload(&bucket, &foreign_key, &PutObjectOptions::default())
         .await
         .expect("create foreign");
 
-    let now = 1_769_900_000i64;
+    let real_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs() as i64;
+    let max_age = 7 * 24 * 60 * 60;
     let src = h::under(root.path(), "orphan.NEF");
     h::write_file(&src, &h::patterned(1024, 2));
     h::seed_queued(&db, &r, Kind::Original, &src);
-    db.set_upload(
-        &r,
-        &MultipartUploadState {
-            upload_id: ours.upload_id.clone(),
-            part_size: cfg.part_size,
-            started_unix: now - 60,
-        },
-    )
-    .expect("set_upload");
+    let set_ours = |started_unix: i64| {
+        db.set_upload(
+            &r,
+            &MultipartUploadState {
+                upload_id: ours.upload_id.clone(),
+                part_size: cfg.part_size,
+                started_unix,
+                size: std::fs::metadata(&src).expect("metadata").len(),
+                mtime_unix_ns: h::mtime_unix_ns(&src),
+            },
+        )
+        .expect("set_upload");
+    };
+    set_ours(real_now - 60);
 
-    let report = abort_stale_uploads(&db, &client, &cfg, 7 * 24 * 60 * 60, now)
+    // Pass 1, real clock: the orphan was Initiated seconds ago, so its
+    // age is NOT provably past max_age — a sibling device (or this
+    // engine's own pump, re-creating the upload after the table was
+    // snapshotted) could be live on this shared key RIGHT NOW. Nothing
+    // may be aborted (the old sweep killed exactly such live uploads).
+    let report = abort_stale_uploads(&db, &client, &cfg, max_age, real_now)
         .await
-        .expect("sweep");
+        .expect("sweep 1");
+    assert!(report.aborted_own.is_empty(), "fresh record untouched");
+    assert!(
+        report.aborted_orphans.is_empty(),
+        "an orphan of unproven age must be left alone (it may be a live \
+         sibling-device upload on the shared key)"
+    );
+    assert_eq!(h::backend_uploads(&client, &bucket).await.len(), 3);
+
+    // Pass 2, clock advanced 8 days (the backend's Initiated timestamps
+    // now prove every listed upload old): the own-key orphan is aborted;
+    // our own fresh record and the foreign-key upload stay.
+    let future_now = real_now + 8 * 24 * 60 * 60;
+    set_ours(future_now - 60); // keep our own record fresh for this pass
+    let report = abort_stale_uploads(&db, &client, &cfg, max_age, future_now)
+        .await
+        .expect("sweep 2");
     assert!(report.aborted_own.is_empty(), "fresh record untouched");
     assert_eq!(
         report.aborted_orphans,
         vec![(key.clone(), orphan.upload_id.clone())],
-        "a different upload_id on a key we track is an orphan"
+        "a provably aged different-id upload on a key we track is an orphan"
     );
     let remaining = h::backend_uploads(&client, &bucket).await;
     assert!(remaining.contains(&(key.clone(), ours.upload_id.clone())));
     assert!(remaining.contains(&(foreign_key.clone(), foreign.upload_id.clone())));
     assert_eq!(remaining.len(), 2);
     assert!(db.get_upload(&r).expect("get_upload").is_some());
+}
+
+#[tokio::test]
+async fn abort_stale_uploads_clears_aged_recordless_rows_without_leaking_the_backend_upload() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-stale-recordless");
+    let client = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+    // An uploads-table row whose item record is gone (e.g. a delete raced
+    // the upload), pointing at a real backend upload.
+    let r = rel("stale/recordless.NEF");
+    let key = library_key(&r);
+    let created = client
+        .create_multipart_upload(&bucket, &key, &PutObjectOptions::default())
+        .await
+        .expect("create");
+    let now = 1_769_900_000i64;
+    db.set_upload(
+        &r,
+        &MultipartUploadState {
+            upload_id: created.upload_id.clone(),
+            part_size: cfg.part_size,
+            started_unix: now - 8 * 24 * 60 * 60,
+            size: 1024,
+            mtime_unix_ns: 1,
+        },
+    )
+    .expect("set_upload");
+    assert!(db.get_item(&r).expect("get_item").is_none(), "no item row");
+
+    let report = abort_stale_uploads(&db, &client, &cfg, 7 * 24 * 60 * 60, now)
+        .await
+        .expect("sweep");
+    assert_eq!(
+        report.cleared_recordless,
+        vec![(r.clone(), created.upload_id.clone())],
+        "the aged recordless row is reported"
+    );
+    assert!(report.aborted_own.is_empty());
+    assert_eq!(
+        db.get_upload(&r).expect("get_upload"),
+        None,
+        "the local row no longer leaks"
+    );
+    assert!(
+        h::backend_uploads(&client, &bucket).await.is_empty(),
+        "the backend upload no longer leaks either (best-effort abort \
+         under both candidate keys)"
+    );
 }
 
 // ===========================================================================
@@ -1397,6 +1477,12 @@ async fn pump_uploads_caps_concurrency_and_isolates_a_failing_item() {
 
     let mut s3 = CountingS3::new(g.client());
     s3.fail_puts.insert(failing_key.clone());
+    // The first PUT to enter holds until a second transfer is in flight:
+    // the pump must actually RUN two at once, so the `== 2` below detects
+    // a pump silently degraded to serial admission (a plain `<= 2` would
+    // pass vacuously for one).
+    s3.gate_first_put_until
+        .store(2, std::sync::atomic::Ordering::SeqCst);
 
     let summary = pump_uploads(&db, &s3, &cfg, 2, &CancelFlag::new())
         .await
@@ -1409,10 +1495,11 @@ async fn pump_uploads_caps_concurrency_and_isolates_a_failing_item() {
     assert_eq!(summary.failed.len(), 1);
     assert_eq!(summary.failed[0].0, failing_rel);
     assert!(!summary.cancelled);
-    assert!(
-        s3.max_in_flight() <= 2,
-        "at most `concurrency` transfers in flight (§2.4), saw {}",
-        s3.max_in_flight()
+    assert_eq!(
+        s3.max_in_flight(),
+        2,
+        "exactly `concurrency` transfers in flight at peak (§2.4): \
+         never more, and demonstrably not serial"
     );
 
     for (r, _) in items.iter().filter(|(r, _)| *r != failing_rel) {
@@ -1580,4 +1667,744 @@ fn transfer_config_defaults_match_the_architecture() {
     );
     assert_eq!(cfg.part_size, 16 * 1024 * 1024);
     assert_eq!(cfg.multipart_threshold, 16 * 1024 * 1024);
+}
+
+// ===========================================================================
+// Review-round regressions: resume integrity, crash re-entry, NoSuchUpload
+// recovery, completion recheck, badge fields, download retry-from-scratch
+// ===========================================================================
+
+/// Blocker regression: a rewrite that preserves BOTH size and mtime
+/// (coarse-mtime filesystems like exFAT; XMP tools that deliberately
+/// restore mtime) must not defeat the mid-resume source-change guard. The
+/// persisted per-part MD5s are the authority: a recorded range that
+/// re-reads with a different MD5 is a changed source, and the resume must
+/// abort — never complete an object that is old-parts + new-parts with a
+/// journal blake3 matching nothing stored anywhere.
+#[tokio::test]
+async fn resume_aborts_on_a_same_size_same_mtime_rewrite_via_recorded_part_md5s() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-mp-md5-guard");
+    let key = library_key(&rel("mp/md5guard.NEF"));
+    let s3 = CountingS3::new(g.client());
+    s3.fail_parts.lock().unwrap().insert((key.clone(), 3), 1);
+    let cfg = h::test_cfg(&bucket, root.path());
+
+    let bytes = h::three_part_bytes(61);
+    let r = rel("mp/md5guard.NEF");
+    let src = h::under(root.path(), "md5guard.NEF");
+    h::write_file(&src, &bytes);
+    h::seed_queued(&db, &r, Kind::Original, &src);
+
+    upload_item(&db, &s3, &cfg, &r, &src)
+        .await
+        .expect_err("injected part-3 failure leaves parts 1-2 recorded");
+    assert_eq!(db.upload_parts(&r).expect("parts").len(), 2);
+
+    // Rewrite with the SAME length and restore the exact mtime — the
+    // size+mtime recheck alone cannot see this.
+    let mtime = filetime::FileTime::from_system_time(
+        std::fs::metadata(&src)
+            .expect("meta")
+            .modified()
+            .expect("mtime"),
+    );
+    let rewritten = h::patterned(bytes.len(), 199);
+    assert_ne!(rewritten, bytes);
+    h::write_file(&src, &rewritten);
+    filetime::set_file_mtime(&src, mtime).expect("restore mtime");
+    assert_eq!(
+        h::mtime_unix_ns(&src),
+        mtime.unix_seconds() * 1_000_000_000 + i64::from(mtime.nanoseconds()),
+        "the rewrite preserved the mtime exactly"
+    );
+
+    let clean = CountingS3::new(g.client());
+    let err = upload_item(&db, &clean, &cfg, &r, &src)
+        .await
+        .expect_err("the recorded part MD5s must catch the rewrite");
+    assert!(
+        matches!(err, TransferError::AbortedSourceChanged { .. }),
+        "got {err:?}"
+    );
+    assert!(
+        h::backend_uploads(&g.client(), &bucket).await.is_empty(),
+        "the poisoned upload is aborted on the backend"
+    );
+    assert_eq!(db.get_upload(&r).expect("get_upload"), None);
+    assert_eq!(h::state_of(&db, &r), ItemState::Dirty);
+    assert_eq!(outbound_len(&db), 0, "nothing journaled for either version");
+
+    // The re-marked item uploads the NEW version cleanly on the next pass.
+    h::advance(&db, &r, &[ItemState::Queued]);
+    let retry = CountingS3::new(g.client());
+    let outcome = upload_item(&db, &retry, &cfg, &r, &src)
+        .await
+        .expect("fresh upload of the new version");
+    assert_eq!(outcome.blake3, h::b3(&rewritten));
+    let stored = h::get_bytes(&g.client(), &bucket, &key).await;
+    assert_eq!(h::b3(&stored), h::b3(&rewritten));
+}
+
+/// The mid-resume source-change baseline is the facts captured when the
+/// upload was CREATED — never the item record's `size`/`mtime_unix_ns`,
+/// which per state.rs's §2.6 coordination note keep naming the last
+/// *published* version while a newer one is in flight. A resume of a
+/// re-edited item (record facts ≠ current file) must still resume, not
+/// spuriously abort.
+#[tokio::test]
+async fn resume_ignores_item_record_facts_that_name_the_published_version() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-mp-pub-facts");
+    let key = library_key(&rel("mp/pubfacts.NEF"));
+    let s3 = CountingS3::new(g.client());
+    s3.fail_parts.lock().unwrap().insert((key.clone(), 2), 1);
+    let cfg = h::test_cfg(&bucket, root.path());
+
+    let bytes = h::three_part_bytes(67);
+    let r = rel("mp/pubfacts.NEF");
+    let src = h::under(root.path(), "pubfacts.NEF");
+    h::write_file(&src, &bytes);
+    h::seed_queued(&db, &r, Kind::Original, &src);
+
+    upload_item(&db, &s3, &cfg, &r, &src)
+        .await
+        .expect_err("injected part-2 failure leaves a resumable upload");
+
+    // Simulate the §2.6 chokepoint posture: the record keeps advertising
+    // the previously PUBLISHED version's facts, which do not match the
+    // file being uploaded.
+    db.update_item(&r, ItemState::Queued, |rec| {
+        rec.size = 123;
+        rec.mtime_unix_ns = 456;
+    })
+    .expect("record keeps published facts");
+
+    let clean = CountingS3::new(g.client());
+    let outcome = upload_item(&db, &clean, &cfg, &r, &src)
+        .await
+        .expect("resume must compare against the upload-time facts and proceed");
+    assert_eq!(
+        clean.part_attempts_for(&key),
+        vec![2, 3],
+        "a genuine resume: only the missing parts go up"
+    );
+    assert_eq!(outcome.blake3, h::b3(&bytes));
+    assert_eq!(h::state_of(&db, &r), ItemState::Synced);
+}
+
+/// A crash in the window between `CompleteMultipartUpload` and the
+/// bookkeeping-clear transaction leaves `uploading` + a full part-record
+/// set for an upload id the backend has discarded. Re-entry must adopt
+/// the durably stored object (HEAD + the MD5-verified re-hash) and drive
+/// it through verify + journal — not loop on `NoSuchUpload` until the
+/// 7-day hygiene ages the record out.
+#[tokio::test]
+async fn resume_after_crash_between_complete_and_bookkeeping_adopts_the_stored_object() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-mp-postcomplete");
+    let client = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("mp/postcomplete.NEF");
+    let key = library_key(&r);
+    let bytes = h::three_part_bytes(71);
+    let src = h::under(root.path(), "postcomplete.NEF");
+    h::write_file(&src, &bytes);
+    h::seed_queued(&db, &r, Kind::Original, &src);
+    h::advance(&db, &r, &[ItemState::Uploading]);
+
+    // Reproduce the exact durable state the crash leaves: upload record +
+    // all part records persisted, object completed on the backend, upload
+    // id discarded, nothing cleared or journaled locally.
+    let created = client
+        .create_multipart_upload(&bucket, &key, &PutObjectOptions::default())
+        .await
+        .expect("create");
+    let mut completed = Vec::new();
+    for (i, range) in [
+        (1u32, 0..h::PART_5MIB as usize),
+        (2, h::PART_5MIB as usize..2 * h::PART_5MIB as usize),
+        (3, 2 * h::PART_5MIB as usize..bytes.len()),
+    ] {
+        let part = &bytes[range];
+        let md5 = h::md5_b64(part);
+        let out = client
+            .upload_part(
+                &bucket,
+                &key,
+                &created.upload_id,
+                i,
+                PartBody::from(Bytes::from(part.to_vec())),
+                Some(&md5),
+            )
+            .await
+            .expect("upload part");
+        db.record_upload_part(
+            &r,
+            i,
+            &UploadPart {
+                etag: out.e_tag.clone(),
+                md5_b64: md5,
+            },
+        )
+        .expect("record part");
+        completed.push(CompletedPart {
+            part_number: i,
+            e_tag: out.e_tag,
+        });
+    }
+    db.set_upload(
+        &r,
+        &MultipartUploadState {
+            upload_id: created.upload_id.clone(),
+            part_size: cfg.part_size,
+            started_unix: 1_769_900_000,
+            size: bytes.len() as u64,
+            mtime_unix_ns: h::mtime_unix_ns(&src),
+        },
+    )
+    .expect("set_upload");
+    client
+        .complete_multipart_upload(&bucket, &key, &created.upload_id, &completed)
+        .await
+        .expect("complete (the backend now forgets the upload id)");
+
+    let s3 = CountingS3::new(g.client());
+    let outcome = upload_item(&db, &s3, &cfg, &r, &src)
+        .await
+        .expect("re-entry adopts the completed upload instead of wedging");
+    assert!(
+        s3.part_attempts_for(&key).is_empty(),
+        "nothing is re-uploaded"
+    );
+    assert_eq!(
+        s3.create_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "no new upload is created"
+    );
+    assert_eq!(outcome.blake3, h::b3(&bytes));
+    let record = db.get_item(&r).expect("get").expect("exists");
+    assert_eq!(record.state, ItemState::Synced);
+    assert!(record.verified_remote);
+    assert_eq!(db.get_upload(&r).expect("get_upload"), None);
+    let entries = staged_entries(&db);
+    assert_eq!(entries.len(), 1, "the crash-lost journal entry is staged");
+    assert_eq!(entries[0].blake3, Some(h::b3(&bytes)));
+}
+
+/// An upload id swept out from under us (another device's hygiene, an
+/// operator abort) must not wedge the item: the `NoSuchUpload` from
+/// `upload_part` clears the dead record so the next pass restarts with a
+/// fresh upload instead of retrying the dead id until the 7-day age-out.
+#[tokio::test]
+async fn an_upload_id_swept_elsewhere_clears_the_record_and_restarts_cleanly() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-mp-swept");
+    let key = library_key(&rel("mp/swept.NEF"));
+    let s3 = CountingS3::new(g.client());
+    s3.fail_parts.lock().unwrap().insert((key.clone(), 2), 1);
+    let cfg = h::test_cfg(&bucket, root.path());
+
+    let bytes = h::three_part_bytes(73);
+    let r = rel("mp/swept.NEF");
+    let src = h::under(root.path(), "swept.NEF");
+    h::write_file(&src, &bytes);
+    h::seed_queued(&db, &r, Kind::Original, &src);
+
+    upload_item(&db, &s3, &cfg, &r, &src)
+        .await
+        .expect_err("injected part-2 failure leaves a resumable upload");
+    let upload = db.get_upload(&r).expect("get_upload").expect("record");
+
+    // Out-of-band sweep (another party) aborts our upload id.
+    g.client()
+        .abort_multipart_upload(&bucket, &key, &upload.upload_id)
+        .await
+        .expect("out-of-band abort");
+
+    // The dead id can never resume. Garage answers the doomed part/
+    // Complete sometimes with a typed NoSuchUpload (record cleared at
+    // once) and sometimes by dropping the connection (a transport error,
+    // which the engine correctly treats as retryable and keeps the record
+    // for) — so drive passes like the pump would until the typed answer
+    // lands. Each failing pass must leave the item resumable.
+    let clean = CountingS3::new(g.client());
+    let mut cleared = false;
+    for _ in 0..5 {
+        upload_item(&db, &clean, &cfg, &r, &src)
+            .await
+            .expect_err("the dead upload id cannot be resumed");
+        assert_eq!(h::state_of(&db, &r), ItemState::Queued, "still resumable");
+        if db.get_upload(&r).expect("get_upload").is_none() {
+            cleared = true;
+            break;
+        }
+    }
+    assert!(
+        cleared,
+        "the dead record is cleared so the next pass restarts"
+    );
+    assert!(db.upload_parts(&r).expect("parts").is_empty());
+
+    let retry = CountingS3::new(g.client());
+    let mut outcome = None;
+    for _ in 0..3 {
+        // Like the pump: a transient transport failure under load keeps
+        // the item resumable and the next pass retries.
+        match upload_item(&db, &retry, &cfg, &r, &src).await {
+            Ok(out) => {
+                outcome = Some(out);
+                break;
+            }
+            Err(_) => assert_eq!(h::state_of(&db, &r), ItemState::Queued),
+        }
+    }
+    let outcome = outcome.expect("fresh restart succeeds");
+    assert!(
+        retry.create_calls.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "a brand-new upload is created"
+    );
+    assert_eq!(outcome.blake3, h::b3(&bytes));
+    assert_eq!(h::state_of(&db, &r), ItemState::Synced);
+}
+
+/// A crash mid-single-PUT (or between the queued→uploading CAS and
+/// `set_upload`) leaves `uploading` with no multipart record. Re-entry
+/// must restart the transfer, not fail the queued→uploading CAS forever.
+#[tokio::test]
+async fn upload_item_restarts_after_a_crash_mid_single_put() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-single-crash");
+    let s3 = CountingS3::new(g.client());
+    let cfg = h::test_cfg(&bucket, root.path());
+
+    let bytes = h::patterned(200_000, 77);
+    let r = rel("single/crash.NEF");
+    let src = h::under(root.path(), "single-crash.NEF");
+    h::write_file(&src, &bytes);
+    h::seed_queued(&db, &r, Kind::Original, &src);
+    // The crash signature: uploading, no upload record, queue row gone.
+    h::advance(&db, &r, &[ItemState::Uploading]);
+    assert_eq!(db.get_upload(&r).expect("get_upload"), None);
+
+    let outcome = upload_item(&db, &s3, &cfg, &r, &src)
+        .await
+        .expect("re-entry restarts the single PUT instead of wedging");
+    assert_eq!(outcome.blake3, h::b3(&bytes));
+    assert_eq!(h::state_of(&db, &r), ItemState::Synced);
+    assert_eq!(outbound_len(&db), 1);
+}
+
+/// The startup sweep re-drives every crash-stranded pipeline-interior
+/// state the pump cannot see (its queue rows were popped pre-crash).
+#[test]
+fn recover_interrupted_requeues_every_crash_stranded_state() {
+    let (_dir, _path, db) = open_db(&dev(common::sync::DEV_A));
+    let root = tempfile::tempdir().expect("tempdir");
+    let mk = |name: &str, bytes: &[u8]| {
+        let r = rel(name);
+        let src = root.path().join(name.replace('/', "-"));
+        h::write_file(&src, bytes);
+        h::seed_queued(&db, &r, Kind::Original, &src);
+        (r, src)
+    };
+
+    // Stranded in verifying (object stored, nothing journaled).
+    let (verifying, _) = mk("rec/verifying.NEF", &h::patterned(64, 1));
+    h::advance(
+        &db,
+        &verifying,
+        &[ItemState::Uploading, ItemState::Verifying],
+    );
+    // Stranded in uploading WITH a multipart record (resumable in place).
+    let (up_rec, up_src) = mk("rec/up-record.NEF", &h::patterned(64, 2));
+    h::advance(&db, &up_rec, &[ItemState::Uploading]);
+    db.set_upload(
+        &up_rec,
+        &MultipartUploadState {
+            upload_id: "live-upload".into(),
+            part_size: 5 * 1024 * 1024,
+            started_unix: 0,
+            size: 64,
+            mtime_unix_ns: h::mtime_unix_ns(&up_src),
+        },
+    )
+    .expect("set_upload");
+    // Stranded in uploading with NO record (mid-single-PUT crash).
+    let (up_bare, _) = mk("rec/up-bare.NEF", &h::patterned(64, 3));
+    h::advance(&db, &up_bare, &[ItemState::Uploading]);
+    // Stranded in downloading.
+    let down = rel("rec/down.NEF");
+    h::seed_pending_down(
+        &db,
+        &down,
+        Kind::Original,
+        &h::patterned(64, 4),
+        1_700_000_000,
+    );
+    h::advance(&db, &down, &[ItemState::Downloading]);
+
+    let report = recover_interrupted(&db, 1).expect("sweep");
+    let mut requeued_up = report.requeued_uploads.clone();
+    requeued_up.sort();
+    let mut want_up = vec![verifying.clone(), up_rec.clone(), up_bare.clone()];
+    want_up.sort();
+    assert_eq!(requeued_up, want_up);
+    assert_eq!(report.requeued_downloads, vec![down.clone()]);
+
+    assert_eq!(h::state_of(&db, &verifying), ItemState::Queued);
+    assert_eq!(
+        h::state_of(&db, &up_rec),
+        ItemState::Uploading,
+        "an uploading item with a record keeps its state so upload_item resumes it"
+    );
+    assert_eq!(h::state_of(&db, &up_bare), ItemState::Queued);
+    assert_eq!(h::state_of(&db, &down), ItemState::PendingDown);
+    assert_eq!(db.queue_len(Queue::Up).expect("queue_len"), 3);
+    assert_eq!(db.queue_len(Queue::Down).expect("queue_len"), 1);
+
+    // Idempotent: a second sweep re-pushes nothing twice.
+    let again = recover_interrupted(&db, 1).expect("sweep again");
+    assert_eq!(db.queue_len(Queue::Up).expect("queue_len"), 3);
+    assert_eq!(db.queue_len(Queue::Down).expect("queue_len"), 1);
+    // The uploading-with-record item is still listed (still stranded) but
+    // nothing else is.
+    assert_eq!(again.requeued_uploads, vec![up_rec.clone()]);
+    assert!(again.requeued_downloads.is_empty());
+}
+
+/// A [`ChunkSource`] that reads the real file and, the first time it is
+/// opened, rewrites the file afterwards — a deterministic stand-in for a
+/// third-party tool rewriting the source mid-upload.
+struct RewriteAfterFirstRead {
+    rewrite_to: Vec<u8>,
+    rewritten: std::sync::atomic::AtomicBool,
+}
+
+impl ChunkSource for RewriteAfterFirstRead {
+    async fn open(&self, path: &Path, start: u64) -> Result<SourceStream, std::io::Error> {
+        use futures::StreamExt as _;
+        let bytes = std::fs::read(path)?;
+        if !self
+            .rewritten
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            std::fs::write(path, &self.rewrite_to)?;
+        }
+        let tail: Vec<u8> = bytes
+            .get(start as usize..)
+            .map(|t| t.to_vec())
+            .unwrap_or_default();
+        let chunks: Vec<Result<Bytes, std::io::Error>> = tail
+            .chunks(64 * 1024)
+            .map(|c| Ok(Bytes::copy_from_slice(c)))
+            .collect();
+        Ok(futures::stream::iter(chunks).boxed())
+    }
+}
+
+/// §2.4 completion recheck: a source rewritten mid-upload has its OLD
+/// version completed, verified and journaled honestly, and the item is
+/// immediately re-marked dirty so the new version uploads next — never
+/// left silently `synced` against stale journaled bytes.
+#[tokio::test]
+async fn a_mid_upload_rewrite_journals_the_old_version_and_re_marks_dirty() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-completion-recheck");
+    let s3 = CountingS3::new(g.client());
+    let cfg = h::test_cfg(&bucket, root.path());
+
+    let old_bytes = h::patterned(150_000, 81);
+    let new_bytes = h::patterned(180_000, 83);
+    let r = rel("recheck/rewrite.NEF");
+    let src = h::under(root.path(), "rewrite.NEF");
+    h::write_file(&src, &old_bytes);
+    h::seed_queued(&db, &r, Kind::Original, &src);
+
+    let source = RewriteAfterFirstRead {
+        rewrite_to: new_bytes.clone(),
+        rewritten: std::sync::atomic::AtomicBool::new(false),
+    };
+    let outcome = upload_item_from(&db, &s3, &cfg, &r, &src, &source)
+        .await
+        .expect("the OLD version's upload completes");
+    assert!(
+        outcome.source_changed_at_completion,
+        "the completion recheck must detect the rewrite"
+    );
+    assert_eq!(outcome.blake3, h::b3(&old_bytes), "old version journaled");
+    let stored = h::get_bytes(&g.client(), &bucket, &library_key(&r)).await;
+    assert_eq!(stored, old_bytes);
+    let entries = staged_entries(&db);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].blake3, Some(h::b3(&old_bytes)));
+    assert_eq!(
+        h::state_of(&db, &r),
+        ItemState::Dirty,
+        "the new version is re-marked dirty, not left silently synced"
+    );
+}
+
+/// §2.2: sidecar `put` entries carry `rating`/`color_label` (grid badges
+/// before the sidecar bytes download, §3.5) and original entries carry
+/// the record's measured `w`/`h`.
+#[tokio::test]
+async fn journal_entries_carry_badges_and_dimensions() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-badges");
+    let s3 = CountingS3::new(g.client());
+    let cfg = h::test_cfg(&bucket, root.path());
+
+    // Sidecar with a rating and an upstream-style color tag.
+    let sidecar =
+        br#"{"version":2,"rating":4,"tags":["keeper","color:red"],"adjustments":{"exposure":0.5}}"#
+            .to_vec();
+    let rs = rel("badges/a.NEF");
+    let src_s = h::under(root.path(), "a.NEF.rrdata");
+    h::write_file(&src_s, &sidecar);
+    h::seed_queued(&db, &rs, Kind::Sidecar, &src_s);
+    upload_item(&db, &s3, &cfg, &rs, &src_s)
+        .await
+        .expect("sidecar upload");
+
+    // Original whose record carries measured dimensions (the import unit
+    // populates these).
+    let bytes = h::patterned(100_000, 91);
+    let ro = rel("badges/b.NEF");
+    let src_o = h::under(root.path(), "b.NEF");
+    h::write_file(&src_o, &bytes);
+    h::seed_queued(&db, &ro, Kind::Original, &src_o);
+    db.update_item(&ro, ItemState::Queued, |rec| {
+        rec.w = Some(6048);
+        rec.h = Some(4024);
+    })
+    .expect("record dimensions");
+    upload_item(&db, &s3, &cfg, &ro, &src_o)
+        .await
+        .expect("original upload");
+
+    let entries = staged_entries(&db);
+    assert_eq!(entries.len(), 2);
+    let se = entries
+        .iter()
+        .find(|e| e.kind == Kind::Sidecar)
+        .expect("sidecar entry");
+    assert_eq!(se.rating, Some(4), "sidecar entry carries the rating");
+    assert_eq!(
+        se.color_label.as_deref(),
+        Some("red"),
+        "sidecar entry carries the color label (from the color: tag)"
+    );
+    assert_eq!(se.sem_hash, Some(sem_hash(&sidecar).expect("sem")));
+    let oe = entries
+        .iter()
+        .find(|e| e.kind == Kind::Original)
+        .expect("original entry");
+    assert_eq!(oe.w, Some(6048), "original entry carries measured w");
+    assert_eq!(oe.h, Some(4024), "original entry carries measured h");
+    assert_eq!(oe.rating, None, "badges are sidecar-entry fields");
+}
+
+/// An unparseable sidecar is caught BEFORE anything is stored: no PUT, no
+/// bucket garbage, nothing journaled, and the item parks `dirty` (not a
+/// re-upload-forever queue loop).
+#[tokio::test]
+async fn an_invalid_sidecar_is_never_uploaded_and_parks_dirty() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-badsidecar-up");
+    let s3 = CountingS3::new(g.client());
+    let cfg = h::test_cfg(&bucket, root.path());
+
+    let r = rel("up/bad.NEF");
+    let src = h::under(root.path(), "bad.NEF.rrdata");
+    h::write_file(&src, b"{ this is not valid sidecar json");
+    h::seed_queued(&db, &r, Kind::Sidecar, &src);
+
+    let err = upload_item(&db, &s3, &cfg, &r, &src)
+        .await
+        .expect_err("invalid sidecar must fail before the PUT");
+    assert!(
+        matches!(err, TransferError::SidecarInvalid { .. }),
+        "got {err:?}"
+    );
+    assert!(s3.put_keys().is_empty(), "nothing was sent at all");
+    let head = g.client().head_object(&bucket, &sidecar_key(&r)).await;
+    assert!(
+        head.expect_err("no object stored").is_no_such_key(),
+        "no garbage object lands in the bucket"
+    );
+    assert_eq!(
+        h::state_of(&db, &r),
+        ItemState::Dirty,
+        "parked dirty: retrying unchanged bytes can never succeed"
+    );
+    assert_eq!(outbound_len(&db), 0);
+}
+
+/// A stale .rr.part from a superseded object version (the journal head
+/// advanced between a cut first attempt and the retry) must not condemn
+/// an intact remote: the resumed mismatch discards the partial and
+/// retries once from scratch, which succeeds.
+#[tokio::test]
+async fn a_stale_partial_from_a_superseded_version_retries_from_scratch_and_installs() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-dl-stale-partial");
+    let client = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("dl/stale.NEF");
+    let key = library_key(&r);
+    let v1 = h::patterned(600_000, 101);
+    client
+        .put_object(
+            &bucket,
+            &key,
+            Bytes::from(v1.clone()),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("put v1");
+
+    // Cut mid-download of v1: a partial of v1's prefix survives.
+    let cut_at = 200_000u64;
+    let s3 = CountingS3::new(g.client());
+    s3.cut_get_after.lock().unwrap().insert(key.clone(), cut_at);
+    h::seed_pending_down(&db, &r, Kind::Original, &v1, 1_700_000_800);
+    let expect_v1 = ExpectedDownload {
+        blake3: h::b3(&v1),
+        size: v1.len() as u64,
+        mtime_unix: 1_700_000_800,
+    };
+    download_item(&db, &s3, &cfg, &r, root.path(), &expect_v1)
+        .await
+        .expect_err("cut first attempt");
+
+    // The remote is legitimately replaced (head advanced) with a
+    // same-size v2, and the caller now expects v2.
+    let v2 = h::patterned(600_000, 103);
+    client
+        .put_object(
+            &bucket,
+            &key,
+            Bytes::from(v2.clone()),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("put v2");
+    let expect_v2 = ExpectedDownload {
+        blake3: h::b3(&v2),
+        size: v2.len() as u64,
+        mtime_unix: 1_700_000_900,
+    };
+    let outcome = download_item(&db, &s3, &cfg, &r, root.path(), &expect_v2)
+        .await
+        .expect("the stale partial is discarded and the retry installs v2");
+    assert_eq!(
+        outcome.resumed_from, 0,
+        "the successful attempt ran from scratch"
+    );
+    let final_path = local_target_path(root.path(), &r, Kind::Original);
+    assert_eq!(std::fs::read(&final_path).expect("installed"), v2);
+    assert!(!partial_path(&final_path).exists());
+    assert_eq!(
+        h::state_of(&db, &r),
+        ItemState::Hydrated,
+        "an intact remote must never land corrupt_remote over a stale partial"
+    );
+    // The spliced resume ran first (ranged GET), then the from-scratch
+    // retry (no range).
+    let ranges = s3.get_ranges_for(&key);
+    assert_eq!(
+        ranges,
+        vec![None, Some(ByteRange::From(cut_at)), None],
+        "cut attempt, poisoned resume, then the clean from-scratch retry"
+    );
+}
+
+/// Zero-byte objects round-trip: the upload path journals one and the
+/// download path installs one (partial created unconditionally, so the
+/// final rename cannot fail NotFound and retry forever).
+#[tokio::test]
+async fn zero_byte_objects_round_trip_both_ways() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-zero-byte");
+    let client = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+
+    // Upload an empty original.
+    let ru = rel("zero/up.NEF");
+    let src = h::under(root.path(), "zero-up.NEF");
+    h::write_file(&src, b"");
+    h::seed_queued(&db, &ru, Kind::Original, &src);
+    let s3 = CountingS3::new(g.client());
+    let outcome = upload_item(&db, &s3, &cfg, &ru, &src)
+        .await
+        .expect("zero-byte upload");
+    assert_eq!(outcome.size, 0);
+    assert_eq!(outcome.blake3, h::b3(b""));
+    assert_eq!(h::state_of(&db, &ru), ItemState::Synced);
+
+    // Download an empty original advertised by a peer.
+    let rd = rel("zero/down.NEF");
+    let key = library_key(&rd);
+    client
+        .put_object(&bucket, &key, Bytes::new(), &PutObjectOptions::default())
+        .await
+        .expect("put empty");
+    h::seed_pending_down(&db, &rd, Kind::Original, b"", 1_700_001_000);
+    let expected = ExpectedDownload {
+        blake3: h::b3(b""),
+        size: 0,
+        mtime_unix: 1_700_001_000,
+    };
+    let outcome = download_item(&db, &s3, &cfg, &rd, root.path(), &expected)
+        .await
+        .expect("zero-byte download must install, not fail NotFound forever");
+    let final_path = local_target_path(root.path(), &rd, Kind::Original);
+    assert_eq!(outcome.path, final_path);
+    assert_eq!(std::fs::metadata(&final_path).expect("installed").len(), 0);
+    assert_eq!(h::mtime_unix(&final_path), 1_700_001_000);
+    assert!(!partial_path(&final_path).exists());
+    assert_eq!(h::state_of(&db, &rd), ItemState::Hydrated);
+}
+
+/// A backend/intermediary that ignores the Range header must not get the
+/// full object spliced after the partial: a resume whose response is not
+/// partial (no Content-Range at our offset) falls back to a from-scratch
+/// download of the full body it was handed.
+#[tokio::test]
+async fn a_range_ignoring_backend_falls_back_to_a_full_download() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-dl-norange");
+    let client = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("dl/norange.NEF");
+    let key = library_key(&r);
+    let bytes = h::patterned(500_000, 107);
+    client
+        .put_object(
+            &bucket,
+            &key,
+            Bytes::from(bytes.clone()),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("put");
+
+    let cut_at = 150_000u64;
+    let mut s3 = CountingS3::new(g.client());
+    s3.cut_get_after.lock().unwrap().insert(key.clone(), cut_at);
+    s3.ignore_range = true;
+
+    h::seed_pending_down(&db, &r, Kind::Original, &bytes, 1_700_001_100);
+    let expected = ExpectedDownload {
+        blake3: h::b3(&bytes),
+        size: bytes.len() as u64,
+        mtime_unix: 1_700_001_100,
+    };
+    download_item(&db, &s3, &cfg, &r, root.path(), &expected)
+        .await
+        .expect_err("cut first attempt leaves a partial");
+
+    let outcome = download_item(&db, &s3, &cfg, &r, root.path(), &expected)
+        .await
+        .expect("resume against a range-ignoring backend must still succeed");
+    assert_eq!(
+        outcome.resumed_from, 0,
+        "the full 200-style response was taken from scratch, never spliced"
+    );
+    // The engine DID ask for the range; the backend ignored it.
+    let ranges = s3.get_ranges_for(&key);
+    assert_eq!(ranges, vec![None, Some(ByteRange::From(cut_at))]);
+    let final_path = local_target_path(root.path(), &r, Kind::Original);
+    assert_eq!(std::fs::read(&final_path).expect("installed"), bytes);
+    assert_eq!(h::state_of(&db, &r), ItemState::Hydrated);
 }

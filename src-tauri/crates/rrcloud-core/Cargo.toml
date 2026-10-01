@@ -87,7 +87,11 @@ tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",
 ] }
-time = { version = "0.3", features = ["formatting", "macros"] }
+# `parsing` added by the P1-U4 review round: the stale-upload orphan sweep
+# age-gates backend-listed uploads on their `Initiated` timestamp (RFC 3339),
+# so it never aborts a live sibling upload it cannot prove stale. Same crate,
+# one more feature — no new dependency.
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 unicode-normalization = "0.1"
 
 [features]

@@ -806,6 +806,8 @@ fn upload_state_and_parts_roundtrip_across_reopen() {
         upload_id: "2~abcdef0123".to_string(),
         part_size: 16 * 1024 * 1024,
         started_unix: 1_769_900_000,
+        size: 0,
+        mtime_unix_ns: 0,
     };
     let p1 = UploadPart {
         etag: "\"9bb58f26192e4ba00f01e2e7b136bbd8\"".to_string(),
@@ -852,6 +854,8 @@ fn clear_upload_removes_state_and_parts_together() {
         upload_id: "u".to_string(),
         part_size: 1,
         started_unix: 0,
+        size: 0,
+        mtime_unix_ns: 0,
     };
     let part = UploadPart {
         etag: "e".to_string(),
@@ -1315,6 +1319,8 @@ fn iter_uploads_scans_all_inflight_multiparts() {
         upload_id: id.to_string(),
         part_size: 16 * 1024 * 1024,
         started_unix: 1_000,
+        size: 0,
+        mtime_unix_ns: 0,
     };
     {
         let db = open_fresh(&path);
@@ -2205,6 +2211,8 @@ fn state_txn_read_accessors_see_uncommitted_writes() {
         upload_id: "upl-1".into(),
         part_size: 16 * 1024 * 1024,
         started_unix: 1_769_900_000,
+        size: 0,
+        mtime_unix_ns: 0,
     };
     let part = UploadPart {
         etag: "\"abc\"".into(),
@@ -2315,6 +2323,8 @@ fn delete_item_composite_cleans_companion_tables_atomically() {
             upload_id: "upl-9".into(),
             part_size: 16 * 1024 * 1024,
             started_unix: 1_769_900_000,
+            size: 0,
+            mtime_unix_ns: 0,
         },
     )
     .expect("upload");
@@ -2459,6 +2469,8 @@ fn iter_uploads_error_names_the_corrupt_key_and_clear_upload_recovers() {
         upload_id: "upl-1".into(),
         part_size: 16 * 1024 * 1024,
         started_unix: 1_769_900_000,
+        size: 0,
+        mtime_unix_ns: 0,
     };
     db.set_upload(&good, &upload).expect("good upload");
     db.force_corrupt_upload(&bad, b"{ not json")
@@ -2805,6 +2817,8 @@ fn upload_parts_enumeration_surfaces_codec_at_with_relkey_and_part_number() {
             upload_id: "uid-1".to_string(),
             part_size: 16 << 20,
             started_unix: 1_769_900_000,
+            size: 0,
+            mtime_unix_ns: 0,
         },
     )
     .expect("set upload");
@@ -2889,6 +2903,8 @@ fn key_side_corrupt_upload_row_is_surfaced_and_clearable_by_raw_key() {
             upload_id: "uid-good".to_string(),
             part_size: 16 << 20,
             started_unix: 1_769_900_000,
+            size: 0,
+            mtime_unix_ns: 0,
         },
     )
     .expect("good upload");
@@ -2897,6 +2913,8 @@ fn key_side_corrupt_upload_row_is_surfaced_and_clearable_by_raw_key() {
         upload_id: "uid-bad".to_string(),
         part_size: 16 << 20,
         started_unix: 1_769_900_000,
+        size: 0,
+        mtime_unix_ns: 0,
     })
     .expect("encode");
     db.force_corrupt_upload_key(raw, &valid_value)
@@ -2915,4 +2933,29 @@ fn key_side_corrupt_upload_row_is_surfaced_and_clearable_by_raw_key() {
     let uploads = db.iter_uploads().expect("scan recovers");
     assert_eq!(uploads.len(), 1);
     assert_eq!(uploads[0].0, good, "healthy rows survive the recovery");
+}
+
+#[test]
+fn legacy_multipart_rows_without_captured_source_facts_decode_as_changed() {
+    // P1-U4 review round: `MultipartUploadState` gained `size` /
+    // `mtime_unix_ns` (the §2.4 mid-resume source-change baseline,
+    // captured at upload creation). A row written before the fields
+    // existed must still decode — with `0` defaults, which the transfer
+    // engine reads as "source changed" (abort + restart, the safe
+    // direction), never a decode failure that wedges the resume scan.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let r = rel("legacy.NEF");
+    let legacy = br#"{"upload_id":"upl-legacy","part_size":16777216,"started_unix":1769900000}"#;
+    db.force_corrupt_upload(&r, legacy).expect("raw legacy row");
+    assert_eq!(
+        db.get_upload(&r).expect("legacy row decodes"),
+        Some(MultipartUploadState {
+            upload_id: "upl-legacy".into(),
+            part_size: 16 * 1024 * 1024,
+            started_unix: 1_769_900_000,
+            size: 0,
+            mtime_unix_ns: 0,
+        })
+    );
 }

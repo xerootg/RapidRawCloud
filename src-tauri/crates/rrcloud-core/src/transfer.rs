@@ -26,9 +26,18 @@
 //! called opportunistically to reconcile, and only parts lacking a durable
 //! record are re-uploaded. Because the journal `blake3` must hash exactly
 //! the sent bytes, resume **re-hashes the already-sent byte ranges from
-//! the source** — legal only if the file is unchanged (size + mtime
-//! recheck). If the source changed mid-resume, the upload is **aborted on
-//! the backend** and the item re-queued `dirty`
+//! the source** — legal only if the file is unchanged. Three guards pin
+//! that, in order of strength: (1) size + mtime are compared against the
+//! facts **captured when the upload was created**
+//! ([`crate::state::MultipartUploadState::size`]/`mtime_unix_ns` — not the
+//! item record's, which per the §2.6 coordination note keep naming the
+//! last *published* version); (2) every already-sent range that is
+//! re-read is **MD5-compared against the part's persisted `md5_b64`**, so
+//! a rewrite that preserves size and mtime (coarse-mtime filesystems,
+//! mtime-restoring tools) still cannot smuggle a journal hash that
+//! matches no stored object; (3) the §2.4 completion recheck below. If
+//! the source changed mid-resume, the upload is **aborted on the
+//! backend** and the item re-marked `dirty`
 //! ([`TransferError::AbortedSourceChanged`]). Note the deliberate
 //! distinction from §2.4's "complete the old version, then queue the new":
 //! that rule applies when the change is detected **at completion** (the
@@ -36,6 +45,26 @@
 //! a change detected **mid-resume** means the old version's bytes are no
 //! longer obtainable for the un-sent parts, so the only honest outcome is
 //! abort + restart.
+//!
+//! **Completion recheck (§2.4)**: after the verify-commit lands, the
+//! source's size/mtime are re-checked against what the transfer captured
+//! at start. A change means the file was rewritten *mid-upload*: the old
+//! version was completed, verified and journaled honestly (streamed-hash
+//! truth), and the item is immediately re-marked `dirty`
+//! ([`UploadOutcome::source_changed_at_completion`]) so the new version
+//! uploads next — §2.4's "complete the old version, journal it, queue the
+//! new". The dirty→queued admission itself (with its §3.7 vv bump) is the
+//! SyncManager's, a later unit.
+//!
+//! **Upload gone (`NoSuchUpload`)**: a persisted upload id the backend no
+//! longer knows (swept elsewhere, or completed just before a crash) never
+//! wedges the item. `Complete` failing `NoSuchUpload` on a resume that
+//! re-uploaded nothing is the crash-after-complete signature: the stored
+//! object is HEAD-checked against the re-hashed source facts and, on
+//! match, adopted and verified/journaled as usual. Every other
+//! `NoSuchUpload` (mid-part, mismatched HEAD, abort of an already-gone
+//! upload) clears the local multipart record so the next pass restarts
+//! cleanly instead of retrying a dead upload id forever.
 //!
 //! `uploading → verifying`: HEAD, size check; single-part ETag == our MD5;
 //! multipart parts were server-verified at receipt. When the backend
@@ -52,15 +81,27 @@
 //! Downloads stream to `<dir>/.rr.part-<name>` ([`partial_path`]). A
 //! surviving partial is resumed: the existing bytes are **re-hashed from
 //! disk** and the transfer continues with a ranged GET (`bytes=N-`) from
-//! exactly the partial's length. The final blake3 must equal the expected
-//! hash — a mismatch is a typed [`TransferError::IntegrityMismatch`], the
-//! partial is deleted, and the item moves to the `corrupt_remote` lane. A
-//! sidecar is additionally **parse-validated** (through the §2.5 semantic
-//! parser) and is *never installed* when invalid. Install is an atomic
-//! rename over the destination followed by an mtime restore (`filetime`)
-//! to the provided remote mtime. The engine does **not** hard-depend on
-//! conditional requests to detect a mid-download remote replacement: the
-//! final-hash check is the backstop (a replaced object can never install).
+//! exactly the partial's length. A resume requires the response to
+//! actually be partial (`Content-Range` starting at the resume offset); a
+//! backend or intermediary that ignored the `Range` header and returned
+//! the full object makes the engine **discard the partial and take the
+//! full body from offset 0** instead of splicing garbage. The final
+//! blake3 must equal the expected hash — but a mismatch after a *resumed*
+//! attempt first **discards the partial and retries once from scratch**,
+//! because a surviving partial may belong to a superseded object version
+//! (journal head advanced between attempts) and must not condemn an
+//! intact remote. Only a from-scratch mismatch is the typed
+//! [`TransferError::IntegrityMismatch`]: the partial is deleted and the
+//! item moves to the `corrupt_remote` lane. A sidecar is additionally
+//! **parse-validated** (through the §2.5 semantic parser) and is *never
+//! installed* when invalid. Install is an atomic rename over the
+//! destination followed by an mtime restore (`filetime`) to the provided
+//! remote mtime. The engine does **not** hard-depend on conditional
+//! requests to detect a mid-download remote replacement: the final-hash
+//! check is the backstop (a replaced object can never install). File I/O
+//! on this path goes through `tokio::fs` (reads/writes land on tokio's
+//! blocking pool in bounded chunks), so one item's disk work never stalls
+//! the pump's other in-flight transfers.
 //!
 //! # Pump
 //!
@@ -73,6 +114,21 @@
 //! recorded in the summary — with its state left resumable — and never
 //! stops the pump. A [`CancelFlag`] stops *admission* deterministically
 //! and waits for in-flight items to finish.
+//!
+//! # Crash recovery ([`recover_interrupted`])
+//!
+//! A crash can strand an item in a pipeline-interior state whose durable
+//! queue row is already gone: `uploading` (with or without a multipart
+//! record), `verifying` (object stored, nothing journaled), or
+//! `downloading` (queue row popped before the crash). [`upload_item`]
+//! accepts `uploading` re-entry directly (resuming when a multipart
+//! record survives, restarting otherwise) and [`download_item`] accepts
+//! `downloading`, but nothing re-*drives* them: the pump only pops queue
+//! rows. [`recover_interrupted`] is the startup sweep that closes that
+//! gap — it walks the three stranded states, demotes along the legal
+//! §2.4 edges where needed, and re-pushes each item onto its queue. The
+//! supervisor (§3.3, a later unit) must run it once before its first
+//! pump pass; it assumes the single-supervisor exclusion (§5.1).
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -92,9 +148,9 @@ use crate::keys::{library_key, sidecar_key, RelKey};
 use crate::publisher::{enqueue_entry_in, PublisherError};
 use crate::s3::{
     ByteRange, CompletedPart, ListMultipartUploadsRequest, ListPartsRequest, PartBody,
-    PutObjectOptions, S3Error, S3TransferApi,
+    PutObjectOptions, S3Error, S3ErrorCode, S3TransferApi,
 };
-use crate::semhash::{sem_hash, Blake3Hex, ContentId, SemHashError};
+use crate::semhash::{sem_hash, sidecar_badges, Blake3Hex, ContentId, SemHash, SemHashError};
 use crate::state::{
     ItemRecord, ItemState, MultipartUploadState, Queue, StateError, SyncDb, UploadPart,
 };
@@ -183,11 +239,14 @@ pub enum TransferError {
         part_number: u32,
     },
 
-    /// The source file changed (size/mtime) while a multipart upload was
-    /// being resumed: the backend upload was aborted, the multipart
-    /// record cleared, and the item re-queued `dirty` with **nothing
-    /// journaled** (see the module docs for why mid-resume differs from
-    /// §2.4's detected-at-completion rule).
+    /// The source file changed while a multipart upload was being resumed
+    /// — caught by the size/mtime recheck against the facts captured at
+    /// upload creation, **or** by an already-sent range re-reading with an
+    /// MD5 that no longer matches the part's persisted `md5_b64` (the
+    /// same-size/same-mtime rewrite case). The backend upload was aborted,
+    /// the multipart record cleared, and the item re-marked `dirty` with
+    /// **nothing journaled** (see the module docs for why mid-resume
+    /// differs from §2.4's detected-at-completion rule).
     #[error("source for {relkey} changed mid-resume; upload aborted and item re-marked dirty")]
     AbortedSourceChanged {
         /// The item.
@@ -231,11 +290,21 @@ pub enum TransferError {
         actual: Blake3Hex,
     },
 
-    /// A downloaded sidecar failed parse-validation (§3.5): it was
-    /// **not** installed, the destination (including any pre-existing
-    /// file) is untouched, the partial was deleted, and the item
-    /// transitioned to `corrupt_remote`.
-    #[error("downloaded sidecar for {relkey} failed parse-validation: {source}")]
+    /// A sidecar failed parse-validation (§2.5 semantic parser). Two
+    /// sites, two contracts:
+    ///
+    /// - **Download** (§3.5): the invalid object was **not** installed,
+    ///   the destination (including any pre-existing file) is untouched,
+    ///   the partial was deleted, and the item transitioned to
+    ///   `corrupt_remote`.
+    /// - **Upload**: the sidecar is validated **before** it is stored —
+    ///   below the multipart threshold nothing is PUT at all; at or above
+    ///   it the already-created multipart upload is aborted before
+    ///   `Complete`, so no unjournaled garbage object lands in the
+    ///   bucket. The item is parked `dirty` (not re-queued — retrying an
+    ///   unchanged invalid sidecar can never succeed; the next local
+    ///   change re-admits it) with nothing journaled.
+    #[error("sidecar for {relkey} failed parse-validation: {source}")]
     SidecarInvalid {
         /// The item.
         relkey: RelKey,
@@ -437,6 +506,11 @@ pub struct UploadOutcome {
     /// Staging id of the journal `put` entry committed with the
     /// `verifying → synced` transition.
     pub outbound_id: u64,
+    /// The §2.4 completion recheck found the source rewritten while the
+    /// upload was in flight: the *old* version was completed, verified
+    /// and journaled honestly, and the item was re-marked `dirty` so the
+    /// new version uploads next (module docs, "Completion recheck").
+    pub source_changed_at_completion: bool,
 }
 
 /// Uploads one item per §2.4, reading the source file through
@@ -455,9 +529,11 @@ pub async fn upload_item(
 /// walk), reading bytes through `chunks`.
 ///
 /// Entry states: `queued` (fresh admission; CAS `queued → uploading`) or
-/// `uploading` with a persisted multipart record (crash-recovery
-/// re-entry; resumed in place). Anything else is a typed
-/// [`StateError::StaleState`] via [`TransferError::State`].
+/// `uploading` (crash-recovery re-entry: resumed in place when a
+/// multipart record survives, **restarted from the top** when none does —
+/// the crash-mid-single-PUT / crash-before-`set_upload` windows, which
+/// must not wedge). Anything else is a typed [`StateError::StaleState`]
+/// via [`TransferError::State`].
 ///
 /// On success the item is `synced` with `verified_remote` set, its
 /// multipart bookkeeping is cleared, and the journal `put` entry is
@@ -488,25 +564,31 @@ pub async fn upload_item_from(
     let resume = db.get_upload(relkey)?;
 
     // Entry: `queued → uploading` CAS, or crash-recovery re-entry already
-    // sitting at `uploading` with a persisted multipart record. Any other
+    // sitting at `uploading` (resumed when a multipart record survives,
+    // restarted otherwise — a crash mid-single-PUT or before `set_upload`
+    // leaves `uploading` with no record, and must not wedge). Any other
     // state fails the CAS typed (StaleState / IllegalTransition).
-    if !(record.state == ItemState::Uploading && resume.is_some()) {
+    if record.state != ItemState::Uploading {
         db.transition(relkey, ItemState::Queued, ItemState::Uploading, |_| {})?;
     }
 
     // ---- uploading: send the bytes (single PUT or multipart) ----
-    let sent =
-        match transfer_object(db, s3, cfg, relkey, &record, &key, source, chunks, resume).await {
-            Ok(sent) => sent,
-            // `AbortedSourceChanged` already re-marked the item dirty; every
-            // other failure re-queues (`uploading → queued`) with the
-            // multipart bookkeeping intact, so the next attempt resumes.
-            Err(e @ TransferError::AbortedSourceChanged { .. }) => return Err(e),
-            Err(e) => {
-                demote(db, relkey, ItemState::Uploading, ItemState::Queued);
-                return Err(e);
-            }
-        };
+    let sent = match transfer_object(db, s3, cfg, relkey, &record, &key, source, chunks, resume)
+        .await
+    {
+        Ok(sent) => sent,
+        // `AbortedSourceChanged` and the upload-side `SidecarInvalid`
+        // already parked the item dirty; every other failure re-queues
+        // (`uploading → queued`) with the multipart bookkeeping
+        // intact, so the next attempt resumes.
+        Err(
+            e @ (TransferError::AbortedSourceChanged { .. } | TransferError::SidecarInvalid { .. }),
+        ) => return Err(e),
+        Err(e) => {
+            demote(db, relkey, ItemState::Uploading, ItemState::Queued);
+            return Err(e);
+        }
+    };
 
     // ---- uploading → verifying; the completed upload's bookkeeping is
     // cleared in the same transaction (nothing on the backend can resume
@@ -534,18 +616,9 @@ pub async fn upload_item_from(
 
     // ---- verifying → synced + journal staging, one transaction ----
     let ts = server_ts_estimate(db)?;
-    let sem = match &sent.sidecar_bytes {
-        Some(bytes) => match sem_hash(bytes) {
-            Ok(sem) => Some(sem),
-            Err(source) => {
-                demote(db, relkey, ItemState::Verifying, ItemState::Queued);
-                return Err(TransferError::SidecarInvalid {
-                    relkey: relkey.clone(),
-                    source,
-                });
-            }
-        },
-        None => None,
+    let (sem, badges) = match sent.sidecar {
+        Some((sem, badges)) => (Some(sem), badges),
+        None => (None, crate::semhash::SidecarBadges::default()),
     };
     let kind = record.kind;
     let blake3 = sent.blake3.clone();
@@ -585,11 +658,16 @@ pub async fn upload_item_from(
                     size: Some(size),
                     blake3: Some(entry_blake3),
                     sem_hash: sem,
-                    rating: None,
-                    color_label: None,
+                    // §2.2: sidecar entries carry the badge fields so the
+                    // grid can render before the sidecar bytes download
+                    // (§3.5) — extracted from exactly the sent bytes.
+                    rating: badges.rating,
+                    color_label: badges.color_label,
                     content_id,
-                    w: None,
-                    h: None,
+                    // Measured dimensions travel on original entries when
+                    // the import unit has recorded them (§2.2).
+                    w: (kind == Kind::Original).then_some(r.w).flatten(),
+                    h: (kind == Kind::Original).then_some(r.h).flatten(),
                     mtime,
                     from_key: None,
                 })
@@ -605,6 +683,21 @@ pub async fn upload_item_from(
         }
     };
 
+    // ---- §2.4 completion recheck (module docs): a source rewritten
+    // mid-upload means the *old* version was just journaled honestly and
+    // the new one is un-backed-up — re-mark dirty so it uploads next. A
+    // stat failure reads as "cannot prove unchanged" and also re-marks
+    // (the upload path will surface a real I/O problem loudly). Best
+    // effort CAS: a concurrent writer that already moved the item off
+    // `synced` owns its state now.
+    let source_changed_at_completion = match tokio::fs::metadata(source).await {
+        Ok(meta) => meta.len() != sent.size || file_mtime_unix_ns(&meta) != sent.mtime_unix_ns,
+        Err(_) => true,
+    };
+    if source_changed_at_completion {
+        demote(db, relkey, ItemState::Synced, ItemState::Dirty);
+    }
+
     Ok(UploadOutcome {
         relkey: relkey.clone(),
         blake3,
@@ -612,6 +705,7 @@ pub async fn upload_item_from(
         e_tag: sent.e_tag,
         multipart: sent.multipart,
         outbound_id,
+        source_changed_at_completion,
     })
 }
 
@@ -629,11 +723,15 @@ struct SentObject {
     /// Hex MD5 of a single-PUT body (`verifying` compares it to the HEAD
     /// ETag on a digest-verifying backend); `None` for multipart.
     md5_hex: Option<String>,
-    /// The sent bytes, retained only for sidecars (the journal entry's
-    /// `sem_hash` is parsed from exactly what was sent).
-    sidecar_bytes: Option<Vec<u8>>,
+    /// Sidecars only: the journal `sem_hash` and §2.2 badge fields,
+    /// parse-validated from exactly the sent bytes **before** the object
+    /// was stored (see [`TransferError::SidecarInvalid`]).
+    sidecar: Option<(SemHash, crate::semhash::SidecarBadges)>,
     /// Source mtime (unix seconds) captured when the transfer began.
     mtime_unix: i64,
+    /// Source mtime (unix nanoseconds) captured when the transfer began —
+    /// the §2.4 completion-recheck baseline.
+    mtime_unix_ns: i64,
 }
 
 /// The `uploading` phase: single buffered PUT below the threshold,
@@ -653,7 +751,9 @@ async fn transfer_object(
     chunks: &impl ChunkSource,
     resume: Option<MultipartUploadState>,
 ) -> Result<SentObject, TransferError> {
-    let meta = std::fs::metadata(source).map_err(|e| io_err(source, e))?;
+    let meta = tokio::fs::metadata(source)
+        .await
+        .map_err(|e| io_err(source, e))?;
     let size = meta.len();
     let mtime_unix_ns = file_mtime_unix_ns(&meta);
     let mtime_unix = mtime_unix_ns.div_euclid(1_000_000_000);
@@ -662,6 +762,16 @@ async fn transfer_object(
     if resume.is_none() && size < cfg.multipart_threshold {
         // --- single buffered PUT with Content-MD5 (signed payload) ---
         let body = read_range(chunks, source, 0, size).await?;
+        // A sidecar is parse-validated BEFORE anything is stored: an
+        // invalid one is never uploaded at all (see the variant doc).
+        let sidecar = if keep_bytes {
+            match parse_sidecar(&body) {
+                Ok(sidecar) => Some(sidecar),
+                Err(source) => return Err(park_sidecar_invalid(db, relkey, source)?),
+            }
+        } else {
+            None
+        };
         let digest = Md5::digest(&body);
         let md5_hex = hex::encode(digest);
         let blake3 = Blake3Hex::from_bytes(&body);
@@ -689,8 +799,9 @@ async fn transfer_object(
             e_tag: out.e_tag,
             multipart: false,
             md5_hex: Some(md5_hex),
-            sidecar_bytes: keep_bytes.then(|| bytes.to_vec()),
+            sidecar,
             mtime_unix,
+            mtime_unix_ns,
         });
     }
 
@@ -698,22 +809,16 @@ async fn transfer_object(
     let resuming = resume.is_some();
     let upload = match resume {
         Some(up) => {
-            // §2.4 mid-resume source-change recheck (size + mtime against
-            // the record the upload describes). A change here means the
+            // §2.4 mid-resume source-change recheck: size + mtime against
+            // the facts captured when the upload was CREATED (never the
+            // item record's `size`/`mtime_unix_ns`, which per the §2.6
+            // coordination note keep naming the last *published* version
+            // while a newer one is in flight). A change here means the
             // un-sent parts of the *old* version are no longer obtainable:
             // abort + re-mark dirty (see the module docs for why this
             // differs from the detected-at-completion rule).
-            if size != record.size || mtime_unix_ns != record.mtime_unix_ns {
-                s3.abort_multipart_upload(&cfg.bucket, key, &up.upload_id)
-                    .await?;
-                db.with_txn(|t| {
-                    t.clear_upload(relkey)?;
-                    t.transition(relkey, ItemState::Uploading, ItemState::Dirty, |_| {})?;
-                    Ok(())
-                })?;
-                return Err(TransferError::AbortedSourceChanged {
-                    relkey: relkey.clone(),
-                });
+            if size != up.size || mtime_unix_ns != up.mtime_unix_ns {
+                return Err(abort_source_changed(db, s3, cfg, relkey, key, &up.upload_id).await?);
             }
             up
         }
@@ -725,6 +830,9 @@ async fn transfer_object(
                 upload_id: created.upload_id,
                 part_size: cfg.part_size,
                 started_unix: now_unix(),
+                // The resume source-change baseline (see above).
+                size,
+                mtime_unix_ns,
             };
             // Persisted BEFORE the first part (§2.4): whatever survives a
             // crash from here on is resumable.
@@ -743,7 +851,10 @@ async fn transfer_object(
     let recorded: BTreeMap<u32, UploadPart> = db.upload_parts(relkey)?.into_iter().collect();
     // ListParts, opportunistically (resume only): a part is trusted as
     // done only when its durable record exists AND the backend lists it
-    // with the recorded ETag. A failed listing falls back to the records.
+    // with the recorded ETag. A failed listing falls back to the records
+    // (a NoSuchUpload here is NOT proof the upload is gone — transport
+    // failures land here too; the Complete/part paths below handle a
+    // genuinely gone upload typed).
     let listed: Option<BTreeMap<u32, String>> = if resuming {
         list_all_parts(s3, &cfg.bucket, key, &upload.upload_id)
             .await
@@ -755,6 +866,7 @@ async fn transfer_object(
     let mut hasher = blake3::Hasher::new();
     let mut sidecar_bytes: Option<Vec<u8>> = keep_bytes.then(Vec::new);
     let mut completed: Vec<CompletedPart> = Vec::with_capacity(part_count as usize);
+    let mut uploaded_this_pass = 0u32;
     for part_no in 1..=part_count as u32 {
         let offset = u64::from(part_no - 1) * part_size;
         let len = part_size.min(size - offset);
@@ -767,16 +879,31 @@ async fn transfer_object(
         // through the same chunk seam, un-sent ranges are read once and
         // sent as exactly the hashed bytes.
         let buf = read_range(chunks, source, offset, len).await?;
-        hasher.update(&buf);
-        if let Some(acc) = sidecar_bytes.as_mut() {
-            acc.extend_from_slice(&buf);
-        }
         if let Some(rec) = done {
+            // The re-read range must still be the bytes the backend holds:
+            // its MD5 is compared against the part's persisted `md5_b64`.
+            // This is what catches a rewrite that preserved size AND mtime
+            // (coarse-mtime filesystems, mtime-restoring tools) — without
+            // it, the journal would advertise a blake3 matching no stored
+            // object anywhere (§2.4 "hash of what was actually sent").
+            if b64(Md5::digest(&buf)) != rec.md5_b64 {
+                return Err(
+                    abort_source_changed(db, s3, cfg, relkey, key, &upload.upload_id).await?,
+                );
+            }
+            hasher.update(&buf);
+            if let Some(acc) = sidecar_bytes.as_mut() {
+                acc.extend_from_slice(&buf);
+            }
             completed.push(CompletedPart {
                 part_number: part_no,
                 e_tag: rec.etag.clone(),
             });
             continue;
+        }
+        hasher.update(&buf);
+        if let Some(acc) = sidecar_bytes.as_mut() {
+            acc.extend_from_slice(&buf);
         }
         let digest = Md5::digest(&buf);
         let md5_b64 = b64(digest);
@@ -817,8 +944,16 @@ async fn transfer_object(
                     Err(second) => return Err(second.into()),
                 }
             }
+            Err(first) if is_no_such_upload(&first) => {
+                // The backend no longer knows this upload id (swept by
+                // another party): retrying it next pass can never succeed.
+                // Clear the record so the requeued item restarts cleanly.
+                db.with_txn(|t| t.clear_upload(relkey))?;
+                return Err(first.into());
+            }
             Err(first) => return Err(first.into()),
         };
+        uploaded_this_pass += 1;
         // {part_no, etag, md5} persisted AFTER the part completed and
         // BEFORE the next part starts (§2.4; the crash suite SIGKILLs
         // between exactly these points).
@@ -835,17 +970,142 @@ async fn transfer_object(
             e_tag: out.e_tag,
         });
     }
-    let done = s3
+    // A multipart sidecar is parse-validated BEFORE Complete: an invalid
+    // one aborts the upload, so no unjournaled garbage object ever lands
+    // (the parts alone are not an object until Complete).
+    let sidecar = match sidecar_bytes {
+        Some(bytes) => match parse_sidecar(&bytes) {
+            Ok(sidecar) => Some(sidecar),
+            Err(source) => {
+                abort_upload_tolerant(s3, cfg, key, &upload.upload_id).await?;
+                db.with_txn(|t| t.clear_upload(relkey))?;
+                return Err(park_sidecar_invalid(db, relkey, source)?);
+            }
+        },
+        None => None,
+    };
+    let blake3 = Blake3Hex::from_hash(&hasher.finalize());
+    let e_tag = match s3
         .complete_multipart_upload(&cfg.bucket, key, &upload.upload_id, &completed)
-        .await?;
+        .await
+    {
+        Ok(done) => done.e_tag,
+        Err(e) if is_no_such_upload(&e) => {
+            // The upload id is definitively dead. Two cases:
+            //
+            // The crash-after-Complete signature — a resume in which every
+            // part was already recorded (nothing re-uploaded this pass) —
+            // means a previous run completed the upload and died before
+            // clearing the bookkeeping. The stored object is adopted iff
+            // it HEAD-matches the size whose ranges were just re-read and
+            // MD5-verified against the recorded parts (so `hasher`
+            // honestly names its bytes); verify and the journal commit
+            // then run as usual.
+            //
+            // Anything else (the id was swept out from under us — some
+            // backends accept the parts and only fail at Complete): the
+            // upload is unfinishable, so the record is cleared and the
+            // requeued item restarts cleanly instead of retrying a dead
+            // id forever.
+            if resuming && uploaded_this_pass == 0 {
+                if let Ok(head) = s3.head_object(&cfg.bucket, key).await {
+                    if head.content_length == size {
+                        return Ok(SentObject {
+                            blake3,
+                            size,
+                            e_tag: head.e_tag,
+                            multipart: true,
+                            md5_hex: None,
+                            sidecar,
+                            mtime_unix,
+                            mtime_unix_ns,
+                        });
+                    }
+                }
+            }
+            db.with_txn(|t| t.clear_upload(relkey))?;
+            return Err(e.into());
+        }
+        Err(e) => return Err(e.into()),
+    };
     Ok(SentObject {
-        blake3: Blake3Hex::from_hash(&hasher.finalize()),
+        blake3,
         size,
-        e_tag: done.e_tag,
+        e_tag,
         multipart: true,
         md5_hex: None,
-        sidecar_bytes,
+        sidecar,
         mtime_unix,
+        mtime_unix_ns,
+    })
+}
+
+/// Parse-validates sidecar bytes (§2.5 parser), returning the journal
+/// facts they carry.
+fn parse_sidecar(bytes: &[u8]) -> Result<(SemHash, crate::semhash::SidecarBadges), SemHashError> {
+    Ok((sem_hash(bytes)?, sidecar_badges(bytes)?))
+}
+
+/// The upload-side invalid-sidecar exit: park the item
+/// `uploading → dirty` (retrying an unchanged invalid sidecar can never
+/// succeed; the next local change re-admits it) and hand back the typed
+/// [`TransferError::SidecarInvalid`].
+fn park_sidecar_invalid(
+    db: &SyncDb,
+    relkey: &RelKey,
+    source: SemHashError,
+) -> Result<TransferError, TransferError> {
+    db.with_txn(|t| {
+        t.transition(relkey, ItemState::Uploading, ItemState::Dirty, |_| {})?;
+        Ok(())
+    })?;
+    Ok(TransferError::SidecarInvalid {
+        relkey: relkey.clone(),
+        source,
+    })
+}
+
+/// `true` when `e` is the backend saying the multipart upload id no
+/// longer exists (`NoSuchUpload`).
+fn is_no_such_upload(e: &S3Error) -> bool {
+    e.code() == Some(&S3ErrorCode::NoSuchUpload)
+}
+
+/// Aborts `upload_id`, treating a backend that no longer knows it
+/// (already aborted/completed elsewhere) as success.
+async fn abort_upload_tolerant(
+    s3: &impl S3TransferApi,
+    cfg: &TransferConfig,
+    key: &str,
+    upload_id: &str,
+) -> Result<(), TransferError> {
+    match s3.abort_multipart_upload(&cfg.bucket, key, upload_id).await {
+        Ok(()) => Ok(()),
+        Err(e) if is_no_such_upload(&e) || e.is_no_such_key() => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// The mid-resume source-change exit: abort the backend upload
+/// (tolerating one already gone), clear the multipart bookkeeping and
+/// re-mark the item `dirty` in one transaction, and hand back the typed
+/// [`TransferError::AbortedSourceChanged`].
+async fn abort_source_changed(
+    db: &SyncDb,
+    s3: &impl S3TransferApi,
+    cfg: &TransferConfig,
+    relkey: &RelKey,
+    key: &str,
+    upload_id: &str,
+) -> Result<TransferError, TransferError> {
+    abort_upload_tolerant(s3, cfg, key, upload_id).await?;
+    db.with_txn(|t| {
+        t.clear_upload(relkey)?;
+        t.transition(relkey, ItemState::Uploading, ItemState::Dirty, |_| {})?;
+        Ok(())
+    })?;
+    Ok(TransferError::AbortedSourceChanged {
+        relkey: relkey.clone(),
     })
 }
 
@@ -960,9 +1220,15 @@ pub struct StaleUploadReport {
     /// on the backend and cleared locally: `(relkey, upload_id)`.
     pub aborted_own: Vec<(RelKey, String)>,
     /// Backend-listed uploads targeting a key **we hold a multipart
-    /// record for** but under a *different* `upload_id` (orphans of a
+    /// record for**, under a *different* `upload_id`, whose `Initiated`
+    /// timestamp proves them older than `max_age` (abandoned orphans of a
     /// restart that re-created the upload): `(bucket_key, upload_id)`.
     pub aborted_orphans: Vec<(String, String)>,
+    /// Aged-out `uploads`-table rows whose item record no longer exists:
+    /// the backend upload was aborted best-effort under both candidate
+    /// bucket keys and the local row cleared, so neither the row nor the
+    /// backend upload leaks forever: `(relkey, upload_id)`.
+    pub cleared_recordless: Vec<(RelKey, String)>,
 }
 
 /// §2.4 stale-upload hygiene.
@@ -972,13 +1238,27 @@ pub struct StaleUploadReport {
 ///    local record and part records cleared, and — when the item sits in
 ///    `uploading` — the item re-marked `dirty` (`uploading → dirty`, the
 ///    §2.4 "upload abandoned" edge). A record still fresh is untouched.
+///    An aged row whose **item record is missing** (a legitimate delete
+///    raced the upload, or corruption recovery removed the item) cannot
+///    derive its one bucket key, so the abort is issued best-effort under
+///    both candidate keys (library/sidecar; abort is addressed by
+///    `(key, upload_id)`, so a wrong-key attempt is a tolerated
+///    `NoSuchUpload`, never someone else's upload) and the row cleared —
+///    reported in [`StaleUploadReport::cleared_recordless`].
 /// 2. `ListMultipartUploads` (paged) is scanned for **own-key orphans**:
-///    uploads whose key corresponds to one of our `uploads`-table
-///    relkeys but whose `upload_id` differs from the recorded one. These
-///    are aborted regardless of age (nothing can ever complete them).
-///    Uploads on keys we hold no record for are **left alone** — another
-///    device may legitimately be mid-upload (§1.2 multi-device bucket);
-///    the cross-device sweep is the worker's job (later unit).
+///    uploads whose key corresponds to one of our `uploads`-table relkeys
+///    but whose `upload_id` differs from the recorded one. An orphan is
+///    aborted only when its `Initiated` timestamp proves it older than
+///    `max_age_secs` — age-gated exactly like the own-record path,
+///    because "a different id on our key" does **not** mean abandoned:
+///    relkeys map to *shared* bucket keys (§1.2), so a sibling device may
+///    be live-uploading the same key right now (duplicate import, the
+///    §2.4 corrupt-remote repair), and this engine's own pump may have
+///    re-created the upload between the table snapshot and this page. An
+///    orphan whose age cannot be proven (missing/unparseable
+///    `Initiated`) is left alone. Uploads on keys we hold no record for
+///    are another device's business and are also left alone; the
+///    cross-device sweep is the worker's job (later unit).
 pub async fn abort_stale_uploads(
     db: &SyncDb,
     s3: &impl S3TransferApi,
@@ -986,34 +1266,35 @@ pub async fn abort_stale_uploads(
     max_age_secs: i64,
     now_unix: i64,
 ) -> Result<StaleUploadReport, TransferError> {
+    let aged = |start: i64| start.saturating_add(max_age_secs) <= now_unix;
     let mut report = StaleUploadReport::default();
-    // Our uploads table is the orphan-matching key set regardless of age:
-    // a backend upload on one of OUR keys under a different id can never
-    // be completed by anyone.
+    // Our uploads table is the orphan-matching key set regardless of age
+    // (the age gate below is per-orphan, on the backend's Initiated).
     let mut own_keys: BTreeMap<String, String> = BTreeMap::new();
     for (relkey, upload) in db.iter_uploads()? {
         let Some(record) = db.get_item(&relkey)? else {
-            // An uploads row without an item record cannot derive a bucket
-            // key; leave it for corruption recovery.
+            // No item record: the one true bucket key is underivable. An
+            // aged row is still cleaned up (doc item 1); a fresh one is
+            // left for the item/delete machinery to settle first.
+            if aged(upload.started_unix) {
+                for key in [library_key(&relkey), sidecar_key(&relkey)] {
+                    abort_upload_tolerant(s3, cfg, &key, &upload.upload_id).await?;
+                }
+                db.with_txn(|t| t.clear_upload(&relkey))?;
+                report.cleared_recordless.push((relkey, upload.upload_id));
+            }
             continue;
         };
         let key = bucket_key_for(&relkey, record.kind)?;
         own_keys.insert(key.clone(), upload.upload_id.clone());
-        if upload.started_unix.saturating_add(max_age_secs) > now_unix {
+        if !aged(upload.started_unix) {
             continue; // still fresh
         }
         // Aged out: abort on the backend, clear locally, and — when the
         // item still sits in `uploading` — re-mark it dirty (§2.4 "upload
         // abandoned"). A backend that no longer knows the upload id
         // (already aborted/completed elsewhere) is treated as done.
-        match s3
-            .abort_multipart_upload(&cfg.bucket, &key, &upload.upload_id)
-            .await
-        {
-            Ok(()) => {}
-            Err(e) if e.code() == Some(&crate::s3::S3ErrorCode::NoSuchUpload) => {}
-            Err(e) => return Err(e.into()),
-        }
+        abort_upload_tolerant(s3, cfg, &key, &upload.upload_id).await?;
         db.with_txn(|t| {
             t.clear_upload(&relkey)?;
             Ok(())
@@ -1024,9 +1305,9 @@ pub async fn abort_stale_uploads(
         report.aborted_own.push((relkey, upload.upload_id));
     }
 
-    // Backend scan for own-key orphans (paged). Uploads on keys we hold
-    // no record for are another device's business (§1.2) and are left
-    // alone.
+    // Backend scan for own-key orphans (paged), age-gated on Initiated
+    // (doc item 2). Uploads on keys we hold no record for are another
+    // device's business (§1.2) and are left alone.
     let mut request = ListMultipartUploadsRequest::default();
     loop {
         let page = s3.list_multipart_uploads(&cfg.bucket, &request).await?;
@@ -1034,9 +1315,13 @@ pub async fn abort_stale_uploads(
             let orphan = own_keys
                 .get(&upload.key)
                 .is_some_and(|ours| *ours != upload.upload_id);
-            if orphan {
-                s3.abort_multipart_upload(&cfg.bucket, &upload.key, &upload.upload_id)
-                    .await?;
+            let provably_aged = upload
+                .initiated
+                .as_deref()
+                .and_then(initiated_unix)
+                .is_some_and(aged);
+            if orphan && provably_aged {
+                abort_upload_tolerant(s3, cfg, &upload.key, &upload.upload_id).await?;
                 report.aborted_orphans.push((upload.key, upload.upload_id));
             }
         }
@@ -1045,6 +1330,82 @@ pub async fn abort_stale_uploads(
         }
         request.key_marker = page.next_key_marker;
         request.upload_id_marker = page.next_upload_id_marker;
+    }
+    Ok(report)
+}
+
+/// Parses a `ListMultipartUploads` `Initiated` timestamp (RFC 3339) to
+/// unix seconds. `None` when absent/unparseable — the caller treats that
+/// as "age unprovable" and leaves the upload alone.
+fn initiated_unix(initiated: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(initiated, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|t| t.unix_timestamp())
+}
+
+/// What [`recover_interrupted`] re-drove.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoveryReport {
+    /// Items found stranded in `uploading`/`verifying` and pushed back
+    /// onto the upload queue (demoted `verifying → queued`, and
+    /// `uploading → queued` when no multipart record survived; an
+    /// `uploading` item **with** a record keeps its state so
+    /// [`upload_item`] resumes it).
+    pub requeued_uploads: Vec<RelKey>,
+    /// Items found stranded in `downloading`, demoted to `pending_down`
+    /// and pushed back onto the download queue (their partial survives
+    /// for a ranged resume).
+    pub requeued_downloads: Vec<RelKey>,
+}
+
+/// The crash-recovery startup sweep (module docs, "Crash recovery"): every
+/// item a crash stranded in a pipeline-interior state whose queue row is
+/// already popped — `uploading`, `verifying`, `downloading` — is demoted
+/// along its legal §2.4 edge where needed and pushed back onto its queue
+/// at priority `class`, so the next pump pass re-drives it. Idempotent
+/// (`queue_push` is membership-checked). Run once at startup, before the
+/// first pump pass, under the §5.1 single-instance exclusion; it is a
+/// check-then-act scan and must not race a live pump.
+pub fn recover_interrupted(db: &SyncDb, class: u8) -> Result<RecoveryReport, TransferError> {
+    let mut report = RecoveryReport::default();
+    // Crash between upload-complete bookkeeping and the verify-commit:
+    // the object may be stored but nothing was journaled — re-run the
+    // whole upload (idempotent: a re-PUT of identical bytes re-verifies).
+    for (relkey, _) in db.items_in_state(ItemState::Verifying)? {
+        db.with_txn(|t| {
+            t.transition(&relkey, ItemState::Verifying, ItemState::Queued, |_| {})?;
+            t.queue_push(Queue::Up, &relkey, class)?;
+            Ok(())
+        })?;
+        report.requeued_uploads.push(relkey);
+    }
+    // Crash mid-upload. With a multipart record the state stays
+    // `uploading` ([`upload_item`] resumes it in place); without one
+    // (mid-single-PUT, or before `set_upload`) it is demoted so the
+    // restart admission is the ordinary queued → uploading CAS.
+    for (relkey, _) in db.items_in_state(ItemState::Uploading)? {
+        db.with_txn(|t| {
+            if t.get_upload(&relkey)?.is_none() {
+                t.transition(&relkey, ItemState::Uploading, ItemState::Queued, |_| {})?;
+            }
+            t.queue_push(Queue::Up, &relkey, class)?;
+            Ok(())
+        })?;
+        report.requeued_uploads.push(relkey);
+    }
+    // Crash mid-download: the queue row was popped before the crash.
+    for (relkey, _) in db.items_in_state(ItemState::Downloading)? {
+        db.with_txn(|t| {
+            t.transition(
+                &relkey,
+                ItemState::Downloading,
+                ItemState::PendingDown,
+                |_| {},
+            )?;
+            t.queue_push(Queue::Down, &relkey, class)?;
+            Ok(())
+        })?;
+        report.requeued_downloads.push(relkey);
     }
     Ok(report)
 }
@@ -1137,7 +1498,11 @@ pub async fn download_item(
         db.transition(relkey, record.state, ItemState::Downloading, |_| {})?;
     }
 
-    match run_download(
+    let had_partial = tokio::fs::metadata(&partial)
+        .await
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    let mut result = run_download(
         db,
         s3,
         cfg,
@@ -1148,8 +1513,29 @@ pub async fn download_item(
         &partial,
         expected,
     )
-    .await
-    {
+    .await;
+    // A hash mismatch after a RESUMED attempt does not prove the remote
+    // wrong: the surviving partial may belong to a superseded object
+    // version (the journal head advanced between attempts), and splicing
+    // old-prefix + new-tail can never verify even over an intact object.
+    // Discard the partial and retry once from scratch (module docs); only
+    // a from-scratch mismatch condemns the remote below.
+    if had_partial && matches!(result, Err(TransferError::IntegrityMismatch { .. })) {
+        let _ = tokio::fs::remove_file(&partial).await;
+        result = run_download(
+            db,
+            s3,
+            cfg,
+            relkey,
+            kind,
+            &key,
+            &final_path,
+            &partial,
+            expected,
+        )
+        .await;
+    }
+    match result {
         Ok(outcome) => Ok(outcome),
         // Integrity/parse failures are properties of the remote object:
         // the partial is deleted (it can never verify) and the item moves
@@ -1186,53 +1572,79 @@ async fn run_download(
     expected: &ExpectedDownload,
 ) -> Result<DownloadOutcome, TransferError> {
     if let Some(parent) = final_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| io_err(parent, e))?;
     }
     let mut hasher = blake3::Hasher::new();
     let mut resumed_from = 0u64;
-    match std::fs::metadata(partial) {
+    match tokio::fs::metadata(partial).await {
         Ok(meta) if meta.len() > expected.size => {
             // An over-long partial can never verify: start fresh.
-            std::fs::remove_file(partial).map_err(|e| io_err(partial, e))?;
+            tokio::fs::remove_file(partial)
+                .await
+                .map_err(|e| io_err(partial, e))?;
         }
         Ok(meta) => {
             // §3.5 resume: re-hash the surviving bytes from disk, then
             // continue with a ranged GET from exactly this offset.
             resumed_from = meta.len();
-            hash_file_into(partial, &mut hasher)?;
+            hash_file_into(partial, &mut hasher).await?;
         }
         Err(_) => {}
     }
 
+    // The partial exists from here on even when nothing needs fetching (a
+    // zero-byte object downloads as create + verify-empty + rename).
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(partial)
+        .await
+        .map_err(|e| io_err(partial, e))?;
     let mut bytes_fetched = 0u64;
     if resumed_from < expected.size {
+        use tokio::io::AsyncWriteExt as _;
         let range = (resumed_from > 0).then_some(ByteRange::From(resumed_from));
         let out = s3.get_object(&cfg.bucket, key, range).await?;
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(partial)
-            .map_err(|e| io_err(partial, e))?;
+        // A resume is only a resume when the response is actually partial
+        // and starts at our offset. A backend/intermediary that ignored
+        // the Range header returned the FULL object — appending it after
+        // the partial would splice garbage and mis-file an intact remote
+        // as corrupt. Discard the partial and take the full body from 0.
+        if resumed_from > 0
+            && out
+                .content_range
+                .as_deref()
+                .and_then(content_range_start)
+                .is_none_or(|start| start != resumed_from)
+        {
+            file.set_len(0).await.map_err(|e| io_err(partial, e))?;
+            hasher.reset();
+            resumed_from = 0;
+        }
         let mut body = out.body;
         loop {
             match body.next().await {
                 Some(Ok(chunk)) => {
-                    use std::io::Write as _;
-                    file.write_all(&chunk).map_err(|e| io_err(partial, e))?;
+                    file.write_all(&chunk)
+                        .await
+                        .map_err(|e| io_err(partial, e))?;
                     hasher.update(&chunk);
                     bytes_fetched += chunk.len() as u64;
                 }
                 Some(Err(e)) => {
                     // Every received byte is already appended: the partial
                     // survives for the next ranged resume.
-                    let _ = file.sync_all();
+                    let _ = file.sync_all().await;
                     return Err(e.into());
                 }
                 None => break,
             }
         }
-        file.sync_all().map_err(|e| io_err(partial, e))?;
+        file.sync_all().await.map_err(|e| io_err(partial, e))?;
     }
+    drop(file);
 
     // The §3.5 backstop for every failure mode, including a mid-download
     // remote replacement: nothing installs unless the full content hashes
@@ -1249,7 +1661,9 @@ async fn run_download(
     // Sidecars are additionally parse-validated (§2.5 semantic parser):
     // an invalid sidecar is never installed, whatever its hash says.
     if kind == Kind::Sidecar {
-        let bytes = std::fs::read(partial).map_err(|e| io_err(partial, e))?;
+        let bytes = tokio::fs::read(partial)
+            .await
+            .map_err(|e| io_err(partial, e))?;
         if let Err(source) = sem_hash(&bytes) {
             return Err(TransferError::SidecarInvalid {
                 relkey: relkey.clone(),
@@ -1260,7 +1674,9 @@ async fn run_download(
 
     // Atomic install (same directory) + mtime restore (§3.5: keeps the
     // thumbnail cache hash stable across hydration).
-    std::fs::rename(partial, final_path).map_err(|e| io_err(final_path, e))?;
+    tokio::fs::rename(partial, final_path)
+        .await
+        .map_err(|e| io_err(final_path, e))?;
     filetime::set_file_mtime(
         final_path,
         filetime::FileTime::from_unix_time(expected.mtime_unix, 0),
@@ -1596,16 +2012,33 @@ async fn read_range(
 }
 
 /// Streams `path` into `hasher` (the §3.5 partial re-hash; never buffers
-/// the whole file).
-fn hash_file_into(path: &Path, hasher: &mut blake3::Hasher) -> Result<(), TransferError> {
-    use std::io::Read as _;
-    let mut file = std::fs::File::open(path).map_err(|e| io_err(path, e))?;
+/// the whole file). Reads go through `tokio::fs` in bounded chunks, so a
+/// multi-gigabyte partial's re-hash yields between chunks instead of
+/// pinning the executor thread for the whole file.
+async fn hash_file_into(path: &Path, hasher: &mut blake3::Hasher) -> Result<(), TransferError> {
+    use tokio::io::AsyncReadExt as _;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|e| io_err(path, e))?;
     let mut buf = vec![0u8; 256 * 1024];
     loop {
-        let n = file.read(&mut buf).map_err(|e| io_err(path, e))?;
+        let n = file.read(&mut buf).await.map_err(|e| io_err(path, e))?;
         if n == 0 {
             return Ok(());
         }
         hasher.update(&buf[..n]);
     }
+}
+
+/// Parses the start offset out of a `Content-Range` header
+/// (`bytes <start>-<end>/<total>`); `None` when it does not parse.
+fn content_range_start(content_range: &str) -> Option<u64> {
+    content_range
+        .trim()
+        .strip_prefix("bytes")?
+        .trim_start()
+        .split('-')
+        .next()?
+        .parse()
+        .ok()
 }

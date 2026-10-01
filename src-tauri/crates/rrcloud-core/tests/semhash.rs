@@ -6,7 +6,9 @@
 //! user-visible change (rating, tags, adjustment values, AI patch blobs)
 //! changes the hash. Invalid JSON is an error, never a default.
 
-use rrcloud_core::semhash::{canonical_json, sem_hash, Blake3Hex, ContentId, SemHash};
+use rrcloud_core::semhash::{
+    canonical_json, sem_hash, sidecar_badges, Blake3Hex, ContentId, SemHash, SidecarBadges,
+};
 use serde_json::{json, Value};
 
 const FULL: &str = include_str!("fixtures/sidecar_full.json");
@@ -566,4 +568,55 @@ fn streaming_hash_constructors_match_the_buffered_forms() {
         ContentId::from_bytes(bytes),
         "a content id IS the full-file blake3 (§1.2)"
     );
+}
+
+#[test]
+fn sidecar_badges_extracts_rating_and_the_color_tag() {
+    // Additive P1-U4 extension (§2.2: sidecar journal entries carry
+    // `rating`/`color_label` for §3.5's pre-download grid badges).
+    // Upstream RapidRAW stores the color label as a `color:<name>` tag.
+    let bytes =
+        br#"{"version":2,"rating":4,"tags":["keeper","color:red","alps"],"adjustments":{}}"#;
+    assert_eq!(
+        sidecar_badges(bytes).expect("valid sidecar"),
+        SidecarBadges {
+            rating: Some(4),
+            color_label: Some("red".to_string()),
+        }
+    );
+
+    // The real fixture: rating present, no color tag.
+    let fixture = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/sidecar_full.json"
+    ))
+    .expect("fixture");
+    assert_eq!(
+        sidecar_badges(&fixture).expect("fixture parses"),
+        SidecarBadges {
+            rating: Some(3),
+            color_label: None,
+        }
+    );
+}
+
+#[test]
+fn sidecar_badges_is_lenient_within_a_valid_document_and_fails_closed_otherwise() {
+    // Lenient on field shape inside a valid document: badges are display
+    // facts, not integrity facts.
+    let odd = br#"{"rating":999,"tags":["color:"],"adjustments":null}"#;
+    assert_eq!(
+        sidecar_badges(odd).expect("valid json object"),
+        SidecarBadges::default(),
+        "an out-of-range rating and an empty color label read as absent"
+    );
+    let null_rating = br#"{"rating":null,"tags":null}"#;
+    assert_eq!(
+        sidecar_badges(null_rating).expect("valid"),
+        SidecarBadges::default()
+    );
+
+    // Same fail-closed parse posture as sem_hash.
+    assert!(sidecar_badges(b"{ not json").is_err());
+    assert!(sidecar_badges(b"[1,2,3]").is_err(), "non-object root");
 }
