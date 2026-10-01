@@ -1791,6 +1791,17 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         let mut vv = original.vv.clone();
         vv.merge(&del_entry.vv);
         vv.bump(&own);
+        // §1.2: content_id IS the full-file blake3 of the bytes this put
+        // advertises. Derive it from the `blake3` being re-advertised (the
+        // PUBLISHED bytes), never from `original.content_id` —
+        // notify_local_change moves that to track an UNCOMMITTED
+        // out-of-band overwrite (§2.6 coordination note), so copying it
+        // here would publish a put whose content_id names bytes other than
+        // the ones it carries (round 4 major: previews/thumbs keyed by the
+        // mislabel are GC'd, and apply_put case-1 content-id equality
+        // mis-converges the record with a genuinely different same-id
+        // overwrite).
+        let content_id = Some(ContentId::from_blake3(&blake3));
         let put = EnginePut {
             device: own.clone(),
             kind: Kind::Original,
@@ -1802,7 +1813,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             sem_hash: None,
             rating: None,
             color_label: None,
-            content_id: original.content_id.clone(),
+            content_id,
             w: original.w,
             h: original.h,
             mtime: Some(original.mtime_unix_ns.div_euclid(1_000_000_000)),
@@ -2463,6 +2474,12 @@ pub fn restore_item(db: &SyncDb, image: &RelKey) -> Result<Vec<RelKey>, EngineEr
             // re-advertise (an EnginePut is unconstructible without one —
             // module docs); it is un-hidden locally only.
             if let Some(blake3) = record.blake3.clone() {
+                // §1.2: derive from the advertised blake3, never copy
+                // `record.content_id` (see resurrect_original) — a deleted
+                // original is not normally dirty-overwritten, but the same
+                // latent mislabel defect applies.
+                let content_id =
+                    (record.kind == Kind::Original).then(|| ContentId::from_blake3(&blake3));
                 let put = EnginePut {
                     device: own.clone(),
                     kind: record.kind,
@@ -2474,7 +2491,7 @@ pub fn restore_item(db: &SyncDb, image: &RelKey) -> Result<Vec<RelKey>, EngineEr
                     sem_hash: record.sem_hash.clone(),
                     rating: record.rating,
                     color_label: record.color_label.clone(),
-                    content_id: record.content_id.clone(),
+                    content_id,
                     w: record.w,
                     h: record.h,
                     mtime: (record.kind == Kind::Original)
@@ -2554,6 +2571,9 @@ fn resurrect_tombstoned_item(
         vv.merge(&row.vv);
     }
     vv.bump(own);
+    // §1.2: derive from the advertised blake3, never copy `rec.content_id`
+    // (see resurrect_original) — same latent defect.
+    let content_id = (rec.kind == Kind::Original).then(|| ContentId::from_blake3(&blake3));
     let put = EnginePut {
         device: own.clone(),
         kind: rec.kind,
@@ -2565,7 +2585,7 @@ fn resurrect_tombstoned_item(
         sem_hash: rec.sem_hash.clone(),
         rating: rec.rating,
         color_label: rec.color_label.clone(),
-        content_id: rec.content_id.clone(),
+        content_id,
         w: rec.w,
         h: rec.h,
         mtime: (rec.kind == Kind::Original).then(|| rec.mtime_unix_ns.div_euclid(1_000_000_000)),

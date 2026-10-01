@@ -2683,3 +2683,166 @@ async fn s24_original_overwrite_surviving_a_delete_resurrects_the_sidecar_edits(
     }
     assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
 }
+
+// ===========================================================================
+// S25 — resurrect_original re-advertises the PUBLISHED bytes' content id
+// ===========================================================================
+
+/// Round 4, MAJOR: `resurrect_original` re-advertised the PUBLISHED
+/// original's `blake3` while COPYING the record's `content_id`, which
+/// [`notify_local_change`] had moved to track an UNCOMMITTED out-of-band
+/// overwrite (the §2.6 coordination note keeps blake3/vv naming the last
+/// published version but lets the original's content_id follow the local
+/// bytes). The emitted resurrection put then advertised
+/// `content_id != blake3(bytes)` — a §1.2 violation (§1.2: a content id
+/// *is* the full-file blake3 of the bytes it names). Consequences: the
+/// resurrected whole item is recorded fleet-wide pointing its
+/// previews/thumbs at a content id (the overwrite's C1) under which NONE
+/// exist — they live under the published bytes' C0 — so §2.7 preview GC
+/// sees C0 unreferenced and destroys the live item's proxies, directly
+/// breaking §2.7's whole-item-survival promise; and apply_put's §2.6
+/// case-1 content-id equality for originals can converge the mislabel
+/// with a genuinely different overwrite carrying the same C1, skipping
+/// the §2.8 displaced-original staging. The fix derives the
+/// re-advertised content id from the blake3 actually being advertised
+/// (`Some(ContentId::from_blake3(&blake3))`), exactly as every
+/// by-construction put does — so a re-advertisement of the published
+/// bytes can never carry a newer local overwrite's content id. (The
+/// sibling re-advertisers [`restore_item`] and
+/// [`resurrect_tombstoned_item`] share the latent defect and the same
+/// fix.) S21 passes only because there the original is clean (content_id
+/// still == C0); this scenario makes it dirty-overwritten so C1 != C0.
+#[tokio::test]
+async fn s25_resurrect_original_readvertises_the_published_bytes_content_id() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s25-resurrect-content-id");
+    let client = g.client();
+    let a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+
+    // A seeds the original O0 + base sidecar and pulls them onto B.
+    let (orig0, _base) = {
+        let mut rest = [&mut b];
+        seed_photo(&image, &a, &mut rest).await
+    };
+    let b0 = Blake3Hex::from_bytes(&orig0);
+    let c0 = ContentId::from_bytes(&orig0); // == ContentId::from_blake3(&b0)
+    assert_eq!(
+        c0,
+        ContentId::from_blake3(&b0),
+        "§1.2 identity of the probe constants"
+    );
+
+    // B overwrites the ORIGINAL out of band with new bytes O1 — Dirty,
+    // UNCOMMITTED. Per the §2.6 coordination note, the intake moves
+    // record.content_id to O1's (C1) while record.blake3 keeps naming the
+    // published O0. B also edits the sidecar (uncommitted Dirty). Neither
+    // is admitted or published.
+    let orig1 = th::patterned(2048, 99);
+    let c1 = ContentId::from_bytes(&orig1);
+    assert_ne!(
+        c0, c1,
+        "precondition: the overwrite is genuinely different bytes"
+    );
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Original, &orig1),
+        ChangeOutcome::MarkedDirty
+    );
+    let doc_b = eh::doc(4, Some("green"), 0.8);
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &doc_b),
+        ChangeOutcome::MarkedDirty
+    );
+    assert_eq!(
+        b.item(&image).content_id,
+        Some(c1.clone()),
+        "precondition: intake moved content_id to the uncommitted overwrite O1"
+    );
+    assert_eq!(
+        b.item(&image).blake3,
+        Some(b0.clone()),
+        "precondition: blake3 still names the published bytes O0"
+    );
+
+    // A, never having seen B's dirt, deletes the whole photo. The dels are
+    // staged sidecar-first, so when B applies them the sidecar del lands
+    // before the original del.
+    delete_item(
+        &a.db,
+        &a.s3,
+        &bucket,
+        &image,
+        &[Kind::Sidecar, Kind::Original],
+    )
+    .await
+    .expect("delete");
+    publish_pending(&a.db, &a.s3, &bucket)
+        .await
+        .expect("publish dels");
+
+    // B polls A's dels: the dirty sidecar hits the edits-beat-deletes
+    // resurrect lane (apply_del Dirty branch), which calls
+    // resurrect_original while B's original is still Dirty (unadmitted) —
+    // so the metadata re-advertisement fires (not the in-flight skip).
+    b.poll_apply().await;
+    assert!(!b.item(&image).deleted, "the original is resurrected whole");
+    assert!(
+        !b.item(&sidecar_rel).deleted,
+        "the dirty sidecar edit beats the del"
+    );
+    assert!(
+        b.events.resurrection_incomplete.is_empty(),
+        "the original was known (blake3 held): full resurrection, no event"
+    );
+
+    // Flush the staged resurrection put (metadata only) WITHOUT admitting
+    // B's dirty overwrite, isolating the re-advertisement on the wire.
+    publish_pending(&b.db, &b.s3, &bucket)
+        .await
+        .expect("publish resurrection");
+    assert_eq!(
+        b.puts_to(&library_key(&image)),
+        0,
+        "the resurrection moves NO original bytes (metadata only)"
+    );
+
+    let entries_b = eh::journal_entries_of(&client, &bucket, &dev(DEV_B)).await;
+    let orig_put = entries_b
+        .iter()
+        .rfind(|e| e.op == Op::Put && e.key == library_key(&image))
+        .expect("original resurrection put published");
+    let put_b3 = orig_put
+        .blake3
+        .clone()
+        .expect("every published original put carries blake3 (§1.2)");
+    assert_eq!(
+        put_b3, b0,
+        "re-advertises the PUBLISHED bytes O0 (whose bucket key is unchanged)"
+    );
+    // §1.2: a content id IS the full-file blake3 of the bytes it names.
+    assert_eq!(
+        orig_put.content_id,
+        Some(ContentId::from_blake3(&put_b3)),
+        "the re-advertised content_id must name the bytes actually advertised"
+    );
+    assert_eq!(
+        orig_put.content_id,
+        Some(c0.clone()),
+        "== the published bytes' content id C0, NOT the uncommitted overwrite's C1"
+    );
+    assert_ne!(
+        orig_put.content_id,
+        Some(c1.clone()),
+        "pre-fix bug: the put carried the uncommitted overwrite's content_id over O0 bytes"
+    );
+
+    // The advertised bytes are in fact what sits at the bucket key, so a
+    // fetcher keying previews/thumbs by the put's content id finds them.
+    assert_eq!(
+        th::get_bytes(&client, &bucket, &library_key(&image)).await,
+        orig0,
+        "the published bytes at the key are O0, matching the advertised content id"
+    );
+}
