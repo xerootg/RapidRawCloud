@@ -942,19 +942,29 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             // move/attest ride later units; skip (never Err).
             //
             // DELIBERATE v1 DEBT (review round 0, pinned by the suite):
-            // a skipped entry is still marked applied, so a §2.7 `move`
-            // published by a FUTURE build is permanently invisible to a
-            // device that polled through this build — the applied-set/
-            // cursor never re-applies it. Acceptable only while no build
-            // publishes moves (none does; `Op::Move` has no writer in
-            // this repo), exactly like manifest.rs's same-shaped
-            // argument. The move unit MUST ship its own migration story
-            // (e.g. a one-time reconcile) before any writer exists.
-            // Fail-closed alternatives were rejected: a consumer `Err`
-            // here is the reader's WHOLE-PASS abort (it would let one
-            // future-op entry starve every later-sorted device's prefix),
-            // and per-device halts are the reader's own version gate,
-            // unreachable from a consumer.
+            // a skipped entry is still marked applied, so a future-build
+            // op published through this build is permanently invisible to
+            // a device that polled it here — the applied-set/cursor never
+            // re-applies it. This bites BOTH deferred ops the same way:
+            //   - `Op::Move` (§2.7 rename): a lost move leaves a stale
+            //     local path / orphaned stub.
+            //   - `Op::Attest` (§2.2): attestations are the §2.4/§3.5
+            //     LRU-eviction gate and the §6 worker is their writer
+            //     (one attest per original it GETs), so a device that
+            //     polls the worker's attests through this build drops them
+            //     from its applied set and silently degrades the eviction
+            //     gate — load-bearing, not cosmetic.
+            // Acceptable only while no build publishes either op (none
+            // does — verified: the only writers in-repo are `Op::Put`
+            // in engine/manifest/transfer and `Op::Del` in engine),
+            // exactly like manifest.rs's same-shaped argument. The move
+            // unit AND the attest/eviction unit MUST each ship their own
+            // migration (e.g. a one-time applied-set re-scan/reconcile)
+            // before any writer exists. Fail-closed alternatives were
+            // rejected: a consumer `Err` here is the reader's WHOLE-PASS
+            // abort (it would let one future-op entry starve every
+            // later-sorted device's prefix), and per-device halts are the
+            // reader's own version gate, unreachable from a consumer.
             return Ok(());
         }
         let class = classify_key(&entry.key);
@@ -1514,6 +1524,16 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             // nothing to upload. Scoped to sidecars: original overwrites
             // adopt the §2.8 displaced-copy lane, and auto re-uploading
             // multi-GB RAWs is a policy choice this unit does not make.
+            //
+            // Cost note (review round 2, accepted): this re-mark is
+            // UNCONDITIONAL on the winning author because the engine
+            // cannot cheaply know the bucket's last-PUT order, so it also
+            // fires when the winner's bytes already occupy the key (no
+            // repair needed) — one spurious version + one re-upload per
+            // conflict on the author, never divergence (receivers
+            // converge either way). A future cheap landing-order probe
+            // (HEAD/ETag vs the winner's blake3 before re-marking) could
+            // drop the redundant re-publish; not worth a round trip here.
             if kind == Kind::Sidecar
                 && local.admitted_vv.is_none()
                 && local.device.as_ref() == Some(&self.own_device)
@@ -1551,16 +1571,26 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
     ///   un-hides when it applies our head's put (the `apply_put`
     ///   deleted-record arm), and both arrival orders of `{put, del}`
     ///   land identical (previously this arm dropped the del entirely:
-    ///   no fold, order-divergent third devices, half-deleted items);
+    ///   no fold, order-divergent third devices, half-deleted items).
+    ///   For a surviving *sidecar* head this arm also resurrects the
+    ///   image's original (author-only — review round 2), so a committed
+    ///   edit raced by a whole-photo delete keeps the whole item, not
+    ///   just the edited key;
     /// - **concurrent del vs an already-hidden record** → two deletes of
     ///   one item: fold vv into the record **and** the row, stay hidden.
     ///
     /// Deletion ordering is strictly **per item key** (§2.6 applied to
-    /// dels): a del of the image's original concurrent with an edit of
-    /// its *sidecar* still hides the original — item-wholeness across
-    /// kinds is the uncommitted-dirty resurrection lane's job, where a
-    /// single device re-advertises (multiple committed holders emitting
-    /// resurrection puts would mint N concurrent versions per delete).
+    /// dels): a del of the image's original is resolved against the
+    /// original's own vv. Item-wholeness across kinds — re-advertising
+    /// the original when its sidecar's edit beats a concurrent delete —
+    /// is carried by the resurrection lanes, each keyed to a *single*
+    /// re-advertiser so a delete mints one resurrection put, not N: the
+    /// uncommitted-dirty lane (the lone dirt holder) and the
+    /// committed/in-flight Concurrent arm (the surviving head's author,
+    /// `local.device == own_device`). A clean whole-photo delete with no
+    /// concurrent edit never reaches either lane: its sidecar del
+    /// *dominates* (the Greater arm hides the sidecar), so no
+    /// resurrection fires and the item deletes whole.
     fn apply_del(
         &mut self,
         txn: &StateTxn<'_>,
@@ -1651,6 +1681,40 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                     // later-bootstrapping device folds, so every arrival
                     // order converges live. No row: the deletion lost.
                     txn.update_item(item, local.state, |r| r.vv.merge(&entry.vv))?;
+                    // Whole-item survival for a COMMITTED/in-flight sidecar
+                    // edit (review round 2 blocker): a surviving sidecar
+                    // edit concurrent with a whole-photo delete used to
+                    // leave the image's ORIGINAL orphaned — its own del
+                    // strictly dominates (the editor never bumped the
+                    // original's component), so apply_del hid it fleet-wide
+                    // and its deleted-set row stood, handing §2.10 GC a
+                    // live-sidecar-but-dead-RAW item to destroy. No event
+                    // fired and the fleet CONVERGED to the broken item, so
+                    // §2.11's "resurrection restores a whole item" was
+                    // silently violated for the ordinary two-devices-online
+                    // case (only the uncommitted-dirty lane above healed
+                    // it). The surviving head's deterministic single author
+                    // re-advertises the original here, exactly as the dirty
+                    // lane and resolve_concurrent's author-only repair do.
+                    //
+                    // Author-only (`local.device == own_device`) is what
+                    // makes this safe where the per-item comment above
+                    // declined committed-holder resurrection: one delete
+                    // yields ONE resurrection put (the lone author's), not
+                    // one per committed holder — the N-version fan-out is
+                    // defeated by the gate, not by dropping the
+                    // resurrection. Receivers (including a third device
+                    // holding the same head) adopt the published put; the
+                    // author alone mints it. Scoped to Sidecar: an
+                    // original's own concurrent del is the §2.8 overwrite
+                    // lane, never a whole-item race. resurrect_original
+                    // itself skips an original whose upload is in flight
+                    // (that put IS its survival) and fires
+                    // ResurrectionIncompleteEvent when the original is
+                    // unknown here — the orphaning is never again silent.
+                    if kind == Kind::Sidecar && local.device.as_ref() == Some(&self.own_device) {
+                        self.resurrect_original(txn, entry, image)?;
+                    }
                     Ok(())
                 }
             }
