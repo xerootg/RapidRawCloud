@@ -1323,9 +1323,15 @@ fn corrupt_stored_record_surfaces_codec_error_not_panic() {
         .expect("corrupt");
     let err = db.get_item(&bad).expect_err("corrupt value must refuse");
     assert!(matches!(err, StateError::Codec(_)), "got {err:?}");
-    // Scans hit the corrupt row too — still typed, still no panic.
+    // Scans hit the corrupt row too — still typed, still no panic, and
+    // the enumeration error names the offending key (round 3: a point
+    // read's caller already holds the key; a scan's caller has no other
+    // way to learn it).
     let err = db.iter_items().expect_err("scan over corrupt value");
-    assert!(matches!(err, StateError::Codec(_)), "got {err:?}");
+    assert!(
+        matches!(&err, StateError::CodecAt { key, .. } if key == bad.as_str()),
+        "got {err:?}"
+    );
     // Unrelated keys stay readable.
     assert!(db.get_item(&good).expect("get good").is_some());
 }
@@ -2235,10 +2241,16 @@ fn queue_clear_recovers_a_queue_wedged_by_a_corrupt_row() {
     // and queue_remove cannot name it (it takes a validated RelKey).
     for _ in 0..2 {
         let err = db.queue_pop(Queue::Up).expect_err("corrupt head refuses");
-        assert!(matches!(err, StateError::Codec(_)), "got {err:?}");
+        assert!(
+            matches!(&err, StateError::CodecAt { key, .. } if key == "../not-a-relkey"),
+            "the error must name the corrupt raw row, got {err:?}"
+        );
     }
     let err = db.queue_peek(Queue::Up).expect_err("peek refuses too");
-    assert!(matches!(err, StateError::Codec(_)), "got {err:?}");
+    assert!(
+        matches!(&err, StateError::CodecAt { key, .. } if key == "../not-a-relkey"),
+        "got {err:?}"
+    );
     assert_eq!(db.queue_len(Queue::Up).expect("len"), 2, "nothing removed");
     // The recovery path: raw drain, no decoding, typed count back.
     assert_eq!(db.queue_clear(Queue::Up).expect("clear"), 2);
@@ -2309,4 +2321,227 @@ fn delete_item_composite_cleans_companion_tables_atomically() {
     // No orphan: a fresh pop on the emptied queue simply reports empty
     // instead of wedging on a deleted item's entry.
     assert_eq!(db.queue_pop(Queue::Up).expect("pop"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Round 3 review findings
+// ---------------------------------------------------------------------------
+
+#[test]
+fn builder_error_caught_inside_with_txn_consumes_no_seqs() {
+    // Regression: StateTxn::freeze_next_segment bumps the seq counter
+    // BEFORE running the builder. If the builder's error is caught inside
+    // the with_txn closure — the shrink-and-retry pattern the SegmentBuild
+    // error doc explicitly invites — and the closure then commits, the
+    // bump must not survive. Before the fix, this committed
+    // last_allocated_seq past the retry's span, leaving the failed
+    // attempt's seqs as a permanent allocated-never-frozen hole: remote
+    // §2.2 contiguity cursors stall below it forever and the published
+    // floor is pinned, the exact degradations freeze_next_segment's doc
+    // rules out "by construction".
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    // A successful segment first, so the retry must stay contiguous.
+    assert_eq!(
+        db.freeze_next_segment(1, |_| Ok(b"one".to_vec()))
+            .expect("seed segment"),
+        1
+    );
+    db.with_txn(|t| {
+        let err = t
+            .freeze_next_segment(3, |_| {
+                Err(rrcloud_core::journal::JournalError::SegmentTooLarge { size: 2_000_000 }.into())
+            })
+            .expect_err("builder must fail");
+        assert!(matches!(err, StateError::SegmentBuild(_)), "got {err:?}");
+        // The failed attempt consumed nothing, even inside this txn.
+        assert_eq!(
+            t.last_allocated_seq()?,
+            1,
+            "counter restored after builder error"
+        );
+        // Shrink and retry in the SAME transaction.
+        let first = t.freeze_next_segment(1, |_| Ok(b"retry".to_vec()))?;
+        assert_eq!(first, 2, "retry is contiguous with the frozen tiling");
+        Ok(())
+    })
+    .expect("composite commits");
+    assert_eq!(
+        db.last_allocated_seq().expect("last"),
+        2,
+        "no allocated-never-frozen seqs"
+    );
+    assert_eq!(
+        db.unpublished_segments().expect("unpublished"),
+        vec![(1, b"one".to_vec()), (2, b"retry".to_vec())]
+    );
+    // The published floor advances over everything — no hole pins it.
+    db.mark_published(1).expect("publish 1");
+    db.mark_published(2).expect("publish 2");
+    assert_eq!(db.published_cursor().expect("cursor"), 2);
+    assert_eq!(db.unpublished_segments().expect("after publish"), vec![]);
+}
+
+#[test]
+fn scan_errors_name_the_corrupt_item_key_so_it_can_be_deleted() {
+    // Regression: a single corrupt `items` value used to abort every
+    // crash-recovery scan with a key-less Codec error — and since the
+    // scans are the only way to enumerate item keys (raw table names are
+    // internal) and delete_item needs a known RelKey, the one bad record
+    // could not even be found to delete it. The enumeration error must
+    // name the offending key: the key side of such a row is intact (only
+    // the value is garbage), so it is available at the failure site.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let good = rel("good.rrdata");
+    let bad = rel("bad.rrdata");
+    db.insert_item(&good, &bare_record(ItemState::Dirty))
+        .expect("good item");
+    db.force_corrupt_item(&bad, b"\xff\x00 not json at all")
+        .expect("corrupt item");
+    for err in [
+        db.iter_items().expect_err("iter_items must refuse"),
+        db.items_in_state(ItemState::Dirty)
+            .expect_err("items_in_state must refuse"),
+        db.count_in_state(ItemState::Dirty)
+            .expect_err("count_in_state must refuse"),
+    ] {
+        assert!(
+            matches!(&err, StateError::CodecAt { key, .. } if key == bad.as_str()),
+            "enumeration error must name the corrupt key, got {err:?}"
+        );
+    }
+    // The named key is exactly what makes the surface-and-delete recovery
+    // real (and the queue_clear doc's "a corrupt item is still deletable"
+    // claim true): delete the one bad record, every scan recovers.
+    assert!(db.delete_item(&bad).expect("targeted delete"));
+    assert_eq!(
+        db.iter_items().expect("iter recovered"),
+        vec![(good.clone(), bare_record(ItemState::Dirty))]
+    );
+    assert_eq!(db.count_in_state(ItemState::Dirty).expect("count"), 1);
+}
+
+#[test]
+fn iter_uploads_error_names_the_corrupt_key_and_clear_upload_recovers() {
+    // Same wedge class as the items scans: one corrupt `uploads` value
+    // must not permanently blind the §2.4 stale-upload/resume scan.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let good = rel("good.rrdata");
+    let bad = rel("bad.rrdata");
+    let upload = MultipartUploadState {
+        upload_id: "upl-1".into(),
+        part_size: 16 * 1024 * 1024,
+        started_unix: 1_769_900_000,
+    };
+    db.set_upload(&good, &upload).expect("good upload");
+    db.force_corrupt_upload(&bad, b"{ not json")
+        .expect("corrupt");
+    let err = db.iter_uploads().expect_err("scan must refuse");
+    assert!(
+        matches!(&err, StateError::CodecAt { key, .. } if key == bad.as_str()),
+        "got {err:?}"
+    );
+    // The key side is intact, so clear_upload can name the bad row.
+    db.clear_upload(&bad).expect("targeted clear");
+    assert_eq!(db.iter_uploads().expect("recovered"), vec![(good, upload)]);
+}
+
+#[test]
+fn iter_cursors_enumerates_the_peer_applied_map_across_reopen() {
+    // The §1.2 device-registry heartbeat publishes applied: {device: seq}
+    // for every known peer, and §2.3 bootstrap compares the merged
+    // cursors against journal segments — both need the full map, not
+    // point reads, or the engine ends up keeping a shadow map of peers
+    // outside the durable store.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    assert_eq!(db.iter_cursors().expect("empty"), vec![]);
+    db.set_cursor(&dev(DEV1), 5).expect("cursor d1");
+    db.set_cursor(&dev(DEV2), 9).expect("cursor d2");
+    db.set_cursor(&dev(DEV2), 7).expect("lower is a no-op");
+    drop(db);
+    let db = SyncDb::open(&path, None).expect("reopen");
+    // Ascending by device id (DEV2 "a3…" < DEV1 "d1…").
+    assert_eq!(
+        db.iter_cursors().expect("iter"),
+        vec![(dev(DEV2), 9), (dev(DEV1), 5)]
+    );
+}
+
+#[test]
+fn replay_put_item_cas_is_a_guarded_bypass_for_apply_loop_edges() {
+    // The two reachable apply-loop situations with no legal() edge —
+    // Stub -> Dirty (§2.8 out-of-band overwrite of an evicted original)
+    // and Dirty -> Synced (§2.6 apply rule case 1: converged, adopt
+    // metadata, no upload) — must not force the CAS-free replay_put_item
+    // bypass, whose lost-update hazard is exactly what update_item was
+    // added to close. replay_put_item_cas is the expected_state-checked
+    // wholesale replace for those edges.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let key = rel("a.rrdata");
+    // Absent record: typed stale, nothing created.
+    let err = db
+        .replay_put_item_cas(&key, ItemState::Stub, &bare_record(ItemState::Dirty))
+        .expect_err("absent record must be stale");
+    assert!(
+        matches!(
+            &err,
+            StateError::StaleState {
+                relkey,
+                expected: ItemState::Stub,
+                found: None,
+            } if relkey == &key
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(db.get_item(&key).expect("get"), None, "nothing created");
+    // §2.8: Stub -> Dirty with a new content_id. Not a legal() edge (the
+    // bytes were REPLACED out-of-band, not downloaded), hence the bypass.
+    assert!(!legal(ItemState::Stub, ItemState::Dirty), "precondition");
+    db.insert_item(&key, &bare_record(ItemState::Stub))
+        .expect("stub record");
+    let mut dirty = full_record();
+    dirty.state = ItemState::Dirty;
+    db.replay_put_item_cas(&key, ItemState::Stub, &dirty)
+        .expect("overwrite-detected replace");
+    assert_eq!(db.get_item(&key).expect("get"), Some(dirty.clone()));
+    // Wrong expected state: typed stale, record untouched — the CAS
+    // protection a racing transfer-engine transition relies on.
+    let mut synced = full_record();
+    synced.state = ItemState::Synced;
+    let err = db
+        .replay_put_item_cas(&key, ItemState::Stub, &synced)
+        .expect_err("stale expectation must refuse");
+    assert!(
+        matches!(
+            &err,
+            StateError::StaleState {
+                expected: ItemState::Stub,
+                found: Some(ItemState::Dirty),
+                ..
+            }
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(
+        db.get_item(&key).expect("get"),
+        Some(dirty.clone()),
+        "nothing mutated on the stale path"
+    );
+    // §2.6 case 1: Dirty -> Synced converged adoption, inside the same
+    // commit as the §2.2 apply bookkeeping (the StateTxn variant).
+    assert!(!legal(ItemState::Dirty, ItemState::Synced), "precondition");
+    db.with_txn(|t| {
+        t.replay_put_item_cas(&key, ItemState::Dirty, &synced)?;
+        t.mark_applied(&dev(DEV2), 3)?;
+        Ok(())
+    })
+    .expect("converged-apply composite");
+    assert!(db.has_applied(&dev(DEV2), 3).expect("applied"));
+    drop(db);
+    let db = SyncDb::open(&path, None).expect("reopen");
+    assert_eq!(db.get_item(&key).expect("get"), Some(synced));
 }

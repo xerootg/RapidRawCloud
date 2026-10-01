@@ -47,6 +47,16 @@
 //! posture rests on the pinned `Immediate` fsync plus the checksummed
 //! commit slot, not on the experiment.
 //!
+//! Platform scope (macOS): redb's `Immediate` durability issues
+//! `File::sync_data` — plain `fsync(2)` (verified in redb 2.6.3's unix
+//! file backend; `F_BARRIERFSYNC` is used only for `Eventual`, and
+//! `F_FULLFSYNC` never). Apple documents that `fsync` does **not** force
+//! the drive's write cache to stable media (`F_FULLFSYNC` is reserved for
+//! that), so on macOS a commit acknowledged `Ok` can still be lost on
+//! power failure, beyond the checksummed-commit-slot caveat above.
+//! Process-death durability is unaffected; this is redb backend behavior
+//! and not changeable at this layer.
+//!
 //! First creation additionally fsyncs the parent **directory** (unix)
 //! after the init commit: POSIX does not promise that a new file's dirent
 //! is durable just because the file itself was fsynced, and redb's
@@ -85,7 +95,10 @@
 //! LRU eviction, §2.3 reconcile) are served by the enumeration accessors
 //! ([`SyncDb::iter_items`], [`SyncDb::items_in_state`],
 //! [`SyncDb::count_in_state`], [`SyncDb::iter_uploads`],
-//! [`SyncDb::queue_peek`]).
+//! [`SyncDb::iter_cursors`], [`SyncDb::queue_peek`]). An enumeration that
+//! hits an undecodable row fails typed with [`StateError::CodecAt`]
+//! naming the row's key, so the engine can remove the one bad record and
+//! rescan instead of losing the subsystem.
 //!
 //! # Encoding
 //!
@@ -238,10 +251,14 @@ pub enum StateError {
     /// typically [`crate::journal::encode_segment`] refusing the batch
     /// because a cap was crossed only once the real seq digits were
     /// stamped (entries embed their seq as JSON digits, so the exact
-    /// encoded size is not knowable before the first seq is). The
-    /// transaction was aborted: **no seqs were consumed and nothing was
-    /// stored**, so the caller can shrink the batch and retry without
-    /// leaving a hole.
+    /// encoded size is not knowable before the first seq is). **No seqs
+    /// were consumed and nothing was stored**, at either API level: from
+    /// [`SyncDb::freeze_next_segment`] the whole transaction was aborted,
+    /// and from [`StateTxn::freeze_next_segment`] the seq counter was
+    /// restored inside the still-open transaction before the error
+    /// returned — so the caller can shrink the batch and retry, even by
+    /// catching this error inside the same [`SyncDb::with_txn`] closure,
+    /// without leaving an allocated-never-frozen hole.
     #[error("segment build failed: {0}")]
     SegmentBuild(#[from] JournalError),
     /// `mark_published` for a seq that was never frozen. Publishing an
@@ -271,9 +288,30 @@ pub enum StateError {
     Db(#[from] Box<redb::Error>),
     /// A stored record failed to encode/decode. On the read side this means
     /// the value bytes do not parse as the record schema — surfaced as a
-    /// typed error, never a panic (library paths do not panic).
+    /// typed error, never a panic (library paths do not panic). Point
+    /// reads use this bare form (the caller already holds the key);
+    /// enumeration scans use [`StateError::CodecAt`].
     #[error("state db record encoding error: {0}")]
     Codec(#[from] serde_json::Error),
+    /// A stored row failed to decode during an **enumeration** scan, at
+    /// the named key. The key is attached because scans are the only way
+    /// to discover it (raw table names are internal, and e.g.
+    /// [`SyncDb::delete_item`] needs a known key): it is what lets the
+    /// engine surface-and-delete the one bad record —
+    /// [`SyncDb::delete_item`] for an item, [`SyncDb::clear_upload`] for
+    /// an upload, [`SyncDb::queue_clear`] for a queue row (whose *key*
+    /// is the corrupt string itself) — instead of losing all enumeration.
+    /// This matters most for the `items` scans, the crash-recovery source
+    /// of truth, where clearing everything is not a recovery option.
+    #[error("state db record encoding error at key {key:?}: {source}")]
+    CodecAt {
+        /// The stored key, in raw string form: a valid relkey/device id
+        /// when the value side of the row is corrupt (the common case),
+        /// or the corrupt raw key itself when the key side is.
+        key: String,
+        /// The decode failure.
+        source: serde_json::Error,
+    },
 }
 
 impl From<redb::Error> for StateError {
@@ -382,6 +420,16 @@ fn from_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StateError> {
     Ok(serde_json::from_slice(bytes)?)
 }
 
+/// [`from_json`] with the row's key attached ([`StateError::CodecAt`]) —
+/// for enumeration scans, whose caller cannot otherwise learn which row
+/// is corrupt.
+fn from_json_at<T: DeserializeOwned>(key: &str, bytes: &[u8]) -> Result<T, StateError> {
+    serde_json::from_slice(bytes).map_err(|source| StateError::CodecAt {
+        key: key.to_owned(),
+        source,
+    })
+}
+
 /// Rehydrates a validating string newtype ([`RelKey`], [`Blake3Hex`],
 /// [`ContentId`], [`DeviceId`]) from its stored string form through its own
 /// `Deserialize` impl, so the type's validation runs and a corrupt stored
@@ -390,6 +438,18 @@ fn from_stored_str<T: DeserializeOwned>(s: &str) -> Result<T, StateError> {
     Ok(serde_json::from_value(serde_json::Value::String(
         s.to_owned(),
     ))?)
+}
+
+/// [`from_stored_str`] with key context attached
+/// ([`StateError::CodecAt`]) — for enumeration scans. When the corrupt
+/// string *is* the row's key, pass it as both arguments.
+fn from_stored_str_at<T: DeserializeOwned>(key: &str, s: &str) -> Result<T, StateError> {
+    serde_json::from_value(serde_json::Value::String(s.to_owned())).map_err(|source| {
+        StateError::CodecAt {
+            key: key.to_owned(),
+            source,
+        }
+    })
 }
 
 /// Reads a JSON-encoded meta value (`None` when the key is absent).
@@ -1015,6 +1075,38 @@ impl SyncDb {
         self.with_txn(|t| t.replay_put_item(relkey, record))
     }
 
+    /// Wholesale-replaces an **existing** item record — including its
+    /// state, bypassing the §2.4 legality table like
+    /// [`SyncDb::replay_put_item`] — but **guarded by compare-and-set** on
+    /// the stored state: the record must exist and currently be in
+    /// `expected_state`, or [`StateError::StaleState`] is returned and
+    /// nothing changes.
+    ///
+    /// This is the apply loop's path for the semantic replacements the
+    /// §2.4 table deliberately has no edge for, where the CAS-free
+    /// [`SyncDb::replay_put_item`] would reopen the exact lost-update
+    /// hazard [`SyncDb::update_item`] was added to close (a racing
+    /// transfer-engine transition silently stomped between read and
+    /// write). The two known cases:
+    ///
+    /// | Replace | Why there is no [`legal`] edge |
+    /// |---|---|
+    /// | `Stub` record → `Dirty` record (new `content_id`) | §2.8 out-of-band overwrite of an evicted original: the bytes were *replaced* on disk, not downloaded, so the `Stub → Downloading → …` download rows do not apply |
+    /// | `Dirty` record → `Synced` record (merged vv) | §2.6 apply rule case 1: remote `sem_hash` equals local — converged, adopt metadata and drop the dirt with **no upload**, so the `Dirty → Queued → …` upload rows do not apply |
+    ///
+    /// State-machine steps stay on [`SyncDb::transition`];
+    /// state-preserving mutations on [`SyncDb::update_item`]; unguarded
+    /// ingest/replay on [`SyncDb::replay_put_item`]. Named `replay_*` so
+    /// every legality bypass stays greppable.
+    pub fn replay_put_item_cas(
+        &self,
+        relkey: &RelKey,
+        expected_state: ItemState,
+        record: &ItemRecord,
+    ) -> Result<(), StateError> {
+        self.with_txn(|t| t.replay_put_item_cas(relkey, expected_state, record))
+    }
+
     /// Reads an item record (`None` when absent). A stored value that does
     /// not parse is [`StateError::Codec`], never a panic.
     pub fn get_item(&self, relkey: &RelKey) -> Result<Option<ItemRecord>, StateError> {
@@ -1047,13 +1139,22 @@ impl SyncDb {
     /// findable only by scanning. v1 materializes the result (libraries are
     /// bounded; records are small); a streaming iterator can replace this
     /// without changing callers' logic.
+    ///
+    /// A row that fails to decode aborts the scan with
+    /// [`StateError::CodecAt`] naming its key, so the one bad record can
+    /// be removed via [`SyncDb::delete_item`] and the scan retried —
+    /// enumeration is never lost wholesale to a single corrupt row.
     pub fn iter_items(&self) -> Result<Vec<(RelKey, ItemRecord)>, StateError> {
         let txn = self.begin_read()?;
         let items = txn.open_table(T_ITEMS).map_err(db_err)?;
         let mut out = Vec::new();
         for entry in items.iter().map_err(db_err)? {
             let (key, value) = entry.map_err(db_err)?;
-            out.push((from_stored_str(key.value())?, from_json(value.value())?));
+            let raw = key.value();
+            out.push((
+                from_stored_str_at(raw, raw)?,
+                from_json_at(raw, value.value())?,
+            ));
         }
         Ok(out)
     }
@@ -1070,9 +1171,10 @@ impl SyncDb {
         let mut out = Vec::new();
         for entry in items.iter().map_err(db_err)? {
             let (key, value) = entry.map_err(db_err)?;
-            let record: ItemRecord = from_json(value.value())?;
+            let raw = key.value();
+            let record: ItemRecord = from_json_at(raw, value.value())?;
             if record.state == state {
-                out.push((from_stored_str(key.value())?, record));
+                out.push((from_stored_str_at(raw, raw)?, record));
             }
         }
         Ok(out)
@@ -1080,13 +1182,21 @@ impl SyncDb {
 
     /// Number of items currently in `state` (§3.3/§3.8 "N edits not backed
     /// up" / `dirty_unbacked` feed).
+    ///
+    /// Cost: like the other enumeration accessors, this decodes **every**
+    /// item record (a full-table JSON scan) — fine for recovery,
+    /// verification and seeding, wrong for a hot path. The §3.3/§3.8
+    /// status feed ticks at up to 1 Hz: the engine must seed in-memory
+    /// per-state counters from one scan at startup and maintain them on
+    /// its own transition/insert/delete calls, reaching for this accessor
+    /// only to (re-)verify — e.g. after crash recovery — never per tick.
     pub fn count_in_state(&self, state: ItemState) -> Result<u64, StateError> {
         let txn = self.begin_read()?;
         let items = txn.open_table(T_ITEMS).map_err(db_err)?;
         let mut count = 0u64;
         for entry in items.iter().map_err(db_err)? {
-            let (_, value) = entry.map_err(db_err)?;
-            let record: ItemRecord = from_json(value.value())?;
+            let (key, value) = entry.map_err(db_err)?;
+            let record: ItemRecord = from_json_at(key.value(), value.value())?;
             if record.state == state {
                 count += 1;
             }
@@ -1196,6 +1306,31 @@ impl SyncDb {
     /// such a stale write idempotent.
     pub fn set_cursor(&self, device: &DeviceId, seq: u64) -> Result<(), StateError> {
         self.with_txn(|t| t.set_cursor(device, seq))
+    }
+
+    /// Every known peer cursor, as `(device, highest contiguously-applied
+    /// seq)` ascending by device id — the full `cursors` map, where
+    /// [`SyncDb::cursor`] is the point read.
+    ///
+    /// The engine needs the whole map in two places: the §1.2
+    /// device-registry heartbeat publishes `applied: {device: seq}` for
+    /// every known peer, and §2.3 bootstrap/catch-up compares the merged
+    /// cursors against the journal's segments. Without this accessor the
+    /// engine would have to keep a shadow map of peers outside the durable
+    /// store. A device appears once a cursor has been set for it
+    /// ([`SyncDb::set_cursor`]); peers this device has never applied from
+    /// read as absent here (their cursor is implicitly 0), and enumerating
+    /// *those* is the device registry's concern, not this table's.
+    pub fn iter_cursors(&self) -> Result<Vec<(DeviceId, u64)>, StateError> {
+        let txn = self.begin_read()?;
+        let cursors = txn.open_table(T_CURSORS).map_err(db_err)?;
+        let mut out = Vec::new();
+        for entry in cursors.iter().map_err(db_err)? {
+            let (key, value) = entry.map_err(db_err)?;
+            let raw = key.value();
+            out.push((from_stored_str_at(raw, raw)?, value.value()));
+        }
+        Ok(out)
     }
 
     // -- journal publication (§2.1.5) --------------------------------------
@@ -1375,13 +1510,21 @@ impl SyncDb {
     /// Every in-flight multipart upload, ascending by relkey — the §2.4
     /// stale-upload hygiene scan ("engine aborts its own `upload_id`s older
     /// than 7 days") and the post-crash resume scan.
+    ///
+    /// A row that fails to decode aborts the scan with
+    /// [`StateError::CodecAt`] naming its key (recovery:
+    /// [`SyncDb::clear_upload`] that one key, then rescan).
     pub fn iter_uploads(&self) -> Result<Vec<(RelKey, MultipartUploadState)>, StateError> {
         let txn = self.begin_read()?;
         let uploads = txn.open_table(T_UPLOADS).map_err(db_err)?;
         let mut out = Vec::new();
         for entry in uploads.iter().map_err(db_err)? {
             let (key, value) = entry.map_err(db_err)?;
-            out.push((from_stored_str(key.value())?, from_json(value.value())?));
+            let raw = key.value();
+            out.push((
+                from_stored_str_at(raw, raw)?,
+                from_json_at(raw, value.value())?,
+            ));
         }
         Ok(out)
     }
@@ -1438,7 +1581,7 @@ impl SyncDb {
         let entries = txn.open_table(entries_def).map_err(db_err)?;
         match queue_head(&entries)? {
             None => Ok(None),
-            Some((class, _, rel)) => Ok(Some((from_stored_str::<RelKey>(&rel)?, class))),
+            Some((class, _, rel)) => Ok(Some((from_stored_str_at::<RelKey>(&rel, &rel)?, class))),
         }
     }
 
@@ -1497,7 +1640,8 @@ impl SyncDb {
     /// wedges [`SyncDb::queue_pop`] permanently (its doc) and is not
     /// addressable by [`SyncDb::queue_remove`], so without a raw drain the
     /// queue would be the one subsystem with no recovery path (a corrupt
-    /// *item* is still deletable via [`SyncDb::delete_item`]). After
+    /// *item* is still deletable via [`SyncDb::delete_item`] — the item
+    /// scans' [`StateError::CodecAt`] names its key). After
     /// clearing, rebuild from [`SyncDb::items_in_state`] — item state, not
     /// queue membership, is the crash-recovery source of truth
     /// ([`SyncDb::iter_items`] docs) — accepting re-derived priorities and
@@ -1675,6 +1819,19 @@ impl SyncDb {
         })
     }
 
+    /// Test support only: store raw (typically unparseable) bytes as the
+    /// multipart upload state for `relkey`, so the keyed enumeration
+    /// error ([`StateError::CodecAt`]) can be pinned on the uploads scan.
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn force_corrupt_upload(&self, relkey: &RelKey, bytes: &[u8]) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut uploads = t.txn.open_table(T_UPLOADS).map_err(db_err)?;
+            uploads.insert(relkey.as_str(), bytes).map_err(db_err)?;
+            Ok(())
+        })
+    }
+
     /// Test support only: enqueue a raw string that is NOT a valid relkey
     /// (modeling on-disk corruption of a queue row), so the documented
     /// wedged-pop behavior and the [`SyncDb::queue_clear`] recovery path
@@ -1786,7 +1943,7 @@ impl StateTxn<'_> {
         let entries = self.txn.open_table(entries_def).map_err(db_err)?;
         match queue_head(&entries)? {
             None => Ok(None),
-            Some((class, _, rel)) => Ok(Some((from_stored_str::<RelKey>(&rel)?, class))),
+            Some((class, _, rel)) => Ok(Some((from_stored_str_at::<RelKey>(&rel, &rel)?, class))),
         }
     }
 
@@ -1825,6 +1982,40 @@ impl StateTxn<'_> {
     pub fn replay_put_item(&self, relkey: &RelKey, record: &ItemRecord) -> Result<(), StateError> {
         let value = to_json(record)?;
         let mut items = self.txn.open_table(T_ITEMS).map_err(db_err)?;
+        items
+            .insert(relkey.as_str(), value.as_slice())
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// [`SyncDb::replay_put_item_cas`] within this transaction — the §2.6
+    /// case-1 converged adoption composes with [`StateTxn::mark_applied`]
+    /// / [`StateTxn::set_cursor`] in one commit here.
+    pub fn replay_put_item_cas(
+        &self,
+        relkey: &RelKey,
+        expected_state: ItemState,
+        record: &ItemRecord,
+    ) -> Result<(), StateError> {
+        let mut items = self.txn.open_table(T_ITEMS).map_err(db_err)?;
+        let stored = match read_item(&items, relkey)? {
+            None => {
+                return Err(StateError::StaleState {
+                    relkey: relkey.clone(),
+                    expected: expected_state,
+                    found: None,
+                });
+            }
+            Some(record) => record,
+        };
+        if stored.state != expected_state {
+            return Err(StateError::StaleState {
+                relkey: relkey.clone(),
+                expected: expected_state,
+                found: Some(stored.state),
+            });
+        }
+        let value = to_json(record)?;
         items
             .insert(relkey.as_str(), value.as_slice())
             .map_err(db_err)?;
@@ -1949,7 +2140,11 @@ impl StateTxn<'_> {
     /// [`SyncDb::freeze_next_segment`] within this transaction — e.g. the
     /// §2.4 `verifying → synced` step, which freezes the journal entry and
     /// transitions the item in one commit. A builder `Err` propagated out
-    /// of the closure aborts the whole composite.
+    /// of the closure aborts the whole composite; it may instead be
+    /// **caught inside the closure** (shrink the batch and retry in the
+    /// same commit): the seq counter is restored before the error
+    /// returns, so the failed attempt consumes no seqs either way
+    /// ([`StateError::SegmentBuild`]).
     pub fn freeze_next_segment(
         &self,
         entry_count: u64,
@@ -1962,7 +2157,25 @@ impl StateTxn<'_> {
             let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
             bump_counter_by(&mut meta, K_LAST_SEQ, entry_count)?
         };
-        let bytes = build(first)?;
+        // Every typed refusal below restores the counter to its prior
+        // value before returning. Within this still-open write transaction
+        // the bump is not yet observable to anyone, so the restore is
+        // race-free — and it is what makes the SegmentBuild "no seqs were
+        // consumed" contract true at THIS level too: a caller that catches
+        // the error inside a `with_txn` closure and shrink-retries in the
+        // same commit (the pattern the error doc invites) would otherwise
+        // commit the failed attempt's seqs as a permanent
+        // allocated-never-frozen hole — stalling remote §2.2 contiguity
+        // cursors and pinning the published floor for the life of the
+        // device. (The meta table is reopened here, not held across
+        // `build`, so a builder that captures the enclosing [`StateTxn`]
+        // can still read meta-backed values.)
+        let restore = || {
+            let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(K_LAST_SEQ, to_json(&(first - 1))?.as_slice())
+                .map_err(db_err)?;
+            Ok::<(), StateError>(())
+        };
         let mut segments = self.txn.open_table(T_SEGMENTS).map_err(db_err)?;
         // Defensive: freshly allocated seqs cannot already be covered
         // unless the counter was tampered backwards; refuse rather than
@@ -1971,8 +2184,16 @@ impl StateTxn<'_> {
         if span_covering(&segments, first)?.is_some()
             || segments.range(first..).map_err(db_err)?.next().is_some()
         {
+            restore()?;
             return Err(StateError::AlreadyFrozen { seq: first });
         }
+        let bytes = match build(first) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                restore()?;
+                return Err(e);
+            }
+        };
         segments
             .insert(first, (entry_count, bytes.as_slice()))
             .map_err(db_err)?;
@@ -2126,7 +2347,7 @@ impl StateTxn<'_> {
                 entries.remove((class, arrival)).map_err(db_err)?;
                 let mut idx = self.txn.open_table(idx_def).map_err(db_err)?;
                 idx.remove(rel.as_str()).map_err(db_err)?;
-                Ok(Some((from_stored_str::<RelKey>(&rel)?, class)))
+                Ok(Some((from_stored_str_at::<RelKey>(&rel, &rel)?, class)))
             }
         }
     }
