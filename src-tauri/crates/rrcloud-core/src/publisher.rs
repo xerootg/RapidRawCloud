@@ -414,14 +414,36 @@ pub async fn publish_pending(
         let key = journal_segment_key(&device, first_seq);
         // A failure here stops the drain: this segment and every later one
         // stay frozen and unpublished, and no later PUT is attempted.
-        s3.put_object(
-            bucket,
-            &key,
-            bytes::Bytes::from(bytes),
-            &PutObjectOptions::default(),
-        )
-        .await?;
+        let output = s3
+            .put_object(
+                bucket,
+                &key,
+                bytes::Bytes::from(bytes),
+                &PutObjectOptions::default(),
+            )
+            .await?;
         db.mark_published(first_seq)?;
+        // §2.10 14-day cap input: stamp this segment's server-time
+        // publication instant so compaction ages it in server time, never
+        // the local clock. Prefer this PUT's own `Date` (also refreshing the
+        // stored offset); fall back to the stored-offset estimate when the
+        // backend omitted a parsable header. A missing stamp only makes
+        // compaction's cap conservative (it will not cap-delete an unaged
+        // segment), never unsafe.
+        let segment_server_ts = match output.date.as_deref().and_then(parse_http_date) {
+            Some(server_secs) => {
+                let offset_ms = server_secs
+                    .saturating_mul(1000)
+                    .saturating_sub(local_unix_ms());
+                db.set_server_time_offset_ms(offset_ms)?;
+                server_secs
+            }
+            None => {
+                let offset_ms = db.server_time_offset_ms()?.unwrap_or(0);
+                local_unix_ms().saturating_add(offset_ms).div_euclid(1000)
+            }
+        };
+        db.set_segment_published_server_ts(first_seq, segment_server_ts)?;
         report.segments.push(first_seq);
         report.entries += entries;
     }
@@ -568,7 +590,7 @@ fn local_unix_ms() -> i64 {
 /// unix seconds. `None` for anything else — including the two obsolete
 /// HTTP-date forms, which no S3 backend this engine targets emits; the
 /// caller surfaces `None` as the typed [`PublisherError::NoServerDate`].
-fn parse_http_date(s: &str) -> Option<i64> {
+pub(crate) fn parse_http_date(s: &str) -> Option<i64> {
     // "<day-name>, " is exactly 5 bytes; the rest is fixed-width fields.
     let rest = s.get(5..)?;
     let mut fields = rest.split(' ');

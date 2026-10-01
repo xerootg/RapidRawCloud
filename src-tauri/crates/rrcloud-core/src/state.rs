@@ -428,6 +428,22 @@ const K_OUTBOUND_ARRIVAL: &str = "outbound_arrival";
 const K_SERVER_TIME_OFFSET_MS: &str = "server_time_offset_ms";
 /// §2.4 setup-probe outcome: does the backend reject a wrong `Content-MD5`?
 const K_BACKEND_DIGEST_REJECTION: &str = "backend_digest_rejection";
+/// §2.3/§2.10 pre-upload quarantine input: the server time (unix seconds)
+/// through which this device has provably applied every deletion — the
+/// newest point its deleted-set knowledge is complete to. When
+/// `now_server - this > 12 months` (the deleted-set retention window), the
+/// device can no longer prove a local-only key was not deleted, so it must
+/// quarantine rather than auto-re-upload (`crate::compact`).
+const K_APPLIED_PROOF_SERVER_TS: &str = "applied_proof_server_ts";
+/// Per-segment server-time publish stamp key prefix (§2.10 14-day cap).
+const K_SEGMENT_PUB_TS_PREFIX: &str = "seg_pub_ts:";
+
+/// The meta key holding the server-time publish stamp of the own-prefix
+/// segment starting at `first_seq` (zero-padded hex, so keys sort in seq
+/// order under a prefix scan should one ever be needed).
+fn segment_pub_ts_key(first_seq: u64) -> String {
+    format!("{K_SEGMENT_PUB_TS_PREFIX}{first_seq:016x}")
+}
 
 // ---------------------------------------------------------------------------
 // Encoding helpers
@@ -2104,6 +2120,60 @@ impl SyncDb {
             let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
             meta.insert(K_BACKEND_DIGEST_REJECTION, to_json(&works)?.as_slice())
                 .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// The server time (unix seconds) through which this device has provably
+    /// applied every deletion (§2.3/§2.10 pre-upload quarantine input), or
+    /// `None` before any catch-up has recorded one. See
+    /// [`K_APPLIED_PROOF_SERVER_TS`].
+    pub fn applied_proof_server_ts(&self) -> Result<Option<i64>, StateError> {
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(T_META).map_err(db_err)?;
+        meta_get(&meta, K_APPLIED_PROOF_SERVER_TS)
+    }
+
+    /// Records the deletion-knowledge proof horizon (see
+    /// [`SyncDb::applied_proof_server_ts`]). Monotonic in intent but not
+    /// enforced here — the engine advances it only forward.
+    pub fn set_applied_proof_server_ts(&self, server_ts: i64) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(K_APPLIED_PROOF_SERVER_TS, to_json(&server_ts)?.as_slice())
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// The **server** time (unix seconds) at which this device published the
+    /// own-prefix segment whose first entry is `first_seq`, or `None` if
+    /// unstamped. §2.10 segment compaction's 14-day cap is measured against
+    /// this — a server-time fact, never the local clock, so two differently
+    /// skewed devices age the same segment identically. Stored under a
+    /// per-segment meta key.
+    pub fn segment_published_server_ts(&self, first_seq: u64) -> Result<Option<i64>, StateError> {
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(T_META).map_err(db_err)?;
+        meta_get(&meta, &segment_pub_ts_key(first_seq))
+    }
+
+    /// Stamps the server-time publication instant of the own-prefix segment
+    /// at `first_seq` (see [`SyncDb::segment_published_server_ts`]). The
+    /// publisher stamps this as it marks a segment published; compaction
+    /// reads it for the 14-day cap.
+    pub fn set_segment_published_server_ts(
+        &self,
+        first_seq: u64,
+        server_ts: i64,
+    ) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(
+                segment_pub_ts_key(first_seq).as_str(),
+                to_json(&server_ts)?.as_slice(),
+            )
+            .map_err(db_err)?;
             Ok(())
         })
     }

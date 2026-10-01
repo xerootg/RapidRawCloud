@@ -231,6 +231,14 @@ pub struct HeadObjectOutput {
     pub metadata: BTreeMap<String, String>,
     /// `Last-Modified` header, verbatim.
     pub last_modified: Option<String>,
+    /// The response's `Date` header, verbatim (RFC 9110 HTTP-date), when
+    /// present — the same **server time** source as [`PutObjectOutput::date`]
+    /// (architecture §2.10). A HEAD is the compaction/GC runner's natural
+    /// server-time measurement point: the §2.10 read-back HEAD and 24 h
+    /// re-confirm run on every pass, letting a worker that never heartbeats
+    /// (it does not journal between runs) still refresh its offset. Additive
+    /// field: populated here, consumed by `crate::compact`'s recording hook.
+    pub date: Option<String>,
 }
 
 /// Result of a `CopyObject`.
@@ -574,6 +582,7 @@ impl S3Client {
             content_type: header_string(resp.headers(), "content-type"),
             metadata: user_metadata(resp.headers()),
             last_modified: header_string(resp.headers(), "last-modified"),
+            date: header_string(resp.headers(), "date"),
         })
     }
 

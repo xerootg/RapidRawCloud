@@ -28,11 +28,15 @@
 //!   change intake, §3.7 quiescence admission (the §2.6 version mint),
 //!   the §2.6 unified apply rule as a `JournalConsumer`, §2.7 soft
 //!   delete/restore/resurrection, §2.8 original-overwrite conflicts.
+//! - [`compact`]: §2.10 compaction, horizons, GC, device lifecycle, and
+//!   the §2.3 pre-upload quarantine decision — the pure server-time
+//!   decisions and their S3 effects, driven by explicit entry points.
 //!
-//! The remaining modules from architecture §3.1 (`tombstone`, `compact`,
-//! `proxy`, `thumbs`) land in later units.
+//! The remaining modules from architecture §3.1 (`proxy`, `thumbs`) land in
+//! later units.
 
 pub mod clock;
+pub mod compact;
 pub mod engine;
 pub mod journal;
 pub mod keys;
