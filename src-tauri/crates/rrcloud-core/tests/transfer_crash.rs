@@ -52,7 +52,7 @@ mod linux {
     };
     use rrcloud_core::semhash::Blake3Hex;
     use rrcloud_core::state::{ItemState, SyncDb};
-    use rrcloud_core::transfer::upload_item;
+    use rrcloud_core::transfer::{recover_interrupted, upload_item};
 
     use crate::common::garage;
     use crate::common::transfer as h;
@@ -398,6 +398,24 @@ mod linux {
             "the crash left the item mid-uploading"
         );
         assert_eq!(db.outbound_len().expect("outbound_len"), 0);
+
+        // The startup sweep re-admits the stranded item (uploading →
+        // queued, multipart record kept): upload_item's single-driver
+        // entry gate accepts only `queued`.
+        let report = recover_interrupted(&db, 0).expect("recovery sweep");
+        assert_eq!(report.requeued_uploads, vec![r.clone()]);
+        assert_eq!(
+            db.get_item(&r)
+                .expect("get item")
+                .expect("item exists")
+                .state,
+            ItemState::Queued,
+            "recovery demotes the stranded uploading item back to queued"
+        );
+        assert!(
+            db.get_upload(&r).expect("get_upload").is_some(),
+            "the multipart record survives recovery and drives the resume"
+        );
 
         // RESUME with a fresh engine instance and a counting client.
         let counting = CountingS3::new(g.client());

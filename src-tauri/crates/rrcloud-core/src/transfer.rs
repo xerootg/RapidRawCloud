@@ -60,11 +60,18 @@
 //! longer knows (swept elsewhere, or completed just before a crash) never
 //! wedges the item. `Complete` failing `NoSuchUpload` on a resume that
 //! re-uploaded nothing is the crash-after-complete signature: the stored
-//! object is HEAD-checked against the re-hashed source facts and, on
-//! match, adopted and verified/journaled as usual. Every other
-//! `NoSuchUpload` (mid-part, mismatched HEAD, abort of an already-gone
-//! upload) clears the local multipart record so the next pass restarts
-//! cleanly instead of retrying a dead upload id forever.
+//! object is HEAD-checked and adopted **only when it is provably our
+//! completed upload** — `content_length` must equal the re-read source
+//! size *and* the stored ETag must equal the multipart ETag derivable
+//! from the recorded part MD5s (`hex(md5(concat(part md5 bytes)))-<n>`,
+//! the S3 multipart ETag convention the §8 harness validates on
+//! Garage/MinIO). Size alone is not proof: relkeys map to *shared*
+//! bucket keys (§1.2), so after our id was swept a sibling device may
+//! have stored a same-size different-content version at the key —
+//! adopting it would journal a blake3 no stored object has and poison
+//! every downloader (§2.1.5). On any mismatch the record is cleared and
+//! the next pass restarts cleanly, like every other `NoSuchUpload`
+//! (mid-part, mismatched HEAD, abort of an already-gone upload).
 //!
 //! `uploading → verifying`: HEAD, size check; single-part ETag == our MD5;
 //! multipart parts were server-verified at receipt. When the backend
@@ -98,10 +105,17 @@
 //! destination followed by an mtime restore (`filetime`) to the provided
 //! remote mtime. The engine does **not** hard-depend on conditional
 //! requests to detect a mid-download remote replacement: the final-hash
-//! check is the backstop (a replaced object can never install). File I/O
-//! on this path goes through `tokio::fs` (reads/writes land on tokio's
-//! blocking pool in bounded chunks), so one item's disk work never stalls
-//! the pump's other in-flight transfers.
+//! check is the backstop (a replaced object can never install). File
+//! *data* I/O on this path goes through `tokio::fs` (reads/writes land on
+//! tokio's blocking pool in bounded chunks), so one item's bulk disk work
+//! never stalls the pump's other in-flight transfers. Two classes of
+//! small, bounded calls remain synchronous on the caller's task and are a
+//! deliberate trade-off, not an oversight: the post-install mtime restore
+//! (one `utimensat`-class syscall via `filetime`) and every state-machine
+//! commit (a synchronous redb fsync — one per part / transition). Both
+//! are micro-scale next to a multi-MiB part transfer; batching or
+//! off-loading them would need a tokio runtime feature this crate
+//! deliberately does not depend on.
 //!
 //! # Pump
 //!
@@ -115,20 +129,34 @@
 //! stops the pump. A [`CancelFlag`] stops *admission* deterministically
 //! and waits for in-flight items to finish.
 //!
-//! # Crash recovery ([`recover_interrupted`])
+//! # Crash recovery ([`recover_interrupted`]) and single-driver entry
 //!
 //! A crash can strand an item in a pipeline-interior state whose durable
 //! queue row is already gone: `uploading` (with or without a multipart
 //! record), `verifying` (object stored, nothing journaled), or
-//! `downloading` (queue row popped before the crash). [`upload_item`]
-//! accepts `uploading` re-entry directly (resuming when a multipart
-//! record survives, restarting otherwise) and [`download_item`] accepts
-//! `downloading`, but nothing re-*drives* them: the pump only pops queue
-//! rows. [`recover_interrupted`] is the startup sweep that closes that
-//! gap — it walks the three stranded states, demotes along the legal
-//! §2.4 edges where needed, and re-pushes each item onto its queue. The
-//! supervisor (§3.3, a later unit) must run it once before its first
-//! pump pass; it assumes the single-supervisor exclusion (§5.1).
+//! `downloading` (queue row popped before the crash).
+//! [`recover_interrupted`] is the startup sweep that re-drives them: it
+//! demotes each stranded item along its legal §2.4 edge back to its
+//! queueable state (`uploading`/`verifying` → `queued`, `downloading` →
+//! `pending_down` — a surviving multipart record or `.rr.part` partial
+//! is what makes the next attempt a *resume*, not the state) and
+//! re-pushes it onto its queue. The supervisor (§3.3, a later unit) must
+//! run it once before its first pump pass; it assumes the
+//! single-supervisor exclusion (§5.1).
+//!
+//! Because recovery normalizes every stranded state, the engine entry
+//! points accept **only** the queueable states and admit via transition
+//! CAS: [`upload_item`] requires `queued`, [`download_item`] requires
+//! `pending_down` or `stub`. A record already sitting at
+//! `uploading`/`downloading` therefore means exactly one thing — a
+//! *live* concurrent transfer owns the item right now — and the second
+//! caller gets a typed [`StateError::StaleState`] instead of silently
+//! double-driving the same multipart bookkeeping or `.rr.part` partial
+//! (which could install a file the live writer keeps appending to).
+//! Callers that can legitimately race on one item (the §3.5
+//! `ensure_local` guard sites vs. the background pump) must treat that
+//! error as "already in flight" — wait for the live transfer or
+//! single-flight per relkey — never as a retry-now signal.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -316,6 +344,9 @@ pub enum TransferError {
     /// nothing could ever verify the fetched bytes, so the engine refuses
     /// to install them (§3.5 — the hash is the backstop for *every*
     /// failure mode, so an unverifiable download is never attempted).
+    /// Because the engine can never supply the missing hash itself, the
+    /// pump **parks** such an item off the queue (state left
+    /// `pending_down`, row not re-pushed) — see [`pump_downloads`].
     #[error("item record for {relkey} has no blake3; refusing an unverifiable download")]
     MissingExpectedHash {
         /// The item.
@@ -528,12 +559,15 @@ pub async fn upload_item(
 /// Uploads one item per §2.4 (see the module docs for the full state
 /// walk), reading bytes through `chunks`.
 ///
-/// Entry states: `queued` (fresh admission; CAS `queued → uploading`) or
-/// `uploading` (crash-recovery re-entry: resumed in place when a
-/// multipart record survives, **restarted from the top** when none does —
-/// the crash-mid-single-PUT / crash-before-`set_upload` windows, which
-/// must not wedge). Anything else is a typed [`StateError::StaleState`]
-/// via [`TransferError::State`].
+/// Entry state: `queued`, admitted via the `queued → uploading`
+/// transition CAS — the single-driver gate (module docs, "Crash recovery
+/// and single-driver entry"). A crash-stranded `uploading` item is
+/// re-admitted by [`recover_interrupted`] demoting it back to `queued`
+/// first (its surviving multipart record is what makes the next pass a
+/// resume); a record *still* at `uploading` here means a live concurrent
+/// transfer owns the item, and this caller gets the CAS's typed
+/// [`StateError::StaleState`] via [`TransferError::State`] without
+/// touching the shared bookkeeping.
 ///
 /// On success the item is `synced` with `verified_remote` set, its
 /// multipart bookkeeping is cleared, and the journal `put` entry is
@@ -563,14 +597,13 @@ pub async fn upload_item_from(
     let key = bucket_key_for(relkey, record.kind)?;
     let resume = db.get_upload(relkey)?;
 
-    // Entry: `queued → uploading` CAS, or crash-recovery re-entry already
-    // sitting at `uploading` (resumed when a multipart record survives,
-    // restarted otherwise — a crash mid-single-PUT or before `set_upload`
-    // leaves `uploading` with no record, and must not wedge). Any other
-    // state fails the CAS typed (StaleState / IllegalTransition).
-    if record.state != ItemState::Uploading {
-        db.transition(relkey, ItemState::Queued, ItemState::Uploading, |_| {})?;
-    }
+    // Entry: the `queued → uploading` CAS is the single-driver gate.
+    // `uploading` is NOT accepted here: recover_interrupted demotes every
+    // crash-stranded `uploading` item back to `queued` (keeping its
+    // multipart record for the resume), so a record still at `uploading`
+    // means a live concurrent transfer owns this item — the CAS fails
+    // typed (StaleState) before any shared bookkeeping is touched.
+    db.transition(relkey, ItemState::Queued, ItemState::Uploading, |_| {})?;
 
     // ---- uploading: send the bytes (single PUT or multipart) ----
     let sent = match transfer_object(db, s3, cfg, relkey, &record, &key, source, chunks, resume)
@@ -585,7 +618,8 @@ pub async fn upload_item_from(
             e @ (TransferError::AbortedSourceChanged { .. } | TransferError::SidecarInvalid { .. }),
         ) => return Err(e),
         Err(e) => {
-            demote(db, relkey, ItemState::Uploading, ItemState::Queued);
+            // The transfer failure stays primary (demote doc).
+            let _ = demote(db, relkey, ItemState::Uploading, ItemState::Queued);
             return Err(e);
         }
     };
@@ -604,11 +638,12 @@ pub async fn upload_item_from(
     if let Err(e) = verify_remote(s3, cfg, relkey, &key, &sent).await {
         return Err(match e {
             corrupt @ TransferError::CorruptRemote { .. } => {
-                demote(db, relkey, ItemState::Verifying, ItemState::CorruptRemote);
+                // The verify outcome stays primary (demote doc).
+                let _ = demote(db, relkey, ItemState::Verifying, ItemState::CorruptRemote);
                 corrupt
             }
             other => {
-                demote(db, relkey, ItemState::Verifying, ItemState::Queued);
+                let _ = demote(db, relkey, ItemState::Verifying, ItemState::Queued);
                 other
             }
         });
@@ -676,8 +711,9 @@ pub async fn upload_item_from(
             Ok(id) => id,
             Err(e) => {
                 // The whole commit rolled back: the item is still
-                // `verifying`; re-queue it so the next pass retries.
-                demote(db, relkey, ItemState::Verifying, ItemState::Queued);
+                // `verifying`; re-queue it so the next pass retries. The
+                // commit failure stays primary (demote doc).
+                let _ = demote(db, relkey, ItemState::Verifying, ItemState::Queued);
                 return Err(e);
             }
         }
@@ -695,7 +731,10 @@ pub async fn upload_item_from(
         Err(_) => true,
     };
     if source_changed_at_completion {
-        demote(db, relkey, ItemState::Synced, ItemState::Dirty);
+        // No primary error exists on this success path, so a real state
+        // store failure here (anything but the tolerated CAS loss) must
+        // surface rather than silently leave the rewritten item `synced`.
+        demote(db, relkey, ItemState::Synced, ItemState::Dirty)?;
     }
 
     Ok(UploadOutcome {
@@ -995,21 +1034,32 @@ async fn transfer_object(
             //
             // The crash-after-Complete signature — a resume in which every
             // part was already recorded (nothing re-uploaded this pass) —
-            // means a previous run completed the upload and died before
-            // clearing the bookkeeping. The stored object is adopted iff
-            // it HEAD-matches the size whose ranges were just re-read and
-            // MD5-verified against the recorded parts (so `hasher`
-            // honestly names its bytes); verify and the journal commit
-            // then run as usual.
+            // means a previous run *may* have completed the upload and
+            // died before clearing the bookkeeping. The stored object is
+            // adopted only when it is provably OUR completed upload:
+            // HEAD's `content_length` must equal the size whose ranges
+            // were just re-read and MD5-verified against the recorded
+            // parts (so `hasher` honestly names its bytes), AND the
+            // stored ETag must equal the multipart ETag derivable from
+            // exactly those recorded part MD5s. Size alone is not proof —
+            // relkeys map to shared bucket keys (§1.2), so after our id
+            // was swept (the §2.4 hygiene is cross-device by design) a
+            // sibling may have stored a same-size different-content
+            // version at this key, and adopting it would journal a blake3
+            // no stored object has (§2.1.5 violation; every downloader
+            // would condemn the intact remote as corrupt).
             //
             // Anything else (the id was swept out from under us — some
-            // backends accept the parts and only fail at Complete): the
-            // upload is unfinishable, so the record is cleared and the
-            // requeued item restarts cleanly instead of retrying a dead
-            // id forever.
+            // backends accept the parts and only fail at Complete; or the
+            // stored object is not ours): the upload is unfinishable, so
+            // the record is cleared and the requeued item restarts
+            // cleanly instead of retrying a dead id forever.
             if resuming && uploaded_this_pass == 0 {
                 if let Ok(head) = s3.head_object(&cfg.bucket, key).await {
-                    if head.content_length == size {
+                    let ours = head.content_length == size
+                        && multipart_etag_from_parts(&recorded, part_count as u32)
+                            .is_some_and(|etag| etag == head.e_tag);
+                    if ours {
                         return Ok(SentObject {
                             blake3,
                             size,
@@ -1063,6 +1113,34 @@ fn park_sidecar_invalid(
         relkey: relkey.clone(),
         source,
     })
+}
+
+/// The S3 multipart ETag the backend must report for an object completed
+/// from exactly these recorded parts: `hex(md5(concat(part md5 bytes)))-
+/// <n>` (the AWS/Garage/MinIO convention the §8 harness validates, like
+/// the single-PUT `ETag == md5hex` convention). `None` when any of parts
+/// `1..=part_count` lacks a record or its persisted `md5_b64` does not
+/// decode — the caller must then treat the stored object as not provably
+/// ours.
+fn multipart_etag_from_parts(
+    recorded: &BTreeMap<u32, UploadPart>,
+    part_count: u32,
+) -> Option<String> {
+    let mut concat = Vec::with_capacity(16 * part_count as usize);
+    for part_no in 1..=part_count {
+        let md5_b64 = &recorded.get(&part_no)?.md5_b64;
+        let digest = base64::engine::general_purpose::STANDARD
+            .decode(md5_b64)
+            .ok()?;
+        if digest.len() != 16 {
+            return None;
+        }
+        concat.extend_from_slice(&digest);
+    }
+    Some(format!(
+        "{}-{part_count}",
+        hex::encode(Md5::digest(&concat))
+    ))
 }
 
 /// `true` when `e` is the backend saying the multipart upload id no
@@ -1133,7 +1211,12 @@ async fn verify_remote(
     }
     if cfg.backend.digest_rejection_works {
         // Parts (multipart) were server-MD5-verified at receipt; a single
-        // PUT's stored ETag must still equal our MD5.
+        // PUT's stored ETag must still equal our MD5, and a multipart
+        // object's stored ETag must still equal what Complete returned —
+        // a different ETag means the key no longer holds the object we
+        // verified part-by-part (e.g. a sibling device replaced the
+        // shared key between Complete and here), and journaling our
+        // blake3 against it would poison every downloader (§2.1.5).
         if let Some(md5_hex) = &sent.md5_hex {
             if head.e_tag != *md5_hex {
                 return Err(TransferError::CorruptRemote {
@@ -1141,6 +1224,14 @@ async fn verify_remote(
                     detail: format!("stored ETag {} != sent MD5 {md5_hex}", head.e_tag),
                 });
             }
+        } else if head.e_tag != sent.e_tag {
+            return Err(TransferError::CorruptRemote {
+                relkey: relkey.clone(),
+                detail: format!(
+                    "stored ETag {} != completed upload ETag {}",
+                    head.e_tag, sent.e_tag
+                ),
+            });
         }
     } else {
         // requires_readback_verify: full GET re-hash against the streamed
@@ -1300,7 +1391,7 @@ pub async fn abort_stale_uploads(
             Ok(())
         })?;
         if record.state == ItemState::Uploading {
-            demote(db, &relkey, ItemState::Uploading, ItemState::Dirty);
+            demote(db, &relkey, ItemState::Uploading, ItemState::Dirty)?;
         }
         report.aborted_own.push((relkey, upload.upload_id));
     }
@@ -1346,11 +1437,10 @@ fn initiated_unix(initiated: &str) -> Option<i64> {
 /// What [`recover_interrupted`] re-drove.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RecoveryReport {
-    /// Items found stranded in `uploading`/`verifying` and pushed back
-    /// onto the upload queue (demoted `verifying → queued`, and
-    /// `uploading → queued` when no multipart record survived; an
-    /// `uploading` item **with** a record keeps its state so
-    /// [`upload_item`] resumes it).
+    /// Items found stranded in `uploading`/`verifying`, demoted back to
+    /// `queued` and pushed onto the upload queue. A surviving multipart
+    /// record is kept — it (not the state) is what makes the next
+    /// [`upload_item`] pass a resume.
     pub requeued_uploads: Vec<RelKey>,
     /// Items found stranded in `downloading`, demoted to `pending_down`
     /// and pushed back onto the download queue (their partial survives
@@ -1379,15 +1469,15 @@ pub fn recover_interrupted(db: &SyncDb, class: u8) -> Result<RecoveryReport, Tra
         })?;
         report.requeued_uploads.push(relkey);
     }
-    // Crash mid-upload. With a multipart record the state stays
-    // `uploading` ([`upload_item`] resumes it in place); without one
-    // (mid-single-PUT, or before `set_upload`) it is demoted so the
-    // restart admission is the ordinary queued → uploading CAS.
+    // Crash mid-upload: demoted back to `queued` so re-admission is the
+    // ordinary queued → uploading CAS (the single-driver gate — a record
+    // still at `uploading` when upload_item runs means a LIVE transfer,
+    // never a crash leftover). A surviving multipart record is kept: it,
+    // not the state, is what makes the next pass a resume; without one
+    // (mid-single-PUT, or before `set_upload`) the pass restarts.
     for (relkey, _) in db.items_in_state(ItemState::Uploading)? {
         db.with_txn(|t| {
-            if t.get_upload(&relkey)?.is_none() {
-                t.transition(&relkey, ItemState::Uploading, ItemState::Queued, |_| {})?;
-            }
+            t.transition(&relkey, ItemState::Uploading, ItemState::Queued, |_| {})?;
             t.queue_push(Queue::Up, &relkey, class)?;
             Ok(())
         })?;
@@ -1467,8 +1557,19 @@ pub fn partial_path(final_path: &Path) -> PathBuf {
 /// resume with partial re-hash, blake3 verify against `expected`,
 /// sidecar parse-validation, atomic rename, mtime restore.
 ///
-/// Entry states: `pending_down` or `stub` (CAS to `downloading`), or
-/// `downloading` (crash-recovery re-entry with a surviving partial).
+/// Entry states: `pending_down` or `stub`, admitted via the transition
+/// CAS — the single-driver gate (module docs, "Crash recovery and
+/// single-driver entry"). `downloading` is **not** an entry state: a
+/// crash-stranded `downloading` item is demoted to `pending_down` by
+/// [`recover_interrupted`] before any pump pass (its surviving `.rr.part`
+/// partial is what makes the next attempt a resume), so a record already
+/// at `downloading` means a live concurrent transfer owns the item and
+/// this caller gets a typed [`StateError::StaleState`] — never a second
+/// writer appending to the live transfer's partial. Callers that can
+/// legitimately race (the §3.5 `ensure_local` guard sites vs. the pump)
+/// must treat that error as "already in flight" (wait / single-flight
+/// per relkey), not retry immediately.
+///
 /// Terminal states: originals land `hydrated`, everything else `synced`;
 /// integrity/parse failures land `corrupt_remote` (partial deleted,
 /// destination untouched). A transport failure keeps the partial and
@@ -1491,12 +1592,21 @@ pub async fn download_item(
     let final_path = local_target_path(dest_root, relkey, kind);
     let partial = partial_path(&final_path);
 
-    // Entry: `pending_down`/`stub` → `downloading`, or crash-recovery
-    // re-entry already at `downloading` (with a surviving partial). Any
-    // other state fails the CAS/legality check typed.
-    if record.state != ItemState::Downloading {
-        db.transition(relkey, record.state, ItemState::Downloading, |_| {})?;
+    // Entry: `pending_down`/`stub` → `downloading` via the transition CAS
+    // — the single-driver gate. `downloading` is NOT accepted:
+    // recover_interrupted demotes crash-stranded items before the first
+    // pump pass, so a record already at `downloading` means a live
+    // concurrent transfer owns this item (and its partial). Refuse typed
+    // instead of racing a second writer onto the shared `.rr.part`.
+    if record.state == ItemState::Downloading {
+        return Err(StateError::StaleState {
+            relkey: relkey.clone(),
+            expected: ItemState::PendingDown,
+            found: Some(ItemState::Downloading),
+        }
+        .into());
     }
+    db.transition(relkey, record.state, ItemState::Downloading, |_| {})?;
 
     let had_partial = tokio::fs::metadata(&partial)
         .await
@@ -1543,14 +1653,15 @@ pub async fn download_item(
         Err(
             e @ (TransferError::IntegrityMismatch { .. } | TransferError::SidecarInvalid { .. }),
         ) => {
-            let _ = std::fs::remove_file(&partial);
-            demote(db, relkey, ItemState::Downloading, ItemState::CorruptRemote);
+            let _ = tokio::fs::remove_file(&partial).await;
+            // The integrity/parse failure stays primary (demote doc).
+            let _ = demote(db, relkey, ItemState::Downloading, ItemState::CorruptRemote);
             Err(e)
         }
         // Everything else (transport, local I/O) keeps the partial for a
         // ranged resume and returns the item to `pending_down`.
         Err(e) => {
-            demote(db, relkey, ItemState::Downloading, ItemState::PendingDown);
+            let _ = demote(db, relkey, ItemState::Downloading, ItemState::PendingDown);
             Err(e)
         }
     }
@@ -1713,9 +1824,9 @@ impl CancelFlag {
         Self::default()
     }
 
-    /// Requests cancellation: the pump stops admitting new items (items
-    /// already running finish; items popped but not yet started are
-    /// re-queued).
+    /// Requests cancellation: the pump stops admitting new items, and
+    /// items already admitted run to completion (a popped item is in
+    /// flight immediately — there is no popped-but-not-started window).
     pub fn cancel(&self) {
         self.0.store(true, Ordering::SeqCst);
     }
@@ -1786,7 +1897,12 @@ pub async fn pump_uploads(
 /// [`ExpectedDownload`] comes from its own record (`blake3`, `size`,
 /// `mtime_unix_ns / 1e9`) and its destination from `cfg.sync_root`. An
 /// item whose record lacks a `blake3` cannot be verified and is recorded
-/// as failed (never installed unverified).
+/// as failed (never installed unverified) — and because nothing inside
+/// the engine can ever supply the missing hash, it is **parked off the
+/// queue** (state left `pending_down`, queue row not re-pushed) instead
+/// of being re-popped and re-failed on every pass forever. Whatever
+/// later supplies the hash (a journal apply advancing the head) re-queues
+/// it through its own admission.
 pub async fn pump_downloads(
     db: &SyncDb,
     s3: &impl S3TransferApi,
@@ -1842,8 +1958,11 @@ type TaggedPumpFuture<'a> =
 /// each item's outcome without stopping the others, and re-queues a
 /// failed item for a **later** pass — only when its state still says it
 /// belongs in the queue (`requeue_state`), so a terminal failure
-/// (`corrupt_remote`, re-marked `dirty`) never loops. A fired
-/// [`CancelFlag`] stops admission; in-flight items are always awaited.
+/// (`corrupt_remote`, re-marked `dirty`) never loops, and never when the
+/// failure can never heal inside the engine
+/// ([`TransferError::MissingExpectedHash`] — such an item is parked off
+/// the queue in its queueable state). A fired [`CancelFlag`] stops
+/// admission; in-flight items are always awaited.
 async fn pump<'a, F>(
     db: &SyncDb,
     queue: Queue,
@@ -1882,8 +2001,17 @@ where
         match result {
             Ok(()) => summary.completed.push(relkey),
             Err(e) => {
+                // A failure the engine can never heal on its own — a
+                // record with no expected hash stays hashless however
+                // often it is popped — is parked: recorded in the
+                // summary, left in its queueable state, but NOT re-pushed
+                // (whatever supplies the hash later re-queues it). Every
+                // other failure goes back for a later pass.
+                let never_heals = matches!(e, TransferError::MissingExpectedHash { .. });
                 summary.failed.push((relkey.clone(), e.to_string()));
-                requeue.push((relkey, class));
+                if !never_heals {
+                    requeue.push((relkey, class));
+                }
             }
         }
     }
@@ -1929,12 +2057,20 @@ fn io_err(path: &Path, source: std::io::Error) -> TransferError {
     }
 }
 
-/// Best-effort state demotion on a failure path. The primary error stays
-/// primary: a CAS loss here means a concurrent writer already moved the
-/// item (its state is *its* responsibility now) and must not mask what
-/// actually failed.
-fn demote(db: &SyncDb, relkey: &RelKey, from: ItemState, to: ItemState) {
-    let _ = db.transition(relkey, from, to, |_| {});
+/// Best-effort state demotion. A CAS loss ([`StateError::StaleState`]) is
+/// tolerated as `Ok` — it means a concurrent writer already moved the
+/// item, whose state is *its* responsibility now. Any **other** state
+/// error (redb I/O, corruption) is returned: call sites with no primary
+/// error in hand propagate it, while failure-path call sites keep their
+/// primary error primary and discard this result explicitly (`let _ =`)
+/// — the item is then stranded in a pipeline-interior state that the
+/// next [`recover_interrupted`] sweep re-drives, which is the only
+/// recovery a failing state store allows anyway.
+fn demote(db: &SyncDb, relkey: &RelKey, from: ItemState, to: ItemState) -> Result<(), StateError> {
+    match db.transition(relkey, from, to, |_| {}) {
+        Ok(_) | Err(StateError::StaleState { .. }) => Ok(()),
+        Err(e) => Err(e),
+    }
 }
 
 /// Local wall clock, unix seconds (saturating; library paths never panic

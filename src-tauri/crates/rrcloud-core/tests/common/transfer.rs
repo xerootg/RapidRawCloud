@@ -276,6 +276,11 @@ pub struct CountingS3 {
     /// every GET is forwarded rangeless and the response carries no
     /// `Content-Range` (a plain 200 with the full object).
     pub ignore_range: bool,
+    /// `key` → ETag `head_object` reports instead of the backend's — a
+    /// deterministic stand-in for "the key no longer holds the object we
+    /// stored" (e.g. a sibling device replaced the shared key between
+    /// Complete and the verify HEAD).
+    pub fake_head_etags: Mutex<HashMap<String, String>>,
     /// Hook run at every `put_object` entry (e.g. to fire a cancel flag
     /// deterministically mid-pump).
     #[allow(clippy::type_complexity)]
@@ -332,6 +337,7 @@ impl CountingS3 {
             corrupt_put_bodies: HashSet::new(),
             cut_get_after: Mutex::new(HashMap::new()),
             ignore_range: false,
+            fake_head_etags: Mutex::new(HashMap::new()),
             on_put: Mutex::new(None),
             gate_first_put_until: AtomicU32::new(0),
         }
@@ -509,7 +515,11 @@ impl S3Api for CountingS3 {
     }
 
     async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, S3Error> {
-        self.inner.head_object(bucket, key).await
+        let mut out = self.inner.head_object(bucket, key).await?;
+        if let Some(etag) = self.fake_head_etags.lock().expect("lock").get(key) {
+            out.e_tag = etag.clone();
+        }
+        Ok(out)
     }
 
     async fn list_objects_v2(

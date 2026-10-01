@@ -27,7 +27,7 @@ use rrcloud_core::s3::{
     PutObjectOptions, S3TransferApi,
 };
 use rrcloud_core::semhash::{sem_hash, Blake3Hex, ContentId};
-use rrcloud_core::state::{ItemState, MultipartUploadState, Queue, SyncDb, UploadPart};
+use rrcloud_core::state::{ItemState, MultipartUploadState, Queue, StateError, SyncDb, UploadPart};
 use rrcloud_core::transfer::{
     abort_stale_uploads, bucket_key_for, commit_verified, download_item, local_target_path,
     partial_path, probe_backend, pump_downloads, pump_uploads, recover_interrupted,
@@ -1866,6 +1866,12 @@ async fn resume_after_crash_between_complete_and_bookkeeping_adopts_the_stored_o
         .await
         .expect("complete (the backend now forgets the upload id)");
 
+    // The startup sweep re-admits the stranded item (uploading → queued,
+    // record kept) — the single-driver entry gate means upload_item never
+    // accepts `uploading` directly.
+    recover_interrupted(&db, 0).expect("recovery sweep");
+    assert_eq!(h::state_of(&db, &r), ItemState::Queued);
+
     let s3 = CountingS3::new(g.client());
     let outcome = upload_item(&db, &s3, &cfg, &r, &src)
         .await
@@ -1965,8 +1971,9 @@ async fn an_upload_id_swept_elsewhere_clears_the_record_and_restarts_cleanly() {
 }
 
 /// A crash mid-single-PUT (or between the queued→uploading CAS and
-/// `set_upload`) leaves `uploading` with no multipart record. Re-entry
-/// must restart the transfer, not fail the queued→uploading CAS forever.
+/// `set_upload`) leaves `uploading` with no multipart record. The startup
+/// sweep demotes it back to `queued` and the next pass restarts the
+/// transfer — the item never wedges.
 #[tokio::test]
 async fn upload_item_restarts_after_a_crash_mid_single_put() {
     let (g, bucket, root, _dbdir, db) = scaffold!("tr-single-crash");
@@ -1982,9 +1989,12 @@ async fn upload_item_restarts_after_a_crash_mid_single_put() {
     h::advance(&db, &r, &[ItemState::Uploading]);
     assert_eq!(db.get_upload(&r).expect("get_upload"), None);
 
+    recover_interrupted(&db, 0).expect("recovery sweep");
+    assert_eq!(h::state_of(&db, &r), ItemState::Queued);
+
     let outcome = upload_item(&db, &s3, &cfg, &r, &src)
         .await
-        .expect("re-entry restarts the single PUT instead of wedging");
+        .expect("the recovered item restarts the single PUT instead of wedging");
     assert_eq!(outcome.blake3, h::b3(&bytes));
     assert_eq!(h::state_of(&db, &r), ItemState::Synced);
     assert_eq!(outbound_len(&db), 1);
@@ -2050,21 +2060,26 @@ fn recover_interrupted_requeues_every_crash_stranded_state() {
     assert_eq!(h::state_of(&db, &verifying), ItemState::Queued);
     assert_eq!(
         h::state_of(&db, &up_rec),
-        ItemState::Uploading,
-        "an uploading item with a record keeps its state so upload_item resumes it"
+        ItemState::Queued,
+        "uploading demotes to queued — the single-driver entry gate means a \
+         record still at uploading is a LIVE transfer, never a crash leftover"
+    );
+    assert!(
+        db.get_upload(&up_rec).expect("get_upload").is_some(),
+        "the multipart record survives the demotion: it, not the state, \
+         is what makes the next upload_item pass a resume"
     );
     assert_eq!(h::state_of(&db, &up_bare), ItemState::Queued);
     assert_eq!(h::state_of(&db, &down), ItemState::PendingDown);
     assert_eq!(db.queue_len(Queue::Up).expect("queue_len"), 3);
     assert_eq!(db.queue_len(Queue::Down).expect("queue_len"), 1);
 
-    // Idempotent: a second sweep re-pushes nothing twice.
+    // Idempotent: a second sweep finds nothing stranded and re-pushes
+    // nothing twice.
     let again = recover_interrupted(&db, 1).expect("sweep again");
     assert_eq!(db.queue_len(Queue::Up).expect("queue_len"), 3);
     assert_eq!(db.queue_len(Queue::Down).expect("queue_len"), 1);
-    // The uploading-with-record item is still listed (still stranded) but
-    // nothing else is.
-    assert_eq!(again.requeued_uploads, vec![up_rec.clone()]);
+    assert!(again.requeued_uploads.is_empty());
     assert!(again.requeued_downloads.is_empty());
 }
 
@@ -2407,4 +2422,443 @@ async fn a_range_ignoring_backend_falls_back_to_a_full_download() {
     let final_path = local_target_path(root.path(), &r, Kind::Original);
     assert_eq!(std::fs::read(&final_path).expect("installed"), bytes);
     assert_eq!(h::state_of(&db, &r), ItemState::Hydrated);
+}
+
+// ===========================================================================
+// Round-1 review regressions: adoption must prove ownership, single-driver
+// entry gates, stub hydration, hashless-download parking, post-complete
+// key replacement
+// ===========================================================================
+
+/// BLOCKER regression: the crash-after-Complete adoption must prove the
+/// stored object is OURS, not merely the right size. Reproduces the
+/// review probe: every part recorded locally (honest MD5s of the local
+/// byte ranges), the upload id aborted out-of-band (the §2.4 cross-device
+/// hygiene), and the shared key holding a same-size DIFFERENT object (a
+/// sibling's version of the fixed-size camera RAW). Adopting it would
+/// journal a blake3 no stored object has (§2.1.5 violation — every
+/// downloader would condemn the intact remote). The resume must refuse
+/// (the recorded-part multipart-ETag proof fails against the stored
+/// single-PUT-shaped ETag), clear the dead record, leave the sibling's
+/// object alone, and restart cleanly.
+#[tokio::test]
+async fn adoption_refuses_a_same_size_foreign_object_at_the_shared_key() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-mp-adopt-foreign");
+    let client = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("mp/adopt-foreign.NEF");
+    let key = library_key(&r);
+    let bytes = h::three_part_bytes(111);
+    let src = h::under(root.path(), "adopt-foreign.NEF");
+    h::write_file(&src, &bytes);
+    h::seed_queued(&db, &r, Kind::Original, &src);
+
+    // The durable state after a crash + out-of-band sweep: upload record
+    // + every part record persisted, upload id dead on the backend.
+    let created = client
+        .create_multipart_upload(&bucket, &key, &PutObjectOptions::default())
+        .await
+        .expect("create");
+    for (i, range) in [
+        (1u32, 0..h::PART_5MIB as usize),
+        (2, h::PART_5MIB as usize..2 * h::PART_5MIB as usize),
+        (3, 2 * h::PART_5MIB as usize..bytes.len()),
+    ] {
+        let part = &bytes[range];
+        db.record_upload_part(
+            &r,
+            i,
+            &UploadPart {
+                etag: h::md5_hex(part),
+                md5_b64: h::md5_b64(part),
+            },
+        )
+        .expect("record part");
+    }
+    db.set_upload(
+        &r,
+        &MultipartUploadState {
+            upload_id: created.upload_id.clone(),
+            part_size: cfg.part_size,
+            started_unix: 1_769_900_000,
+            size: bytes.len() as u64,
+            mtime_unix_ns: h::mtime_unix_ns(&src),
+        },
+    )
+    .expect("set_upload");
+    client
+        .abort_multipart_upload(&bucket, &key, &created.upload_id)
+        .await
+        .expect("out-of-band sweep aborts our id");
+    // A sibling device stored a same-size, different-content version at
+    // the shared key.
+    let foreign = h::patterned(bytes.len(), 113);
+    assert_ne!(foreign, bytes);
+    client
+        .put_object(
+            &bucket,
+            &key,
+            Bytes::from(foreign.clone()),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("sibling PUT");
+
+    // Like the swept-id test: Garage answers the doomed Complete sometimes
+    // typed (record cleared at once) and sometimes with a dropped
+    // connection (retryable), so drive passes like the pump would. NO pass
+    // may adopt, journal, or condemn the sibling's intact object.
+    let s3 = CountingS3::new(g.client());
+    let mut cleared = false;
+    for _ in 0..5 {
+        let err = upload_item(&db, &s3, &cfg, &r, &src)
+            .await
+            .expect_err("a same-size foreign object must NOT be adopted");
+        assert!(
+            !matches!(
+                err,
+                TransferError::CorruptRemote { .. } | TransferError::IntegrityMismatch { .. }
+            ),
+            "the intact sibling object must not be condemned, got {err:?}"
+        );
+        assert_eq!(
+            outbound_len(&db),
+            0,
+            "no journal entry may advertise a blake3 the bucket does not hold"
+        );
+        let record = db.get_item(&r).expect("get").expect("exists");
+        assert!(!record.verified_remote, "never marked verified");
+        assert_eq!(record.state, ItemState::Queued, "resumable, not wedged");
+        if db.get_upload(&r).expect("get_upload").is_none() {
+            cleared = true;
+            break;
+        }
+    }
+    assert!(
+        cleared,
+        "the dead record is cleared so the next pass restarts cleanly"
+    );
+    let stored = h::get_bytes(&client, &bucket, &key).await;
+    assert_eq!(
+        stored, foreign,
+        "the failed resume left the sibling's object alone"
+    );
+
+    // The restart uploads OUR bytes and journals exactly what is stored.
+    let retry = CountingS3::new(g.client());
+    let mut outcome = None;
+    for _ in 0..3 {
+        match upload_item(&db, &retry, &cfg, &r, &src).await {
+            Ok(out) => {
+                outcome = Some(out);
+                break;
+            }
+            Err(_) => assert_eq!(h::state_of(&db, &r), ItemState::Queued),
+        }
+    }
+    let outcome = outcome.expect("fresh restart succeeds");
+    assert_eq!(outcome.blake3, h::b3(&bytes));
+    let stored = h::get_bytes(&client, &bucket, &key).await;
+    assert_eq!(h::b3(&stored), h::b3(&bytes));
+    let entries = staged_entries(&db);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(
+        entries[0].blake3,
+        Some(Blake3Hex::from_bytes(&stored)),
+        "journal blake3 == blake3 of what the bucket actually stores"
+    );
+}
+
+/// The positive adoption counterpart lives in
+/// `resume_after_crash_between_complete_and_bookkeeping_adopts_the_stored_object`,
+/// which (post round 1) passes only because Garage's stored multipart
+/// ETag equals the one derivable from the recorded part MD5s — the §8
+/// ETag-convention proof the adoption guard relies on.
+///
+/// The single-driver entry gate, upload side: a record sitting at
+/// `uploading` means a LIVE concurrent transfer owns the item (the
+/// startup sweep demotes crash leftovers to `queued` before any pump
+/// pass), so a second caller is refused typed before touching the shared
+/// multipart bookkeeping.
+#[tokio::test]
+async fn upload_item_refuses_entry_while_another_transfer_is_live() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-up-live");
+    let s3 = CountingS3::new(g.client());
+    let cfg = h::test_cfg(&bucket, root.path());
+    let bytes = h::three_part_bytes(121);
+    let r = rel("up/live.NEF");
+    let src = h::under(root.path(), "live.NEF");
+    h::write_file(&src, &bytes);
+    h::seed_queued(&db, &r, Kind::Original, &src);
+    // The live first driver: queued → uploading CAS done, multipart
+    // record persisted, parts in flight right now.
+    h::advance(&db, &r, &[ItemState::Uploading]);
+    db.set_upload(
+        &r,
+        &MultipartUploadState {
+            upload_id: "live-first-driver".into(),
+            part_size: cfg.part_size,
+            started_unix: 0,
+            size: bytes.len() as u64,
+            mtime_unix_ns: h::mtime_unix_ns(&src),
+        },
+    )
+    .expect("set_upload");
+
+    let err = upload_item(&db, &s3, &cfg, &r, &src)
+        .await
+        .expect_err("a second concurrent driver must be refused");
+    assert!(
+        matches!(
+            &err,
+            TransferError::State(StateError::StaleState {
+                found: Some(ItemState::Uploading),
+                ..
+            })
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(
+        h::state_of(&db, &r),
+        ItemState::Uploading,
+        "the live transfer still owns the item"
+    );
+    assert!(
+        db.get_upload(&r).expect("get_upload").is_some(),
+        "the live transfer's bookkeeping is untouched"
+    );
+    assert!(
+        s3.part_calls().is_empty() && s3.put_keys().is_empty(),
+        "the refused driver sent nothing"
+    );
+    assert_eq!(
+        s3.create_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "and created no competing upload"
+    );
+}
+
+/// The single-driver entry gate, download side — the §3.5 `ensure_local`
+/// race shape: a second `download_item` on an item already `downloading`
+/// is refused typed, never admitted as a second writer onto the live
+/// transfer's `.rr.part` (which could install a file the live writer
+/// keeps appending to). The crash-leftover shape goes through
+/// `recover_interrupted` instead, after which the download resumes off
+/// the surviving partial.
+#[tokio::test]
+async fn download_item_refuses_entry_while_another_transfer_is_live() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-dl-live");
+    let client = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("dl/live.NEF");
+    let key = library_key(&r);
+    let bytes = h::patterned(400_000, 131);
+    client
+        .put_object(
+            &bucket,
+            &key,
+            Bytes::from(bytes.clone()),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("put");
+    let mtime = 1_700_002_000i64;
+    h::seed_pending_down(&db, &r, Kind::Original, &bytes, mtime);
+    // The live first driver: pending_down → downloading CAS done, a
+    // partial growing on disk.
+    h::advance(&db, &r, &[ItemState::Downloading]);
+    let final_path = local_target_path(root.path(), &r, Kind::Original);
+    h::write_file(&partial_path(&final_path), &bytes[..8192]);
+
+    let expected = ExpectedDownload {
+        blake3: h::b3(&bytes),
+        size: bytes.len() as u64,
+        mtime_unix: mtime,
+    };
+    let s3 = CountingS3::new(g.client());
+    let err = download_item(&db, &s3, &cfg, &r, root.path(), &expected)
+        .await
+        .expect_err("a second concurrent driver must be refused");
+    assert!(
+        matches!(
+            &err,
+            TransferError::State(StateError::StaleState {
+                found: Some(ItemState::Downloading),
+                ..
+            })
+        ),
+        "got {err:?}"
+    );
+    assert!(s3.get_requests().is_empty(), "no second writer, no network");
+    assert_eq!(
+        std::fs::read(partial_path(&final_path)).expect("partial intact"),
+        &bytes[..8192],
+        "the live transfer's partial is untouched"
+    );
+    assert!(!final_path.exists(), "nothing installed");
+    assert_eq!(
+        h::state_of(&db, &r),
+        ItemState::Downloading,
+        "the live transfer still owns the item"
+    );
+
+    // The CRASH shape: recover_interrupted demotes the stranded item,
+    // then the next attempt resumes off the surviving partial.
+    recover_interrupted(&db, 0).expect("recovery sweep");
+    assert_eq!(h::state_of(&db, &r), ItemState::PendingDown);
+    let outcome = download_item(&db, &s3, &cfg, &r, root.path(), &expected)
+        .await
+        .expect("recovered download completes");
+    assert_eq!(outcome.resumed_from, 8192, "resumed off the partial");
+    assert_eq!(std::fs::read(&final_path).expect("installed"), bytes);
+    assert!(!partial_path(&final_path).exists());
+    assert_eq!(h::state_of(&db, &r), ItemState::Hydrated);
+}
+
+/// §3.5 hydration from `stub` — the entry edge the P2 `ensure_local` unit
+/// drives: CAS stub → downloading, stream to the `.rr.part`, rename
+/// atomically OVER the 0-byte stub at the final path, restore the remote
+/// mtime (the thumbnail-cache-hash stability §3.5 depends on), land
+/// hydrated.
+#[tokio::test]
+async fn download_from_stub_replaces_the_stub_and_restores_mtime() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-dl-stub");
+    let client = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("dl/stub.NEF");
+    let key = library_key(&r);
+    let bytes = h::patterned(400_000, 137);
+    client
+        .put_object(
+            &bucket,
+            &key,
+            Bytes::from(bytes.clone()),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("put");
+
+    let mtime = 1_700_002_100i64;
+    // An evicted original: record at `stub`, 0-byte placeholder at the
+    // final path.
+    let mut record = h::item_record(
+        Kind::Original,
+        ItemState::Stub,
+        bytes.len() as u64,
+        mtime * 1_000_000_000,
+        db.device_id(),
+    );
+    record.blake3 = Some(h::b3(&bytes));
+    assert!(db.insert_item(&r, &record).expect("insert stub item"));
+    let final_path = local_target_path(root.path(), &r, Kind::Original);
+    h::write_file(&final_path, b"");
+    assert_eq!(std::fs::metadata(&final_path).expect("stub").len(), 0);
+
+    let expected = ExpectedDownload {
+        blake3: h::b3(&bytes),
+        size: bytes.len() as u64,
+        mtime_unix: mtime,
+    };
+    let s3 = CountingS3::new(g.client());
+    let outcome = download_item(&db, &s3, &cfg, &r, root.path(), &expected)
+        .await
+        .expect("hydration from stub");
+    assert_eq!(outcome.path, final_path);
+    assert_eq!(
+        std::fs::read(&final_path).expect("installed"),
+        bytes,
+        "the stub is replaced by the verified bytes"
+    );
+    assert_eq!(
+        h::mtime_unix(&final_path),
+        mtime,
+        "mtime restored (§3.5 thumbnail-hash stability)"
+    );
+    assert!(!partial_path(&final_path).exists(), "temp gone");
+    assert_eq!(h::state_of(&db, &r), ItemState::Hydrated);
+}
+
+/// A `pending_down` item whose record carries no `blake3` can never
+/// download verified, and nothing inside the engine can ever supply the
+/// hash: the pump records the typed failure once and PARKS the item off
+/// the queue (state stays `pending_down`) instead of popping and
+/// re-failing it on every pass forever.
+#[tokio::test]
+async fn pump_parks_a_hashless_download_instead_of_requeueing_forever() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-pump-hashless");
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("pump-park/nohash.NEF");
+    let record = h::item_record(
+        Kind::Original,
+        ItemState::PendingDown,
+        100,
+        0,
+        db.device_id(),
+    );
+    assert!(record.blake3.is_none(), "the record carries no hash");
+    assert!(db.insert_item(&r, &record).expect("insert"));
+    assert!(db.queue_push(Queue::Down, &r, 0).expect("push"));
+
+    let s3 = CountingS3::new(g.client());
+    let summary = pump_downloads(&db, &s3, &cfg, 2, &CancelFlag::new())
+        .await
+        .expect("pump");
+    assert!(summary.completed.is_empty());
+    assert_eq!(summary.failed.len(), 1);
+    assert_eq!(summary.failed[0].0, r);
+    assert_eq!(
+        h::state_of(&db, &r),
+        ItemState::PendingDown,
+        "parked in its queueable state (a later journal apply re-queues it)"
+    );
+    assert_eq!(
+        db.queue_len(Queue::Down).expect("queue_len"),
+        0,
+        "NOT re-queued: the engine can never heal a missing hash"
+    );
+    assert!(
+        s3.get_requests().is_empty(),
+        "the unverifiable download is never attempted"
+    );
+
+    // The next pass finds nothing: no unbounded churn.
+    let again = pump_downloads(&db, &s3, &cfg, 2, &CancelFlag::new())
+        .await
+        .expect("pump again");
+    assert!(again.completed.is_empty());
+    assert!(again.failed.is_empty());
+}
+
+/// §2.4 `verifying`, multipart path on a digest-verifying backend: a HEAD
+/// ETag that no longer equals what Complete returned means the shared key
+/// was replaced out from under us between Complete and verify — the item
+/// lands `corrupt_remote` with NOTHING journaled (journaling our blake3
+/// against the replaced object would poison every downloader, §2.1.5).
+#[tokio::test]
+async fn multipart_verify_catches_a_post_complete_key_replacement() {
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-verify-replaced");
+    let r = rel("verify/replaced.NEF");
+    let key = library_key(&r);
+    let s3 = CountingS3::new(g.client());
+    // Deterministic stand-in for the sibling replacement: HEAD reports a
+    // different (single-PUT-shaped) ETag than our Complete returned.
+    s3.fake_head_etags
+        .lock()
+        .unwrap()
+        .insert(key.clone(), "d41d8cd98f00b204e9800998ecf8427e".to_string());
+    let cfg = h::test_cfg(&bucket, root.path());
+    let bytes = h::three_part_bytes(141);
+    let src = h::under(root.path(), "replaced.NEF");
+    h::write_file(&src, &bytes);
+    h::seed_queued(&db, &r, Kind::Original, &src);
+
+    let err = upload_item(&db, &s3, &cfg, &r, &src)
+        .await
+        .expect_err("verify must catch the replacement");
+    match err {
+        TransferError::CorruptRemote { relkey, .. } => assert_eq!(relkey, r),
+        other => panic!("expected CorruptRemote, got {other:?}"),
+    }
+    assert_eq!(h::state_of(&db, &r), ItemState::CorruptRemote);
+    assert_eq!(outbound_len(&db), 0, "nothing journaled");
 }
