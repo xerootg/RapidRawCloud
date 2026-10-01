@@ -432,6 +432,10 @@ fn build_manifest_withholds_rows_its_own_merge_cannot_convert() {
 fn build_manifest_withholds_items_whose_version_never_finished_an_upload() {
     let a = dev(DEV_A);
     let (_dir, _path, db) = open_db(&a);
+    // blake3 None throughout: by the ItemRecord contract blake3 names the
+    // last uploaded/verified bytes, so None proves NO version of the key
+    // was ever uploaded — withholding such rows cannot drop a published
+    // entry's effect (no entry was ever published for the key).
     let base = ItemRecord {
         kind: Kind::Sidecar,
         state: ItemState::Synced,
@@ -484,6 +488,59 @@ fn build_manifest_withholds_items_whose_version_never_finished_an_upload() {
         vec!["hydrated.NEF", "stub.NEF", "synced.NEF", "verifying.NEF"],
         "never-uploaded versions are withheld; uploaded ones ascend by relkey"
     );
+}
+
+#[test]
+fn in_flight_items_with_a_published_version_stay_advertised() {
+    // The round-2 blocker's local half: the §2.3 row gate is
+    // evidence-based, not purely state-based. An item whose PREVIOUS
+    // version completed an upload (blake3 names bytes that ARE in the
+    // bucket) must keep advertising that version through the §2.4
+    // Dirty/Queued/Uploading pipeline — its journal `put` was published
+    // and is covered by the header's own-cursor attestation, so the row
+    // is the manifest's ONLY carrier of that entry's effect. Withholding
+    // it would make a §2.3 bootstrap merge silently drop the item (the
+    // skip-and-diverge §2.1 principle 2 forbids).
+    let a = dev(DEV_A);
+    let (_dir, _path, db) = open_db(&a);
+    let record = ItemRecord {
+        kind: Kind::Sidecar,
+        state: ItemState::Dirty,
+        size: 64,
+        mtime_unix_ns: 0,
+        blake3: Some(Blake3Hex::parse(BLAKE3_HEX).expect("blake3")),
+        sem_hash: Some(SemHash::parse(SEMHASH_HEX).expect("semhash")),
+        vv: [(a.clone(), 1u32)].into_iter().collect(),
+        content_id: None,
+        w: None,
+        h: None,
+        pinned: false,
+        last_access_unix: 0,
+        verified_remote: true,
+        attested: false,
+        base_unknown: false,
+    };
+    for state in [ItemState::Dirty, ItemState::Queued, ItemState::Uploading] {
+        let record = ItemRecord {
+            state,
+            ..record.clone()
+        };
+        db.replay_put_item(&rel("re-edited.NEF"), &record)
+            .expect("put");
+        let manifest = build_manifest(&db, 1_769_950_000).expect("build");
+        let row = manifest
+            .rows
+            .iter()
+            .find(|r| r.key == rel("re-edited.NEF"))
+            .unwrap_or_else(|| panic!("row must stay advertised in {state:?}"));
+        // The row describes the published version: in ItemRecord v1 the
+        // vv and blake3 still name it (the §2.6 queue-admission bump is a
+        // later unit, which inherits the snapshot requirement documented
+        // on build_manifest).
+        assert_eq!(row.vv, record.vv);
+        assert_eq!(row.blake3, record.blake3);
+        assert_eq!(row.size, record.size);
+    }
 }
 
 #[test]
@@ -571,7 +628,7 @@ fn merge_propagates_deletions_the_receiver_never_saw_a_journal_entry_for() {
 }
 
 #[test]
-fn merge_applies_rows_in_relkey_order_as_synthetic_ops_and_seeds_max_cursors() {
+fn merge_applies_rows_in_relkey_order_as_synthetic_ops_and_seeds_owner_attested_cursors() {
     let a = dev(DEV_A);
     let b = dev(DEV_B);
     let c = dev(DEV_C);
@@ -580,9 +637,15 @@ fn merge_applies_rows_in_relkey_order_as_synthetic_ops_and_seeds_max_cursors() {
 
     // Two manifests with interleaved relkeys and overlapping cursor
     // claims: rows must reach the consumer in ascending relkey order
-    // across manifests, and cursors seed at the per-device max.
+    // across manifests, and each device's cursor seeds ONLY from its own
+    // manifest's self-attestation (`cursors[owner]`, backed by that
+    // manifest's rows). A peer's header claim about a third device's
+    // prefix (A's `c: 7` and `b: 2`, B's inflated `a: 9`) is subject to
+    // the claimant's own live-row withholding, so trusting it could skip
+    // journal entries whose effects no merged row folds — the round-2
+    // blocker's third-device lane.
     let m1 = Manifest {
-        header: header(&[(&b, 2), (&c, 7)]),
+        header: header(&[(&a, 4), (&b, 2), (&c, 7)]),
         rows: vec![
             live_row("a.NEF", Kind::Sidecar, &a),
             live_row("m.NEF", Kind::Original, &a),
@@ -590,7 +653,7 @@ fn merge_applies_rows_in_relkey_order_as_synthetic_ops_and_seeds_max_cursors() {
         deleted: vec![deleted_row("zz-gone.NEF", &a)],
     };
     let m2 = Manifest {
-        header: header(&[(&b, 5)]),
+        header: header(&[(&a, 9), (&b, 5)]),
         rows: vec![live_row("g.NEF", Kind::Sidecar, &b)],
         deleted: vec![],
     };
@@ -601,12 +664,22 @@ fn merge_applies_rows_in_relkey_order_as_synthetic_ops_and_seeds_max_cursors() {
     assert_eq!(report.deleted_rows, 1);
     assert_eq!(
         report.cursors,
-        [(b.clone(), 5u64), (c.clone(), 7u64)]
+        [(a.clone(), 4u64), (b.clone(), 5u64)]
             .into_iter()
             .collect::<BTreeMap<_, _>>()
     );
-    assert_eq!(db.cursor(&b).expect("cursor"), 5, "max across headers wins");
-    assert_eq!(db.cursor(&c).expect("cursor"), 7);
+    assert_eq!(
+        db.cursor(&a).expect("cursor"),
+        4,
+        "A's own attestation wins over B's unbacked claim of 9"
+    );
+    assert_eq!(db.cursor(&b).expect("cursor"), 5);
+    assert_eq!(
+        db.cursor(&c).expect("cursor"),
+        0,
+        "no manifest of C's own was merged, so C's prefix stays unseeded \
+         and the next poll applies it from the journal"
+    );
 
     // Synthetic entries: live rows ascending by relkey (across manifests)
     // then deleted rows; bucket keys rebuilt from (kind, relkey); ops
@@ -789,8 +862,9 @@ async fn merging_a_manifest_equals_replaying_the_journal() {
     );
     assert_eq!(
         db_y.cursor(&c).expect("cursor"),
-        7,
-        "merge seeded A's knowledge of C"
+        0,
+        "A's header claim about C's prefix is unbacked by A's rows and \
+         never seeds a cursor — Y will apply C's journal itself"
     );
 
     // Bootstrap = merge then poll: polling after the merge re-applies
@@ -876,15 +950,66 @@ async fn build_manifest_attests_the_writers_own_published_cursor() {
 }
 
 #[tokio::test]
-async fn merged_header_cursors_make_the_next_poll_skip_covered_segments() {
+async fn own_manifest_cursors_make_the_next_poll_skip_covered_segments_losslessly() {
     let Some(g) = garage::shared() else { return };
     let bucket = g.create_unique_bucket("man-seed");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let c = dev(DEV_C);
+
+    // B applies and publishes seqs 1-2, then writes its OWN manifest: the
+    // header attests cursors[B] = 2 (its published cursor) and the rows
+    // fold both entries' effects.
+    let (_bdir, _bpath, db_b) = open_db(&b);
+    let entries = common::sync::sidecar_entries(&b, "seed", 2);
+    apply_entries_locally(&db_b, &entries);
+    for e in &entries {
+        enqueue_entry(&db_b, e).expect("enqueue");
+    }
+    publish_pending(&db_b, &client, &bucket)
+        .await
+        .expect("publish");
+    let manifest = build_manifest(&db_b, 1_769_950_000).expect("build");
+    assert_eq!(manifest.rows.len(), 2, "the attestation is backed by rows");
+
+    // Fresh C merges B's manifest, then polls: B's segments are covered
+    // by the owner-attested cursor and nothing is re-applied — and C
+    // holds both items, because the rows carried their effects. Skipping
+    // is an optimization, never a loss.
+    let (_cdir, _cpath, db_c) = open_db(&c);
+    let mut replay = ReplayConsumer;
+    merge(&[(b.clone(), manifest)], &db_c, &mut replay).expect("merge");
+    assert_eq!(
+        db_c.cursor(&b).expect("cursor"),
+        2,
+        "the owner's self-attestation seeds the receiver"
+    );
+    assert_eq!(db_c.iter_items().expect("items").len(), 2);
+
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_c, &client, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_eq!(report.entries_applied, 0, "covered segments are skipped");
+    assert!(consumer.transcript.is_empty());
+    assert_eq!(db_c.cursor(&b).expect("cursor"), 2);
+}
+
+#[tokio::test]
+async fn a_peers_unbacked_claim_about_a_third_device_never_skips_its_journal() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("man-peer-claim");
     let client = g.client();
     let a = dev(DEV_A);
     let b = dev(DEV_B);
     let c = dev(DEV_C);
 
-    // B publishes seqs 1-2.
+    // B publishes seqs 1-2. A's manifest claims it applied B up to 2 —
+    // but A's rows fold NONE of those entries' effects (A's live-row
+    // withholding may legitimately hide them, e.g. an item A re-dirtied
+    // from a base it never uploaded). Round-2 blocker: trusting this
+    // claim made a fresh device skip B's segments and silently lose both
+    // entries.
     let (_bdir, _bpath, db_b) = open_db(&b);
     for e in &common::sync::sidecar_entries(&b, "seed", 2) {
         enqueue_entry(&db_b, e).expect("enqueue");
@@ -892,27 +1017,110 @@ async fn merged_header_cursors_make_the_next_poll_skip_covered_segments() {
     publish_pending(&db_b, &client, &bucket)
         .await
         .expect("publish");
-
-    // A's manifest attests it applied B up to 2.
     let (_adir, _apath, db_a) = open_db(&a);
     db_a.set_cursor(&b, 2).expect("cursor");
     let manifest = build_manifest(&db_a, 1_769_950_000).expect("build");
-
-    // Fresh C merges A's manifest, then polls: B's segments are covered
-    // by the seeded cursor — nothing is applied or re-applied.
-    let (_cdir, _cpath, db_c) = open_db(&c);
-    let mut consumer = RecordingConsumer::default();
-    merge(&[(a.clone(), manifest)], &db_c, &mut consumer).expect("merge");
     assert_eq!(
-        db_c.cursor(&b).expect("cursor"),
-        2,
-        "header cursors seed the receiver"
+        manifest.header.cursors,
+        [(b.clone(), 2u64)].into_iter().collect::<BTreeMap<_, _>>(),
+        "A still publishes its applied cursors (compaction input)"
     );
 
+    // Fresh C merges A's manifest: the peer claim must NOT seed B's
+    // cursor, so the next poll applies B's journal itself.
+    let (_cdir, _cpath, db_c) = open_db(&c);
+    let mut replay = ReplayConsumer;
+    merge(&[(a.clone(), manifest)], &db_c, &mut replay).expect("merge");
+    assert_eq!(
+        db_c.cursor(&b).expect("cursor"),
+        0,
+        "an unbacked peer claim never seeds a cursor"
+    );
+    let mut consumer = RecordingConsumer::default();
     let report = poll(&db_c, &client, &bucket, &mut consumer)
         .await
         .expect("poll");
-    assert_eq!(report.entries_applied, 0, "covered segments are skipped");
-    assert!(consumer.transcript.is_empty());
+    assert_eq!(
+        report.entries_applied, 2,
+        "B's entries are applied, not lost"
+    );
     assert_eq!(db_c.cursor(&b).expect("cursor"), 2);
+}
+
+/// The round-2 blocker's confirmed probe, pinned as a regression test:
+/// device A publishes `put` seq 1 for a key, the item reaches `Synced`,
+/// the user re-edits (`Synced` → `Dirty`, a legal §2.4 edge). A's
+/// manifest attests `cursors[A] = 1`, so a fresh device bootstrapping per
+/// §2.3 (merge then poll) seeds past seq 1 — the manifest row is the only
+/// carrier of the published entry's effect, and withholding it silently
+/// and permanently dropped the item (no gap, no halt, no outcome).
+#[tokio::test]
+async fn bootstrap_merge_cannot_drop_an_item_whose_re_edit_is_in_flight() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("man-inflight");
+    let client = g.client();
+    let a = dev(DEV_A);
+    let c = dev(DEV_C);
+    let k = rel("2026/10/IMG_0042.NEF");
+
+    // A publishes put seq 1 for K; the upload completed, so the record
+    // carries the uploaded bytes' blake3 (the ItemRecord contract).
+    let (_adir, _apath, db_a) = open_db(&a);
+    let mut e = entry(&a, Op::Put, Kind::Sidecar, sidecar_key(&k));
+    e.blake3 = Some(Blake3Hex::parse(BLAKE3_HEX).expect("blake3"));
+    apply_entries_locally(&db_a, &[e.clone()]);
+    enqueue_entry(&db_a, &e).expect("enqueue");
+    publish_pending(&db_a, &client, &bucket)
+        .await
+        .expect("publish");
+
+    // The user re-edits: Synced → Dirty, then on through the §2.4
+    // pipeline. At every in-flight state the manifest must keep carrying
+    // the published version's row next to the own-cursor attestation.
+    for (from, to) in [
+        (ItemState::Synced, ItemState::Dirty),
+        (ItemState::Dirty, ItemState::Queued),
+        (ItemState::Queued, ItemState::Uploading),
+    ] {
+        db_a.transition(&k, from, to, |_| {}).expect("transition");
+        let manifest = build_manifest(&db_a, 1_769_950_000).expect("build");
+        assert_eq!(
+            manifest.header.cursors.get(&a),
+            Some(&1),
+            "the own published cursor stays attested"
+        );
+        assert!(
+            manifest.rows.iter().any(|r| r.key == k),
+            "the published version's row must not be withheld in {to:?}"
+        );
+    }
+
+    // Bootstrap per §2.3 (merge then poll) on a fresh device, through the
+    // full wire path, with A's re-edit still in flight (A may stay
+    // offline indefinitely).
+    let manifest = build_manifest(&db_a, 1_769_950_000).expect("build");
+    put_manifest(&client, &bucket, &a, &manifest)
+        .await
+        .expect("put manifest");
+    let fetched = get_manifest(&client, &bucket, &a)
+        .await
+        .expect("get manifest");
+    let (_cdir, _cpath, db_c) = open_db(&c);
+    let mut replay = ReplayConsumer;
+    merge(&[(a.clone(), fetched)], &db_c, &mut replay).expect("merge");
+    let report = poll(&db_c, &client, &bucket, &mut replay)
+        .await
+        .expect("poll");
+
+    // Before the fix: entries_applied == 0, no gaps, and get_item == None
+    // — the published item silently vanished from the bootstrapped fleet.
+    assert!(report.gaps.is_empty() && report.mid_stream_gaps.is_empty());
+    assert_eq!(report.entries_applied, 0, "seq 1 is covered by the row");
+    let item = db_c
+        .get_item(&k)
+        .expect("get")
+        .expect("the published item must survive a bootstrap merge");
+    assert_eq!(item.vv, e.vv, "the row carried the published version");
+    assert_eq!(item.blake3, e.blake3);
+    assert_eq!(db_c.cursor(&a).expect("cursor"), 1);
 }

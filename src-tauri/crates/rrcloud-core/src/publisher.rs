@@ -160,6 +160,24 @@ pub enum PublisherError {
         /// the true size when the refusal came from the capped collect).
         declared: u64,
     },
+    /// A fetched `devices/<id>.json` does not decode as a §1.2 registry
+    /// entry: a persistent per-**object** condition of the stored
+    /// document (the [`crate::reader::CorruptSegment`] analogue on the
+    /// registry lane), never a local state-store failure
+    /// — surfacing it as `State(Codec)` would read as "my redb is
+    /// broken" (abort-the-pass territory) when the remedy is to distrust
+    /// or rewrite the one stored object.
+    #[error("stored device registry entry is malformed: {source}")]
+    MalformedRegistryEntry {
+        /// The decode failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// This build's own registry entry failed to **serialize** (should be
+    /// unreachable for the fixed §1.2 schema; typed so a wire-document
+    /// codec failure is never mislabeled as a state-db failure).
+    #[error("device registry entry could not be encoded: {0}")]
+    EncodeRegistryEntry(#[source] serde_json::Error),
 }
 
 /// What one [`publish_pending`] pass did.
@@ -482,7 +500,7 @@ pub async fn put_device_entry(
             write: PROTO_WRITE,
         },
     };
-    let body = serde_json::to_vec(&entry).map_err(StateError::from)?;
+    let body = serde_json::to_vec(&entry).map_err(PublisherError::EncodeRegistryEntry)?;
     let output = s3
         .put_object(
             bucket,
@@ -566,7 +584,9 @@ fn parse_http_date(s: &str) -> Option<i64> {
 
 /// GETs and decodes `device`'s registry entry (§1.2). Unknown JSON fields
 /// are ignored (min-reader rule for a v1 document); a missing key
-/// surfaces as the underlying typed [`S3Error`]. Network-lane allocation
+/// surfaces as the underlying typed [`S3Error`], and a stored object that
+/// does not decode as the typed
+/// [`PublisherError::MalformedRegistryEntry`]. Network-lane allocation
 /// is bounded ([`DEVICE_ENTRY_MAX_BYTES`]) like every other fetch lane in
 /// this unit: an oversized object is the typed
 /// [`PublisherError::OversizedRegistryEntry`] before (and, against a
@@ -590,7 +610,8 @@ pub async fn get_device_entry(
         }
         Err(e) => return Err(e.into()),
     };
-    Ok(serde_json::from_slice(&bytes).map_err(StateError::from)?)
+    serde_json::from_slice(&bytes)
+        .map_err(|source| PublisherError::MalformedRegistryEntry { source })
 }
 
 #[cfg(test)]

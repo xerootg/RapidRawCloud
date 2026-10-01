@@ -933,3 +933,34 @@ async fn an_oversized_registry_entry_is_refused_before_buffering() {
         other => panic!("expected OversizedRegistryEntry, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_malformed_registry_entry_is_a_typed_wire_error_not_a_state_db_error() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("dev-malformed");
+    let client = g.client();
+    let a = dev(DEV_A);
+
+    // A corrupt stored devices/<id>.json is a persistent per-OBJECT
+    // condition (the CorruptSegment analogue on the registry lane), not a
+    // local state-store failure: surfacing it as PublisherError::State
+    // (Codec) read as "my redb is broken" — abort-the-pass territory —
+    // when the true condition is "this stored object is malformed".
+    client
+        .put_object(
+            &bucket,
+            &device_registry_key(&a),
+            Bytes::from_static(b"{\"name\": not-json"),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("garbage put");
+
+    let err = get_device_entry(&client, &bucket, &a)
+        .await
+        .expect_err("a malformed registry entry must be refused, typed");
+    match err {
+        PublisherError::MalformedRegistryEntry { .. } => {}
+        other => panic!("expected MalformedRegistryEntry, got {other:?}"),
+    }
+}

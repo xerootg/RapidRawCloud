@@ -24,9 +24,11 @@
 //! [`merge`] converts every row into a synthetic journal entry and drives
 //! the **same** [`crate::reader::JournalConsumer`] the journal apply loop
 //! uses — live rows become `put` ops, deleted rows become `del` ops — and
-//! seeds cursors from the merged headers (max per device), so
-//! "bootstrap = merge then poll" and a subsequent poll skips the covered
-//! segments.
+//! seeds each device's cursor from its **own** manifest's
+//! self-attestation (`cursors[owner]`; a peer's header claim about a
+//! third device's prefix never seeds — see [`merge`]), so "bootstrap =
+//! merge then poll" and a subsequent poll skips exactly the segments
+//! whose effects the merged rows are guaranteed to fold.
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
@@ -42,7 +44,7 @@ use crate::keys::{
 use crate::reader::{ConsumerError, JournalConsumer};
 use crate::s3::{PutObjectOptions, S3Api, S3Error};
 use crate::semhash::{Blake3Hex, ContentId, SemHash};
-use crate::state::{ItemState, StateError, SyncDb};
+use crate::state::{ItemRecord, ItemState, StateError, SyncDb};
 
 /// The manifest format version this build reads and writes (the header's
 /// `proto` field).
@@ -107,6 +109,12 @@ pub enum ManifestError {
         /// The declared proto (`None` when absent/malformed).
         proto: Option<u64>,
     },
+    /// A header or row failed to **serialize** while encoding a manifest
+    /// (should be unreachable for this build's own types; typed so a
+    /// wire-document codec failure is never mislabeled as a state-db
+    /// failure).
+    #[error("manifest line could not be encoded: {0}")]
+    Encode(#[source] serde_json::Error),
     /// A line (header or row) failed to decode. 1-based line number in
     /// the uncompressed NDJSON; includes strict-wire relkey rejections
     /// (non-NFC `key`/`del`).
@@ -241,9 +249,12 @@ pub struct Manifest {
 /// nonzero): §2.10 compaction rule 1 ("the owner's own manifest has
 /// `cursors[owner] >= s`") makes this entry the one guaranteed §2.3
 /// catch-up attestation over the owner's compacted seqs — the manifest's
-/// rows fold those entries' effects, so the snapshot provably covers
-/// them. Without it, a device bootstrapping after compaction could wedge
-/// in a permanent [`crate::reader::MidStreamGap`].
+/// rows fold those entries' effects (deleted rows are always included,
+/// and every live effect of a published entry is advertised, including
+/// through the in-flight states: [`record_is_advertisable`]), so the
+/// snapshot provably covers them. Without it, a device bootstrapping
+/// after compaction could wedge in a permanent
+/// [`crate::reader::MidStreamGap`].
 ///
 /// Rows this build's own [`merge`] could not convert — `thumb` rows
 /// (advertised via thumbpacks per §2.2; the row schema carries no thumb
@@ -251,15 +262,37 @@ pub struct Manifest {
 /// **withheld**: publishing a row no reader can apply would at best be
 /// dead weight and at worst wedge a less lenient peer's bootstrap.
 ///
-/// Rows whose [`crate::state::ItemState`] does not prove a remote object
-/// exists for the recorded version — `Dirty`, `Queued`, `Uploading`
-/// ([`state_is_remotely_visible`]) — are likewise **withheld**: a §2.3
-/// live row is an advertisement that the key's version is in the bucket,
-/// and a freshly imported (or locally re-edited) item that has never
-/// finished an upload would point every bootstrapping peer at an object
-/// that is not there (404 on hydrate, phantom "missing" noise in
-/// reconcile). The items table may hold such rows freely; the manifest
-/// just does not advertise them until their upload completes.
+/// Rows in the in-flight states `Dirty`, `Queued`, `Uploading` (not
+/// [`state_is_remotely_visible`]) are withheld **only when the record
+/// carries no uploaded version at all** (`blake3` `None` —
+/// [`record_is_advertisable`]): a §2.3 live row is an advertisement that
+/// the key's version is in the bucket, and a freshly imported item that
+/// has never finished an upload would point every bootstrapping peer at
+/// an object that is not there (404 on hydrate, phantom "missing" noise
+/// in reconcile). But an in-flight item **with** a `blake3` has a
+/// previously-published version (the record's `blake3` names the last
+/// uploaded/verified bytes, which ARE in the bucket), and its row is the
+/// manifest's only carrier of that published journal entry's effect —
+/// withholding it while the header attests the own published cursor over
+/// the entry's seq would make a §2.3 bootstrap merge silently drop the
+/// item (the skip-and-diverge §2.1 principle 2 forbids; pinned by the
+/// bootstrap regression tests). The emitted row truthfully describes the
+/// published version: in [`crate::state::ItemRecord`] v1 its `vv`,
+/// `blake3` and hashes still name it at these states.
+///
+/// Two invariants this gate leans on, owed by the engine units around it:
+///
+/// - A completed upload records its `blake3`, and `blake3` is never set
+///   before the first completed upload (or remote adoption) — so
+///   `blake3: None` proves no version of the key was ever published, and
+///   withholding such a row cannot un-fold a published entry.
+/// - **§2.6 coordination note**: the queue-admission vv bump is a later
+///   unit. Once it lands, the record — or a last-published snapshot
+///   carried for this purpose — must keep the advertised fields (`vv`,
+///   `blake3`, `size`, hashes) describing the last **published** version
+///   while an upload is in flight; otherwise this row would pair the
+///   bumped vv with the previous version's bytes and poison peer
+///   idempotency.
 ///
 /// Fields [`crate::state::ItemRecord`] v1 does not carry (`device`,
 /// `rating`, `color_label`) are honestly `None`: a device bootstrapping
@@ -284,10 +317,11 @@ pub fn build_manifest(db: &SyncDb, written_server_ts: i64) -> Result<Manifest, M
     let rows = db
         .iter_items()?
         .into_iter()
-        // Never advertise a version that provably may not exist remotely
-        // (doc comment): states before the first completed upload stay
-        // local-only facts.
-        .filter(|(_, record)| state_is_remotely_visible(record.state))
+        // Never advertise a key that provably has no remote object; but an
+        // in-flight item with a published previous version MUST stay
+        // advertised, or the own-cursor attestation above would claim
+        // coverage the rows don't deliver (doc comment).
+        .filter(|(_, record)| record_is_advertisable(record))
         .map(|(key, record)| ManifestRow {
             key,
             kind: record.kind,
@@ -329,9 +363,10 @@ pub fn build_manifest(db: &SyncDb, written_server_ts: i64) -> Result<Manifest, M
 pub fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
     let mut ndjson = Vec::new();
     let mut push_line = |line: Result<String, serde_json::Error>| -> Result<(), ManifestError> {
-        // Encode-side serialization failures carry no useful line number;
-        // the shared Codec lane (via StateError) is truthful enough.
-        let line = line.map_err(StateError::from)?;
+        // Encode-side serialization failures carry no useful line number,
+        // but they are wire-document codec failures, not state-db ones:
+        // the dedicated Encode variant keeps the error taxonomy truthful.
+        let line = line.map_err(ManifestError::Encode)?;
         ndjson.extend_from_slice(line.as_bytes());
         ndjson.push(b'\n');
         Ok(())
@@ -508,10 +543,12 @@ pub struct MergeReport {
     pub live_rows: u64,
     /// Deleted rows applied through the consumer.
     pub deleted_rows: u64,
-    /// The merged cursor seed (max per device across all headers,
-    /// excluding the merging device's own id — its own prefix is
-    /// authoritative locally), as committed via
-    /// [`crate::state::StateTxn::set_cursor`].
+    /// The merged cursor seed, as committed via
+    /// [`crate::state::StateTxn::set_cursor`]: per device, the max of
+    /// that device's **own** manifests' self-attestations
+    /// (`cursors[owner]`), never a peer's claim about it, and excluding
+    /// the merging device's own id — its own prefix is authoritative
+    /// locally. See [`merge`] for why peer claims are not trusted.
     pub cursors: BTreeMap<DeviceId, u64>,
     /// Live rows no synthetic apply op could be built for (`thumb` rows,
     /// `preview` rows without a `content_id`), as `(relkey, kind)`
@@ -525,8 +562,19 @@ pub struct MergeReport {
 
 /// §2.3 bootstrap/catch-up merge: applies every manifest's rows through
 /// the **same** [`JournalConsumer`] as journal replay, then seeds the
-/// db's cursors from the merged headers — all in **one** committed state
-/// transaction (a failed merge leaves nothing behind).
+/// db's cursors from the merged headers' **owner self-attestations** —
+/// all in **one** committed state transaction (a failed merge leaves
+/// nothing behind).
+///
+/// Cursor seeding (pinned): device `D`'s cursor seeds only from
+/// `cursors[D]` of a manifest **owned by `D`** — the §2.10 rule-1
+/// attestation whose coverage `D`'s own rows are guaranteed to fold
+/// ([`build_manifest`]). A peer's header claim about a third device's
+/// prefix is never trusted: the claimant's rows are subject to its own
+/// live-row withholding, so seeding from the claim could skip journal
+/// entries whose effects no merged row folds (silent loss, §2.1
+/// principle 2). An unseeded prefix is simply applied from the journal
+/// on the next poll.
 ///
 /// Each element pairs a manifest with its **owning device** (known from
 /// the key it was fetched from); the owner stamps synthetic `del`
@@ -535,9 +583,11 @@ pub struct MergeReport {
 /// Conversion (pinned): live rows become synthetic `put` entries carrying
 /// the row's `kind`, `vv`, hashes, dimensions and `mtime`, with the
 /// bucket key rebuilt from `(kind, key)` via the [`crate::keys`]
-/// constructors and `device` = the row's `device` (falling back to the
-/// manifest owner); deleted rows become synthetic `del` entries with
-/// `ts` = the row's `server_ts`. Synthetic entries have `seq` 0 and are
+/// constructors, `device` = the row's `device` (falling back to the
+/// manifest owner), and `ts` = the header's `written_server_ts` (a
+/// provenance rewrite — see [`live_row_entry`]'s caveat); deleted rows
+/// become synthetic `del` entries with `ts` = the row's `server_ts`.
+/// Synthetic entries have `seq` 0 and are
 /// **never** marked applied — idempotency across merge-then-poll comes
 /// from the consumer's own apply semantics (§2.3: merging manifests *is*
 /// the idempotent apply operation), not the applied set. Application
@@ -562,16 +612,26 @@ pub fn merge(
         for row in &manifest.deleted {
             deleted.push((owner, row));
         }
-        for (device, &seq) in &manifest.header.cursors {
-            // Never seed a cursor for the merging device's own prefix: a
-            // device never applies its own journal, its cursors table
-            // holds peers only, and its own published cursor is the
-            // authoritative local fact.
-            if device == db.device_id() {
-                continue;
+        // Cursor seeding trusts only each OWNER's self-attestation
+        // (`cursors[owner]`): the §2.10 rule-1 entry whose coverage this
+        // manifest's own rows are guaranteed to fold. A peer's header
+        // claim about a THIRD device's prefix is "I applied these", but
+        // the claimant's rows are subject to its own live-row withholding
+        // (e.g. an item it re-dirtied from a base it never uploaded, the
+        // PendingDown→Dirty edge), so trusting the claim could skip
+        // journal entries whose effects no merged row folds — silent loss.
+        // Unseeded prefixes simply get applied from the journal (or hit
+        // the typed gap outcomes) on the next poll.
+        //
+        // Never seed a cursor for the merging device's own prefix either:
+        // a device never applies its own journal, its cursors table holds
+        // peers only, and its own published cursor is the authoritative
+        // local fact.
+        if *owner != *db.device_id() {
+            if let Some(&seq) = manifest.header.cursors.get(owner) {
+                let slot = cursors.entry(owner.clone()).or_insert(0);
+                *slot = (*slot).max(seq);
             }
-            let slot = cursors.entry(device.clone()).or_insert(0);
-            *slot = (*slot).max(seq);
         }
     }
     live.sort_by(|a, b| a.2.key.cmp(&b.2.key));
@@ -623,15 +683,30 @@ pub fn merge(
     Ok(report)
 }
 
-/// Whether an item in this state may be advertised as a §2.3 live row:
-/// `true` iff the recorded version's upload has **completed**, so a
-/// remote object for it provably exists. `Dirty`/`Queued`/`Uploading`
-/// versions have never finished an upload — advertising them would hand
-/// every bootstrapping peer a key (or version) that is not in the bucket.
-/// `Verifying` and later states follow a completed upload (or an
-/// advertisement by another writer, for the download-side states); even
-/// `CorruptRemote` names an object that exists — content verification is
-/// every reader's own job, keyed by the row's `blake3`.
+/// Whether an item record may be advertised as a §2.3 live row: `true`
+/// iff a remote object for some version of the key provably exists —
+/// either the state itself proves a completed upload
+/// ([`state_is_remotely_visible`]), or the record's `blake3` does (it
+/// names the last **uploaded/verified** bytes by the
+/// [`crate::state::ItemRecord`] contract, so an in-flight re-edit of a
+/// previously-published item keeps advertising the published version).
+/// Only a record that is both in-flight and `blake3`-less — a key no
+/// version of which was ever uploaded, hence no published journal entry
+/// covers — is withheld. See [`build_manifest`]'s docs for why anything
+/// weaker breaks the own-cursor attestation.
+fn record_is_advertisable(record: &ItemRecord) -> bool {
+    state_is_remotely_visible(record.state) || record.blake3.is_some()
+}
+
+/// Whether an item's **state alone** proves a remote object exists for
+/// the recorded version. `Dirty`/`Queued`/`Uploading` versions have never
+/// finished an upload; `Verifying` and later states follow a completed
+/// upload (or an advertisement by another writer, for the download-side
+/// states); even `CorruptRemote` names an object that exists — content
+/// verification is every reader's own job, keyed by the row's `blake3`.
+/// This is one input to [`record_is_advertisable`], never the whole gate:
+/// an in-flight record whose `blake3` evidences a published previous
+/// version is still advertised.
 fn state_is_remotely_visible(state: ItemState) -> bool {
     // Exhaustive on purpose: a future ItemState must decide its
     // manifest visibility explicitly.
@@ -672,6 +747,16 @@ fn bucket_key_for(row: &ManifestRow) -> Result<String, ManifestError> {
 
 /// Converts one live row into its synthetic `put` entry (`seq` 0, never
 /// marked applied; conversion pinned by the merge tests).
+///
+/// `ts` provenance (pinned asymmetry, like [`deleted_row_entry`]'s): a
+/// [`ManifestRow`] v1 carries no per-row ts, so the synthetic entry is
+/// stamped with the **header's** `written_server_ts` — always newer than
+/// the original edit's journal `ts`. Wall-clock `ts` is exactly what the
+/// §2.6 case-4 tie-break reads, so a device that learned a version via
+/// manifest merge can deterministically pick a *different* conflict
+/// primary than one that replayed the journal; the loser is preserved
+/// either way, so nothing is lost. The §2.6 vv-engine unit inherits this
+/// caveat.
 fn live_row_entry(
     owner: &DeviceId,
     header: &ManifestHeader,
