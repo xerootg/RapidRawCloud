@@ -367,6 +367,27 @@ fn write_json_string(s: &str, out: &mut String) {
 ///
 /// Invalid JSON or a non-object root is an error — never a default.
 pub fn sem_hash(sidecar_json_bytes: &[u8]) -> Result<SemHash, SemHashError> {
+    let canonical = semantic_document(sidecar_json_bytes)?;
+    let hex = blake3::hash(canonical.as_bytes()).to_hex().to_string();
+    Ok(SemHash(hex))
+}
+
+/// The **canonical semantic document** of a sidecar (§2.5): the
+/// `{rating, tags: sorted, adjustments'}` projection serialized as
+/// [`canonical_json`] — exactly the bytes [`sem_hash`] hashes, so
+/// `sem_hash(semantic_document(x)) == sem_hash(x)` and the projection is
+/// idempotent (`semantic_document(semantic_document(x)) ==
+/// semantic_document(x)`), both pinned by the semhash suite.
+///
+/// This is the §2.5 definition of a sidecar's *content*: everything
+/// outside it (the `exif` cache, `version`, `lutPath`, formatting) is
+/// churn the protocol deliberately ignores. The §2.6 loser virtual copy
+/// materializes **these** bytes, which is what makes every holder of a
+/// loser version — including holders whose local file diverged only by
+/// churn — write byte-identical copies to one deterministic key.
+///
+/// Same fail-closed parse posture as [`sem_hash`].
+pub fn semantic_document(sidecar_json_bytes: &[u8]) -> Result<String, SemHashError> {
     use serde_json::{Map, Value};
 
     let doc: Value = serde_json::from_slice(sidecar_json_bytes)?;
@@ -416,9 +437,7 @@ pub fn sem_hash(sidecar_json_bytes: &[u8]) -> Result<SemHash, SemHashError> {
         }
     }
 
-    let canonical = canonical_json(&serde_json::Value::Object(projection));
-    let hex = blake3::hash(canonical.as_bytes()).to_hex().to_string();
-    Ok(SemHash(hex))
+    Ok(canonical_json(&serde_json::Value::Object(projection)))
 }
 
 /// The grid-badge facts a sidecar document carries (§2.2: sidecar journal

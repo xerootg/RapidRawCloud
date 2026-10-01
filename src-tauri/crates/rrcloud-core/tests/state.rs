@@ -69,6 +69,7 @@ fn full_record() -> ItemRecord {
         device: Some(dev(DEV1)),
         head_ts: Some(1_769_900_000),
         admitted_vv: Some([(dev(DEV1), 10u32)].into_iter().collect()),
+        admitted_ts: None,
         deleted: false,
     }
 }
@@ -96,6 +97,7 @@ fn bare_record(state: ItemState) -> ItemRecord {
         device: None,
         head_ts: None,
         admitted_vv: None,
+        admitted_ts: None,
         deleted: false,
     }
 }
@@ -3012,6 +3014,7 @@ fn v1_records_without_engine_fields_decode_with_defaults() {
     assert_eq!(record.device, None);
     assert_eq!(record.head_ts, None);
     assert_eq!(record.admitted_vv, None);
+    assert_eq!(record.admitted_ts, None);
     assert!(!record.deleted);
     // And the pre-existing fields still carried through.
     assert_eq!(record.kind, Kind::Original);
@@ -3029,6 +3032,7 @@ fn engine_fields_round_trip_across_reopen() {
     record.device = Some(dev(DEV2));
     record.head_ts = Some(1_769_901_234);
     record.admitted_vv = Some([(dev(DEV1), 10u32)].into_iter().collect());
+    record.admitted_ts = Some(1_769_901_200);
     record.deleted = true;
     {
         let db = open_fresh(&path);

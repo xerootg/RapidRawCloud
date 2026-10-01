@@ -192,6 +192,7 @@ mod linux {
                             device: None,
                             head_ts: None,
                             admitted_vv: None,
+                            admitted_ts: None,
                             deleted: false,
                         },
                     )?;

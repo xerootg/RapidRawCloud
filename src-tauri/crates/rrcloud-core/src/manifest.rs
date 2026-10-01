@@ -202,6 +202,19 @@ pub struct ManifestRow {
     /// File mtime, unix **seconds** (journal-entry provenance, §2.2).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtime: Option<i64>,
+    /// The advertised head version's journal `ts` — the §2.6 case-4
+    /// tiebreak input (review round 0: without it, [`merge`] stamped the
+    /// synthetic put with `written_server_ts`, so a device learning a
+    /// version via manifest could pick a different conflict primary
+    /// than every journal replayer — fleet-visible divergence plus a
+    /// wrong-blake3 download wedge). Additive within proto 1 (readers
+    /// ignore unknown fields); absent in rows from older writers, for
+    /// which [`live_row_entry`] falls back to the header ts (residual,
+    /// documented there). Withheld while an upload intent is in flight —
+    /// the record's `head_ts` then names the in-flight version, not the
+    /// advertised published one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ts: Option<i64>,
     /// Star rating (sidecars), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rating: Option<u8>,
@@ -332,23 +345,35 @@ pub fn build_manifest(db: &SyncDb, written_server_ts: i64) -> Result<Manifest, M
         // every bootstrapping peer a live/deleted contradiction for the
         // same key (engine unit; pinned by the engine suite).
         .filter(|(_, record)| !record.deleted && record_is_advertisable(record))
-        .map(|(key, record)| ManifestRow {
-            key,
-            kind: record.kind,
-            size: record.size,
-            blake3: record.blake3,
-            sem_hash: record.sem_hash,
-            vv: record.vv,
-            // §2.2/§2.6 provenance, carried since the engine unit landed
-            // the additive record fields; absent (older records, non-head
-            // kinds) stays honestly absent.
-            device: record.device,
-            content_id: record.content_id,
-            w: record.w,
-            h: record.h,
-            mtime: Some(record.mtime_unix_ns / 1_000_000_000),
-            rating: record.rating,
-            color_label: record.color_label,
+        .map(|(key, record)| {
+            // §2.6 coordination note: while an upload intent is in
+            // flight the row advertises the last PUBLISHED version
+            // (vv/blake3/size), but the record's head identity
+            // (`head_ts`/`device`) names the IN-FLIGHT version — pairing
+            // them would advertise a (version, identity) no journal
+            // entry ever carried, so both are withheld for in-flight
+            // rows (merge falls back to owner/header ts; review round 0).
+            let in_flight = record.admitted_vv.is_some();
+            ManifestRow {
+                key,
+                kind: record.kind,
+                size: record.size,
+                blake3: record.blake3,
+                sem_hash: record.sem_hash,
+                vv: record.vv,
+                // §2.2/§2.6 provenance, carried since the engine unit
+                // landed the additive record fields; absent (older
+                // records, non-head kinds, in-flight rows) stays
+                // honestly absent.
+                device: if in_flight { None } else { record.device },
+                content_id: record.content_id,
+                w: record.w,
+                h: record.h,
+                mtime: Some(record.mtime_unix_ns / 1_000_000_000),
+                ts: if in_flight { None } else { record.head_ts },
+                rating: record.rating,
+                color_label: record.color_label,
+            }
         })
         // Withhold rows merge cannot convert (doc comment): emitting them
         // would hand every peer an unusable row.
@@ -779,15 +804,18 @@ fn bucket_key_for(row: &ManifestRow) -> Result<String, ManifestError> {
 /// Converts one live row into its synthetic `put` entry (`seq` 0, never
 /// marked applied; conversion pinned by the merge tests).
 ///
-/// `ts` provenance (pinned asymmetry, like [`deleted_row_entry`]'s): a
-/// [`ManifestRow`] v1 carries no per-row ts, so the synthetic entry is
-/// stamped with the **header's** `written_server_ts` — always newer than
-/// the original edit's journal `ts`. Wall-clock `ts` is exactly what the
-/// §2.6 case-4 tie-break reads, so a device that learned a version via
-/// manifest merge can deterministically pick a *different* conflict
-/// primary than one that replayed the journal; the loser is preserved
-/// either way, so nothing is lost. The §2.6 vv-engine unit inherits this
-/// caveat.
+/// `ts` provenance: the row's own `ts` — the advertised version's real
+/// journal timestamp — so a device learning a version via manifest merge
+/// resolves §2.6 case 4 with the SAME candidate the journal replayers
+/// compare, picking the same primary (review round 0: the old
+/// `written_server_ts` stamp made merge-learned heads win ties they
+/// lost everywhere else — fleet-divergent primaries with equal folded
+/// vvs plus a wrong-blake3 download wedge). **Residual fallback**: a
+/// row without `ts` (an older writer, or a row advertised while its
+/// writer had an upload in flight) still stamps `written_server_ts` —
+/// always-newer, so such a head can win a pick it would lose with its
+/// true ts; the loser is preserved either way, and the next real journal
+/// entry for the key re-heads it.
 fn live_row_entry(
     owner: &DeviceId,
     header: &ManifestHeader,
@@ -796,7 +824,7 @@ fn live_row_entry(
     Ok(JournalEntry {
         v: JOURNAL_VERSION,
         seq: 0,
-        ts: header.written_server_ts,
+        ts: row.ts.unwrap_or(header.written_server_ts),
         device: row.device.clone().unwrap_or_else(|| owner.clone()),
         op: Op::Put,
         kind: row.kind,
@@ -815,19 +843,34 @@ fn live_row_entry(
     })
 }
 
-/// Converts one deleted-set row into its synthetic `del` entry. A
-/// [`DeletedRow`] carries neither kind nor device: the deletion aims at
-/// the relkey's primary sidecar key (the §2.7 deletion anchor), and the
+/// Converts one deleted-set row into its synthetic `del` entry. The
+/// deleted set holds **one row per deleted item**, keyed by the item's
+/// own file relkey (§2.3 "one row per deleted key"; [`crate::engine`]
+/// records them this way — review round 0: a single image-keyed row
+/// synthesized only a primary-sidecar del, so a laggard catching a
+/// deletion up via manifest merge hid the sidecar but left the original
+/// live, breaking "merge is the same idempotent apply as replay"). The
+/// del therefore aims at the item's own bucket key, with the kind that
+/// key classifies to; a [`DeletedRow`] carries no device, so the
 /// manifest's owner stamps the entry.
 fn deleted_row_entry(owner: &DeviceId, row: &DeletedRow) -> JournalEntry {
+    let key = library_key(&row.del);
+    let kind = match crate::keys::classify_key(&key) {
+        crate::keys::KeyClass::Original { .. } => Kind::Original,
+        crate::keys::KeyClass::Xmp { .. } => Kind::Xmp,
+        // Sidecar spellings (primary or vc) — and, unreachably for a
+        // library key built from a valid relkey, anything else — aim at
+        // the sidecar kind, matching the engine's classification.
+        _ => Kind::Sidecar,
+    };
     JournalEntry {
         v: JOURNAL_VERSION,
         seq: 0,
         ts: row.server_ts,
         device: owner.clone(),
         op: Op::Del,
-        kind: Kind::Sidecar,
-        key: sidecar_key(&row.del),
+        kind,
+        key,
         vv: row.vv.clone(),
         size: None,
         blake3: None,

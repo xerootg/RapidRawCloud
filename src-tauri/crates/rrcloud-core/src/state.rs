@@ -756,6 +756,19 @@ pub struct ItemRecord {
     /// additive field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admitted_vv: Option<VersionVector>,
+    /// §2.6 admission snapshot, `ts` half: the wall-clock entry timestamp
+    /// frozen when the in-flight upload was admitted — the `(vv, ts)`
+    /// identity "one admitted upload = one version" promises. The §2.4
+    /// verify-commit stamps the staged entry with exactly this value, so
+    /// the published `ts` stays the admission freeze even when a
+    /// converged twin applied mid-flight moved the *record's* `head_ts`
+    /// (which tracks the resolved head identity, not the intent). Set and
+    /// cleared together with `admitted_vv`; a record written before this
+    /// field decodes it as `None`, for which the commit seam falls back
+    /// to `head_ts` (the pre-field behavior). Engine-unit additive field
+    /// (review round 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_ts: Option<i64>,
     /// §2.7 soft-delete marker: a dominating `del` was applied. The item
     /// keeps its record (hidden from the UI, listed under "Recently
     /// Deleted"); a deliberate flag, not an [`ItemState`], because

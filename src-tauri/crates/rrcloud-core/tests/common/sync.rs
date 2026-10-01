@@ -167,6 +167,7 @@ fn probe_record() -> ItemRecord {
         device: None,
         head_ts: None,
         admitted_vv: None,
+        admitted_ts: None,
         deleted: false,
     }
 }
@@ -252,6 +253,7 @@ impl JournalConsumer for ReplayConsumer {
                     device: None,
                     head_ts: None,
                     admitted_vv: None,
+                    admitted_ts: None,
                     deleted: false,
                 };
                 txn.replay_put_item(&relkey, &record)?;

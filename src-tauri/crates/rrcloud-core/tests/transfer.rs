@@ -830,6 +830,92 @@ async fn abort_stale_uploads_aborts_aged_own_uploads_and_re_marks_dirty() {
 }
 
 #[tokio::test]
+async fn abort_stale_uploads_withdraws_the_admission_intent_with_the_demotion() {
+    // Review round 0 (engine finding 3): every `uploading -> dirty`
+    // demotion must clear the §2.6 admission snapshot — a Dirty record
+    // with a stale intent reads as a committed head to the apply rule,
+    // and the next admission then mints a false descendant of a
+    // merged-in concurrent branch.
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-stale-intent");
+    let client = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("stale/intent.NEF");
+    let key = library_key(&r);
+
+    let created = client
+        .create_multipart_upload(&bucket, &key, &PutObjectOptions::default())
+        .await
+        .expect("create");
+    let now = 1_769_900_000i64;
+    let src = h::under(root.path(), "intent.NEF");
+    h::write_file(&src, &h::patterned(1024, 2));
+    h::seed_queued(&db, &r, Kind::Original, &src);
+    // The queue admission snapshotted an intent before the upload hung.
+    db.update_item(&r, ItemState::Queued, |rec| {
+        rec.admitted_vv = Some([(db.device_id().clone(), 1u32)].into_iter().collect());
+        rec.admitted_ts = Some(now - 9 * 24 * 60 * 60);
+    })
+    .expect("plant intent");
+    h::advance(&db, &r, &[ItemState::Uploading]);
+    db.set_upload(
+        &r,
+        &MultipartUploadState {
+            upload_id: created.upload_id.clone(),
+            part_size: cfg.part_size,
+            started_unix: now - 8 * 24 * 60 * 60,
+            size: std::fs::metadata(&src).expect("metadata").len(),
+            mtime_unix_ns: h::mtime_unix_ns(&src),
+        },
+    )
+    .expect("set_upload");
+
+    abort_stale_uploads(&db, &client, &cfg, 7 * 24 * 60 * 60, now)
+        .await
+        .expect("sweep");
+    let record = db.get_item(&r).expect("get").expect("record");
+    assert_eq!(record.state, ItemState::Dirty);
+    assert_eq!(
+        record.admitted_vv, None,
+        "the demotion withdraws the intent (review round 0)"
+    );
+    assert_eq!(record.admitted_ts, None);
+}
+
+#[tokio::test]
+async fn commit_refuses_to_journal_a_record_deleted_mid_upload() {
+    // Review round 0 (engine minor): an upload completing after a §2.7
+    // local delete must journal NOTHING — the fallback would stage a
+    // put carrying the record's del-bumped vv.
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-deleted-mid-upload");
+    let s3 = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("del/mid.NEF");
+    let src = h::under(root.path(), "mid.NEF");
+    h::write_file(&src, &h::patterned(2048, 3));
+    h::seed_queued(&db, &r, Kind::Original, &src);
+    // The item is soft-deleted while the slot still holds it (the §5.1
+    // sequential model makes this a crash-shaped corner, guarded anyway).
+    db.update_item(&r, ItemState::Queued, |rec| rec.deleted = true)
+        .expect("hide");
+
+    let err = upload_item(&db, &s3, &cfg, &r, &src)
+        .await
+        .expect_err("refused");
+    assert!(
+        matches!(err, TransferError::DeletedMidUpload { .. }),
+        "got {err:?}"
+    );
+    assert_eq!(
+        db.outbound_len().expect("outbound"),
+        0,
+        "nothing journaled for a deleted record"
+    );
+    let record = db.get_item(&r).expect("get").expect("record");
+    assert_ne!(record.state, ItemState::Synced, "commit refused");
+    assert!(record.deleted, "still hidden");
+}
+
+#[tokio::test]
 async fn abort_stale_uploads_age_gates_own_key_orphans_and_leaves_live_uploads_alone() {
     let (g, bucket, root, _dbdir, db) = scaffold!("tr-stale-orphan");
     let client = g.client();

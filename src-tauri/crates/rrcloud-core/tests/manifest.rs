@@ -66,6 +66,7 @@ fn live_row(key: &str, kind: Kind, device: &DeviceId) -> ManifestRow {
         w: None,
         h: None,
         mtime: Some(1_769_899_000),
+        ts: Some(1_769_898_000),
         rating: Some(3),
         color_label: Some("red".to_string()),
     }
@@ -255,6 +256,7 @@ fn build_manifest_snapshots_items_deleted_set_and_cursors() {
         device: None,
         head_ts: None,
         admitted_vv: None,
+        admitted_ts: None,
         deleted: false,
     };
     db.replay_put_item(&rel("z/last.NEF"), &record)
@@ -401,6 +403,7 @@ fn build_manifest_withholds_rows_its_own_merge_cannot_convert() {
         device: None,
         head_ts: None,
         admitted_vv: None,
+        admitted_ts: None,
         deleted: false,
     };
     db.replay_put_item(&rel("good.NEF"), &base).expect("put");
@@ -469,6 +472,7 @@ fn build_manifest_withholds_items_whose_version_never_finished_an_upload() {
         device: None,
         head_ts: None,
         admitted_vv: None,
+        admitted_ts: None,
         deleted: false,
     };
     // A §2.3 live row advertises that the key's version IS in the bucket.
@@ -542,6 +546,7 @@ fn in_flight_items_with_a_published_version_stay_advertised() {
         device: None,
         head_ts: None,
         admitted_vv: None,
+        admitted_ts: None,
         deleted: false,
     };
     for state in [ItemState::Dirty, ItemState::Queued, ItemState::Uploading] {
@@ -719,7 +724,10 @@ fn merge_applies_rows_in_relkey_order_as_synthetic_ops_and_seeds_owner_attested_
             (sidecar_key(&rel("a.NEF")), Op::Put, 0),
             (sidecar_key(&rel("g.NEF")), Op::Put, 0),
             (library_key(&rel("m.NEF")), Op::Put, 0),
-            (sidecar_key(&rel("zz-gone.NEF")), Op::Del, 0),
+            // Deleted rows are per-ITEM (engine unit, review round 0):
+            // the del aims at the row's own bucket key — here an
+            // original-item row, so library_key, kind Original.
+            (library_key(&rel("zz-gone.NEF")), Op::Del, 0),
         ]
     );
     assert!(
@@ -1279,6 +1287,7 @@ fn build_manifest_advertises_suffix_keyed_sidecar_items() {
         device: Some(a.clone()),
         head_ts: Some(1_769_900_000),
         admitted_vv: None,
+        admitted_ts: None,
         deleted: false,
     };
     db.replay_put_item(&rel("p/img.NEF.ab12cd.rrdata"), &record)
@@ -1301,4 +1310,100 @@ fn build_manifest_advertises_suffix_keyed_sidecar_items() {
     assert_eq!(row.rating, Some(2), "badge provenance travels");
     assert_eq!(row.color_label, Some("red".to_string()));
     assert_eq!(row.device, Some(a));
+}
+
+// ---------------------------------------------------------------------------
+// Review round 0: per-row ts provenance + per-item deleted-row conversion
+// ---------------------------------------------------------------------------
+
+/// Captures the full synthetic entries a merge drives (the Recording
+/// double keeps only key/op; these conversions pin ts and kind too).
+struct CaptureConsumer(Vec<rrcloud_core::journal::JournalEntry>);
+
+impl rrcloud_core::reader::JournalConsumer for CaptureConsumer {
+    fn apply(
+        &mut self,
+        _txn: &rrcloud_core::state::StateTxn<'_>,
+        entry: &rrcloud_core::journal::JournalEntry,
+    ) -> Result<(), rrcloud_core::reader::ConsumerError> {
+        self.0.push(entry.clone());
+        Ok(())
+    }
+}
+
+#[test]
+fn merge_stamps_live_rows_with_their_own_ts_and_falls_back_to_the_header() {
+    // Review round 0: the synthetic put must carry the ROW's `ts` (the
+    // advertised version's real journal timestamp) so merge-learned
+    // heads resolve §2.6 case 4 exactly like journal-replayed ones; a
+    // row without one (older writer / in-flight advertisement) keeps the
+    // documented header fallback.
+    let a = dev(DEV_A);
+    let b = dev(DEV_B);
+    let (_dir, _path, db) = open_db(&b);
+    let mut with_ts = live_row("with-ts.NEF", Kind::Sidecar, &a);
+    with_ts.ts = Some(1_234);
+    let mut without_ts = live_row("without-ts.NEF", Kind::Sidecar, &a);
+    without_ts.ts = None;
+    let manifest = Manifest {
+        header: header(&[(&a, 1)]),
+        rows: vec![with_ts, without_ts],
+        deleted: vec![],
+    };
+    let mut consumer = CaptureConsumer(Vec::new());
+    merge(&[(a.clone(), manifest)], &db, &mut consumer).expect("merge");
+    let by_key: BTreeMap<String, i64> = consumer.0.iter().map(|e| (e.key.clone(), e.ts)).collect();
+    assert_eq!(by_key[&sidecar_key(&rel("with-ts.NEF"))], 1_234);
+    assert_eq!(
+        by_key[&sidecar_key(&rel("without-ts.NEF"))],
+        1_769_950_000,
+        "absent row ts falls back to written_server_ts (documented residual)"
+    );
+}
+
+#[test]
+fn merge_converts_deleted_rows_per_item_with_the_classified_kind() {
+    // Review round 0: deleted rows are per-ITEM (keyed by the item's own
+    // file relkey); the synthetic del aims at that item's bucket key
+    // with the kind it classifies to — so a laggard catching a deletion
+    // up via manifests hides the original AND the sidecar AND a vc,
+    // exactly like journal replay.
+    let a = dev(DEV_A);
+    let b = dev(DEV_B);
+    let (_dir, _path, db) = open_db(&b);
+    let manifest = Manifest {
+        header: header(&[(&a, 1)]),
+        rows: vec![],
+        deleted: vec![
+            deleted_row("p/img.NEF", &a),               // original item
+            deleted_row("p/img.NEF.rrdata", &a),        // primary sidecar item
+            deleted_row("p/img.NEF.ab12cd.rrdata", &a), // vc item
+            deleted_row("p/img.xmp", &a),               // xmp item
+        ],
+    };
+    let mut consumer = CaptureConsumer(Vec::new());
+    merge(&[(a.clone(), manifest)], &db, &mut consumer).expect("merge");
+    let seen: Vec<(String, Kind, Op)> = consumer
+        .0
+        .iter()
+        .map(|e| (e.key.clone(), e.kind, e.op))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (library_key(&rel("p/img.NEF")), Kind::Original, Op::Del),
+            (
+                library_key(&rel("p/img.NEF.ab12cd.rrdata")),
+                Kind::Sidecar,
+                Op::Del
+            ),
+            (
+                library_key(&rel("p/img.NEF.rrdata")),
+                Kind::Sidecar,
+                Op::Del
+            ),
+            (library_key(&rel("p/img.xmp")), Kind::Xmp, Op::Del),
+        ],
+        "one del per deleted item, aimed at its own key with its own kind"
+    );
 }

@@ -328,6 +328,20 @@ pub enum TransferError {
         relkey: RelKey,
     },
 
+    /// The item was §2.7 soft-deleted while its upload was in flight:
+    /// the verify-commit REFUSES to stage the journal entry (review
+    /// round 0 — the delete withdrew the admitted intent, so the
+    /// fallback would stage a put at the record's del-bumped vv,
+    /// colliding one vv across two distinct events and resurrecting
+    /// deleted state on the wire). Nothing is journaled; the whole
+    /// commit transaction rolls back and the hidden item is left for
+    /// restore/GC to settle.
+    #[error("item {relkey} was deleted while its upload was in flight; nothing journaled")]
+    DeletedMidUpload {
+        /// The item.
+        relkey: RelKey,
+    },
+
     /// A single PUT's returned ETag did not equal the body's hex MD5
     /// (upload verify, §2.4). The item is re-queued.
     #[error("ETag mismatch on {relkey}: expected {expected}, got {actual}")]
@@ -738,17 +752,42 @@ pub async fn upload_item_from(
             if let Some(vv) = &admitted {
                 r.vv.merge(vv);
             }
-            *admitted_snapshot.borrow_mut() = (admitted, r.head_ts);
+            // The entry's ts is the ADMISSION freeze (`admitted_ts`),
+            // not the record's head_ts: a converged twin applied
+            // mid-flight legitimately moves head_ts to the resolved
+            // identity, and publishing that foreign ts would break "one
+            // admitted upload = one (vv, ts) identity" (review round 0).
+            // Records without the field (pre-field rows) fall back to
+            // head_ts, the pre-field behavior.
+            let frozen_ts = r.admitted_ts.take().or(r.head_ts);
+            *admitted_snapshot.borrow_mut() = (admitted, frozen_ts);
             r.blake3 = Some(blake3.clone());
             r.size = size;
             if sem.is_some() {
                 r.sem_hash = sem.clone();
+                // The §2.2 badges follow the PUBLISHED document exactly
+                // (parsed from the sent bytes): an edit-then-revert
+                // leaves the intake's badge refresh describing the
+                // detour, and the commit is where the record starts
+                // naming this version (review round 0, found by the
+                // in-flight-window scenario's state-equivalence check).
+                r.rating = badges.rating;
+                r.color_label = badges.color_label.clone();
             }
             if content_id.is_some() {
                 r.content_id = content_id.clone();
             }
         },
         |r| {
+            // §2.7 refusal (review round 0): a record soft-deleted while
+            // this upload was in flight must journal NOTHING — its
+            // intent was withdrawn, and the vv fallback below would
+            // stage a put at the del-bumped record vv.
+            if r.deleted {
+                return Err(TransferError::DeletedMidUpload {
+                    relkey: relkey.clone(),
+                });
+            }
             let (admitted, frozen_ts) = std::mem::take(&mut *admitted_snapshot.borrow_mut());
             Ok(JournalEntry {
                 v: JOURNAL_VERSION,
@@ -1193,14 +1232,37 @@ fn park_sidecar_invalid(
     relkey: &RelKey,
     source: SemHashError,
 ) -> Result<TransferError, TransferError> {
-    db.with_txn(|t| {
-        t.transition(relkey, ItemState::Uploading, ItemState::Dirty, |_| {})?;
-        Ok(())
-    })?;
+    park_dirty_withdrawing_intent(db, relkey, ItemState::Uploading)?;
     Ok(TransferError::SidecarInvalid {
         relkey: relkey.clone(),
         source,
     })
+}
+
+/// The single demotion lane into `dirty` (§2.4 "upload abandoned"),
+/// shared by every `uploading → dirty` site: the admission intent
+/// (`admitted_vv`/`admitted_ts`) is **withdrawn in the same transition**
+/// (review round 0). A Dirty record carrying a stale intent read as a
+/// committed head to the §2.6 apply rule, so a losing concurrent remote
+/// merged into `record.vv` and the NEXT admission minted a false
+/// descendant of a version this device never saw — publishing which
+/// destroys the other branch fleet-wide with no loser copy. (The engine's
+/// apply gate now also treats `Dirty` as uncommitted regardless of a
+/// leftover intent — defense in depth; the withdrawn, never-published
+/// vv component is simply re-minted by the next admission.)
+fn park_dirty_withdrawing_intent(
+    db: &SyncDb,
+    relkey: &RelKey,
+    from: ItemState,
+) -> Result<(), TransferError> {
+    db.with_txn(|t| {
+        t.transition(relkey, from, ItemState::Dirty, |r| {
+            r.admitted_vv = None;
+            r.admitted_ts = None;
+        })?;
+        Ok(())
+    })?;
+    Ok(())
 }
 
 /// The S3 multipart ETag the backend must report for an object completed
@@ -1267,7 +1329,12 @@ async fn abort_source_changed(
     abort_upload_tolerant(s3, cfg, key, upload_id).await?;
     db.with_txn(|t| {
         t.clear_upload(relkey)?;
-        t.transition(relkey, ItemState::Uploading, ItemState::Dirty, |_| {})?;
+        t.transition(relkey, ItemState::Uploading, ItemState::Dirty, |r| {
+            // Withdraw the admission intent with the demotion (review
+            // round 0; see park_dirty_withdrawing_intent).
+            r.admitted_vv = None;
+            r.admitted_ts = None;
+        })?;
         Ok(())
     })?;
     Ok(TransferError::AbortedSourceChanged {
@@ -1546,7 +1613,11 @@ pub async fn abort_stale_uploads(
             Ok(())
         })?;
         if record.state == ItemState::Uploading {
-            demote(db, &relkey, ItemState::Uploading, ItemState::Dirty)?;
+            // Tolerate a lost CAS like `demote` (a live driver owns it).
+            match park_dirty_withdrawing_intent(db, &relkey, ItemState::Uploading) {
+                Ok(()) | Err(TransferError::State(StateError::StaleState { .. })) => {}
+                Err(e) => return Err(e),
+            }
         }
         report.aborted_own.push((relkey, upload.upload_id));
     }

@@ -22,7 +22,7 @@ use std::path::Path;
 use common::engine as eh;
 use common::engine::RecordedEvents;
 use common::garage;
-use common::sync::{dev, open_db, rel, DEV_A, DEV_B, DEV_C};
+use common::sync::{dev, open_db, rel, DEV_A, DEV_B, DEV_C, DEV_X};
 use common::transfer as th;
 use common::transfer::CountingS3;
 use rrcloud_core::clock::{compare, VersionVector, VvOrder};
@@ -39,7 +39,7 @@ use rrcloud_core::keys::{
 };
 use rrcloud_core::manifest::build_manifest;
 use rrcloud_core::reader::{ConsumerError, JournalConsumer};
-use rrcloud_core::semhash::{canonical_json, sem_hash, sidecar_badges, Blake3Hex, ContentId};
+use rrcloud_core::semhash::{sem_hash, sidecar_badges, Blake3Hex, ContentId};
 use rrcloud_core::state::{ItemRecord, ItemState, Queue, SyncDb};
 use rrcloud_core::transfer::{bucket_key_for, local_target_path, upload_item};
 
@@ -78,6 +78,7 @@ fn rec(kind: Kind, state: ItemState) -> ItemRecord {
         device: None,
         head_ts: None,
         admitted_vv: None,
+        admitted_ts: None,
         deleted: false,
     }
 }
@@ -291,10 +292,19 @@ fn loser_vc_suffix_is_content_deterministic_six_hex() {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         "suffix {suffix:?} must be lowercase hex"
     );
-    // Pinned derivation (§2.6): blake3(canonical loser document)[..6].
-    let value: serde_json::Value = serde_json::from_slice(&d).expect("doc parses");
-    let expected = blake3::hash(canonical_json(&value).as_bytes()).to_hex();
+    // Pinned derivation (§2.6, churn-stable — review round 0): the
+    // canonical loser document is the §2.5 SEMANTIC canonical form, so
+    // the suffix is the first 6 hex of the loser's sem_hash.
+    let expected = sem_hash(&d).expect("sem");
     assert_eq!(suffix, expected.as_str()[..6].to_string());
+    // Churn-stable: an EXIF-cache rewrite (same semantics, different
+    // bytes) must NOT move the key, or two holders of one loser would
+    // materialize two different vcs (the review's duplicate-vc finding).
+    assert_eq!(
+        loser_vc_suffix(&eh::churned(&d)).expect("churned suffix"),
+        suffix,
+        "a §2.5 churn rewrite must not move the loser's vc key"
+    );
     // Spelling-insensitive: key order and number spelling do not move
     // the key (two writers of the same document agree).
     let respelled =
@@ -1034,8 +1044,10 @@ fn case4_remote_wins_materializes_the_held_loser_and_adopts_the_winner() {
     assert_eq!(record.head_ts, Some(2_000));
 
     // We hold the loser (we authored it): it materialized at the
-    // deterministic vc key with our exact bytes, admitted for upload
-    // with a fresh single-component vv.
+    // deterministic vc key as the CANONICAL loser document (the §2.5
+    // semantic form — byte-identical on every holder, churn included;
+    // review round 0), admitted for upload with a fresh
+    // single-component vv.
     let suffix = loser_vc_suffix(&ours).expect("suffix");
     let vc_key = vc_item_relkey(&image, &suffix).expect("vc relkey");
     let vc = item(&db, &vc_key);
@@ -1047,11 +1059,18 @@ fn case4_remote_wins_materializes_the_held_loser_and_adopts_the_winner() {
         Some(vv(&[(DEV_A, 1)])),
         "fresh single-component vv"
     );
-    assert_eq!(vc.sem_hash, Some(sem_hash(&ours).expect("sem")));
     assert_eq!(
-        eh::read_file(&item_local_path(root.path(), &vc_key)),
-        ours,
-        "loser bytes written to the vc file"
+        vc.admitted_ts,
+        Some(2_500),
+        "the vc admission freezes the pass's now as its entry ts"
+    );
+    assert_eq!(vc.sem_hash, Some(sem_hash(&ours).expect("sem")));
+    let vc_bytes = eh::read_file(&item_local_path(root.path(), &vc_key));
+    assert_eq!(vc_bytes, eh::semantic(&ours), "canonical loser doc");
+    assert_eq!(
+        sem_hash(&vc_bytes).expect("vc sem"),
+        sem_hash(&ours).expect("loser sem"),
+        "the canonical form preserves the loser's semantic identity"
     );
 
     assert_eq!(
@@ -1386,7 +1405,14 @@ fn case4_remote_wins_over_committed_queued_local_redirects_it_to_the_vc() {
         after.admitted_vv, None,
         "the primary upload intent is withdrawn"
     );
-    assert_eq!(after.vv, vv(&[(DEV_A, 2), (DEV_B, 1)]));
+    // The withdrawn intent's vv does NOT fold into the primary path
+    // (review round 0): {A:1, B:1} was never published on this key — the
+    // losing version lives on at the vc key with its own fresh vv — so
+    // folding it would leave this device with a component no peer can
+    // ever learn, making every future honest descendant of the
+    // converged state read as concurrent here. The record converges to
+    // exactly what every other device computes.
+    assert_eq!(after.vv, vv(&[(DEV_A, 2)]));
     assert_eq!(after.sem_hash, Some(sem_hash(&theirs).expect("sem")));
 
     let suffix = loser_vc_suffix(&ours).expect("suffix");
@@ -1398,7 +1424,11 @@ fn case4_remote_wins_over_committed_queued_local_redirects_it_to_the_vc() {
         Some(vv(&[(DEV_B, 1)])),
         "fresh vv for the new key"
     );
-    assert_eq!(eh::read_file(&item_local_path(root.path(), &vc_rel)), ours);
+    assert_eq!(
+        eh::read_file(&item_local_path(root.path(), &vc_rel)),
+        eh::semantic(&ours),
+        "canonical loser doc at the vc path"
+    );
     assert_eq!(
         drain_queue(&db, Queue::Up),
         vec![vc_rel.as_str().to_string()],
@@ -1444,10 +1474,18 @@ fn dominating_del_hides_the_item_and_records_the_deletion() {
         vv(&[(DEV_A, 2)]),
         "the del is a version of the key"
     );
+    // The hidden record keeps the deleted CONTENT version's head
+    // identity (review round 0: it is what restore re-advertises, and
+    // what a del-first bootstrapper records — so arrival orders agree).
+    assert_eq!(record.head_ts, Some(100));
+    assert_eq!(record.device, Some(dev(DEV_A)));
+    // §2.3: the deleted-set row is keyed by the deleted ITEM's own file
+    // relkey (one row per deleted key — review round 0).
+    assert_eq!(db.get_deleted(&image).expect("no image-keyed row"), None);
     let deleted = db
-        .get_deleted(&image)
+        .get_deleted(&key)
         .expect("get_deleted")
-        .expect("recorded");
+        .expect("recorded under the item key");
     assert_eq!(deleted.vv, vv(&[(DEV_A, 2)]));
     assert_eq!(deleted.server_ts, 900);
     let listed = recently_deleted(&db).expect("recently_deleted");
@@ -1667,7 +1705,7 @@ fn dominating_put_over_a_deleted_record_undeletes_and_clears_the_row() {
     db.update_item(&key, ItemState::Synced, |r| r.deleted = true)
         .expect("mark deleted");
     db.record_deleted(
-        &image,
+        &key,
         &rrcloud_core::state::DeletedRecord {
             vv: vv(&[(DEV_A, 2)]),
             server_ts: 900,
@@ -1687,7 +1725,7 @@ fn dominating_put_over_a_deleted_record_undeletes_and_clears_the_row() {
     assert!(!record.deleted, "undeleted by the dominating put");
     assert_eq!(record.state, ItemState::PendingDown, "new content fetches");
     assert_eq!(
-        db.get_deleted(&image).expect("get_deleted"),
+        db.get_deleted(&key).expect("get_deleted"),
         None,
         "row withdrawn"
     );
@@ -2056,12 +2094,21 @@ async fn delete_puts_tombstone_stages_dels_and_hides_records() {
     }
     assert_eq!(item(&db, &sidecar_rel).vv, vv(&[(DEV_A, 3), (DEV_B, 1)]));
     assert_eq!(item(&db, &image).vv, vv(&[(DEV_A, 2)]));
+    // §2.3 "one row per deleted key" (review round 0): one deleted-set
+    // row PER ITEM, keyed by the item's file relkey with ITS del vv.
+    assert_eq!(
+        db.get_deleted(&sidecar_rel)
+            .expect("get_deleted")
+            .expect("sidecar row")
+            .vv,
+        vv(&[(DEV_A, 3), (DEV_B, 1)])
+    );
     assert_eq!(
         db.get_deleted(&image)
             .expect("get_deleted")
-            .expect("row")
+            .expect("original row")
             .vv,
-        vv(&[(DEV_A, 3), (DEV_B, 1)])
+        vv(&[(DEV_A, 2)])
     );
     assert_eq!(
         recently_deleted(&db)
@@ -2088,23 +2135,30 @@ async fn delete_puts_tombstone_stages_dels_and_hides_records() {
         "deleted items must not be advertised live: {:?}",
         manifest.rows
     );
-    assert_eq!(manifest.deleted.len(), 1);
+    assert_eq!(manifest.deleted.len(), 2, "one deleted row per item");
     assert_eq!(manifest.deleted[0].del, image);
-    assert_eq!(manifest.deleted[0].vv, vv(&[(DEV_A, 3), (DEV_B, 1)]));
+    assert_eq!(manifest.deleted[0].vv, vv(&[(DEV_A, 2)]));
+    assert_eq!(manifest.deleted[1].del, sidecar_rel);
+    assert_eq!(manifest.deleted[1].vv, vv(&[(DEV_A, 3), (DEV_B, 1)]));
 
     // Restore: metadata-only dominating puts, flags cleared, row gone.
     let restored = restore_item(&db, &image).expect("restore_item");
     assert_eq!(restored.len(), 2);
-    for key in [&sidecar_rel, &image] {
+    // Restore dominates each ITEM's own deletion (per-lineage vvs —
+    // the original's counters are independent of the sidecar's).
+    for (key, del_vv) in [
+        (&sidecar_rel, vv(&[(DEV_A, 3), (DEV_B, 1)])),
+        (&image, vv(&[(DEV_A, 2)])),
+    ] {
         let record = item(&db, key);
         assert!(!record.deleted, "{key} restored");
         assert_eq!(
-            compare(&record.vv, &vv(&[(DEV_A, 3), (DEV_B, 1)])),
+            compare(&record.vv, &del_vv),
             VvOrder::Greater,
             "restore dominates the deletion for {key}"
         );
+        assert_eq!(db.get_deleted(key).expect("get_deleted"), None);
     }
-    assert_eq!(db.get_deleted(&image).expect("get_deleted"), None);
     assert!(recently_deleted(&db).expect("listing").is_empty());
     let staged_after: Vec<JournalEntry> = db
         .iter_outbound()
@@ -2119,10 +2173,15 @@ async fn delete_puts_tombstone_stages_dels_and_hides_records() {
     assert_eq!(restore_puts.len(), 2, "sidecar + original restore puts");
     for put in restore_puts {
         assert!(put.blake3.is_some(), "every engine put carries blake3");
+        let del_vv = if put.key == sidecar_key(&image) {
+            vv(&[(DEV_A, 3), (DEV_B, 1)])
+        } else {
+            vv(&[(DEV_A, 2)])
+        };
         assert_eq!(
-            compare(&put.vv, &tombstone.vv.clone()),
+            compare(&put.vv, &del_vv),
             VvOrder::Greater,
-            "restore put {} dominates the tombstone",
+            "restore put {} dominates its item's del",
             put.key
         );
     }
@@ -2331,4 +2390,1209 @@ fn put_and_del_mix_is_order_equivalent() {
         "the dominating restore put wins in every order"
     );
     assert_eq!(record.vv, vv(&[(DEV_A, 3), (DEV_B, 1)]));
+}
+
+// ===========================================================================
+// Review round 0 regressions — the verified failure interleavings, pinned
+// ===========================================================================
+
+/// Finding 1 (B1) unit half: with an admitted upload in flight, the
+/// §2.6 case-1 content test must compare the entry against the
+/// IN-FLIGHT head's content (the local file), never the record's
+/// stale published `sem_hash` — an entry matching the OLD published
+/// semantics but concurrent with the admitted version is case 4, not
+/// convergence.
+#[test]
+fn in_flight_head_resolves_content_against_the_local_file() {
+    let (_d, root, db) = scratch(DEV_A);
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item key");
+    let v1 = eh::doc(1, None, 0.0);
+    let v2 = eh::doc(4, Some("red"), 0.5);
+    // Published v1; v2 admitted and in flight (Queued, intent {A:2});
+    // the record's sem_hash still names v1 (§2.6 coordination note).
+    let mut record = rec(Kind::Sidecar, ItemState::Queued);
+    record.sem_hash = Some(sem_hash(&v1).expect("sem"));
+    record.blake3 = Some(Blake3Hex::from_bytes(&v1));
+    record.vv = vv(&[(DEV_A, 1)]);
+    record.admitted_vv = Some(vv(&[(DEV_A, 2)]));
+    record.admitted_ts = Some(1_000);
+    record.head_ts = Some(1_000);
+    record.device = Some(dev(DEV_A));
+    db.replay_put_item(&key, &record).expect("seed queued");
+    db.queue_push(Queue::Up, &key, 1).expect("queue");
+    th::write_file(&item_local_path(root.path(), &key), &v2);
+
+    // B edited-then-reverted: its entry re-advertises v1's SEMANTICS
+    // under a vv concurrent with the admitted v2, with a winning ts.
+    let entry = put_sidecar(DEV_B, &image, &v1, vv(&[(DEV_A, 1), (DEV_B, 1)]), 9_000);
+    assert_eq!(compare(&entry.vv, &vv(&[(DEV_A, 2)])), VvOrder::Concurrent);
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(1_500);
+    apply(&db, &mut consumer, &entry);
+
+    // Case 4 fired (pre-fix: silent convergence, zero conflict events,
+    // v2 destined to publish under a ts that was not its freeze).
+    assert_eq!(events.conflicts.len(), 1, "case 4 must fire");
+    assert_eq!(events.conflicts[0].winner_device, dev(DEV_B));
+    let suffix = loser_vc_suffix(&v2).expect("suffix");
+    let vc_rel = vc_item_relkey(&image, &suffix).expect("vc relkey");
+    assert_eq!(events.conflicts[0].copy_relkey, Some(vc_rel.clone()));
+    let after = item(&db, &key);
+    assert_eq!(after.state, ItemState::PendingDown, "winner fetch pending");
+    assert_eq!(after.admitted_vv, None, "intent withdrawn");
+    assert_eq!(after.admitted_ts, None);
+    assert_eq!(after.sem_hash, Some(sem_hash(&v1).expect("sem")));
+    // The in-flight v2 survives as the vc.
+    let vc = item(&db, &vc_rel);
+    assert_eq!(vc.sem_hash, Some(sem_hash(&v2).expect("sem")));
+    assert_eq!(vc.state, ItemState::Queued);
+    assert_eq!(
+        eh::read_file(&item_local_path(root.path(), &vc_rel)),
+        eh::semantic(&v2)
+    );
+}
+
+/// Finding 1 (B1), local-wins direction: the in-flight head WINS the
+/// pick — the entry's branch folds into the record vv, the intent stays
+/// exactly as admitted, and nothing converges silently.
+#[test]
+fn in_flight_head_winning_keeps_its_intent_untouched() {
+    let (_d, root, db) = scratch(DEV_A);
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item key");
+    let v1 = eh::doc(1, None, 0.0);
+    let v2 = eh::doc(4, Some("red"), 0.5);
+    let mut record = rec(Kind::Sidecar, ItemState::Queued);
+    record.sem_hash = Some(sem_hash(&v1).expect("sem"));
+    record.blake3 = Some(Blake3Hex::from_bytes(&v1));
+    record.vv = vv(&[(DEV_A, 1)]);
+    record.admitted_vv = Some(vv(&[(DEV_A, 2)]));
+    record.admitted_ts = Some(8_000);
+    record.head_ts = Some(8_000);
+    record.device = Some(dev(DEV_A));
+    db.replay_put_item(&key, &record).expect("seed queued");
+    db.queue_push(Queue::Up, &key, 1).expect("queue");
+    th::write_file(&item_local_path(root.path(), &key), &v2);
+
+    let entry = put_sidecar(DEV_B, &image, &v1, vv(&[(DEV_A, 1), (DEV_B, 1)]), 2_000);
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(8_500);
+    apply(&db, &mut consumer, &entry);
+
+    let after = item(&db, &key);
+    assert_eq!(after.state, ItemState::Queued, "still bound for upload");
+    assert_eq!(
+        after.admitted_vv,
+        Some(vv(&[(DEV_A, 2)])),
+        "the admitted snapshot is untouched by the losing branch"
+    );
+    assert_eq!(after.admitted_ts, Some(8_000));
+    assert_eq!(after.vv, vv(&[(DEV_A, 1), (DEV_B, 1)]), "branch folded");
+    assert_eq!(events.conflicts.len(), 1);
+    assert_eq!(events.conflicts[0].winner_device, dev(DEV_A));
+}
+
+/// Finding 2/5 (B2/B5) unit half, receiver side: a del CONCURRENT with
+/// a committed live head loses (§2.7 edits beat deletes) — the item
+/// stays live and ABSORBS the del's vv; no deleted-set row stands.
+#[test]
+fn concurrent_del_vs_committed_head_folds_and_stays_live() {
+    let (_d, root, db) = scratch(DEV_B);
+    let image = rel(IMG);
+    let d2 = eh::doc(2, Some("blue"), 0.4);
+    let key = seed_synced_sidecar(
+        &db,
+        root.path(),
+        &image,
+        &d2,
+        DEV_B,
+        vv(&[(DEV_A, 1), (DEV_B, 1)]),
+        2_000,
+    );
+
+    // A deleted from the base version: concurrent with our edit.
+    let entry = del(
+        DEV_A,
+        Kind::Sidecar,
+        sidecar_key(&image),
+        vv(&[(DEV_A, 2)]),
+        1_500,
+    );
+    assert_eq!(
+        compare(&entry.vv, &vv(&[(DEV_A, 1), (DEV_B, 1)])),
+        VvOrder::Concurrent,
+        "precondition"
+    );
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(3_000);
+    apply(&db, &mut consumer, &entry);
+
+    let record = item(&db, &key);
+    assert!(!record.deleted, "edits beat deletes: the item stays live");
+    assert_eq!(
+        record.vv,
+        vv(&[(DEV_A, 2), (DEV_B, 1)]),
+        "the losing del's vv is absorbed (pre-fix: dropped entirely)"
+    );
+    assert_eq!(record.sem_hash, Some(sem_hash(&d2).expect("sem")));
+    assert_eq!(db.get_deleted(&key).expect("row"), None, "no standing row");
+    assert_eq!(db.get_deleted(&image).expect("row"), None);
+    assert!(recently_deleted(&db).expect("listing").is_empty());
+}
+
+/// Finding 2/5 (B2/B5) unit half, deleter side: a put CONCURRENT with
+/// the applied deletion un-hides the item and adopts the put as the
+/// head — with NO vc materialized from the deleted content and no
+/// conflict pick (the delete superseded the local content; the edit
+/// beat the delete).
+#[test]
+fn concurrent_put_over_a_deleted_record_undeletes_and_adopts() {
+    let (_d, root, db) = scratch(DEV_A);
+    let image = rel(IMG);
+    let d1 = eh::doc(1, None, 0.0);
+    let key = seed_synced_sidecar(&db, root.path(), &image, &d1, DEV_A, vv(&[(DEV_A, 1)]), 100);
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(1_000);
+    // Our own deletion applies first.
+    apply(
+        &db,
+        &mut consumer,
+        &del(
+            DEV_A,
+            Kind::Sidecar,
+            sidecar_key(&image),
+            vv(&[(DEV_A, 2)]),
+            900,
+        ),
+    );
+    assert!(item(&db, &key).deleted);
+    assert!(db.get_deleted(&key).expect("row").is_some());
+
+    // B's edit, concurrent with the deletion, wins (edits beat deletes).
+    let d2 = eh::doc(5, Some("green"), 0.9);
+    let entry = put_sidecar(DEV_B, &image, &d2, vv(&[(DEV_A, 1), (DEV_B, 1)]), 2_000);
+    apply(&db, &mut consumer, &entry);
+
+    let record = item(&db, &key);
+    assert!(!record.deleted, "the winning edit un-hides the item");
+    assert_eq!(record.state, ItemState::PendingDown, "fetch the edit");
+    assert_eq!(record.vv, vv(&[(DEV_A, 2), (DEV_B, 1)]), "both folded");
+    assert_eq!(record.sem_hash, Some(sem_hash(&d2).expect("sem")));
+    assert_eq!(db.get_deleted(&key).expect("row"), None, "row withdrawn");
+    assert_eq!(
+        drain_queue(&db, Queue::Down),
+        vec![key.as_str().to_string()]
+    );
+    assert!(
+        events.conflicts.is_empty(),
+        "no §2.6 pick runs against deleted content"
+    );
+    assert_eq!(
+        db.iter_items().expect("items").len(),
+        1,
+        "no vc leaks the deleted content back"
+    );
+}
+
+/// Finding 5 (B5), third-device half: the probe's exact entry pair —
+/// put {A:2} ts 2000 (committed edit) vs del {A:1,X:1} ts 1500
+/// (concurrent delete) — lands IDENTICAL state in both arrival orders,
+/// on a fresh device and on one that knew v1 first.
+#[test]
+fn concurrent_del_vs_committed_put_is_arrival_order_equivalent() {
+    let image = rel(IMG);
+    let d2 = eh::doc(2, None, 0.1);
+    let put = put_sidecar(DEV_A, &image, &d2, vv(&[(DEV_A, 2)]), 2_000);
+    let dele = del(
+        "deadbeef-0000-4000-9000-000000000002",
+        Kind::Sidecar,
+        sidecar_key(&image),
+        vv(&[(DEV_A, 1), ("deadbeef-0000-4000-9000-000000000002", 1)]),
+        1_500,
+    );
+    assert_eq!(compare(&put.vv, &dele.vv), VvOrder::Concurrent);
+
+    let run = |seed_v1: bool, order: &[&JournalEntry]| {
+        let (_d, root, db) = scratch(DEV_C);
+        if seed_v1 {
+            let d1 = eh::doc(1, None, 0.0);
+            seed_synced_sidecar(&db, root.path(), &image, &d1, DEV_A, vv(&[(DEV_A, 1)]), 100);
+        }
+        let mut events = RecordedEvents::default();
+        let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+            .expect("consumer")
+            .with_now(9_000);
+        for e in order {
+            apply(&db, &mut consumer, e);
+        }
+        (
+            eh::full_items(&db),
+            db.iter_deleted().expect("iter_deleted"),
+        )
+    };
+    for seed_v1 in [false, true] {
+        let put_first = run(seed_v1, &[&put, &dele]);
+        let del_first = run(seed_v1, &[&dele, &put]);
+        assert_eq!(
+            put_first, del_first,
+            "arrival order diverged (seed_v1={seed_v1})"
+        );
+        let key = sidecar_item_relkey(&image).expect("key");
+        let record = &put_first.0[key.as_str()];
+        assert!(!record.deleted, "edits beat deletes in every order");
+        assert_eq!(
+            record.vv,
+            vv(&[(DEV_A, 2), ("deadbeef-0000-4000-9000-000000000002", 1)])
+        );
+        assert!(put_first.1.is_empty(), "no standing deletion rows");
+    }
+}
+
+/// Two CONCURRENT deletes of one item both stand: the record and the
+/// row fold both vvs, in both arrival orders.
+#[test]
+fn concurrent_dels_fold_rows_and_stay_hidden_in_both_orders() {
+    let image = rel(IMG);
+    let del_a = del(
+        DEV_A,
+        Kind::Sidecar,
+        sidecar_key(&image),
+        vv(&[(DEV_A, 2)]),
+        900,
+    );
+    let del_b = del(
+        DEV_B,
+        Kind::Sidecar,
+        sidecar_key(&image),
+        vv(&[(DEV_A, 1), (DEV_B, 1)]),
+        950,
+    );
+    let run = |order: &[&JournalEntry]| {
+        let (_d, root, db) = scratch(DEV_C);
+        let d1 = eh::doc(1, None, 0.0);
+        seed_synced_sidecar(&db, root.path(), &image, &d1, DEV_A, vv(&[(DEV_A, 1)]), 100);
+        let mut events = RecordedEvents::default();
+        let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+            .expect("consumer")
+            .with_now(9_000);
+        for e in order {
+            apply(&db, &mut consumer, e);
+        }
+        (
+            eh::full_items(&db),
+            db.iter_deleted().expect("iter_deleted"),
+        )
+    };
+    let ab = run(&[&del_a, &del_b]);
+    let ba = run(&[&del_b, &del_a]);
+    assert_eq!(ab, ba, "del/del arrival order diverged");
+    let key = sidecar_item_relkey(&image).expect("key");
+    assert!(ab.0[key.as_str()].deleted, "both deletes stand");
+    assert_eq!(ab.0[key.as_str()].vv, vv(&[(DEV_A, 2), (DEV_B, 1)]));
+    assert_eq!(ab.1.len(), 1);
+    assert_eq!(ab.1[0].0, key);
+    assert_eq!(ab.1[0].1.vv, vv(&[(DEV_A, 2), (DEV_B, 1)]), "row folded");
+}
+
+/// Finding 7 (B6) unit half: edits-beat-deletes resurrection with
+/// ASYMMETRIC vvs — original authored on A, sidecar authored on B, A
+/// deletes both, C holds uncommitted dirt. The original's resurrection
+/// put is concurrent with the original's OWN del, and the deleter must
+/// still un-hide it (content-equal converge + §2.7 edits-beat-deletes
+/// undelete).
+#[test]
+fn asymmetric_resurrection_unhides_the_original_on_the_deleter() {
+    let image = rel(IMG);
+    let orig_bytes = th::patterned(2048, 7);
+    let key = sidecar_item_relkey(&image).expect("sidecar item");
+    let published = eh::doc(1, None, 0.0);
+    let edited = eh::doc(5, Some("red"), 0.9);
+
+    // --- C: dirty sidecar (authored on B: vv {B:1}), original {A:1}.
+    let (_d, root, db_c) = scratch(DEV_C);
+    let mut sidecar = rec(Kind::Sidecar, ItemState::Dirty);
+    sidecar.sem_hash = Some(sem_hash(&published).expect("sem"));
+    sidecar.blake3 = Some(Blake3Hex::from_bytes(&published));
+    sidecar.vv = vv(&[(DEV_B, 1)]);
+    db_c.insert_item(&key, &sidecar).expect("seed sidecar");
+    th::write_file(&item_local_path(root.path(), &key), &edited);
+    let mut original = rec(Kind::Original, ItemState::Stub);
+    original.blake3 = Some(Blake3Hex::from_bytes(&orig_bytes));
+    original.content_id = Some(ContentId::from_bytes(&orig_bytes));
+    original.size = orig_bytes.len() as u64;
+    original.vv = vv(&[(DEV_A, 1)]);
+    db_c.insert_item(&image, &original).expect("seed original");
+
+    // A's dels: sidecar del {A:1,B:1}, original del {A:2} (per-lineage).
+    let del_sidecar = del(
+        DEV_A,
+        Kind::Sidecar,
+        sidecar_key(&image),
+        vv(&[(DEV_A, 1), (DEV_B, 1)]),
+        700,
+    );
+    let del_original = del(
+        DEV_A,
+        Kind::Original,
+        library_key(&image),
+        vv(&[(DEV_A, 2)]),
+        700,
+    );
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db_c, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(1_500);
+    apply(&db_c, &mut consumer, &del_sidecar);
+    apply(&db_c, &mut consumer, &del_original);
+
+    // C: whole item live, both resurrection puts staged.
+    assert!(!item(&db_c, &key).deleted && !item(&db_c, &image).deleted);
+    let staged: Vec<JournalEntry> = db_c
+        .iter_outbound()
+        .expect("outbound")
+        .into_iter()
+        .map(|(_, b)| {
+            JournalEntry::from_json_line(std::str::from_utf8(&b).expect("utf8")).expect("decodes")
+        })
+        .collect();
+    let orig_put = staged
+        .iter()
+        .find(|e| e.op == Op::Put && e.key == library_key(&image))
+        .expect("original resurrection put");
+    // The resurrection vv {A:1,B:1,C:1} is CONCURRENT with del_original
+    // {A:2} — the shape the old strictly-Greater undelete lost.
+    assert_eq!(compare(&orig_put.vv, &del_original.vv), VvOrder::Concurrent);
+
+    // --- A (the deleter): both items hidden, then C's puts arrive.
+    let (_d2, root_a, db_a) = scratch(DEV_A);
+    let mut a_sidecar = rec(Kind::Sidecar, ItemState::Synced);
+    a_sidecar.sem_hash = Some(sem_hash(&published).expect("sem"));
+    a_sidecar.blake3 = Some(Blake3Hex::from_bytes(&published));
+    a_sidecar.vv = vv(&[(DEV_A, 1), (DEV_B, 1)]);
+    a_sidecar.deleted = true;
+    db_a.replay_put_item(&key, &a_sidecar).expect("seed");
+    let mut a_original = rec(Kind::Original, ItemState::Hydrated);
+    a_original.blake3 = Some(Blake3Hex::from_bytes(&orig_bytes));
+    a_original.content_id = Some(ContentId::from_bytes(&orig_bytes));
+    a_original.vv = vv(&[(DEV_A, 2)]);
+    a_original.deleted = true;
+    db_a.replay_put_item(&image, &a_original).expect("seed");
+    db_a.record_deleted(
+        &key,
+        &rrcloud_core::state::DeletedRecord {
+            vv: vv(&[(DEV_A, 1), (DEV_B, 1)]),
+            server_ts: 700,
+        },
+    )
+    .expect("row");
+    db_a.record_deleted(
+        &image,
+        &rrcloud_core::state::DeletedRecord {
+            vv: vv(&[(DEV_A, 2)]),
+            server_ts: 700,
+        },
+    )
+    .expect("row");
+
+    // The sidecar resurrection goes through the upload lane (its dirt
+    // was admitted); the entry the §2.4 seam will publish carries
+    // exactly the admitted (vv, ts) and the sent bytes' facts.
+    let c_sidecar = item(&db_c, &key);
+    let admitted = c_sidecar.admitted_vv.clone().expect("admitted intent");
+    let sidecar_put = put_sidecar(
+        DEV_C,
+        &image,
+        &edited,
+        admitted,
+        c_sidecar.admitted_ts.expect("admitted ts"),
+    );
+    let mut events_a = RecordedEvents::default();
+    let mut consumer_a = EngineConsumer::new(&db_a, root_a.path(), &mut events_a)
+        .expect("consumer")
+        .with_now(2_000);
+    apply(&db_a, &mut consumer_a, &sidecar_put);
+    apply(&db_a, &mut consumer_a, orig_put);
+
+    assert!(
+        !item(&db_a, &key).deleted,
+        "sidecar un-hidden on the deleter"
+    );
+    assert!(
+        !item(&db_a, &image).deleted,
+        "original un-hidden on the deleter although its resurrection vv \
+         is only CONCURRENT with its del (review round 0)"
+    );
+    assert_eq!(
+        item(&db_a, &image).vv,
+        vv(&[(DEV_A, 2), (DEV_B, 1), (DEV_C, 1)]),
+        "both branches folded"
+    );
+    assert_eq!(db_a.get_deleted(&key).expect("row"), None);
+    assert_eq!(db_a.get_deleted(&image).expect("row"), None);
+    assert!(recently_deleted(&db_a).expect("listing").is_empty());
+}
+
+/// Finding 8 (B7): deleting a VIRTUAL COPY records its deleted-set row
+/// under the VC ITEM's own key on the deleter AND on appliers, and a
+/// fresh device applying either prefix order keeps the primary
+/// original+sidecar live — the vc del hides only the vc.
+#[tokio::test]
+async fn deleting_a_virtual_copy_hides_only_the_vc_in_every_order() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("eng-vc-delete");
+    let client = g.client();
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("sidecar item");
+    let loser = eh::doc(3, Some("red"), 0.25);
+    let suffix = loser_vc_suffix(&loser).expect("suffix");
+    let vc_rel = vc_item_relkey(&image, &suffix).expect("vc relkey");
+    let d1 = eh::doc(1, None, 0.0);
+    let orig_bytes = th::patterned(1024, 3);
+
+    // Deleter B holds primaries + the vc.
+    let (_d, _root, db_b) = open_db(&dev(DEV_B));
+    let mut orig = rec(Kind::Original, ItemState::Hydrated);
+    orig.blake3 = Some(Blake3Hex::from_bytes(&orig_bytes));
+    orig.content_id = Some(ContentId::from_bytes(&orig_bytes));
+    orig.vv = vv(&[(DEV_A, 1)]);
+    db_b.insert_item(&image, &orig).expect("seed orig");
+    let mut primary = rec(Kind::Sidecar, ItemState::Synced);
+    primary.sem_hash = Some(sem_hash(&d1).expect("sem"));
+    primary.blake3 = Some(Blake3Hex::from_bytes(&d1));
+    primary.vv = vv(&[(DEV_A, 1)]);
+    db_b.insert_item(&key, &primary).expect("seed primary");
+    let mut vc = rec(Kind::Sidecar, ItemState::Synced);
+    vc.sem_hash = Some(sem_hash(&loser).expect("sem"));
+    vc.blake3 = Some(Blake3Hex::from_bytes(&loser));
+    vc.vv = vv(&[(DEV_B, 2)]);
+    db_b.insert_item(&vc_rel, &vc).expect("seed vc");
+
+    // The only lane for discarding a conflict copy: delete the vc item.
+    let outcome = delete_item(&db_b, &client, &bucket, &vc_rel, &[Kind::Sidecar])
+        .await
+        .expect("delete vc");
+    assert_eq!(outcome.staged, vec![vc_rel.clone()]);
+    assert!(item(&db_b, &vc_rel).deleted, "vc hidden on the deleter");
+    assert!(!item(&db_b, &key).deleted, "primary sidecar untouched");
+    assert!(!item(&db_b, &image).deleted, "original untouched");
+    assert!(
+        db_b.get_deleted(&vc_rel).expect("row").is_some(),
+        "the row is keyed by the VC ITEM's own relkey on the deleter"
+    );
+    assert_eq!(db_b.get_deleted(&image).expect("row"), None);
+    assert_eq!(db_b.get_deleted(&key).expect("row"), None);
+
+    // The staged del aims at the vc's own bucket key.
+    let staged: Vec<JournalEntry> = db_b
+        .iter_outbound()
+        .expect("outbound")
+        .into_iter()
+        .map(|(_, b)| {
+            JournalEntry::from_json_line(std::str::from_utf8(&b).expect("utf8")).expect("decodes")
+        })
+        .collect();
+    let vc_del = staged.iter().find(|e| e.op == Op::Del).expect("vc del");
+    assert_eq!(vc_del.key, library_key(&vc_rel));
+
+    // An APPLYING device with the same items records the row under the
+    // SAME key (pre-fix: deleter keyed by vc relkey, appliers by the
+    // base image — fleet-divergent deleted sets).
+    let (_d2, root_x, db_x) = scratch(DEV_X);
+    db_x.insert_item(&image, &orig).expect("seed orig");
+    db_x.insert_item(&key, &primary).expect("seed primary");
+    db_x.insert_item(&vc_rel, &vc).expect("seed vc");
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db_x, root_x.path(), &mut events)
+        .expect("consumer")
+        .with_now(5_000);
+    apply(&db_x, &mut consumer, vc_del);
+    assert!(item(&db_x, &vc_rel).deleted);
+    assert!(!item(&db_x, &key).deleted && !item(&db_x, &image).deleted);
+    assert!(db_x.get_deleted(&vc_rel).expect("row").is_some());
+    assert_eq!(db_x.get_deleted(&image).expect("row"), None);
+
+    // A FRESH device applying {vc put, vc del} before the primaries —
+    // or after — keeps the primaries live either way (pre-fix: the
+    // base-keyed row hid the whole image on the del-first order).
+    let mut vc_put = put_sidecar(DEV_B, &image, &loser, vv(&[(DEV_B, 2)]), 1_000);
+    vc_put.key = library_key(&vc_rel);
+    let primary_put = put_sidecar(DEV_A, &image, &d1, vv(&[(DEV_A, 1)]), 500);
+    let orig_put = put_original(DEV_A, &image, &orig_bytes, vv(&[(DEV_A, 1)]), 500);
+    let run = |order: &[&JournalEntry]| {
+        let (_d, root, db) = scratch(DEV_C);
+        let mut events = RecordedEvents::default();
+        let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+            .expect("consumer")
+            .with_now(9_000);
+        for e in order {
+            apply(&db, &mut consumer, e);
+        }
+        (
+            eh::full_items(&db),
+            db.iter_deleted().expect("iter_deleted"),
+        )
+    };
+    let b_first = run(&[&vc_put, vc_del, &primary_put, &orig_put]);
+    let a_first = run(&[&primary_put, &orig_put, &vc_put, vc_del]);
+    assert_eq!(b_first, a_first, "arrival order diverged");
+    assert!(!b_first.0[key.as_str()].deleted, "primary sidecar live");
+    assert!(!b_first.0[image.as_str()].deleted, "original live");
+    assert!(b_first.0[vc_rel.as_str()].deleted, "only the vc hidden");
+}
+
+/// Finding M2: delete_item addresses an xmp item (self-keyed by the
+/// caller) and restore brings it back; the kind filter no longer drops
+/// the request on the floor.
+#[tokio::test]
+async fn delete_item_addresses_xmp_items_and_restore_reverses_it() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("eng-xmp-delete");
+    let client = g.client();
+    let (_d, _root, db) = open_db(&dev(DEV_A));
+    let xmp_rel = rel("p/img.xmp");
+    let xmp_bytes = b"<x:xmpmeta/>";
+    let mut xmp = rec(Kind::Xmp, ItemState::Synced);
+    xmp.blake3 = Some(Blake3Hex::from_bytes(xmp_bytes));
+    xmp.content_id = Some(ContentId::from_bytes(xmp_bytes));
+    xmp.vv = vv(&[(DEV_A, 1)]);
+    db.insert_item(&xmp_rel, &xmp).expect("seed xmp");
+
+    let outcome = delete_item(&db, &client, &bucket, &xmp_rel, &[Kind::Xmp])
+        .await
+        .expect("delete xmp (pre-fix: UnknownItem)");
+    assert_eq!(outcome.staged, vec![xmp_rel.clone()]);
+    assert_eq!(outcome.tombstone.kinds, vec![Kind::Xmp]);
+    assert!(item(&db, &xmp_rel).deleted);
+    assert!(db.get_deleted(&xmp_rel).expect("row").is_some());
+    let staged: Vec<JournalEntry> = db
+        .iter_outbound()
+        .expect("outbound")
+        .into_iter()
+        .map(|(_, b)| {
+            JournalEntry::from_json_line(std::str::from_utf8(&b).expect("utf8")).expect("decodes")
+        })
+        .collect();
+    let xdel = staged.iter().find(|e| e.op == Op::Del).expect("xmp del");
+    assert_eq!(xdel.kind, Kind::Xmp);
+    assert_eq!(xdel.key, library_key(&xmp_rel));
+
+    let restored = restore_item(&db, &xmp_rel).expect("restore xmp");
+    assert_eq!(restored, vec![xmp_rel.clone()]);
+    assert!(!item(&db, &xmp_rel).deleted);
+    assert_eq!(db.get_deleted(&xmp_rel).expect("row"), None);
+}
+
+/// Finding 10 (B8a): a deleted-then-restored `PendingDown` item is
+/// re-pushed onto the download queue — the delete dequeued it and
+/// nothing else ever would have re-queued it.
+#[test]
+fn restore_requeues_a_pending_down_item() {
+    let (_d, root, db) = scratch(DEV_B);
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item key");
+    let d1 = eh::doc(1, None, 0.0);
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(1_000);
+    // Remote put creates the item queued-down; a dominating del hides
+    // and dequeues it.
+    apply(
+        &db,
+        &mut consumer,
+        &put_sidecar(DEV_A, &image, &d1, vv(&[(DEV_A, 1)]), 500),
+    );
+    apply(
+        &db,
+        &mut consumer,
+        &del(
+            DEV_A,
+            Kind::Sidecar,
+            sidecar_key(&image),
+            vv(&[(DEV_A, 2)]),
+            900,
+        ),
+    );
+    assert!(item(&db, &key).deleted);
+    assert_eq!(db.queue_len(Queue::Down).expect("len"), 0, "dequeued");
+
+    let restored = restore_item(&db, &image).expect("restore");
+    assert_eq!(restored, vec![key.clone()]);
+    let record = item(&db, &key);
+    assert!(!record.deleted);
+    assert_eq!(record.state, ItemState::PendingDown);
+    assert_eq!(
+        drain_queue(&db, Queue::Down),
+        vec![key.as_str().to_string()],
+        "restore must re-queue the fetch (pre-fix: wedged off the queue)"
+    );
+}
+
+/// Finding 10 (B8b) unit half: restoring an item whose upload lane was
+/// stranded by the delete (Queued with a withdrawn intent) demotes it
+/// to Dirty so the next admission re-admits the LOCAL FILE's content —
+/// the lane that makes a withdrawn v2 reachable again.
+#[test]
+fn restore_normalizes_a_wedged_queued_item_to_dirty() {
+    let (_d, _root, db) = scratch(DEV_B);
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item key");
+    let d1 = eh::doc(1, None, 0.0);
+    // Published v1, then v2 admitted (Queued) — and then deleted: the
+    // delete withdrew the intent, dequeued, and hid the record.
+    let mut record = rec(Kind::Sidecar, ItemState::Queued);
+    record.sem_hash = Some(sem_hash(&d1).expect("sem"));
+    record.blake3 = Some(Blake3Hex::from_bytes(&d1));
+    record.vv = vv(&[(DEV_B, 2)]);
+    record.deleted = true;
+    db.replay_put_item(&key, &record).expect("seed");
+    db.record_deleted(
+        &key,
+        &rrcloud_core::state::DeletedRecord {
+            vv: vv(&[(DEV_B, 2)]),
+            server_ts: 900,
+        },
+    )
+    .expect("row");
+
+    let restored = restore_item(&db, &image).expect("restore");
+    assert_eq!(restored, vec![key.clone()]);
+    let after = item(&db, &key);
+    assert!(!after.deleted);
+    assert_eq!(
+        after.state,
+        ItemState::Dirty,
+        "the stranded upload lane is normalized to Dirty (pre-fix: \
+         Queued forever with an empty queue — the local edit unreachable)"
+    );
+    assert_eq!(after.admitted_vv, None);
+    // The next admission picks it up: the heal lane exists.
+    let admitted = admit_pending(&db, |_, _| true).expect("admit");
+    assert_eq!(admitted, vec![key.clone()]);
+    assert_eq!(item(&db, &key).state, ItemState::Queued);
+    assert!(item(&db, &key).admitted_vv.is_some());
+}
+
+/// Finding m2: restore's target matcher is structural — a sibling image
+/// whose relkey merely extends `<image>.` is NOT restored and keeps its
+/// own deletion row.
+#[test]
+fn restore_does_not_overmatch_sibling_images() {
+    let (_d, _root, db) = scratch(DEV_A);
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item key");
+    let sibling = rel("p/img.NEF.bak"); // its own image, not ours
+    let d1 = eh::doc(1, None, 0.0);
+    for (k, kind) in [
+        (&image, Kind::Original),
+        (&key, Kind::Sidecar),
+        (&sibling, Kind::Original),
+    ] {
+        let mut r = rec(kind, ItemState::Synced);
+        r.blake3 = Some(Blake3Hex::from_bytes(&d1));
+        if kind == Kind::Sidecar {
+            r.sem_hash = Some(sem_hash(&d1).expect("sem"));
+        } else {
+            r.content_id = Some(ContentId::from_bytes(&d1));
+        }
+        r.vv = vv(&[(DEV_A, 1)]);
+        r.deleted = true;
+        db.replay_put_item(k, &r).expect("seed");
+        db.record_deleted(
+            k,
+            &rrcloud_core::state::DeletedRecord {
+                vv: vv(&[(DEV_A, 2)]),
+                server_ts: 900,
+            },
+        )
+        .expect("row");
+    }
+
+    let mut restored = restore_item(&db, &image).expect("restore");
+    restored.sort();
+    assert_eq!(restored, vec![image.clone(), key.clone()]);
+    assert!(!item(&db, &image).deleted && !item(&db, &key).deleted);
+    assert!(
+        item(&db, &sibling).deleted,
+        "the sibling image stays deleted (pre-fix: prefix over-match \
+         resurrected it while leaving its row standing)"
+    );
+    assert!(
+        db.get_deleted(&sibling).expect("row").is_some(),
+        "the sibling's row stands with its items"
+    );
+}
+
+/// Finding m4: a dominating put without size/mtime keeps the local
+/// facts instead of zeroing them (adopt path parity with converge).
+#[test]
+fn adopt_without_size_keeps_local_size_and_mtime() {
+    let (_d, root, db) = scratch(DEV_A);
+    let image = rel(IMG);
+    let d1 = eh::doc(1, None, 0.0);
+    let key = seed_synced_sidecar(&db, root.path(), &image, &d1, DEV_A, vv(&[(DEV_A, 1)]), 100);
+    let before = item(&db, &key);
+    assert!(before.size > 0, "precondition");
+
+    let d2 = eh::doc(5, Some("green"), 1.0);
+    let mut entry = put_sidecar(DEV_B, &image, &d2, vv(&[(DEV_A, 1), (DEV_B, 1)]), 200);
+    entry.size = None;
+    entry.mtime = None;
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(500);
+    apply(&db, &mut consumer, &entry);
+
+    let record = item(&db, &key);
+    assert_eq!(record.state, ItemState::PendingDown);
+    assert_eq!(record.size, before.size, "size keeps the local fallback");
+    assert_eq!(record.mtime_unix_ns, before.mtime_unix_ns);
+}
+
+/// Finding m7: intake over a pipeline-interior state refreshes the
+/// scanned identity but defers the dirty mark — and says so with the
+/// dedicated outcome instead of a misleading `MarkedDirty`.
+#[test]
+fn notify_on_pipeline_interior_state_returns_deferred() {
+    let (_d, _root, db) = scratch(DEV_A);
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item key");
+    let d1 = eh::doc(1, None, 0.0);
+    let mut record = rec(Kind::Sidecar, ItemState::Queued);
+    record.sem_hash = Some(sem_hash(&d1).expect("sem"));
+    record.vv = vv(&[(DEV_A, 1)]);
+    record.admitted_vv = Some(vv(&[(DEV_A, 2)]));
+    db.replay_put_item(&key, &record).expect("seed");
+
+    let d2 = eh::doc(4, Some("red"), 0.5);
+    let outcome = notify_local_change(
+        &db,
+        &image,
+        Kind::Sidecar,
+        &LocalScan {
+            size: d2.len() as u64,
+            mtime_unix_ns: 10,
+            bytes: &d2,
+        },
+    )
+    .expect("notify");
+    assert_eq!(
+        outcome,
+        ChangeOutcome::DeferredToPipeline,
+        "the pipeline owns the state; nothing was marked dirty"
+    );
+    assert_eq!(item(&db, &key).state, ItemState::Queued, "state untouched");
+    assert_eq!(
+        item(&db, &key).rating,
+        Some(4),
+        "the badge refresh still lands"
+    );
+}
+
+/// Finding M5: loser preservation is never skipped silently — a missing
+/// local file fires the event (and the apply still completes), while a
+/// transient I/O failure aborts the apply transaction entirely.
+#[test]
+fn loser_preservation_failures_are_event_or_abort_never_silent() {
+    // (a) FileMissing: state says we hold the loser, the file is gone.
+    let (_d, root, db) = scratch(DEV_A);
+    let image = rel(IMG);
+    let ours = eh::doc(3, Some("red"), 0.25);
+    let key = seed_synced_sidecar(
+        &db,
+        root.path(),
+        &image,
+        &ours,
+        DEV_A,
+        vv(&[(DEV_A, 2)]),
+        100,
+    );
+    std::fs::remove_file(item_local_path(root.path(), &key)).expect("drop the file");
+    let theirs = eh::doc(5, Some("green"), 0.75);
+    let entry = put_sidecar(DEV_B, &image, &theirs, vv(&[(DEV_A, 1), (DEV_B, 1)]), 9_000);
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(500);
+    apply(&db, &mut consumer, &entry);
+    assert_eq!(events.loser_skipped.len(), 1, "no silent skip");
+    assert_eq!(
+        events.loser_skipped[0].reason,
+        rrcloud_core::engine::LoserSkipReason::FileMissing
+    );
+    assert_eq!(
+        item(&db, &key).state,
+        ItemState::PendingDown,
+        "winner adopted"
+    );
+
+    // (b) Unparsable: the file exists but is not a sidecar document.
+    let (_d2, root2, db2) = scratch(DEV_A);
+    let key2 = seed_synced_sidecar(
+        &db2,
+        root2.path(),
+        &image,
+        &ours,
+        DEV_A,
+        vv(&[(DEV_A, 2)]),
+        100,
+    );
+    th::write_file(&item_local_path(root2.path(), &key2), b"not json");
+    let mut events2 = RecordedEvents::default();
+    let mut consumer2 = EngineConsumer::new(&db2, root2.path(), &mut events2)
+        .expect("consumer")
+        .with_now(500);
+    apply(&db2, &mut consumer2, &entry);
+    assert_eq!(events2.loser_skipped.len(), 1);
+    assert_eq!(
+        events2.loser_skipped[0].reason,
+        rrcloud_core::engine::LoserSkipReason::Unparsable
+    );
+
+    // (c) A transient read failure (here: the path is a directory, so
+    // the read errors without being NotFound) aborts the apply — the
+    // reader would retry next poll; nothing half-applies.
+    let (_d3, root3, db3) = scratch(DEV_A);
+    let key3 = seed_synced_sidecar(
+        &db3,
+        root3.path(),
+        &image,
+        &ours,
+        DEV_A,
+        vv(&[(DEV_A, 2)]),
+        100,
+    );
+    std::fs::remove_file(item_local_path(root3.path(), &key3)).expect("drop");
+    std::fs::create_dir(item_local_path(root3.path(), &key3)).expect("dir in the way");
+    let before = item(&db3, &key3);
+    let mut events3 = RecordedEvents::default();
+    let mut consumer3 = EngineConsumer::new(&db3, root3.path(), &mut events3)
+        .expect("consumer")
+        .with_now(500);
+    let result = db3.with_txn_err::<_, ConsumerError>(|t| consumer3.apply(t, &entry));
+    assert!(result.is_err(), "transient I/O must abort the apply");
+    assert_eq!(item(&db3, &key3), before, "transaction rolled back whole");
+    assert!(events3.loser_skipped.is_empty());
+
+    // (d) Displaced-original staging: same no-silent-skip contract.
+    let (_d4, root4, db4) = scratch(DEV_A);
+    let orig_bytes = th::patterned(512, 9);
+    let mut orig = rec(Kind::Original, ItemState::Hydrated);
+    orig.blake3 = Some(Blake3Hex::from_bytes(&orig_bytes));
+    orig.content_id = Some(ContentId::from_bytes(&orig_bytes));
+    orig.vv = vv(&[(DEV_A, 2)]);
+    orig.device = Some(dev(DEV_A));
+    orig.head_ts = Some(100);
+    db4.replay_put_item(&image, &orig).expect("seed");
+    // No local file at all.
+    let other = th::patterned(512, 10);
+    let oentry = put_original(DEV_B, &image, &other, vv(&[(DEV_A, 1), (DEV_B, 1)]), 9_000);
+    let mut events4 = RecordedEvents::default();
+    let mut consumer4 = EngineConsumer::new(&db4, root4.path(), &mut events4)
+        .expect("consumer")
+        .with_now(500);
+    apply(&db4, &mut consumer4, &oentry);
+    assert_eq!(events4.loser_skipped.len(), 1);
+    assert_eq!(
+        events4.loser_skipped[0].reason,
+        rrcloud_core::engine::LoserSkipReason::FileMissing
+    );
+    assert!(events4.original_conflicts.is_empty(), "nothing was staged");
+}
+
+/// Finding M3: the loser-vc dedup is honestly (key, sem_hash) — a
+/// DIFFERENT document already resident at the derived vc key is never
+/// clobbered (file or record), and nothing is staged for the collider.
+#[test]
+fn vc_suffix_collision_with_different_document_never_clobbers() {
+    let (_d, root, db) = scratch(DEV_A);
+    let image = rel(IMG);
+    let ours = eh::doc(3, Some("red"), 0.25);
+    let key = seed_synced_sidecar(
+        &db,
+        root.path(),
+        &image,
+        &ours,
+        DEV_A,
+        vv(&[(DEV_A, 2)]),
+        100,
+    );
+    let _ = key;
+    // A legitimately different vc already lives at OUR loser's key
+    // (modeling a 24-bit suffix-prefix collision).
+    let suffix = loser_vc_suffix(&ours).expect("suffix");
+    let vc_rel = vc_item_relkey(&image, &suffix).expect("vc relkey");
+    let resident_doc = eh::doc(1, Some("blue"), 0.9);
+    let mut resident = rec(Kind::Sidecar, ItemState::Synced);
+    resident.sem_hash = Some(sem_hash(&resident_doc).expect("sem"));
+    resident.blake3 = Some(Blake3Hex::from_bytes(&resident_doc));
+    resident.vv = vv(&[(DEV_C, 1)]);
+    db.insert_item(&vc_rel, &resident)
+        .expect("seed resident vc");
+    th::write_file(&item_local_path(root.path(), &vc_rel), &resident_doc);
+
+    let theirs = eh::doc(5, Some("green"), 0.75);
+    let entry = put_sidecar(DEV_B, &image, &theirs, vv(&[(DEV_A, 1), (DEV_B, 1)]), 9_000);
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(500);
+    apply(&db, &mut consumer, &entry);
+
+    assert_eq!(
+        eh::read_file(&item_local_path(root.path(), &vc_rel)),
+        resident_doc,
+        "the resident vc's file is never overwritten (pre-fix: clobbered \
+         while the record kept the old document's identity)"
+    );
+    assert_eq!(
+        item(&db, &vc_rel).sem_hash,
+        Some(sem_hash(&resident_doc).expect("sem")),
+        "record untouched"
+    );
+    assert_eq!(
+        item(&db, &vc_rel).state,
+        ItemState::Synced,
+        "nothing staged"
+    );
+    assert_eq!(events.loser_skipped.len(), 1);
+    assert_eq!(
+        events.loser_skipped[0].reason,
+        rrcloud_core::engine::LoserSkipReason::KeyCollision
+    );
+    assert_eq!(
+        events.conflicts.len(),
+        1,
+        "the conflict itself still resolves"
+    );
+}
+
+/// Finding 3 (B3), gate half: a Dirty record carrying a STALE leftover
+/// intent is still uncommitted dirt to the apply rule — the losing
+/// concurrent remote triggers commit-then-case-4 with a freshly minted
+/// admitted vv that is CONCURRENT with (never a false descendant of)
+/// the remote branch.
+#[test]
+fn stale_intent_on_dirty_is_treated_as_uncommitted_dirt() {
+    let (_d, root, db) = scratch(DEV_B);
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item key");
+    let published = eh::doc(1, None, 0.0);
+    let edited = eh::doc(4, Some("red"), 0.5);
+    let mut record = rec(Kind::Sidecar, ItemState::Dirty);
+    record.sem_hash = Some(sem_hash(&published).expect("sem"));
+    record.blake3 = Some(Blake3Hex::from_bytes(&published));
+    record.vv = vv(&[(DEV_A, 1)]);
+    // The poison shape the demotion bug left behind: Dirty + intent.
+    record.admitted_vv = Some(vv(&[(DEV_A, 1), (DEV_B, 1)]));
+    record.admitted_ts = Some(50);
+    db.replay_put_item(&key, &record).expect("seed");
+    th::write_file(&item_local_path(root.path(), &key), &edited);
+
+    // A concurrent remote that LOSES the pick (our now is newer).
+    let remote = eh::doc(2, Some("blue"), 0.9);
+    let entry = put_sidecar(DEV_A, &image, &remote, vv(&[(DEV_A, 2)]), 1_000);
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(5_000);
+    apply(&db, &mut consumer, &entry);
+
+    let after = item(&db, &key);
+    assert_eq!(after.state, ItemState::Queued, "dirt committed, not merged");
+    let minted = after.admitted_vv.clone().expect("fresh intent");
+    assert_eq!(minted, vv(&[(DEV_A, 1), (DEV_B, 1)]));
+    assert_eq!(
+        compare(&minted, &entry.vv),
+        VvOrder::Concurrent,
+        "the minted version is concurrent with the remote branch — never \
+         a false descendant of it (the pre-fix shape destroyed the \
+         remote's edit fleet-wide with no loser copy)"
+    );
+    assert_eq!(events.conflicts.len(), 1, "case 4 fired");
+}
+
+/// Finding 3 (B3), park half (Garage): an invalid-sidecar park —
+/// `uploading → dirty` — WITHDRAWS the admission intent; re-admission
+/// after the file heals mints a fresh version from the record's
+/// published history, never from a stale leftover.
+#[tokio::test]
+async fn invalid_sidecar_park_withdraws_the_admission_intent() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("eng-park-intent");
+    let s3 = CountingS3::new(g.client());
+    let root = tempfile::tempdir().expect("root");
+    let (_dbdir, _p, db) = open_db(&dev(DEV_B));
+    let cfg = th::test_cfg(&bucket, root.path());
+
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item key");
+    let d1 = eh::doc(2, None, 0.5);
+    let path = item_local_path(root.path(), &key);
+    th::write_file(&path, &d1);
+    notify_local_change(
+        &db,
+        &image,
+        Kind::Sidecar,
+        &scan(&d1, th::mtime_unix_ns(&path)),
+    )
+    .expect("notify");
+    admit_pending(&db, |_, _| true).expect("admit");
+    assert!(item(&db, &key).admitted_vv.is_some());
+
+    // The file turns invalid before the transfer reads it: the upload
+    // parks the item dirty (§2.4 "upload abandoned").
+    th::write_file(&path, b"not a sidecar");
+    let err = upload_item(&db, &s3, &cfg, &key, &path)
+        .await
+        .expect_err("invalid sidecar");
+    assert!(
+        matches!(
+            err,
+            rrcloud_core::transfer::TransferError::SidecarInvalid { .. }
+        ),
+        "got {err:?}"
+    );
+    let parked = item(&db, &key);
+    assert_eq!(parked.state, ItemState::Dirty);
+    assert_eq!(
+        parked.admitted_vv, None,
+        "the park withdraws the intent (pre-fix: a Dirty record kept it, \
+         read as committed to the apply rule, and the next admission \
+         minted a false descendant of a merged-in concurrent branch)"
+    );
+    assert_eq!(parked.admitted_ts, None);
+
+    // Heal the file; re-admission mints from the published history.
+    th::write_file(&path, &d1);
+    let admitted = admit_pending(&db, |_, _| true).expect("re-admit");
+    assert_eq!(admitted, vec![key.clone()]);
+    assert_eq!(
+        item(&db, &key).admitted_vv,
+        Some(vv(&[(DEV_B, 1)])),
+        "fresh mint from the (empty) published vv"
+    );
+}
+
+/// Finding 1 (B1), seam half (Garage): the published entry's `ts` is
+/// the ADMISSION freeze even when a converged twin applied mid-flight
+/// legitimately moved the record's `head_ts` to the twin's identity.
+#[tokio::test]
+async fn published_entry_ts_is_the_admission_freeze_not_the_converged_head_ts() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("eng-freeze-ts");
+    let s3 = CountingS3::new(g.client());
+    let root = tempfile::tempdir().expect("root");
+    let (_dbdir, _p, db) = open_db(&dev(DEV_B));
+    let cfg = th::test_cfg(&bucket, root.path());
+
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item key");
+    let d2 = eh::doc(4, Some("red"), 0.5);
+    let path = item_local_path(root.path(), &key);
+    th::write_file(&path, &d2);
+    notify_local_change(
+        &db,
+        &image,
+        Kind::Sidecar,
+        &scan(&d2, th::mtime_unix_ns(&path)),
+    )
+    .expect("notify");
+    admit_pending(&db, |_, _| true).expect("admit");
+    let freeze = item(&db, &key).admitted_ts.expect("admitted ts");
+
+    // A converged twin (same content, concurrent vv, far-future ts)
+    // applies while the upload is still queued: the record's head
+    // identity converges to the twin's — but the entry we publish must
+    // still carry OUR freeze.
+    let twin = put_sidecar(DEV_A, &image, &d2, vv(&[(DEV_A, 7)]), freeze + 7_200);
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(freeze + 1);
+    apply(&db, &mut consumer, &twin);
+    let converged = item(&db, &key);
+    assert_eq!(
+        converged.head_ts,
+        Some(freeze + 7_200),
+        "the converged head identity is the twin's (deterministic pick)"
+    );
+    assert_eq!(converged.state, ItemState::Queued, "upload still owed");
+    assert_eq!(converged.admitted_ts, Some(freeze), "freeze intact");
+
+    upload_item(&db, &s3, &cfg, &key, &path)
+        .await
+        .expect("upload");
+    let staged = db.iter_outbound().expect("outbound");
+    let entry = JournalEntry::from_json_line(
+        std::str::from_utf8(&staged.last().expect("one staged").1).expect("utf8"),
+    )
+    .expect("decodes");
+    assert_eq!(
+        entry.ts, freeze,
+        "the published ts is the admission freeze (pre-fix: the twin's \
+         head_ts leaked into the entry — 'X's entry carried Y's ts')"
+    );
+    assert_eq!(
+        entry.vv,
+        vv(&[(DEV_B, 1)]),
+        "and the admitted vv snapshot, untouched by the converge merge"
+    );
+}
+
+/// Finding 9 (B9) build half: manifest rows carry the head version's
+/// journal `ts`; rows advertised while an upload intent is in flight
+/// omit `ts` AND `device` (the record's identity then names the
+/// in-flight version, not the advertised published one).
+#[test]
+fn manifest_rows_carry_head_ts_and_omit_identity_while_in_flight() {
+    let (_dbdir, _p, db) = open_db(&dev(DEV_A));
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item");
+    let d1 = eh::doc(4, Some("blue"), 0.5);
+    let mut record = rec(Kind::Sidecar, ItemState::Synced);
+    record.sem_hash = Some(sem_hash(&d1).expect("sem"));
+    record.blake3 = Some(Blake3Hex::from_bytes(&d1));
+    record.size = d1.len() as u64;
+    record.vv = vv(&[(DEV_A, 1)]);
+    record.device = Some(dev(DEV_A));
+    record.head_ts = Some(1_000);
+    db.insert_item(&key, &record).expect("seed");
+
+    let manifest = build_manifest(&db, 1_769_950_000).expect("build");
+    assert_eq!(manifest.rows.len(), 1);
+    assert_eq!(manifest.rows[0].ts, Some(1_000), "head ts travels");
+    assert_eq!(manifest.rows[0].device, Some(dev(DEV_A)));
+
+    // Re-admit: the in-flight row keeps the published vv/blake3 but
+    // withholds ts/device — head identity now names the in-flight
+    // version.
+    let d2 = eh::doc(5, None, 0.9);
+    notify_local_change(
+        &db,
+        &image,
+        Kind::Sidecar,
+        &LocalScan {
+            size: d2.len() as u64,
+            mtime_unix_ns: 10,
+            bytes: &d2,
+        },
+    )
+    .expect("notify");
+    admit_pending(&db, |_, _| true).expect("admit");
+    let manifest = build_manifest(&db, 1_769_950_100).expect("build");
+    assert_eq!(manifest.rows.len(), 1);
+    assert_eq!(manifest.rows[0].vv, vv(&[(DEV_A, 1)]), "published vv");
+    assert_eq!(manifest.rows[0].ts, None, "in-flight: ts withheld");
+    assert_eq!(manifest.rows[0].device, None, "in-flight: device withheld");
 }

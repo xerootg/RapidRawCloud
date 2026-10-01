@@ -110,7 +110,7 @@ use crate::publisher::{enqueue_entry_in, PublisherError};
 use crate::reader::{ConsumerError, JournalConsumer};
 use crate::s3::{PutObjectOptions, S3Api, S3Error};
 use crate::semhash::{
-    canonical_json, sem_hash, sidecar_badges, Blake3Hex, ContentId, SemHash, SemHashError,
+    sem_hash, semantic_document, sidecar_badges, Blake3Hex, ContentId, SemHash, SemHashError,
 };
 use crate::state::{DeletedRecord, ItemRecord, ItemState, Queue, StateError, StateTxn, SyncDb};
 use crate::transfer::TransferError;
@@ -207,16 +207,19 @@ pub fn vc_item_relkey(image: &RelKey, vc6: &str) -> Result<RelKey, KeyError> {
 }
 
 /// The deterministic §2.6 loser virtual-copy suffix:
-/// `blake3(canonical loser document)[..6]` — six lowercase hex chars of
-/// the blake3 of [`crate::semhash::canonical_json`] over the parsed
-/// loser sidecar document. Canonicalization makes the suffix a function
-/// of the document's **content**, not its spelling, so every holder of
-/// the loser materializes the **same** key (§2.6 / review B2). Invalid
-/// JSON fails closed like [`crate::semhash::sem_hash`].
+/// `blake3(canonical loser document)[..6]`, where the canonical loser
+/// document is the §2.5 **semantic** canonical form
+/// ([`crate::semhash::semantic_document`]) — so the suffix is the first
+/// six hex chars of the loser's [`crate::semhash::sem_hash`]. Deriving
+/// from the semantic form (not the raw bytes) makes the suffix
+/// **churn-stable** (review round 0): two holders of one loser version
+/// whose local files diverged only by a §2.5 churn rewrite (EXIF
+/// caching, auto-heal) still name the **same** key, preserving §2.6's
+/// single-copy materialization. Invalid JSON fails closed like
+/// [`crate::semhash::sem_hash`].
 pub fn loser_vc_suffix(loser_doc: &[u8]) -> Result<String, EngineError> {
-    let value: serde_json::Value = serde_json::from_slice(loser_doc).map_err(SemHashError::from)?;
-    let hex = blake3::hash(canonical_json(&value).as_bytes()).to_hex();
-    Ok(hex.as_str()[..6].to_string())
+    let sem = sem_hash(loser_doc)?;
+    Ok(sem.as_str()[..6].to_string())
 }
 
 /// The deterministic §2.8 displaced-original relkey for `image` whose
@@ -289,10 +292,24 @@ fn state_holds_local_bytes(state: ItemState) -> bool {
 
 /// The §2.6 case-4/convergence identity pick over the local head and the
 /// arriving entry: `true` when the entry's `(ts, device)` wins
-/// ([`pick_winner`]; a local head without recorded identity always
-/// loses, deterministically — the entry carries a complete candidate).
-/// Both devices of any exchange compare the same candidate pair, so the
-/// outcome is fleet-deterministic whatever the clocks said.
+/// ([`pick_winner`]).
+///
+/// A local head **without recorded identity** always loses to the
+/// arriving entry. That fallback is locally deterministic but not
+/// fleet-symmetric in the abstract (the entry's author compares the real
+/// candidate pair) — it is fleet-safe here because identity-less heads
+/// with a nonempty vv are unreachable through engine-written state:
+/// every path that commits or adopts a head records `(head_ts, device)`
+/// (admission, [`EngineConsumer`] apply, delete/restore), and the only
+/// records predating those fields were written by pre-engine builds that
+/// had **no production lane minting vvs at all** (their vv decodes
+/// empty, so any entry compares `Greater` and case 4 never fires). A
+/// record built outside the engine (test doubles, hand migration) that
+/// pairs a nonempty vv with no identity accepts the remote-always-wins
+/// pick as its contract (review round 0: rejected backfill — there is no
+/// data to backfill from, and no shipped lineage produces the shape).
+/// Both devices of a real exchange therefore compare the same candidate
+/// pair, so the outcome is fleet-deterministic whatever the clocks said.
 fn remote_wins_identity(local: &ItemRecord, entry: &JournalEntry) -> bool {
     match (local.head_ts, &local.device) {
         (Some(ts), Some(device)) => {
@@ -316,12 +333,17 @@ fn remote_wins_identity(local: &ItemRecord, entry: &JournalEntry) -> bool {
 /// superseded identity win a same-second tie on the device that held it,
 /// diverging from the author's own record); only genuinely concurrent
 /// twins fall to the deterministic [`pick_winner`] over the shared
-/// candidate pair.
+/// candidate pair. An `Equal` vv is the **same version** re-delivered
+/// (a manifest row, a replayed segment): its identity is already
+/// recorded locally, so the local identity is kept — adopting here would
+/// let a provenance-rewritten redelivery (e.g. a pre-`ts` manifest row
+/// falling back to `written_server_ts`) corrupt the version's recorded
+/// `(ts, device)` (review round 0).
 fn converged_identity_is_remote(local: &ItemRecord, entry: &JournalEntry, ord: VvOrder) -> bool {
     match ord {
         VvOrder::Greater => true,
-        VvOrder::Less => false,
-        VvOrder::Equal | VvOrder::Concurrent => remote_wins_identity(local, entry),
+        VvOrder::Less | VvOrder::Equal => false,
+        VvOrder::Concurrent => remote_wins_identity(local, entry),
     }
 }
 
@@ -377,6 +399,15 @@ pub enum ChangeOutcome {
     /// A semantic change was recorded: the item is `Dirty` (created
     /// `Dirty` when no record existed) and awaits [`admit_pending`].
     MarkedDirty,
+    /// A semantic change was observed while a pipeline-interior state
+    /// (`Queued`/`Uploading`/`Verifying`/`Downloading`/`Conflict`/
+    /// `CorruptRemote`) owns the item: only the scanned identity was
+    /// refreshed — **nothing was marked dirty** — and the caller still
+    /// owes a re-scan once the pipeline settles (the §2.4 completion
+    /// recheck, or the next intake). Honest third outcome (review round
+    /// 0): the old `MarkedDirty` answer here misled callers into
+    /// believing the re-admission was already recorded.
+    DeferredToPipeline,
 }
 
 /// The scanned §2.5 change identity of one file.
@@ -391,10 +422,40 @@ enum ScanIdentity {
 /// `image`'s item of `kind` (module docs: the sidecar's `.rrdata` suffix
 /// is part of the key; every other kind keys by the file's own relkey,
 /// which for originals and the xmp projection the caller already names).
+///
+/// Suffix-aware for `Sidecar` (review round 0): a relkey that already
+/// ends in `.rrdata` — a virtual-copy or primary sidecar named by its
+/// own file path — **is** the item key; appending a second suffix would
+/// derive a key no item ever had, making vc items unaddressable by
+/// `delete_item`/`notify_local_change`.
 fn item_key_for_kind(image: &RelKey, kind: Kind) -> Result<RelKey, KeyError> {
     match kind {
+        Kind::Sidecar if image.as_str().ends_with(".rrdata") => Ok(image.clone()),
         Kind::Sidecar => sidecar_item_relkey(image),
         _ => Ok(image.clone()),
+    }
+}
+
+/// Whether `item` is one of `image`'s items under the module's keying
+/// convention: the original (`item == image`), the primary sidecar
+/// (`<image>.rrdata`), or a virtual-copy sidecar
+/// (`<image>.<6hex>.rrdata`). Structural, not a string prefix match — a
+/// sibling image whose relkey merely extends `<image>.` (e.g.
+/// `p/img.NEF.bak`) is **not** matched (review round 0:
+/// `restore_item`'s old prefix filter over-matched exactly that).
+fn item_belongs_to_image(item: &RelKey, image: &RelKey) -> bool {
+    if item == image {
+        return true;
+    }
+    let Some(rest) = item.as_str().strip_prefix(image.as_str()) else {
+        return false;
+    };
+    match rest.strip_prefix('.') {
+        Some("rrdata") => true,
+        Some(tail) => tail
+            .strip_suffix(".rrdata")
+            .is_some_and(|hex| crate::hexutil::is_lower_hex(hex, 6)),
+        None => false,
     }
 }
 
@@ -475,6 +536,7 @@ pub fn notify_local_change(
             device: None,
             head_ts: None,
             admitted_vv: None,
+            admitted_ts: None,
             deleted: false,
         };
         db.insert_item(&item, &fresh)?;
@@ -544,8 +606,9 @@ pub fn notify_local_change(
             // Downloading/Conflict/CorruptRemote): the pipeline owns the
             // state — refresh the scanned identity only; the §2.4
             // completion recheck (or the next intake after the pipeline
-            // settles) re-marks the item.
+            // settles) re-marks the item. The outcome says so honestly.
             db.update_item(&item, state, refresh)?;
+            return Ok(ChangeOutcome::DeferredToPipeline);
         }
     }
     Ok(ChangeOutcome::MarkedDirty)
@@ -592,6 +655,7 @@ pub fn admit_pending(
                 let mut vv = r.vv.clone();
                 vv.bump(&own);
                 r.admitted_vv = Some(vv);
+                r.admitted_ts = Some(now);
                 r.head_ts = Some(now);
                 r.device = Some(own.clone());
             })?;
@@ -647,9 +711,61 @@ pub struct OriginalConflictEvent {
     pub displaced_content_id: ContentId,
 }
 
+/// Why a §2.6/§2.8 loser-preservation step was skipped on this device
+/// (review round 0: the skip must never be silent).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoserSkipReason {
+    /// The state said this device holds the losing head, but the local
+    /// file is gone (removed out of band). Not retried: the file will
+    /// not come back on its own, and another holder (the loser's author)
+    /// still materializes its copy.
+    FileMissing,
+    /// The local file exists but does not parse as a sidecar document
+    /// (the §3.4 corruption case) — no deterministic vc key can be named
+    /// from it.
+    Unparsable,
+    /// A different document already occupies the loser's deterministic
+    /// vc key (a 24-bit suffix-prefix collision). The existing copy is
+    /// never clobbered; the colliding loser stays unmaterialized here.
+    KeyCollision,
+}
+
+/// §2.6 invariant-violation event: this device's state said it holds a
+/// losing head, but the loser could **not** be preserved (the file is
+/// missing, unparsable, or its vc key is occupied by a different
+/// document). If this device was the loser's only holder, that version
+/// is now unreachable — surfaced so the app can tell the user instead
+/// of failing silently (review round 0; transient I/O failures are NOT
+/// this event: they abort the apply transaction and retry next poll).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoserPreservationSkippedEvent {
+    /// The conflicted image relkey.
+    pub relkey: RelKey,
+    /// The losing item whose preservation was skipped.
+    pub item: RelKey,
+    /// Why it was skipped.
+    pub reason: LoserSkipReason,
+}
+
 /// The engine's event sink (§3.8's `sync-conflict`/`sync-error` family,
 /// as a small trait so the core carries no channel dependency; the app
 /// side adapts it onto `app_handle.emit`).
+///
+/// # Delivery contract (review round 0)
+///
+/// Events fire **inside the open apply transaction**, before it commits:
+///
+/// - **At-least-once, possibly for a rolled-back apply**: if the
+///   surrounding transaction later aborts (a store failure, a consumer
+///   error on a later mutation), the event was already delivered for a
+///   resolution that never committed — and the retried apply re-fires
+///   it. Sinks must treat events as advisory notifications to
+///   re-derive state from, never as the state itself.
+/// - **No reentrancy into the state store**: the sink runs on the thread
+///   holding the single redb write transaction. A sink that
+///   synchronously calls any `SyncDb` write path deadlocks the apply
+///   (same single-writer hazard the [`crate::reader::JournalConsumer`]
+///   docs pin). Queue the event and return; do the work after the poll.
 pub trait EngineEvents {
     /// A §2.6 case-4 conflict was resolved.
     fn conflict(&mut self, event: ConflictEvent);
@@ -657,6 +773,12 @@ pub trait EngineEvents {
     fn resurrection_incomplete(&mut self, event: ResurrectionIncompleteEvent);
     /// A §2.8 original-overwrite conflict was resolved.
     fn original_conflict(&mut self, event: OriginalConflictEvent);
+    /// A losing head this device supposedly holds could not be preserved
+    /// (see [`LoserPreservationSkippedEvent`]). Default: ignored, so the
+    /// method is additive for existing sinks.
+    fn loser_preservation_skipped(&mut self, event: LoserPreservationSkippedEvent) {
+        let _ = event;
+    }
 }
 
 /// The no-op sink (callers that do not care).
@@ -798,6 +920,21 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
     fn apply_inner(&mut self, txn: &StateTxn<'_>, entry: &JournalEntry) -> Result<(), EngineError> {
         if !matches!(entry.op, Op::Put | Op::Del) {
             // move/attest ride later units; skip (never Err).
+            //
+            // DELIBERATE v1 DEBT (review round 0, pinned by the suite):
+            // a skipped entry is still marked applied, so a §2.7 `move`
+            // published by a FUTURE build is permanently invisible to a
+            // device that polled through this build — the applied-set/
+            // cursor never re-applies it. Acceptable only while no build
+            // publishes moves (none does; `Op::Move` has no writer in
+            // this repo), exactly like manifest.rs's same-shaped
+            // argument. The move unit MUST ship its own migration story
+            // (e.g. a one-time reconcile) before any writer exists.
+            // Fail-closed alternatives were rejected: a consumer `Err`
+            // here is the reader's WHOLE-PASS abort (it would let one
+            // future-op entry starve every later-sorted device's prefix),
+            // and per-device halts are the reader's own version gate,
+            // unreachable from a consumer.
             return Ok(());
         }
         let class = classify_key(&entry.key);
@@ -837,18 +974,44 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         item: &RelKey,
     ) -> Result<(), EngineError> {
         let Some(mut local) = txn.get_item(item)? else {
-            return self.create_from_put(txn, entry, kind, image, item);
+            return self.create_from_put(txn, entry, kind, item);
         };
         if local.kind != kind {
             return Ok(());
+        }
+
+        // §2.7: a hidden record resolves put-vs-del FIRST — its vv
+        // already folds the deletion, so a put the deletion does not
+        // dominate un-hides the item (a restore/resurrection put, or an
+        // edit genuinely concurrent with the delete: EDITS BEAT DELETES,
+        // review round 0 — previously only a strictly dominating put
+        // undeleted, so the deleter kept a winning concurrent edit
+        // hidden forever). No conflict pick and no loser materialization
+        // run against deleted content: the delete superseded it, so
+        // un-hiding adopts the put as the head outright.
+        if local.deleted {
+            let ord = compare(&entry.vv, &local.vv);
+            return match ord {
+                VvOrder::Less | VvOrder::Equal => Ok(()),
+                VvOrder::Greater | VvOrder::Concurrent => {
+                    if self.content_equal(entry, kind, item, &local) {
+                        self.converge(txn, entry, item, &local, ord)
+                    } else {
+                        self.adopt_remote(txn, entry, item, &local, kind)
+                    }
+                }
+            };
         }
 
         // Local-commit-before-compare (§2.6 case 2's dirty clause):
         // uncommitted dirty edits are first committed as a local version —
         // unless the local FILE already holds the entry's content (the
         // §2.5 "same test applied to downloaded sidecars": converged, the
-        // dirt collapses with no upload and no version).
-        if local.state == ItemState::Dirty && local.admitted_vv.is_none() {
+        // dirt collapses with no upload and no version). The gate is on
+        // the Dirty STATE alone: an `admitted_vv` on a Dirty record is by
+        // invariant a stale leftover (every demotion into Dirty withdraws
+        // the intent — review round 0), and `commit_dirty` re-mints it.
+        if local.state == ItemState::Dirty {
             if compare(&entry.vv, &local.vv) == VvOrder::Less {
                 return Ok(()); // an ancestor of our base: our dirt supersedes it
             }
@@ -859,7 +1022,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                 _ => entry.content_id.is_some() && entry.content_id == local.content_id,
             };
             if file_converged {
-                return self.converge_dirty(txn, entry, image, item, &local);
+                return self.converge_dirty(txn, entry, item, &local);
             }
             if compare(&entry.vv, &local.vv) == VvOrder::Equal {
                 return Ok(()); // the remote re-advertised our base; dirt stays
@@ -876,39 +1039,81 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         if compare(&entry.vv, &head_vv) == VvOrder::Equal {
             return Ok(()); // the identical version: nothing moves
         }
-        let content_equal = match kind {
-            Kind::Sidecar => entry.sem_hash.is_some() && entry.sem_hash == local.sem_hash,
-            _ => {
-                (entry.blake3.is_some() && entry.blake3 == local.blake3)
-                    || (entry.content_id.is_some() && entry.content_id == local.content_id)
-            }
-        };
-        if content_equal {
+        if self.content_equal(entry, kind, item, &local) {
             let ord = compare(&entry.vv, &head_vv);
-            return self.converge(txn, entry, image, item, &local, ord);
+            return self.converge(txn, entry, item, &local, ord);
         }
         match compare(&entry.vv, &head_vv) {
             VvOrder::Less | VvOrder::Equal => Ok(()), // case 3 (Equal handled above)
-            VvOrder::Greater => self.adopt_remote(txn, entry, image, item, &local, kind),
+            VvOrder::Greater => self.adopt_remote(txn, entry, item, &local, kind),
             VvOrder::Concurrent => self.resolve_concurrent(txn, entry, image, item, &local, kind),
         }
     }
 
-    /// Case 2 for an unknown item: create it `PendingDown` with the
-    /// entry's facts — hidden instead when a recorded deletion still
-    /// dominates it (§2.7 ordering holds in every arrival order).
+    /// The §2.6 case-1 content test against the local **head**. With an
+    /// upload intent in flight (`admitted_vv` set), the record's
+    /// `sem_hash`/`blake3` still name the last *published* version (the
+    /// §2.6 coordination note), while `head_vv` is the admitted snapshot
+    /// — comparing the entry's content against the published fields
+    /// would converge an entry that matches the OLD version with the
+    /// in-flight head and silently skip case 4 (review round 0, verified
+    /// divergence). The in-flight head's content identity is derivable
+    /// only from the local file (sidecars: [`Self::local_file_sem`], as
+    /// the dirty lane already does) or the intake-refreshed `content_id`
+    /// (originals; [`notify_local_change`] keeps it tracking the local
+    /// bytes). An unreadable/unparsable local file reads as "not equal",
+    /// which conservatively falls through to the vv comparison.
+    fn content_equal(
+        &self,
+        entry: &JournalEntry,
+        kind: Kind,
+        item: &RelKey,
+        local: &ItemRecord,
+    ) -> bool {
+        let in_flight = local.admitted_vv.is_some();
+        match kind {
+            Kind::Sidecar => {
+                entry.sem_hash.is_some()
+                    && if in_flight {
+                        entry.sem_hash == self.local_file_sem(item)
+                    } else {
+                        entry.sem_hash == local.sem_hash
+                    }
+            }
+            _ => {
+                if in_flight {
+                    entry.content_id.is_some() && entry.content_id == local.content_id
+                } else {
+                    (entry.blake3.is_some() && entry.blake3 == local.blake3)
+                        || (entry.content_id.is_some() && entry.content_id == local.content_id)
+                }
+            }
+        }
+    }
+
+    /// Case 2 for an unknown item: create it with the entry's facts —
+    /// hidden instead when a recorded deletion for the **item** still
+    /// dominates the put (per-item deleted-set rows, review round 0; the
+    /// record's vv folds the known deletion lineage either way, so both
+    /// arrival orders of `{put, del}` produce the identical record).
     fn create_from_put(
         &mut self,
         txn: &StateTxn<'_>,
         entry: &JournalEntry,
         kind: Kind,
-        image: &RelKey,
         item: &RelKey,
     ) -> Result<(), EngineError> {
-        let row = txn.get_deleted(image)?;
-        let dominates_row = row
+        let row = txn.get_deleted(item)?;
+        // §2.7: a put the deletion does not dominate is live (restore,
+        // resurrection, or edits-beat-deletes); only a put the deletion
+        // strictly supersedes (or equals) stays hidden behind the row.
+        let hidden = row
             .as_ref()
-            .is_none_or(|r| compare(&entry.vv, &r.vv) == VvOrder::Greater);
+            .is_some_and(|r| matches!(compare(&entry.vv, &r.vv), VvOrder::Less | VvOrder::Equal));
+        let mut vv = entry.vv.clone();
+        if let Some(row) = &row {
+            vv.merge(&row.vv);
+        }
         let record = ItemRecord {
             kind,
             state: ItemState::PendingDown,
@@ -916,7 +1121,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             mtime_unix_ns: entry.mtime.unwrap_or(0).saturating_mul(1_000_000_000),
             blake3: entry.blake3.clone(),
             sem_hash: entry.sem_hash.clone(),
-            vv: entry.vv.clone(),
+            vv,
             content_id: entry.content_id.clone(),
             w: entry.w,
             h: entry.h,
@@ -930,12 +1135,13 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             device: Some(entry.device.clone()),
             head_ts: Some(entry.ts),
             admitted_vv: None,
-            deleted: !dominates_row,
+            admitted_ts: None,
+            deleted: hidden,
         };
         txn.insert_item(item, &record)?;
-        if dominates_row {
+        if !hidden {
             if row.is_some() {
-                txn.remove_deleted(image)?;
+                txn.remove_deleted(item)?;
             }
             // xmp download policy is P2: metadata recording only.
             if kind != Kind::Xmp {
@@ -953,7 +1159,6 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         &mut self,
         txn: &StateTxn<'_>,
         entry: &JournalEntry,
-        image: &RelKey,
         item: &RelKey,
         local: &ItemRecord,
     ) -> Result<(), EngineError> {
@@ -981,28 +1186,41 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             record.device = Some(entry.device.clone());
         }
         record.admitted_vv = None;
-        if local.deleted && compare(&entry.vv, &local.vv) == VvOrder::Greater {
-            record.deleted = false;
-        }
+        record.admitted_ts = None;
         txn.replay_put_item_cas(item, ItemState::Dirty, &record)?;
-        self.clear_superseded_row(txn, &entry.vv, image)
+        self.clear_superseded_row(txn, &entry.vv, item)
     }
 
     /// Case 1 for a committed/clean local head: same content under a
     /// different vv — vv max-merge, deterministic head-identity
     /// convergence ([`converged_identity_is_remote`]), local bytes stay
-    /// authoritative, no transfer.
+    /// authoritative, no transfer. A hidden record un-hides when the
+    /// entry is `Greater` **or `Concurrent`** with the folded deletion
+    /// (§2.7 edits beat deletes / content-equal resurrection — review
+    /// round 0: the strictly-Greater predicate kept a re-advertised
+    /// original hidden on the deleter when the resurrection vv was
+    /// concurrent with the original's own del).
     fn converge(
         &mut self,
         txn: &StateTxn<'_>,
         entry: &JournalEntry,
-        image: &RelKey,
         item: &RelKey,
         local: &ItemRecord,
         ord: VvOrder,
     ) -> Result<(), EngineError> {
-        let undelete = local.deleted && compare(&entry.vv, &local.vv) == VvOrder::Greater;
-        let adopt_identity = converged_identity_is_remote(local, entry, ord);
+        let undelete = local.deleted
+            && matches!(
+                compare(&entry.vv, &local.vv),
+                VvOrder::Greater | VvOrder::Concurrent
+            );
+        // Un-hiding adopts the put's identity unconditionally: the
+        // deletion superseded the local content's head claim, so the
+        // arriving put is the item's only live head — and its author
+        // stamped itself (restore/resurrection), so every device
+        // converges on that identity whatever its local vv relation to
+        // the folded deletion was (review round 0, pinned by the
+        // asymmetric-resurrection scenario's state-equivalence check).
+        let adopt_identity = undelete || converged_identity_is_remote(local, entry, ord);
         let mutate = |r: &mut ItemRecord| {
             r.vv.merge(&entry.vv);
             if adopt_identity {
@@ -1029,38 +1247,51 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         } else {
             txn.update_item(item, local.state, mutate)?;
         }
-        self.clear_superseded_row(txn, &entry.vv, image)
+        self.clear_superseded_row(txn, &entry.vv, item)
     }
 
-    /// Case 2 (and the case-4 remote-winner half): the record adopts the
-    /// entry's facts and the item heads for the download lane —
-    /// `PendingDown` plus a queue row for sidecars and held originals;
-    /// `Stub` originals adopt metadata only (hydration is on-demand,
-    /// P2), and xmp items are metadata-only at this unit.
+    /// Case 2 (and the case-4 remote-winner half, and the §2.7
+    /// un-hide-and-adopt half): the record adopts the entry's facts and
+    /// the item heads for the download lane — `PendingDown` plus a queue
+    /// row for sidecars and held originals; `Stub` originals adopt
+    /// metadata only (hydration is on-demand, P2), and xmp items are
+    /// metadata-only at this unit.
     fn adopt_remote(
         &mut self,
         txn: &StateTxn<'_>,
         entry: &JournalEntry,
-        image: &RelKey,
         item: &RelKey,
         local: &ItemRecord,
         kind: Kind,
     ) -> Result<(), EngineError> {
-        let undelete = local.deleted && compare(&entry.vv, &local.vv) == VvOrder::Greater;
+        // §2.7 un-hide rule, same as `converge`'s: Greater (restore) or
+        // Concurrent (edits beat deletes) vs the deletion-folded vv.
+        let undelete = local.deleted
+            && matches!(
+                compare(&entry.vv, &local.vv),
+                VvOrder::Greater | VvOrder::Concurrent
+            );
         let had_intent = local.admitted_vv.is_some();
         let adopt = |r: &mut ItemRecord| {
-            // §2.6: the path's vv becomes the elementwise max of BOTH
-            // heads. A withdrawn committed-local head (its admitted
-            // snapshot) folds in too: that version lives on as the vc,
-            // and the next edit on this path must dominate it.
-            if let Some(admitted) = &local.admitted_vv {
-                r.vv.merge(admitted);
-            }
+            // §2.6: the path's vv becomes the elementwise max of both
+            // heads' PUBLISHED histories. A withdrawn in-flight intent
+            // (its admitted snapshot) deliberately does NOT fold in
+            // (review round 0): the snapshot was never published on this
+            // key — the losing version lives on as the vc under its own
+            // key and vv — so folding it would give this device a vv
+            // component no other device can ever learn, making every
+            // FUTURE honest descendant of the converged state read as
+            // concurrent here (a permanent spurious-conflict wedge). The
+            // unpublished component is simply re-mintable: the next
+            // admission bumps from the merged record vv.
             r.vv.merge(&entry.vv);
             r.blake3 = entry.blake3.clone();
             r.sem_hash = entry.sem_hash.clone();
-            r.size = entry.size.unwrap_or(0);
-            r.mtime_unix_ns = entry.mtime.unwrap_or(0).saturating_mul(1_000_000_000);
+            r.size = entry.size.unwrap_or(local.size);
+            r.mtime_unix_ns = entry
+                .mtime
+                .map(|m| m.saturating_mul(1_000_000_000))
+                .unwrap_or(local.mtime_unix_ns);
             r.rating = entry.rating;
             r.color_label = entry.color_label.clone();
             r.content_id = entry.content_id.clone();
@@ -1071,6 +1302,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             // The in-flight upload intent (if any) is withdrawn: the
             // version it named lost its claim to the primary key.
             r.admitted_vv = None;
+            r.admitted_ts = None;
             // Integrity facts described the superseded version.
             r.verified_remote = false;
             r.attested = false;
@@ -1130,7 +1362,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         if fetch {
             txn.queue_push(Queue::Down, item, transfer_class(kind))?;
         }
-        self.clear_superseded_row(txn, &entry.vv, image)
+        self.clear_superseded_row(txn, &entry.vv, item)
     }
 
     /// Case 4: deterministic winner, loser preservation (module docs).
@@ -1148,7 +1380,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             // conflict domain — the §2.6 pick decides which metadata the
             // record carries; no vc, no event, no transfer.
             if remote_wins_identity(local, entry) {
-                return self.adopt_remote(txn, entry, image, item, local, kind);
+                return self.adopt_remote(txn, entry, item, local, kind);
             }
             txn.update_item(item, local.state, |r| r.vv.merge(&entry.vv))?;
             return Ok(());
@@ -1161,7 +1393,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                 Kind::Sidecar => self.materialize_sidecar_loser(txn, image, item, local)?,
                 _ => self.stage_displaced_original(txn, image, item, local)?,
             };
-            self.adopt_remote(txn, entry, image, item, local, kind)?;
+            self.adopt_remote(txn, entry, item, local, kind)?;
             if kind == Kind::Sidecar {
                 self.events.conflict(ConflictEvent {
                     relkey: image.clone(),
@@ -1191,9 +1423,29 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
 
     // -- del ----------------------------------------------------------------
 
-    /// §2.7 del ordering: dominate → hide; ancestor → ignore; concurrent
-    /// (or any non-ancestor meeting uncommitted dirt) → edits beat
-    /// deletes.
+    /// §2.7 del ordering, arrival-order independent (review round 0):
+    ///
+    /// - **dominating del** → hide, fold the vv, record the per-item
+    ///   deleted-set row;
+    /// - **ancestor/equal del** → ignore (our version supersedes it);
+    /// - **concurrent del vs uncommitted dirt** → resurrect (the single
+    ///   dirt holder commits + re-advertises, §2.7's explicit lane);
+    /// - **concurrent del vs a committed/in-flight live head** → EDITS
+    ///   BEAT DELETES: the item stays live and the del's vv **folds into
+    ///   the record** so the state is absorbing — the deleter's side
+    ///   un-hides when it applies our head's put (the `apply_put`
+    ///   deleted-record arm), and both arrival orders of `{put, del}`
+    ///   land identical (previously this arm dropped the del entirely:
+    ///   no fold, order-divergent third devices, half-deleted items);
+    /// - **concurrent del vs an already-hidden record** → two deletes of
+    ///   one item: fold vv into the record **and** the row, stay hidden.
+    ///
+    /// Deletion ordering is strictly **per item key** (§2.6 applied to
+    /// dels): a del of the image's original concurrent with an edit of
+    /// its *sidecar* still hides the original — item-wholeness across
+    /// kinds is the uncommitted-dirty resurrection lane's job, where a
+    /// single device re-advertises (multiple committed holders emitting
+    /// resurrection puts would mint N concurrent versions per delete).
     fn apply_del(
         &mut self,
         txn: &StateTxn<'_>,
@@ -1206,7 +1458,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             // Unknown item: remember the deletion so a slower put cannot
             // resurrect it out of order (§2.7; the row merges with any
             // prior knowledge so the §2.7 anchor survives arrival order).
-            self.record_deletion_row(txn, image, &entry.vv, entry.ts)?;
+            self.record_deletion_row(txn, item, &entry.vv, entry.ts)?;
             return Ok(());
         };
         if local.kind != kind {
@@ -1216,8 +1468,10 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         // §2.7 edits-beat-deletes: a del meeting UNCOMMITTED dirty edits
         // resurrects — the dirt commits as a local version whose vv
         // dominates the del, and (for the sidecar) the image's original
-        // is re-advertised so the whole item survives.
-        if local.state == ItemState::Dirty && local.admitted_vv.is_none() {
+        // is re-advertised so the whole item survives. A hidden record is
+        // never dirt (deletion withdraws local intents), so the deleted
+        // case below is not shadowed.
+        if !local.deleted && local.state == ItemState::Dirty {
             if compare(&entry.vv, &local.vv) == VvOrder::Less {
                 return Ok(()); // the del predates our base; superseded
             }
@@ -1229,6 +1483,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             let admitted_snapshot = admitted.clone();
             txn.transition(item, ItemState::Dirty, ItemState::Queued, |r| {
                 r.admitted_vv = Some(admitted_snapshot);
+                r.admitted_ts = Some(now);
                 r.head_ts = Some(now);
                 r.device = Some(own.clone());
                 r.deleted = false;
@@ -1237,7 +1492,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             if kind == Kind::Sidecar {
                 self.resurrect_original(txn, entry, image)?;
             }
-            return self.clear_superseded_row(txn, &admitted, image);
+            return self.clear_superseded_row(txn, &admitted, item);
         }
 
         let head_vv = local
@@ -1250,25 +1505,40 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             // already-applied deletion re-delivered (manifest merge).
             VvOrder::Less | VvOrder::Equal => Ok(()),
             VvOrder::Greater => {
-                // Dominating del: hide — the record survives whole (§2.7),
-                // the transfer lanes let go of it, and the deletion is
-                // recorded for the §2.3 deleted set.
+                // Dominating del: hide — the record survives whole (§2.7)
+                // and keeps the deleted CONTENT version's head identity
+                // (what restore re-advertises; also what a device that
+                // learns `{put, del}` del-first records, so arrival
+                // orders agree bit-for-bit — review round 0), the
+                // transfer lanes let go of it, and the deletion is
+                // recorded for the §2.3 deleted set under the item key.
                 txn.update_item(item, local.state, |r| {
                     r.vv.merge(&entry.vv);
                     r.deleted = true;
-                    r.device = Some(entry.device.clone());
-                    r.head_ts = Some(entry.ts);
                     r.admitted_vv = None;
+                    r.admitted_ts = None;
                 })?;
                 txn.queue_remove(Queue::Up, item)?;
                 txn.queue_remove(Queue::Down, item)?;
-                self.record_deletion_row(txn, image, &entry.vv, entry.ts)
+                self.record_deletion_row(txn, item, &entry.vv, entry.ts)
             }
-            // Concurrent with our committed/published head: edits beat
-            // deletes (§2.7) — the item stays live; our version reaches
-            // the deleter through our journal, and only a del dominating
-            // it could hide the item again.
-            VvOrder::Concurrent => Ok(()),
+            VvOrder::Concurrent => {
+                if local.deleted {
+                    // Concurrent deletes of one item: both stand — fold
+                    // the vv into the record and the row.
+                    txn.update_item(item, local.state, |r| r.vv.merge(&entry.vv))?;
+                    self.record_deletion_row(txn, item, &entry.vv, entry.ts)
+                } else {
+                    // Edits beat deletes (§2.7): our committed (or
+                    // in-flight) version survives and ABSORBS the del —
+                    // the record's folded vv is what reaches the deleter
+                    // (its apply_put un-hides on Concurrent) and what any
+                    // later-bootstrapping device folds, so every arrival
+                    // order converges live. No row: the deletion lost.
+                    txn.update_item(item, local.state, |r| r.vv.merge(&entry.vv))?;
+                    Ok(())
+                }
+            }
         }
     }
 
@@ -1326,7 +1596,9 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             r.head_ts = Some(now);
             r.device = Some(own.clone());
         })?;
-        Ok(())
+        // The original's own deleted-set row (if its del already applied
+        // here) is superseded by the resurrection put.
+        self.clear_superseded_row(txn, &vv, image)
     }
 
     // -- shared pieces -------------------------------------------------------
@@ -1340,12 +1612,30 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
     }
 
     /// §2.6 loser materialization: when this device's state proves the
-    /// local file holds the losing head, the loser document is written
-    /// to its deterministic vc path (idempotent — byte-identical on
-    /// every holder) and, unless the vc key is already known (`(key,
-    /// sem_hash)` apply dedup), staged for upload with a fresh
-    /// single-component vv through the ordinary admission lane. Returns
-    /// the vc item relkey when this device can name it.
+    /// local file holds the losing head, the loser's **canonical
+    /// semantic document** ([`crate::semhash::semantic_document`]) is
+    /// written to its deterministic vc path and, unless the vc key is
+    /// already known (`(key, sem_hash)` apply dedup), staged for upload
+    /// with a fresh single-component vv through the ordinary admission
+    /// lane. Returns the vc item relkey when this device can name it.
+    ///
+    /// Materializing the canonical form — not the holder's raw bytes —
+    /// is what makes the §2.6 "byte-identical PUTs to the same key"
+    /// claim TRUE for holders whose local files diverged only by §2.5
+    /// churn (review round 0): every holder derives the same suffix
+    /// ([`loser_vc_suffix`], sem-based) AND writes the same bytes, so
+    /// records, bucket bytes and blake3s all converge. The semantic form
+    /// is the §2.5 definition of the document's content; everything it
+    /// drops (`exif` cache, `version`, `lutPath`, formatting) is churn
+    /// the protocol never syncs. Idempotent: the projection is a fixed
+    /// point, so `sem_hash(vc file) == sem_hash(loser)`.
+    ///
+    /// Failure posture (review round 0 — preservation must never be
+    /// skipped silently): a missing file or an unparsable document fires
+    /// [`LoserPreservationSkippedEvent`] (plus
+    /// [`loser_vc_suffix`]-collision with a DIFFERENT resident document,
+    /// which is never clobbered); any other I/O failure is `Err`, which
+    /// aborts the apply transaction so the next poll retries.
     fn materialize_sidecar_loser(
         &mut self,
         txn: &StateTxn<'_>,
@@ -1357,36 +1647,64 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             return Ok(None);
         }
         let path = item_local_path(&self.sync_root, item);
-        let Ok(bytes) = std::fs::read(&path) else {
-            return Ok(None); // not actually held
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Removed out of band: not transient (never retried); the
+                // loser's author still materializes its copy elsewhere.
+                self.events
+                    .loser_preservation_skipped(LoserPreservationSkippedEvent {
+                        relkey: image.clone(),
+                        item: item.clone(),
+                        reason: LoserSkipReason::FileMissing,
+                    });
+                return Ok(None);
+            }
+            Err(e) => return Err(io_err(&path, e)),
         };
         // An unparsable local document cannot name a deterministic vc
-        // key: content-level skip (the §3.4 corruption guard owns local
-        // corruption; the loser's author still materializes its copy).
-        let Ok(suffix) = loser_vc_suffix(&bytes) else {
+        // key (the §3.4 corruption case): skipped WITH an event.
+        let Ok(canonical) = semantic_document(&bytes) else {
+            self.events
+                .loser_preservation_skipped(LoserPreservationSkippedEvent {
+                    relkey: image.clone(),
+                    item: item.clone(),
+                    reason: LoserSkipReason::Unparsable,
+                });
             return Ok(None);
         };
-        let Ok(sem) = sem_hash(&bytes) else {
-            return Ok(None);
-        };
+        let canonical = canonical.into_bytes();
+        let sem = sem_hash(&canonical)?;
+        let suffix = sem.as_str()[..6].to_string();
         let vc_rel = vc_item_relkey(image, &suffix)?;
-        let vc_path = item_local_path(&self.sync_root, &vc_rel);
-        if let Some(parent) = vc_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| io_err(&vc_path, e))?;
-        }
-        std::fs::write(&vc_path, &bytes).map_err(|e| io_err(&vc_path, e))?;
-        if txn.get_item(&vc_rel)?.is_some() {
+        if let Some(existing) = txn.get_item(&vc_rel)? {
+            if existing.sem_hash.as_ref() != Some(&sem) {
+                // 24-bit suffix-prefix collision with a genuinely
+                // different document (review round 0): never clobber the
+                // resident vc's file or record, never stage anything.
+                self.events
+                    .loser_preservation_skipped(LoserPreservationSkippedEvent {
+                        relkey: image.clone(),
+                        item: item.clone(),
+                        reason: LoserSkipReason::KeyCollision,
+                    });
+                return Ok(None);
+            }
             // Apply dedup by (key, sem_hash): the vc is already known —
-            // our own earlier materialization, or the peer's advertisement
-            // (which the ordinary put apply converges with ours).
+            // our own earlier materialization, or the peer's
+            // advertisement (which the ordinary put apply converges with
+            // ours). Re-write the (byte-identical) file idempotently so
+            // a missing local copy heals.
+            self.write_vc_file(&vc_rel, &canonical)?;
             return Ok(Some(vc_rel));
         }
-        let badges = sidecar_badges(&bytes).unwrap_or_default();
+        self.write_vc_file(&vc_rel, &canonical)?;
+        let badges = sidecar_badges(&canonical).unwrap_or_default();
         let own = self.own_device.clone();
         let record = ItemRecord {
             kind: Kind::Sidecar,
             state: ItemState::Dirty,
-            size: bytes.len() as u64,
+            size: canonical.len() as u64,
             mtime_unix_ns: 0,
             blake3: None,
             sem_hash: Some(sem),
@@ -1404,16 +1722,29 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             device: Some(own.clone()),
             head_ts: Some(self.now_unix),
             admitted_vv: None,
+            admitted_ts: None,
             deleted: false,
         };
         txn.insert_item(&vc_rel, &record)?;
+        let now = self.now_unix;
         txn.transition(&vc_rel, ItemState::Dirty, ItemState::Queued, |r| {
             let mut fresh = VersionVector::new();
             fresh.bump(&own);
             r.admitted_vv = Some(fresh);
+            r.admitted_ts = Some(now);
         })?;
         txn.queue_push(Queue::Up, &vc_rel, CLASS_SIDECAR)?;
         Ok(Some(vc_rel))
+    }
+
+    /// Writes a materialized vc document to its local path (parents
+    /// created as needed).
+    fn write_vc_file(&self, vc_rel: &RelKey, canonical: &[u8]) -> Result<(), EngineError> {
+        let vc_path = item_local_path(&self.sync_root, vc_rel);
+        if let Some(parent) = vc_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| io_err(&vc_path, e))?;
+        }
+        std::fs::write(&vc_path, canonical).map_err(|e| io_err(&vc_path, e))
     }
 
     /// §2.8 displaced-bytes staging: when this device holds the losing
@@ -1431,10 +1762,21 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             return Ok(None);
         }
         let path = item_local_path(&self.sync_root, item);
-        if !path.is_file() {
-            return Ok(None); // not actually held
-        }
-        let blake3 = hash_file(&path).map_err(|e| io_err(&path, e))?;
+        let blake3 = match hash_file(&path) {
+            Ok(b3) => b3,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The state said we hold the displaced bytes but the file
+                // is gone out of band (review round 0: no silent skip).
+                self.events
+                    .loser_preservation_skipped(LoserPreservationSkippedEvent {
+                        relkey: image.clone(),
+                        item: item.clone(),
+                        reason: LoserSkipReason::FileMissing,
+                    });
+                return Ok(None);
+            }
+            Err(e) => return Err(io_err(&path, e)),
+        };
         let size = std::fs::metadata(&path)
             .map_err(|e| io_err(&path, e))?
             .len();
@@ -1468,13 +1810,16 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                 device: Some(own.clone()),
                 head_ts: Some(self.now_unix),
                 admitted_vv: None,
+                admitted_ts: None,
                 deleted: false,
             };
             txn.insert_item(&conflict_rel, &record)?;
+            let now = self.now_unix;
             txn.transition(&conflict_rel, ItemState::Dirty, ItemState::Queued, |r| {
                 let mut fresh = VersionVector::new();
                 fresh.bump(&own);
                 r.admitted_vv = Some(fresh);
+                r.admitted_ts = Some(now);
             })?;
             txn.queue_push(Queue::Up, &conflict_rel, CLASS_ORIGINAL)?;
         }
@@ -1486,17 +1831,21 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         Ok(Some(conflict_rel))
     }
 
-    /// Records (or vv-max-merges into) the §2.3 deleted-set row for
-    /// `image` — merging keeps the §2.7 tombstone anchor (the sidecar
-    /// del's vv) regardless of the per-kind dels' arrival order.
+    /// Records (or vv-max-merges into) the §2.3 deleted-set row for one
+    /// deleted **item** — keyed by the item's own file relkey (§2.3 "one
+    /// row per deleted key"; review round 0: an image-keyed row mixed
+    /// the sidecar's, original's and vcs' independent vv lineages, so a
+    /// manifest-merging laggard hid only the sidecar and bootstrap
+    /// compared cross-lineage vvs). Merging keeps the anchor regardless
+    /// of the dels' arrival order.
     fn record_deletion_row(
         &self,
         txn: &StateTxn<'_>,
-        image: &RelKey,
+        item: &RelKey,
         vv: &VersionVector,
         server_ts: i64,
     ) -> Result<(), EngineError> {
-        let merged = match txn.get_deleted(image)? {
+        let merged = match txn.get_deleted(item)? {
             Some(mut row) => {
                 row.vv.merge(vv);
                 DeletedRecord {
@@ -1509,22 +1858,26 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                 server_ts,
             },
         };
-        txn.record_deleted(image, &merged)?;
+        txn.record_deleted(item, &merged)?;
         Ok(())
     }
 
-    /// Withdraws this device's deleted-set row for `image` when `vv`
-    /// strictly dominates it (the deletion was superseded by a restore
-    /// or resurrection, §2.7).
+    /// Withdraws this device's deleted-set row for `item` when an
+    /// applied live put's `vv` supersedes the deletion — strictly
+    /// dominating (restore/resurrection) **or concurrent** (§2.7 edits
+    /// beat deletes, review round 0): a put that wins against the
+    /// deletion leaves no standing row in any arrival order, so
+    /// manifests advertise one truth fleet-wide. A put the row dominates
+    /// compares `Less`/`Equal` and leaves the row standing.
     fn clear_superseded_row(
         &self,
         txn: &StateTxn<'_>,
         vv: &VersionVector,
-        image: &RelKey,
+        item: &RelKey,
     ) -> Result<(), EngineError> {
-        if let Some(row) = txn.get_deleted(image)? {
-            if compare(vv, &row.vv) == VvOrder::Greater {
-                txn.remove_deleted(image)?;
+        if let Some(row) = txn.get_deleted(item)? {
+            if matches!(compare(vv, &row.vv), VvOrder::Greater | VvOrder::Concurrent) {
+                txn.remove_deleted(item)?;
             }
         }
         Ok(())
@@ -1545,6 +1898,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             let mut vv = r.vv.clone();
             vv.bump(&own);
             r.admitted_vv = Some(vv);
+            r.admitted_ts = Some(now);
             r.head_ts = Some(now);
             r.device = Some(own.clone());
         })?;
@@ -1583,12 +1937,23 @@ pub struct DeleteOutcome {
 ///    kinds}` — **data keys untouched**, now and here: destruction is
 ///    GC's (§2.10, a later unit).
 /// 2. In **one** committed transaction: per existing item of a named
-///    kind, bump `vv[self]` and stage the `del` journal entry carrying
-///    it; mark every such record
+///    kind, bump `vv[self]` **past the withdrawn upload intent too**
+///    (the del's vv strictly supersedes every version this device ever
+///    minted, so it can never collide with an admitted-but-unpublished
+///    put's vv — review round 0) and stage the `del` journal entry
+///    carrying it; mark every such record
 ///    [`crate::state::ItemRecord::deleted`] (hidden; local trash is
-///    app-side); record the §2.3 deleted-set row
-///    ([`crate::state::StateTxn::record_deleted`]) under the image
-///    relkey with the sidecar del's vv.
+///    app-side; the record keeps the deleted *content* version's head
+///    identity, which is what restore re-advertises); record one §2.3
+///    deleted-set row **per deleted item**, keyed by the item's file
+///    relkey with that item's del vv (§2.3 "one row per deleted key").
+///
+/// Addressing (review round 0): `Sidecar` resolves suffix-aware — an
+/// `image` already ending in `.rrdata` (a virtual copy, or the primary
+/// named by its own file path) IS the item; `Original` and `Xmp` items
+/// are self-keyed by the passed relkey (the xmp's own file relkey, which
+/// the caller names — it is not derivable from the image's). Kinds with
+/// no engine delete lane (previews/thumbs/meta) are skipped.
 ///
 /// A kind with no item record is skipped (deleting a never-synced kind
 /// is a no-op, not an error); naming no existing item at all is
@@ -1606,15 +1971,20 @@ pub async fn delete_item(
     // The targets, in the caller's kind order, each with its bumped vv.
     let mut targets: Vec<(Kind, RelKey, ItemRecord, VersionVector)> = Vec::new();
     for &kind in kinds {
-        // Only the kinds whose item key is derivable from the image
-        // relkey live in this unit's delete lane.
-        if !matches!(kind, Kind::Sidecar | Kind::Original) {
+        // Only kinds with an engine item lane; the item key resolves
+        // per the module's file-relkey convention (doc: Addressing).
+        if !matches!(kind, Kind::Sidecar | Kind::Original | Kind::Xmp) {
             continue;
         }
         let item = item_key_for_kind(image, kind)?;
         if let Some(record) = db.get_item(&item)? {
             if record.kind == kind {
                 let mut vv = record.vv.clone();
+                if let Some(admitted) = &record.admitted_vv {
+                    // The del supersedes the withdrawn in-flight intent
+                    // too, so no put and del can ever share a vv.
+                    vv.merge(admitted);
+                }
                 vv.bump(&own);
                 targets.push((kind, item, record, vv));
             }
@@ -1681,21 +2051,22 @@ pub async fn delete_item(
             t.update_item(item, record.state, |r| {
                 r.vv = vv.clone();
                 r.deleted = true;
-                r.device = Some(own.clone());
-                r.head_ts = Some(server_ts);
                 r.admitted_vv = None;
+                r.admitted_ts = None;
             })?;
             t.queue_remove(Queue::Up, item)?;
             t.queue_remove(Queue::Down, item)?;
+            // §2.3: one deleted-set row per deleted item key, carrying
+            // that item's own del vv (per-lineage; review round 0).
+            t.record_deleted(
+                item,
+                &DeletedRecord {
+                    vv: vv.clone(),
+                    server_ts,
+                },
+            )?;
             staged.push(item.clone());
         }
-        t.record_deleted(
-            image,
-            &DeletedRecord {
-                vv: anchor.clone(),
-                server_ts,
-            },
-        )?;
         Ok(())
     })?;
 
@@ -1704,36 +2075,51 @@ pub async fn delete_item(
 
 /// §2.7 restore from "Recently Deleted": for every deleted item of
 /// `image`, stage a metadata-only [`EnginePut`] whose vv dominates the
-/// deletion (elementwise max of the record's vv and the known deletion
-/// vv, plus a `vv[self]` bump), re-advertising the record's known
-/// `blake3`/`sem_hash`/`content_id` — the data keys are still in the
-/// bucket during grace, so restore moves **no bytes**. Clears the
-/// `deleted` flags and this device's deleted-set row in the same
-/// transaction. Returns the restored item relkeys.
+/// deletion (elementwise max of the record's vv and the item's known
+/// deleted-set row, plus a `vv[self]` bump), re-advertising the record's
+/// known `blake3`/`sem_hash`/`content_id` — the data keys are still in
+/// the bucket during grace, so restore moves **no bytes**. Clears the
+/// `deleted` flags and this device's per-item deleted-set rows in the
+/// same transaction. Returns the restored item relkeys.
+///
+/// Targets are matched **structurally** ([`item_belongs_to_image`]): the
+/// original, the primary sidecar, and the image's 6-hex virtual copies —
+/// never a sibling image whose relkey merely extends `<image>.` (review
+/// round 0). An xmp or vc item can also be restored by passing its own
+/// file relkey as `image` (the exact-match arm), mirroring
+/// [`delete_item`]'s addressing.
+///
+/// Transfer-lane normalization (review round 0 — restore used to wedge
+/// items off the queues): a restored `PendingDown` item with a known
+/// `blake3` is re-pushed onto the download queue (the delete dequeued
+/// it, and nothing else ever would have); a restored item stranded in
+/// the upload lane (`Queued`/`Uploading`/`Verifying` — its intent was
+/// withdrawn by the delete) is demoted to `Dirty`, so the next
+/// [`admit_pending`] re-admits the **local file's** content as a new
+/// version. (When that file still matches the restored version this
+/// re-uploads one semantically identical version, which every receiver
+/// converges case-1; when it holds a newer edit — the probe's lost-v2
+/// shape — this is exactly what publishes it.)
 ///
 /// An image with nothing deleted is [`EngineError::NotDeleted`].
 pub fn restore_item(db: &SyncDb, image: &RelKey) -> Result<Vec<RelKey>, EngineError> {
     let own = db.device_id().clone();
     let now = crate::transfer::server_ts_estimate(db)?;
-    let prefix = format!("{image}.");
     let targets: Vec<(RelKey, ItemRecord)> = db
         .iter_items()?
         .into_iter()
-        .filter(|(key, record)| {
-            record.deleted && (key == image || key.as_str().starts_with(&prefix))
-        })
+        .filter(|(key, record)| record.deleted && item_belongs_to_image(key, image))
         .collect();
     if targets.is_empty() {
         return Err(EngineError::NotDeleted {
             relkey: image.clone(),
         });
     }
-    let row = db.get_deleted(image)?;
     let mut restored = Vec::new();
     db.with_txn_err::<_, EngineError>(|t| {
         for (relkey, record) in &targets {
             let mut vv = record.vv.clone();
-            if let Some(row) = &row {
+            if let Some(row) = t.get_deleted(relkey)? {
                 vv.merge(&row.vv);
             }
             vv.bump(&own);
@@ -1766,9 +2152,27 @@ pub fn restore_item(db: &SyncDb, image: &RelKey) -> Result<Vec<RelKey>, EngineEr
                 r.head_ts = Some(now);
                 r.device = Some(own.clone());
             })?;
+            // Transfer-lane normalization (doc comment).
+            match record.state {
+                ItemState::PendingDown => {
+                    if record.blake3.is_some() {
+                        t.queue_push(Queue::Down, relkey, transfer_class(record.kind))?;
+                    }
+                }
+                state @ (ItemState::Queued | ItemState::Uploading) => {
+                    t.transition(relkey, state, ItemState::Dirty, |_| {})?;
+                }
+                ItemState::Verifying => {
+                    // No direct Verifying → Dirty edge: via the legal
+                    // retry demotion first.
+                    t.transition(relkey, ItemState::Verifying, ItemState::Queued, |_| {})?;
+                    t.transition(relkey, ItemState::Queued, ItemState::Dirty, |_| {})?;
+                }
+                _ => {}
+            }
+            t.remove_deleted(relkey)?;
             restored.push(relkey.clone());
         }
-        t.remove_deleted(image)?;
         Ok(())
     })?;
     Ok(restored)

@@ -10,8 +10,8 @@ use std::path::Path;
 
 use rrcloud_core::clock::{DeviceId, VersionVector};
 use rrcloud_core::engine::{
-    admit_pending, ConflictEvent, EngineConsumer, EngineEvents, OriginalConflictEvent,
-    ResurrectionIncompleteEvent,
+    admit_pending, ConflictEvent, EngineConsumer, EngineEvents, LoserPreservationSkippedEvent,
+    OriginalConflictEvent, ResurrectionIncompleteEvent,
 };
 use rrcloud_core::journal::{decode_segment, JournalEntry, Kind};
 use rrcloud_core::keys::{classify_key, KeyClass, RelKey, CONTROL_PREFIX, LIBRARY_PREFIX};
@@ -34,6 +34,7 @@ pub struct RecordedEvents {
     pub conflicts: Vec<ConflictEvent>,
     pub resurrection_incomplete: Vec<ResurrectionIncompleteEvent>,
     pub original_conflicts: Vec<OriginalConflictEvent>,
+    pub loser_skipped: Vec<LoserPreservationSkippedEvent>,
 }
 
 impl EngineEvents for RecordedEvents {
@@ -47,6 +48,10 @@ impl EngineEvents for RecordedEvents {
 
     fn original_conflict(&mut self, event: OriginalConflictEvent) {
         self.original_conflicts.push(event);
+    }
+
+    fn loser_preservation_skipped(&mut self, event: LoserPreservationSkippedEvent) {
+        self.loser_skipped.push(event);
     }
 }
 
@@ -69,6 +74,14 @@ pub fn doc(rating: u64, label: Option<&str>, exposure: f64) -> Vec<u8> {
         "exif": { "camera": "TestCam", "iso": 100 },
     }))
     .expect("doc encodes")
+}
+
+/// The §2.6 canonical loser document the engine materializes as a vc
+/// (the §2.5 semantic canonical form — churn-stable across holders).
+pub fn semantic(bytes: &[u8]) -> Vec<u8> {
+    rrcloud_core::semhash::semantic_document(bytes)
+        .expect("semantic document")
+        .into_bytes()
 }
 
 /// A §2.5 churn rewrite of `original`: same semantic content (rating,
@@ -212,6 +225,12 @@ pub async fn journal_entries_of(
 // ---------------------------------------------------------------------------
 // Drive helpers (the scenario suite's manual publish/poll/pump)
 // ---------------------------------------------------------------------------
+
+/// Admits every quiesced-dirty item WITHOUT pumping or publishing —
+/// the in-flight-intent window the review-round-0 scenarios hold open.
+pub fn sync_up_admit_only(db: &SyncDb) -> Vec<RelKey> {
+    admit_pending(db, |_, _| true).expect("admit_pending")
+}
 
 /// Admits every quiesced-dirty item, pumps the upload queue to
 /// completion, and publishes the staged journal entries. Returns the

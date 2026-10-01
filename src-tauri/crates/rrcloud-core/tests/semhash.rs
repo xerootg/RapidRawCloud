@@ -620,3 +620,44 @@ fn sidecar_badges_is_lenient_within_a_valid_document_and_fails_closed_otherwise(
     assert!(sidecar_badges(b"{ not json").is_err());
     assert!(sidecar_badges(b"[1,2,3]").is_err(), "non-object root");
 }
+
+// ---------------------------------------------------------------------------
+// P1-U5 review round 0: the canonical semantic document
+// ---------------------------------------------------------------------------
+
+#[test]
+fn semantic_document_is_idempotent_and_sem_stable() {
+    use rrcloud_core::semhash::semantic_document;
+    let doc = br#"{
+        "version": 1,
+        "rating": 3,
+        "tags": ["color:red", "alpha"],
+        "adjustments": { "exposure": 0.5, "contrast": 0, "lutPath": "/x.cube" },
+        "exif": { "camera": "TestCam", "cached_at": 123 }
+    }"#;
+    let canonical = semantic_document(doc).expect("projects");
+    // The projection drops exif/version/lutPath and sorts.
+    assert!(!canonical.contains("exif"));
+    assert!(!canonical.contains("version"));
+    assert!(!canonical.contains("lutPath"));
+    // Idempotent: projecting the projection is a fixed point, so the
+    // §2.6 loser vc (which materializes these bytes) hashes to the
+    // loser's own sem_hash.
+    assert_eq!(
+        semantic_document(canonical.as_bytes()).expect("re-projects"),
+        canonical
+    );
+    assert_eq!(
+        sem_hash(canonical.as_bytes()).expect("sem of canonical"),
+        sem_hash(doc).expect("sem of doc"),
+        "sem_hash(semantic_document(x)) == sem_hash(x)"
+    );
+    // sem_hash IS blake3 of exactly these bytes.
+    assert_eq!(
+        sem_hash(doc).expect("sem").as_str(),
+        blake3::hash(canonical.as_bytes()).to_hex().as_str()
+    );
+    // Fail-closed like sem_hash.
+    assert!(semantic_document(b"not json").is_err());
+    assert!(semantic_document(b"[1,2]").is_err());
+}

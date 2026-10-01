@@ -18,7 +18,7 @@ mod common;
 use common::engine as eh;
 use common::engine::RecordedEvents;
 use common::garage;
-use common::sync::{dev, open_db, rel, DEV_A, DEV_B, DEV_C};
+use common::sync::{dev, open_db, rel, DEV_A, DEV_B, DEV_C, DEV_X};
 use common::transfer as th;
 use common::transfer::CountingS3;
 use rrcloud_core::clock::{compare, pick_winner, Candidate, DeviceId, VvOrder};
@@ -29,6 +29,7 @@ use rrcloud_core::engine::{
 };
 use rrcloud_core::journal::{JournalEntry, Kind, Op, Tombstone};
 use rrcloud_core::keys::{library_key, sidecar_key, tombstone_key, RelKey};
+use rrcloud_core::manifest::{build_manifest, merge};
 use rrcloud_core::publisher::publish_pending;
 use rrcloud_core::reader::{ConsumerError, JournalConsumer as _};
 use rrcloud_core::semhash::{sem_hash, ContentId};
@@ -162,6 +163,13 @@ fn concurrent_pair<'a>(
     (last_of(entries_a), last_of(entries_b))
 }
 
+/// A fresh db + sync root for the same device id (order-equivalence
+/// harness scaffolding).
+fn fresh_dev(id: &str) -> (tempfile::TempDir, tempfile::TempDir, SyncDb) {
+    let (d, _p, db) = open_db(&dev(id));
+    (d, tempfile::tempdir().expect("root"), db)
+}
+
 /// Applies `entries` to `db` through a fresh engine consumer (manual
 /// arrival-order driving for the order-equivalence assertions).
 fn apply_manually(db: &SyncDb, root: &std::path::Path, entries: &[&JournalEntry]) {
@@ -248,7 +256,11 @@ async fn s1_concurrent_offline_sidecar_edits_converge_with_one_loser_vc() {
     let vc_rel = vc_item_relkey(&image, &suffix).expect("vc relkey");
     for d in [&a, &b] {
         assert_eq!(d.file(&sidecar_rel), doc_b, "winner is the primary");
-        assert_eq!(d.file(&vc_rel), doc_a, "loser preserved as the vc");
+        assert_eq!(
+            d.file(&vc_rel),
+            eh::semantic(&doc_a),
+            "loser preserved as the vc (canonical semantic doc — review round 0)"
+        );
     }
     let library = eh::library_keys(&client, &bucket).await;
     assert_eq!(
@@ -262,7 +274,7 @@ async fn s1_concurrent_offline_sidecar_edits_converge_with_one_loser_vc() {
     );
     assert_eq!(
         th::get_bytes(&client, &bucket, &library_key(&vc_rel)).await,
-        doc_a
+        eh::semantic(&doc_a)
     );
     assert_eq!(
         th::get_bytes(&client, &bucket, &sidecar_key(&image)).await,
@@ -576,11 +588,15 @@ async fn s4_uncommitted_dirty_commits_first_and_no_edit_bytes_are_lost() {
     let vc_rel = vc_item_relkey(&image, &suffix).expect("vc relkey");
     for d in [&a, &b] {
         assert_eq!(d.file(&sidecar_rel), doc_b2, "B's edit is the primary");
-        assert_eq!(d.file(&vc_rel), doc_a2, "A's edit survives as the vc");
+        assert_eq!(
+            d.file(&vc_rel),
+            eh::semantic(&doc_a2),
+            "A's edit survives as the vc (canonical semantic doc)"
+        );
     }
     assert_eq!(
         th::get_bytes(&client, &bucket, &library_key(&vc_rel)).await,
-        doc_a2
+        eh::semantic(&doc_a2)
     );
     assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
     assert_eq!(a.events.conflicts.len(), 1);
@@ -646,6 +662,10 @@ async fn s5_dominating_del_hides_everywhere_and_restore_reappears() {
     // B polls: clean (not dirty), dominated — hidden, not resurrected.
     b.poll_apply().await;
     assert!(b.item(&sidecar_rel).deleted && b.item(&image).deleted);
+    // Each item's deletion vv (per-lineage): what the restore must beat.
+    let sidecar_del_vv = b.item(&sidecar_rel).vv.clone();
+    let original_del_vv = b.item(&image).vv.clone();
+    assert_eq!(sidecar_del_vv, outcome.tombstone.vv, "sidecar del anchor");
     assert_eq!(
         recently_deleted(&b.db)
             .expect("listing")
@@ -672,11 +692,12 @@ async fn s5_dominating_del_hides_everywhere_and_restore_reappears() {
     assert!(!a.item(&sidecar_rel).deleted && !a.item(&image).deleted);
     assert!(recently_deleted(&a.db).expect("listing").is_empty());
     assert_eq!(a.db.get_deleted(&image).expect("row"), None);
-    for key in [&sidecar_rel, &image] {
+    assert_eq!(a.db.get_deleted(&sidecar_rel).expect("row"), None);
+    for (key, del_vv) in [(&sidecar_rel, &sidecar_del_vv), (&image, &original_del_vv)] {
         assert_eq!(
-            compare(&a.item(key).vv, &outcome.tombstone.vv),
+            compare(&a.item(key).vv, del_vv),
             VvOrder::Greater,
-            "{key}: restored past the deletion"
+            "{key}: restored past its own deletion"
         );
     }
     assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
@@ -866,8 +887,8 @@ async fn s7_two_holders_materialize_one_identical_loser_vc() {
     for d in [&a, &c] {
         assert_eq!(
             d.file(&vc_rel),
-            doc2,
-            "each holder wrote the identical vc file"
+            eh::semantic(&doc2),
+            "each holder wrote the identical (canonical) vc file"
         );
     }
     a.pump_down().await;
@@ -886,7 +907,7 @@ async fn s7_two_holders_materialize_one_identical_loser_vc() {
     );
     assert_eq!(
         th::get_bytes(&client, &bucket, &library_key(&vc_rel)).await,
-        doc2
+        eh::semantic(&doc2)
     );
 
     // Cross-apply the two vc advertisements: apply dedup by
@@ -918,7 +939,7 @@ async fn s7_two_holders_materialize_one_identical_loser_vc() {
     assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
     assert_eq!(
         b.file(&vc_rel),
-        doc2,
+        eh::semantic(&doc2),
         "the vc reached the winner's author too"
     );
 }
@@ -1000,4 +1021,639 @@ async fn s8_every_published_engine_put_carries_blake3() {
         "the flow must have exercised seed (2) + edits (2) + vc (1) + restores (2) puts, saw {puts}"
     );
     assert_eq!(dels, 2, "the §2.7 delete staged both dels");
+}
+
+// ===========================================================================
+// Review round 0 — the verified failure interleavings, pinned end to end
+// ===========================================================================
+
+/// Finding 1 (B1): a device polls while an admitted upload is in
+/// flight, and the arriving entry is concurrent with the ADMITTED
+/// version while matching the stale PUBLISHED sem (Y edited then
+/// reverted). Pre-fix: X converged silently (0 conflict events) and the
+/// fleet ended with identical vvs over different primaries. Now: case 4
+/// fires, X's in-flight edit survives as the vc, and every arrival
+/// order of the final entry set lands identically.
+#[tokio::test]
+async fn s9_in_flight_admission_window_conflicts_instead_of_converging() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s9-inflight-window");
+    let client = g.client();
+    let mut a = device(g, &bucket, DEV_A); // X
+    let mut b = device(g, &bucket, DEV_B); // Y
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+    let (_orig, base) = {
+        let mut rest = [&mut b];
+        seed_photo(&image, &a, &mut rest).await
+    };
+
+    // Y edits then REVERTS (same sem as the published base), admits and
+    // publishes with its clock two hours ahead: {A:1,B:1}, base sem.
+    let detour = eh::doc(2, Some("blue"), 0.3);
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &detour),
+        ChangeOutcome::MarkedDirty
+    );
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &base),
+        ChangeOutcome::Unchanged,
+        "the revert collapses under the churn gate but the dirt stands"
+    );
+    b.db.set_server_time_offset_ms(7_200_000).expect("offset");
+    b.sync_up().await;
+
+    // X admits its own edit ({A:2}) and polls BEFORE pumping.
+    let doc_x = eh::doc(5, Some("red"), 0.6);
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Sidecar, &doc_x),
+        ChangeOutcome::MarkedDirty
+    );
+    let admitted = eh::sync_up_admit_only(&a.db);
+    assert_eq!(admitted, vec![sidecar_rel.clone()]);
+    a.poll_apply().await;
+
+    // Case 4 fired on X (pre-fix: zero events, silent divergence).
+    assert_eq!(a.events.conflicts.len(), 1, "the window is a conflict");
+    assert_eq!(a.events.conflicts[0].winner_device, dev(DEV_B));
+    let suffix = loser_vc_suffix(&doc_x).expect("suffix");
+    let vc_rel = vc_item_relkey(&image, &suffix).expect("vc relkey");
+    assert_eq!(a.events.conflicts[0].copy_relkey, Some(vc_rel.clone()));
+
+    a.pump_down().await; // fetch Y's (reverted) winner bytes
+    a.sync_up().await; // upload + publish the vc
+    b.poll_apply().await; // Y learns the vc
+    b.pump_down().await;
+
+    // Both primaries hold the winner; X's edit survives as the vc.
+    for d in [&a, &b] {
+        assert_eq!(d.file(&sidecar_rel), base, "winner is the reverted base");
+        assert_eq!(d.file(&vc_rel), eh::semantic(&doc_x), "edit preserved");
+    }
+    assert_eq!(
+        th::get_bytes(&client, &bucket, &library_key(&vc_rel)).await,
+        eh::semantic(&doc_x)
+    );
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
+    let primary = a.item(&sidecar_rel);
+    assert_eq!(
+        primary.vv,
+        [(dev(DEV_A), 1), (dev(DEV_B), 1)].into_iter().collect(),
+        "the fleet-learnable history; the withdrawn {{A:2}} never published"
+    );
+    assert_eq!(primary.sem_hash, Some(sem_hash(&base).expect("sem")));
+
+    // §2.11: a fresh device applying both full arrival orders agrees.
+    let entries_a = eh::journal_entries_of(&client, &bucket, &dev(DEV_A)).await;
+    let entries_b = eh::journal_entries_of(&client, &bucket, &dev(DEV_B)).await;
+    let a_first: Vec<&JournalEntry> = entries_a.iter().chain(entries_b.iter()).collect();
+    let b_first: Vec<&JournalEntry> = entries_b.iter().chain(entries_a.iter()).collect();
+    let (_d1, root1, db1) = fresh_dev(DEV_C);
+    apply_manually(&db1, root1.path(), &a_first);
+    let (_d2, root2, db2) = fresh_dev(DEV_C);
+    apply_manually(&db2, root2.path(), &b_first);
+    assert_eq!(eh::full_items(&db1), eh::full_items(&db2));
+    assert_eq!(
+        eh::sync_view(&db1),
+        eh::sync_view(&a.db),
+        "the fresh device agrees with the fleet"
+    );
+}
+
+/// Finding 2/5 (B2/B5): a del genuinely CONCURRENT with a
+/// committed/published edit. Pre-fix: no-op on the editor, half-applied
+/// on the deleter, arrival-order divergent on third devices. Now: the
+/// edit beats the delete on the edited key everywhere, the original's
+/// own del stands everywhere (per-key ordering), and both arrival
+/// orders agree bit for bit.
+#[tokio::test]
+async fn s10_del_concurrent_with_committed_edit_converges_in_every_order() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s10-del-vs-edit");
+    let client = g.client();
+    let mut a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+    {
+        let mut rest = [&mut b];
+        seed_photo(&image, &a, &mut rest).await;
+    }
+
+    // B's edit is committed and published (clock ahead: it wins every
+    // tiebreak) — but A has NOT polled it when A deletes.
+    let doc_b2 = eh::doc(4, Some("green"), 0.8);
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &doc_b2),
+        ChangeOutcome::MarkedDirty
+    );
+    b.db.set_server_time_offset_ms(7_200_000).expect("offset");
+    b.sync_up().await;
+
+    delete_item(
+        &a.db,
+        &a.s3,
+        &bucket,
+        &image,
+        &[Kind::Sidecar, Kind::Original],
+    )
+    .await
+    .expect("delete");
+    publish_pending(&a.db, &a.s3, &bucket)
+        .await
+        .expect("publish dels");
+
+    // Cross-apply.
+    a.poll_apply().await; // B's edit: concurrent with A's del -> edit wins
+    a.pump_down().await;
+    b.poll_apply().await; // A's dels: sidecar del loses, original del stands
+
+    // The edited key is LIVE everywhere with B's edit; the original's
+    // own deletion stands everywhere (per-key §2.6 ordering of dels).
+    for d in [&a, &b] {
+        let sidecar = d.item(&sidecar_rel);
+        assert!(!sidecar.deleted, "edits beat deletes on the edited key");
+        assert_eq!(sidecar.sem_hash, Some(sem_hash(&doc_b2).expect("sem")));
+        assert!(d.item(&image).deleted, "the original's del stands");
+        assert_eq!(
+            d.db.get_deleted(&sidecar_rel).expect("row"),
+            None,
+            "no standing row for the key the edit won"
+        );
+        assert!(
+            d.db.get_deleted(&image).expect("row").is_some(),
+            "the original's row stands"
+        );
+    }
+    assert_eq!(a.file(&sidecar_rel), doc_b2, "the edit's bytes landed on A");
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
+    assert!(
+        a.events.conflicts.is_empty() && b.events.conflicts.is_empty(),
+        "del-vs-edit is §2.7 ordering, not a §2.6 content conflict"
+    );
+
+    // §2.11: both arrival orders on a fresh device agree bit for bit
+    // (pre-fix: deleted=true on del-first, deleted=false on put-first).
+    let entries_a = eh::journal_entries_of(&client, &bucket, &dev(DEV_A)).await;
+    let entries_b = eh::journal_entries_of(&client, &bucket, &dev(DEV_B)).await;
+    let a_first: Vec<&JournalEntry> = entries_a.iter().chain(entries_b.iter()).collect();
+    let b_first: Vec<&JournalEntry> = entries_b.iter().chain(entries_a.iter()).collect();
+    let (_d1, root1, db1) = fresh_dev(DEV_C);
+    apply_manually(&db1, root1.path(), &a_first);
+    let (_d2, root2, db2) = fresh_dev(DEV_C);
+    apply_manually(&db2, root2.path(), &b_first);
+    assert_eq!(eh::full_items(&db1), eh::full_items(&db2));
+    assert_eq!(
+        db1.iter_deleted().expect("deleted"),
+        db2.iter_deleted().expect("deleted")
+    );
+    assert!(
+        !db1.get_item(&sidecar_rel)
+            .expect("get")
+            .expect("rec")
+            .deleted
+    );
+    assert!(db1.get_item(&image).expect("get").expect("rec").deleted);
+
+    // Restore the original on B; A agrees after a poll.
+    restore_item(&b.db, &image).expect("restore");
+    publish_pending(&b.db, &b.s3, &bucket)
+        .await
+        .expect("publish restore");
+    a.poll_apply().await;
+    for d in [&a, &b] {
+        assert!(!d.item(&image).deleted, "whole item live again");
+        assert!(recently_deleted(&d.db).expect("listing").is_empty());
+    }
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
+}
+
+/// Finding 7 (B6): edits-beat-deletes resurrection with ASYMMETRIC
+/// per-item vvs — the original authored on A, the sidecar on B, deleted
+/// by A while C holds uncommitted dirt. Pre-fix: the original stayed
+/// hidden on the deleter forever (the resurrection vv is only
+/// concurrent with the original's own del). Now the whole item is live
+/// on every device.
+#[tokio::test]
+async fn s11_asymmetric_vvs_resurrect_the_whole_item_everywhere() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s11-asymmetric-resurrection");
+    let mut a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let mut c = device(g, &bucket, DEV_C);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+
+    // A authors the original; B authors the first sidecar version —
+    // the normal shape for an image imported on one device and edited
+    // on another.
+    let orig = th::patterned(2048, 42);
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Original, &orig),
+        ChangeOutcome::MarkedDirty
+    );
+    a.sync_up().await;
+    b.poll_apply().await;
+    b.pump_down().await;
+    let base = eh::doc(1, None, 0.1);
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &base),
+        ChangeOutcome::MarkedDirty
+    );
+    b.sync_up().await;
+    for d in [&mut a, &mut c] {
+        d.poll_apply().await;
+        d.pump_down().await;
+    }
+    assert_eq!(
+        a.item(&sidecar_rel).vv,
+        [(dev(DEV_B), 1)]
+            .into_iter()
+            .collect::<rrcloud_core::clock::VersionVector>(),
+        "asymmetric precondition: sidecar lineage is B's, original is A's"
+    );
+
+    // C edits the sidecar offline (uncommitted dirt); A deletes both.
+    let edited = eh::doc(5, Some("red"), 0.9);
+    assert_eq!(
+        c.write_and_notify(&image, Kind::Sidecar, &edited),
+        ChangeOutcome::MarkedDirty
+    );
+    delete_item(
+        &a.db,
+        &a.s3,
+        &bucket,
+        &image,
+        &[Kind::Sidecar, Kind::Original],
+    )
+    .await
+    .expect("delete");
+    publish_pending(&a.db, &a.s3, &bucket)
+        .await
+        .expect("publish dels");
+
+    // C polls -> resurrection; its puts publish.
+    c.poll_apply().await;
+    assert!(!c.item(&sidecar_rel).deleted && !c.item(&image).deleted);
+    assert!(c.events.resurrection_incomplete.is_empty());
+    c.sync_up().await;
+
+    // The deleter and the sidecar's author both converge to the whole
+    // live item (pre-fix: A kept the original hidden forever).
+    a.poll_apply().await;
+    a.pump_down().await;
+    b.poll_apply().await;
+    b.pump_down().await;
+    for (name, d) in [("A", &a), ("B", &b), ("C", &c)] {
+        assert!(
+            !d.item(&sidecar_rel).deleted && !d.item(&image).deleted,
+            "{name}: the whole item is live"
+        );
+        assert!(
+            recently_deleted(&d.db).expect("listing").is_empty(),
+            "{name}: Recently Deleted is empty"
+        );
+    }
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&c.db));
+    assert_eq!(eh::sync_view(&b.db), eh::sync_view(&c.db));
+    assert_eq!(
+        a.item(&sidecar_rel).sem_hash,
+        Some(sem_hash(&edited).expect("sem")),
+        "C's edit is the surviving head"
+    );
+}
+
+/// Finding 10 (B8): delete -> restore of an item whose edit was admitted
+/// but never pumped. Pre-fix: the item wedged at Queued with an empty
+/// queue and the v2 edit became unreachable (later destroyed by the
+/// next remote adopt). Now restore normalizes the lane to Dirty and the
+/// next sync_up publishes the v2 edit.
+#[tokio::test]
+async fn s13_delete_restore_of_an_admitted_edit_still_publishes_it() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s13-delete-restore");
+    let a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+    {
+        let mut rest = [&mut b];
+        seed_photo(&image, &a, &mut rest).await;
+    }
+
+    // v2 admitted (Queued, intent minted) but NOT pumped.
+    let v2 = eh::doc(5, Some("red"), 0.9);
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Sidecar, &v2),
+        ChangeOutcome::MarkedDirty
+    );
+    let admitted = eh::sync_up_admit_only(&a.db);
+    assert_eq!(admitted, vec![sidecar_rel.clone()]);
+
+    // Delete withdraws the intent; restore normalizes the lane.
+    delete_item(
+        &a.db,
+        &a.s3,
+        &bucket,
+        &image,
+        &[Kind::Sidecar, Kind::Original],
+    )
+    .await
+    .expect("delete");
+    restore_item(&a.db, &image).expect("restore");
+    let restored = a.item(&sidecar_rel);
+    assert!(!restored.deleted);
+    assert_eq!(
+        restored.state,
+        ItemState::Dirty,
+        "the stranded upload lane is normalized (pre-fix: Queued with an \
+         empty queue — the v2 edit unreachable forever)"
+    );
+
+    // The next ordinary pass publishes the local file's content: v2.
+    a.sync_up().await;
+    b.poll_apply().await;
+    b.pump_down().await;
+    assert_eq!(b.file(&sidecar_rel), v2, "the v2 edit reached the fleet");
+    assert_eq!(
+        b.item(&sidecar_rel).sem_hash,
+        Some(sem_hash(&v2).expect("sem"))
+    );
+    for d in [&a, &b] {
+        assert!(!d.item(&sidecar_rel).deleted && !d.item(&image).deleted);
+        assert!(recently_deleted(&d.db).expect("listing").is_empty());
+    }
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
+}
+
+/// Finding 4 (B4): a §2.10 laggard catching a deletion up via
+/// manifest::merge — driven through the REAL EngineConsumer — hides the
+/// original AND the sidecar, identically to journal replay, and a
+/// fresh bootstrap ends equivalent too.
+#[tokio::test]
+async fn s14_manifest_deletion_catchup_equals_journal_replay() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s14-manifest-deletion");
+    let client = g.client();
+    let a = device(g, &bucket, DEV_A);
+    let mut laggard = device(g, &bucket, DEV_B); // catches up via manifest
+    let mut replayer = device(g, &bucket, DEV_C); // catches up via journal
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+    {
+        let mut rest = [&mut laggard, &mut replayer];
+        seed_photo(&image, &a, &mut rest).await;
+    }
+
+    // A deletes and publishes; its manifest carries the deleted set.
+    delete_item(
+        &a.db,
+        &a.s3,
+        &bucket,
+        &image,
+        &[Kind::Sidecar, Kind::Original],
+    )
+    .await
+    .expect("delete");
+    publish_pending(&a.db, &a.s3, &bucket)
+        .await
+        .expect("publish dels");
+    let manifest = build_manifest(&a.db, 1_769_960_000).expect("manifest");
+    assert_eq!(manifest.deleted.len(), 2, "one deleted row per item");
+
+    // The laggard merges the manifest through the real EngineConsumer
+    // (its §2.6 unified apply rule), never polling A's segments.
+    {
+        let mut consumer =
+            EngineConsumer::new(&laggard.db, laggard.root.path(), &mut laggard.events)
+                .expect("consumer");
+        merge(
+            &[(dev(DEV_A), manifest.clone())],
+            &laggard.db,
+            &mut consumer,
+        )
+        .expect("merge");
+    }
+    // The replayer polls the journal.
+    replayer.poll_apply().await;
+
+    // Both items are hidden on the laggard (pre-fix: only the sidecar;
+    // the original stayed live and its next manifest advertised the
+    // exact live/deleted contradiction build_manifest forbids).
+    assert!(laggard.item(&sidecar_rel).deleted, "sidecar hidden");
+    assert!(laggard.item(&image).deleted, "original hidden too");
+    assert_eq!(
+        eh::full_items(&laggard.db),
+        eh::full_items(&replayer.db),
+        "merge is the same idempotent apply as journal replay (§2.3)"
+    );
+    assert_eq!(
+        laggard.db.iter_deleted().expect("deleted"),
+        replayer.db.iter_deleted().expect("deleted")
+    );
+
+    // A fresh bootstrapping device (manifest only, then the journal):
+    // the header's own-cursor attestation covers A's segments, so no
+    // puts replay — the deleted items exist as ROWS only, and both rows
+    // (original AND sidecar — pre-fix only the sidecar) match the
+    // fleet's. A put that later sneaks in behind the rows (a laggard
+    // writer re-advertising the deleted version) stays hidden.
+    let mut boot = device(g, &bucket, DEV_X);
+    {
+        let mut consumer =
+            EngineConsumer::new(&boot.db, boot.root.path(), &mut boot.events).expect("consumer");
+        merge(&[(dev(DEV_A), manifest)], &boot.db, &mut consumer).expect("merge");
+    }
+    boot.poll_apply().await;
+    assert!(
+        boot.db.iter_items().expect("items").is_empty(),
+        "nothing live to bootstrap: the deletion rows fold the puts"
+    );
+    assert_eq!(
+        boot.db.iter_deleted().expect("deleted"),
+        replayer.db.iter_deleted().expect("deleted"),
+        "the full per-item deleted set reached the bootstrapper"
+    );
+    let entries_a = eh::journal_entries_of(&client, &bucket, &dev(DEV_A)).await;
+    let seed_puts: Vec<&JournalEntry> = entries_a.iter().filter(|e| e.op == Op::Put).collect();
+    apply_manually(&boot.db, boot.root.path(), &seed_puts.to_vec());
+    assert!(
+        boot.item(&sidecar_rel).deleted && boot.item(&image).deleted,
+        "re-delivered puts stay hidden behind the per-item rows"
+    );
+}
+
+/// Finding 9 (B9): a device that learns one branch of a true concurrent
+/// pair via manifest merge resolves the §2.6 case-4 pick with the SAME
+/// candidate as every journal replayer — the manifest row carries the
+/// head version's real ts — and its downloads verify (no CorruptRemote
+/// wedge).
+#[tokio::test]
+async fn s15_manifest_learned_heads_pick_the_same_case4_winner() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s15-manifest-ts");
+    let a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+    {
+        let mut rest = [&mut b];
+        seed_photo(&image, &a, &mut rest).await;
+    }
+
+    // True concurrent pair: A's v{A:2} (older ts), B's v{A:1,B:1}
+    // (clock two hours ahead — wins every honest pick).
+    let doc_a2 = eh::doc(2, Some("red"), 0.2);
+    let doc_b2 = eh::doc(4, Some("blue"), 0.7);
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Sidecar, &doc_a2),
+        ChangeOutcome::MarkedDirty
+    );
+    a.sync_up().await;
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &doc_b2),
+        ChangeOutcome::MarkedDirty
+    );
+    b.db.set_server_time_offset_ms(7_200_000).expect("offset");
+    b.sync_up().await;
+
+    // The journal replayer picks B.
+    let mut replayer = device(g, &bucket, DEV_C);
+    replayer.poll_apply().await;
+    assert_eq!(
+        replayer.item(&sidecar_rel).sem_hash,
+        Some(sem_hash(&doc_b2).expect("sem")),
+        "journal pick: B wins"
+    );
+
+    // The merge-then-poll device learns A's branch from A's manifest —
+    // written much later, so the pre-fix header-ts stamp would have
+    // made A's branch unbeatable here — then B's branch from the
+    // journal.
+    let manifest = build_manifest(&a.db, 1_769_990_000).expect("manifest");
+    let mut merged = device(g, &bucket, DEV_X);
+    {
+        let mut consumer = EngineConsumer::new(&merged.db, merged.root.path(), &mut merged.events)
+            .expect("consumer");
+        merge(&[(dev(DEV_A), manifest)], &merged.db, &mut consumer).expect("merge");
+    }
+    merged.poll_apply().await;
+    assert_eq!(
+        merged.item(&sidecar_rel).sem_hash,
+        Some(sem_hash(&doc_b2).expect("sem")),
+        "manifest-learned head loses to B exactly like everywhere else \
+         (pre-fix: equal folded vvs over DIFFERENT primaries)"
+    );
+    assert_eq!(
+        eh::sync_view(&merged.db),
+        eh::sync_view(&replayer.db),
+        "merge-then-poll converges with pure replay"
+    );
+    // And the fetch verifies — the record's blake3 names the bytes that
+    // actually won the bucket key (pre-fix: IntegrityMismatch wedge).
+    merged.pump_down().await;
+    assert_eq!(merged.file(&sidecar_rel), doc_b2);
+}
+
+/// Finding M1/M3: two holders of one loser whose local files diverged
+/// only by §2.5 churn materialize ONE vc — same key, byte-identical
+/// canonical content — and the fleet converges on a single vc item
+/// with one blake3.
+#[tokio::test]
+async fn s16_churn_divergent_holders_materialize_one_identical_vc() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s16-churned-vc");
+    let client = g.client();
+    let mut a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let mut c = device(g, &bucket, DEV_C);
+    let image = rel("p/IMG_0042.NEF");
+
+    // v1 everywhere; A publishes v2; C downloads it and then suffers a
+    // §2.5 churn rewrite (same sem, different bytes) — A and C now hold
+    // byte-DIVERGENT copies of the same version.
+    let doc1 = eh::doc(0, None, 0.0);
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Sidecar, &doc1),
+        ChangeOutcome::MarkedDirty
+    );
+    a.sync_up().await;
+    for d in [&mut b, &mut c] {
+        d.poll_apply().await;
+        d.pump_down().await;
+    }
+    let doc2 = eh::doc(3, Some("red"), 0.5);
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Sidecar, &doc2),
+        ChangeOutcome::MarkedDirty
+    );
+    a.sync_up().await;
+    c.poll_apply().await;
+    c.pump_down().await;
+    let churned = eh::churned(&doc2);
+    assert_eq!(
+        c.write_and_notify(&image, Kind::Sidecar, &churned),
+        ChangeOutcome::Unchanged,
+        "churn: same sem, different bytes"
+    );
+
+    // B edits concurrently from v1 and wins: v2 loses on A and C.
+    let doc3 = eh::doc(5, Some("blue"), 0.9);
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &doc3),
+        ChangeOutcome::MarkedDirty
+    );
+    b.db.set_server_time_offset_ms(14_400_000).expect("offset");
+    b.sync_up().await;
+    a.poll_apply().await;
+    c.poll_apply().await;
+
+    // ONE deterministic key — derived from the SEMANTIC form, so the
+    // churn-divergent holders agree (pre-fix: two different keys, two
+    // journal entries, duplicate vcs fleet-wide) — and byte-identical
+    // canonical content on both.
+    let suffix = loser_vc_suffix(&doc2).expect("suffix");
+    assert_eq!(
+        loser_vc_suffix(&churned).expect("churned suffix"),
+        suffix,
+        "churn-stable key"
+    );
+    let vc_rel = vc_item_relkey(&image, &suffix).expect("vc relkey");
+    for d in [&a, &c] {
+        assert_eq!(d.file(&vc_rel), eh::semantic(&doc2));
+    }
+    a.pump_down().await;
+    a.sync_up().await;
+    c.pump_down().await;
+    c.sync_up().await;
+    let library = eh::library_keys(&client, &bucket).await;
+    assert_eq!(
+        library,
+        vec![library_key(&vc_rel), sidecar_key(&image)],
+        "ONE vc key despite churn-divergent materializers"
+    );
+    assert_eq!(
+        th::get_bytes(&client, &bucket, &library_key(&vc_rel)).await,
+        eh::semantic(&doc2)
+    );
+
+    // Cross-apply the advertisements: one vc item, fully converged —
+    // including blake3 (the canonical bytes hash identically).
+    a.poll_apply().await;
+    c.poll_apply().await;
+    b.poll_apply().await;
+    b.poll_apply().await;
+    b.pump_down().await;
+    for d in [&a, &b, &c] {
+        let vc = d.item(&vc_rel);
+        assert_eq!(vc.sem_hash, Some(sem_hash(&doc2).expect("sem")));
+        assert_eq!(
+            vc.vv,
+            [(dev(DEV_A), 1), (dev(DEV_C), 1)]
+                .into_iter()
+                .collect::<rrcloud_core::clock::VersionVector>()
+        );
+    }
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&c.db));
 }
