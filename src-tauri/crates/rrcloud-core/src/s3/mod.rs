@@ -237,8 +237,7 @@ pub trait S3TransferApi: S3Api {
 
 impl S3TransferApi for S3Client {
     async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
-        let _ = (bucket, key);
-        todo!("P1-U4: delegate to S3Client::delete_object")
+        S3Client::delete_object(self, bucket, key).await
     }
 
     async fn create_multipart_upload(
@@ -247,8 +246,7 @@ impl S3TransferApi for S3Client {
         key: &str,
         opts: &PutObjectOptions,
     ) -> Result<CreateMultipartUploadOutput, S3Error> {
-        let _ = (bucket, key, opts);
-        todo!("P1-U4: delegate to S3Client::create_multipart_upload")
+        S3Client::create_multipart_upload(self, bucket, key, opts).await
     }
 
     async fn upload_part(
@@ -260,8 +258,7 @@ impl S3TransferApi for S3Client {
         body: PartBody,
         content_md5: Option<&str>,
     ) -> Result<UploadPartOutput, S3Error> {
-        let _ = (bucket, key, upload_id, part_number, body, content_md5);
-        todo!("P1-U4: delegate to S3Client::upload_part")
+        S3Client::upload_part(self, bucket, key, upload_id, part_number, body, content_md5).await
     }
 
     async fn complete_multipart_upload(
@@ -271,8 +268,7 @@ impl S3TransferApi for S3Client {
         upload_id: &str,
         parts: &[CompletedPart],
     ) -> Result<CompleteMultipartUploadOutput, S3Error> {
-        let _ = (bucket, key, upload_id, parts);
-        todo!("P1-U4: delegate to S3Client::complete_multipart_upload")
+        S3Client::complete_multipart_upload(self, bucket, key, upload_id, parts).await
     }
 
     async fn abort_multipart_upload(
@@ -281,8 +277,7 @@ impl S3TransferApi for S3Client {
         key: &str,
         upload_id: &str,
     ) -> Result<(), S3Error> {
-        let _ = (bucket, key, upload_id);
-        todo!("P1-U4: delegate to S3Client::abort_multipart_upload")
+        S3Client::abort_multipart_upload(self, bucket, key, upload_id).await
     }
 
     async fn list_multipart_uploads(
@@ -290,8 +285,7 @@ impl S3TransferApi for S3Client {
         bucket: &str,
         request: &ListMultipartUploadsRequest,
     ) -> Result<ListMultipartUploadsOutput, S3Error> {
-        let _ = (bucket, request);
-        todo!("P1-U4: delegate to S3Client::list_multipart_uploads")
+        S3Client::list_multipart_uploads(self, bucket, request).await
     }
 
     async fn list_parts(
@@ -301,8 +295,7 @@ impl S3TransferApi for S3Client {
         upload_id: &str,
         request: &ListPartsRequest,
     ) -> Result<ListPartsOutput, S3Error> {
-        let _ = (bucket, key, upload_id, request);
-        todo!("P1-U4: delegate to S3Client::list_parts")
+        S3Client::list_parts(self, bucket, key, upload_id, request).await
     }
 }
 

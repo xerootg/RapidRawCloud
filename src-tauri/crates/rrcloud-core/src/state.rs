@@ -426,6 +426,8 @@ const K_PUBLISHED_FLOOR: &str = "published_floor";
 const K_QUEUE_ARRIVAL: &str = "queue_arrival";
 const K_OUTBOUND_ARRIVAL: &str = "outbound_arrival";
 const K_SERVER_TIME_OFFSET_MS: &str = "server_time_offset_ms";
+/// §2.4 setup-probe outcome: does the backend reject a wrong `Content-MD5`?
+const K_BACKEND_DIGEST_REJECTION: &str = "backend_digest_rejection";
 
 // ---------------------------------------------------------------------------
 // Encoding helpers
@@ -2014,15 +2016,21 @@ impl SyncDb {
     /// perform a full ranged-GET re-hash because the backend performs no
     /// digest verification of its own.
     pub fn backend_digest_rejection(&self) -> Result<Option<bool>, StateError> {
-        todo!("P1-U4: read the probed digest-rejection flag from the meta table")
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(T_META).map_err(db_err)?;
+        meta_get(&meta, K_BACKEND_DIGEST_REJECTION)
     }
 
     /// Persists the §2.4 setup-probe outcome (see
     /// [`SyncDb::backend_digest_rejection`]). Overwrites any previous
     /// probe result — re-probing against a reconfigured backend must win.
     pub fn set_backend_digest_rejection(&self, works: bool) -> Result<(), StateError> {
-        let _ = works;
-        todo!("P1-U4: persist the probed digest-rejection flag in the meta table")
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(K_BACKEND_DIGEST_REJECTION, to_json(&works)?.as_slice())
+                .map_err(db_err)?;
+            Ok(())
+        })
     }
 
     // -- test support (not part of the supported API) ----------------------

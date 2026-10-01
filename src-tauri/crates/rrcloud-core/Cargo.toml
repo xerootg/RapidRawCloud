@@ -13,6 +13,12 @@ publish = false
 [workspace]
 
 [dependencies]
+# Promoted from dev-dependency by the transfer-engine unit (P1-U4): the §2.4
+# integrity backbone sends a `Content-MD5` header (base64 of the MD5) on
+# every single PUT and every multipart part, so the engine itself computes
+# MD5s (md-5) and base64-encodes them (base64). Both were already in the
+# test build; no new transitive surface.
+base64 = "0.22"
 blake3 = "1"
 # State store (§3.2). The only runtime dependency added by the state-store
 # unit: pure Rust, shadow-paging B-tree, commits durable at commit() —
@@ -36,6 +42,8 @@ flate2 = "1"
 filetime = "0.2"
 futures = "0.3"
 hex = "0.4"
+# See the base64 note above (P1-U4 Content-MD5 computation).
+md-5 = "0.10"
 hmac = "0.12"
 percent-encoding = "2"
 quick-xml = { version = "0.38", features = ["serialize"] }
@@ -65,19 +73,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
-# Promoted from dev-dependency by the transfer-engine unit (P1-U4): §2.4
-# names `tokio::sync::Semaphore` as the transfer-concurrency primitive, and
-# the streamed per-part reads use `tokio::fs`/`io-util`. No new transitive
-# surface: reqwest 0.13 (above) already drives tokio on every async path,
-# so this only makes the existing runtime dependency explicit. No runtime
-# features (`rt`/`macros`) — the engine never spawns; concurrency is
-# structured (`FuturesUnordered` + `Semaphore`) on the caller's runtime.
-# `tokio_util` (CancellationToken) is deliberately NOT added: the pump's
-# cancel flag is a plain atomic (see `transfer::CancelFlag`).
+# Promoted from dev-dependency by the transfer-engine unit (P1-U4): the
+# streamed per-part/source reads use `tokio::fs`/`io-util`. No new
+# transitive surface: reqwest 0.13 (above) already drives tokio on every
+# async path, so this only makes the existing runtime dependency explicit.
+# No runtime features (`rt`/`macros`) and no `sync` — the engine never
+# spawns; the §2.4 transfer-concurrency cap is structural (the pump's
+# `FuturesUnordered` length never exceeds the cap, polled on the caller's
+# runtime), so no semaphore is needed. `tokio_util` (CancellationToken) is
+# deliberately NOT added: the pump's cancel flag is a plain atomic (see
+# `transfer::CancelFlag`).
 tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",
-    "sync",
 ] }
 time = { version = "0.3", features = ["formatting", "macros"] }
 unicode-normalization = "0.1"
@@ -92,14 +100,9 @@ unicode-normalization = "0.1"
 test-util = []
 
 [dev-dependencies]
-base64 = "0.22"
-# Tests set source mtimes explicitly (the §2.4 size+mtime source-change
-# recheck must not depend on filesystem timestamp granularity).
-filetime = "0.2"
 # Self-dependency: enables `test-util` when building this crate's tests,
 # without any production build ever carrying the feature.
 rrcloud-core = { path = ".", features = ["test-util"] }
-md-5 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = [
     "rt-multi-thread",

@@ -547,3 +547,23 @@ fn sem_hash_parse_validates() {
     assert_eq!(SemHash::parse(good).expect("valid").as_str(), good);
     assert!(SemHash::parse("nope").is_err());
 }
+
+#[test]
+fn streaming_hash_constructors_match_the_buffered_forms() {
+    // Additive P1-U4 extensions: the transfer engine's running blake3 is
+    // finalized from a streaming hasher (no contiguous buffer ever
+    // exists), and an original's content id is by definition the same
+    // digest relabeled (§1.2). Both constructions must equal what the
+    // buffered entry points produce for the same bytes.
+    let bytes = b"streamed in several chunks";
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&bytes[..9]);
+    hasher.update(&bytes[9..]);
+    let streamed = Blake3Hex::from_hash(&hasher.finalize());
+    assert_eq!(streamed, Blake3Hex::from_bytes(bytes));
+    assert_eq!(
+        ContentId::from_blake3(&streamed),
+        ContentId::from_bytes(bytes),
+        "a content id IS the full-file blake3 (§1.2)"
+    );
+}

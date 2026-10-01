@@ -65,25 +65,39 @@
 //! # Pump
 //!
 //! [`pump_uploads`]/[`pump_downloads`] pop the durable queues by priority
-//! class and run up to `concurrency` items at once (`tokio::sync::Semaphore`
-//! — §2.4 names 2 on Android, 4 on desktop; the number is a parameter
-//! here). One item's failure is recorded in the summary — with its state
-//! left resumable — and never stops the pump. A [`CancelFlag`] stops
-//! *admission* deterministically and waits for in-flight items to finish.
+//! class and run up to `concurrency` items at once (§2.4 names 2 on
+//! Android, 4 on desktop; the number is a parameter here). The cap is
+//! structural: the pump admits into a [`FuturesUnordered`] on the
+//! caller's task and never lets its length exceed `concurrency`, so no
+//! semaphore (and no task spawning) is needed. One item's failure is
+//! recorded in the summary — with its state left resumable — and never
+//! stops the pump. A [`CancelFlag`] stops *admission* deterministically
+//! and waits for in-flight items to finish.
 
+use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use bytes::Bytes;
-use futures::stream::BoxStream;
+use futures::stream::{BoxStream, FuturesUnordered};
+use futures::{StreamExt as _, TryStreamExt as _};
+use md5::{Digest as _, Md5};
 
-use crate::journal::{JournalEntry, Kind};
+use crate::journal::{JournalEntry, Kind, Op, JOURNAL_VERSION};
 use crate::keys::{library_key, sidecar_key, RelKey};
-use crate::publisher::PublisherError;
-use crate::s3::{S3Error, S3TransferApi};
-use crate::semhash::{Blake3Hex, SemHashError};
-use crate::state::{ItemRecord, StateError, SyncDb};
+use crate::publisher::{enqueue_entry_in, PublisherError};
+use crate::s3::{
+    ByteRange, CompletedPart, ListMultipartUploadsRequest, ListPartsRequest, PartBody,
+    PutObjectOptions, S3Error, S3TransferApi,
+};
+use crate::semhash::{sem_hash, Blake3Hex, ContentId, SemHashError};
+use crate::state::{
+    ItemRecord, ItemState, MultipartUploadState, Queue, StateError, SyncDb, UploadPart,
+};
 
 /// Default part size for multipart uploads: 16 MiB (§2.4; ≥ the 5 MiB
 /// S3 minimum, a 60 MB RAW is 4 parts).
@@ -229,6 +243,16 @@ pub enum TransferError {
         source: SemHashError,
     },
 
+    /// A pump-admitted download whose item record carries no `blake3`:
+    /// nothing could ever verify the fetched bytes, so the engine refuses
+    /// to install them (§3.5 — the hash is the backstop for *every*
+    /// failure mode, so an unverifiable download is never attempted).
+    #[error("item record for {relkey} has no blake3; refusing an unverifiable download")]
+    MissingExpectedHash {
+        /// The item.
+        relkey: RelKey,
+    },
+
     /// The [`TransferConfig`] is unusable (e.g. `part_size` below
     /// [`MIN_PART_SIZE`]).
     #[error("invalid transfer config: {0}")]
@@ -310,8 +334,33 @@ pub async fn probe_backend(
     s3: &impl S3TransferApi,
     bucket: &str,
 ) -> Result<BackendProfile, TransferError> {
-    let _ = (db, s3, bucket);
-    todo!("P1-U4: §2.4 backend digest probe")
+    const PROBE_BODY: &[u8] = b"rrcloud digest probe";
+    // A well-formed base64 MD5 of *different* bytes: syntactically valid,
+    // so a verifying backend must answer a digest rejection, not a
+    // malformed-header error.
+    let wrong_md5 = b64(Md5::digest(b"deliberately not the probe body"));
+    let opts = PutObjectOptions {
+        content_md5: Some(wrong_md5),
+        ..PutObjectOptions::default()
+    };
+    let digest_rejection_works = match s3
+        .put_object(bucket, PROBE_KEY, Bytes::from_static(PROBE_BODY), &opts)
+        .await
+    {
+        Err(e) if e.is_digest_rejection() => true,
+        Ok(_) => {
+            // The backend stored an object whose digest never verified:
+            // clean it up before reporting `requires_readback_verify`.
+            s3.delete_object(bucket, PROBE_KEY).await?;
+            false
+        }
+        // Transport/auth/bucket failures are errors, never a probe outcome.
+        Err(e) => return Err(e.into()),
+    };
+    db.set_backend_digest_rejection(digest_rejection_works)?;
+    Ok(BackendProfile {
+        digest_rejection_works,
+    })
 }
 
 /// The persisted probe outcome, when one exists
@@ -349,8 +398,24 @@ pub struct FsChunkSource;
 
 impl ChunkSource for FsChunkSource {
     async fn open(&self, path: &Path, offset: u64) -> Result<SourceStream, std::io::Error> {
-        let _ = (path, offset);
-        todo!("P1-U4: chunked file reader")
+        use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
+        let mut file = tokio::fs::File::open(path).await?;
+        if offset > 0 {
+            file.seek(std::io::SeekFrom::Start(offset)).await?;
+        }
+        let stream = futures::stream::unfold(Some(file), |file| async move {
+            let mut file = file?;
+            let mut buf = vec![0u8; 64 * 1024];
+            match file.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((Ok(Bytes::from(buf)), Some(file)))
+                }
+                Err(e) => Some((Err(e), None)),
+            }
+        });
+        Ok(stream.boxed())
     }
 }
 
@@ -408,8 +473,455 @@ pub async fn upload_item_from(
     source: &Path,
     chunks: &impl ChunkSource,
 ) -> Result<UploadOutcome, TransferError> {
-    let _ = (db, s3, cfg, relkey, source, chunks);
-    todo!("P1-U4: §2.4 upload state walk")
+    if cfg.part_size < MIN_PART_SIZE {
+        return Err(TransferError::InvalidConfig(format!(
+            "part_size {} is below the {MIN_PART_SIZE}-byte S3 minimum for non-final parts",
+            cfg.part_size
+        )));
+    }
+    let record = db
+        .get_item(relkey)?
+        .ok_or_else(|| TransferError::MissingItem {
+            relkey: relkey.clone(),
+        })?;
+    let key = bucket_key_for(relkey, record.kind)?;
+    let resume = db.get_upload(relkey)?;
+
+    // Entry: `queued → uploading` CAS, or crash-recovery re-entry already
+    // sitting at `uploading` with a persisted multipart record. Any other
+    // state fails the CAS typed (StaleState / IllegalTransition).
+    if !(record.state == ItemState::Uploading && resume.is_some()) {
+        db.transition(relkey, ItemState::Queued, ItemState::Uploading, |_| {})?;
+    }
+
+    // ---- uploading: send the bytes (single PUT or multipart) ----
+    let sent =
+        match transfer_object(db, s3, cfg, relkey, &record, &key, source, chunks, resume).await {
+            Ok(sent) => sent,
+            // `AbortedSourceChanged` already re-marked the item dirty; every
+            // other failure re-queues (`uploading → queued`) with the
+            // multipart bookkeeping intact, so the next attempt resumes.
+            Err(e @ TransferError::AbortedSourceChanged { .. }) => return Err(e),
+            Err(e) => {
+                demote(db, relkey, ItemState::Uploading, ItemState::Queued);
+                return Err(e);
+            }
+        };
+
+    // ---- uploading → verifying; the completed upload's bookkeeping is
+    // cleared in the same transaction (nothing on the backend can resume
+    // it any more) ----
+    db.with_txn(|t| {
+        t.transition(relkey, ItemState::Uploading, ItemState::Verifying, |_| {})?;
+        t.clear_upload(relkey)?;
+        Ok(())
+    })?;
+
+    // ---- verifying: HEAD (+ read-back re-hash when the backend failed
+    // the digest probe) ----
+    if let Err(e) = verify_remote(s3, cfg, relkey, &key, &sent).await {
+        return Err(match e {
+            corrupt @ TransferError::CorruptRemote { .. } => {
+                demote(db, relkey, ItemState::Verifying, ItemState::CorruptRemote);
+                corrupt
+            }
+            other => {
+                demote(db, relkey, ItemState::Verifying, ItemState::Queued);
+                other
+            }
+        });
+    }
+
+    // ---- verifying → synced + journal staging, one transaction ----
+    let ts = server_ts_estimate(db)?;
+    let sem = match &sent.sidecar_bytes {
+        Some(bytes) => match sem_hash(bytes) {
+            Ok(sem) => Some(sem),
+            Err(source) => {
+                demote(db, relkey, ItemState::Verifying, ItemState::Queued);
+                return Err(TransferError::SidecarInvalid {
+                    relkey: relkey.clone(),
+                    source,
+                });
+            }
+        },
+        None => None,
+    };
+    let kind = record.kind;
+    let blake3 = sent.blake3.clone();
+    let size = sent.size;
+    let content_id = (kind == Kind::Original).then(|| ContentId::from_blake3(&blake3));
+    let mtime = (kind == Kind::Original).then_some(sent.mtime_unix);
+    let device = db.device_id().clone();
+    let outbound_id = {
+        let mutate_blake3 = blake3.clone();
+        let mutate_sem = sem.clone();
+        let mutate_cid = content_id.clone();
+        let entry_blake3 = blake3.clone();
+        let entry_key = key.clone();
+        match commit_verified(
+            db,
+            relkey,
+            move |r| {
+                r.blake3 = Some(mutate_blake3);
+                r.size = size;
+                if mutate_sem.is_some() {
+                    r.sem_hash = mutate_sem;
+                }
+                if mutate_cid.is_some() {
+                    r.content_id = mutate_cid;
+                }
+            },
+            move |r| {
+                Ok(JournalEntry {
+                    v: JOURNAL_VERSION,
+                    seq: 0,
+                    ts,
+                    device,
+                    op: Op::Put,
+                    kind,
+                    key: entry_key,
+                    vv: r.vv.clone(),
+                    size: Some(size),
+                    blake3: Some(entry_blake3),
+                    sem_hash: sem,
+                    rating: None,
+                    color_label: None,
+                    content_id,
+                    w: None,
+                    h: None,
+                    mtime,
+                    from_key: None,
+                })
+            },
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                // The whole commit rolled back: the item is still
+                // `verifying`; re-queue it so the next pass retries.
+                demote(db, relkey, ItemState::Verifying, ItemState::Queued);
+                return Err(e);
+            }
+        }
+    };
+
+    Ok(UploadOutcome {
+        relkey: relkey.clone(),
+        blake3,
+        size,
+        e_tag: sent.e_tag,
+        multipart: sent.multipart,
+        outbound_id,
+    })
+}
+
+/// What the `uploading` phase produced (the §2.4 facts the verify and
+/// commit phases run on).
+struct SentObject {
+    /// Running blake3 over exactly the bytes that were sent.
+    blake3: Blake3Hex,
+    /// Total bytes sent.
+    size: u64,
+    /// The stored object's ETag.
+    e_tag: String,
+    /// Whether the object went multipart.
+    multipart: bool,
+    /// Hex MD5 of a single-PUT body (`verifying` compares it to the HEAD
+    /// ETag on a digest-verifying backend); `None` for multipart.
+    md5_hex: Option<String>,
+    /// The sent bytes, retained only for sidecars (the journal entry's
+    /// `sem_hash` is parsed from exactly what was sent).
+    sidecar_bytes: Option<Vec<u8>>,
+    /// Source mtime (unix seconds) captured when the transfer began.
+    mtime_unix: i64,
+}
+
+/// The `uploading` phase: single buffered PUT below the threshold,
+/// multipart (fresh or resumed) otherwise. State edges are the caller's
+/// job except the §2.4 mid-resume source-change abort, which re-marks the
+/// item `dirty` itself (its terminal state differs from every other
+/// failure).
+#[allow(clippy::too_many_arguments)] // internal seam of one state walk
+async fn transfer_object(
+    db: &SyncDb,
+    s3: &impl S3TransferApi,
+    cfg: &TransferConfig,
+    relkey: &RelKey,
+    record: &ItemRecord,
+    key: &str,
+    source: &Path,
+    chunks: &impl ChunkSource,
+    resume: Option<MultipartUploadState>,
+) -> Result<SentObject, TransferError> {
+    let meta = std::fs::metadata(source).map_err(|e| io_err(source, e))?;
+    let size = meta.len();
+    let mtime_unix_ns = file_mtime_unix_ns(&meta);
+    let mtime_unix = mtime_unix_ns.div_euclid(1_000_000_000);
+    let keep_bytes = record.kind == Kind::Sidecar;
+
+    if resume.is_none() && size < cfg.multipart_threshold {
+        // --- single buffered PUT with Content-MD5 (signed payload) ---
+        let body = read_range(chunks, source, 0, size).await?;
+        let digest = Md5::digest(&body);
+        let md5_hex = hex::encode(digest);
+        let blake3 = Blake3Hex::from_bytes(&body);
+        let opts = PutObjectOptions {
+            content_md5: Some(b64(digest)),
+            ..PutObjectOptions::default()
+        };
+        let bytes = Bytes::from(body);
+        let out = s3
+            .put_object(&cfg.bucket, key, bytes.clone(), &opts)
+            .await?;
+        // ETag == md5hex (§2.4) — meaningful only on a backend whose ETag
+        // convention the digest probe validated; a non-verifying backend
+        // is caught by the read-back re-hash instead.
+        if cfg.backend.digest_rejection_works && out.e_tag != md5_hex {
+            return Err(TransferError::EtagMismatch {
+                relkey: relkey.clone(),
+                expected: md5_hex,
+                actual: out.e_tag,
+            });
+        }
+        return Ok(SentObject {
+            blake3,
+            size,
+            e_tag: out.e_tag,
+            multipart: false,
+            md5_hex: Some(md5_hex),
+            sidecar_bytes: keep_bytes.then(|| bytes.to_vec()),
+            mtime_unix,
+        });
+    }
+
+    // --- multipart ---
+    let resuming = resume.is_some();
+    let upload = match resume {
+        Some(up) => {
+            // §2.4 mid-resume source-change recheck (size + mtime against
+            // the record the upload describes). A change here means the
+            // un-sent parts of the *old* version are no longer obtainable:
+            // abort + re-mark dirty (see the module docs for why this
+            // differs from the detected-at-completion rule).
+            if size != record.size || mtime_unix_ns != record.mtime_unix_ns {
+                s3.abort_multipart_upload(&cfg.bucket, key, &up.upload_id)
+                    .await?;
+                db.with_txn(|t| {
+                    t.clear_upload(relkey)?;
+                    t.transition(relkey, ItemState::Uploading, ItemState::Dirty, |_| {})?;
+                    Ok(())
+                })?;
+                return Err(TransferError::AbortedSourceChanged {
+                    relkey: relkey.clone(),
+                });
+            }
+            up
+        }
+        None => {
+            let created = s3
+                .create_multipart_upload(&cfg.bucket, key, &PutObjectOptions::default())
+                .await?;
+            let up = MultipartUploadState {
+                upload_id: created.upload_id,
+                part_size: cfg.part_size,
+                started_unix: now_unix(),
+            };
+            // Persisted BEFORE the first part (§2.4): whatever survives a
+            // crash from here on is resumable.
+            db.set_upload(relkey, &up)?;
+            up
+        }
+    };
+
+    let part_size = upload.part_size.max(1);
+    let part_count = size.div_ceil(part_size).max(1);
+    if part_count > 10_000 {
+        return Err(TransferError::InvalidConfig(format!(
+            "{size}-byte object needs {part_count} parts of {part_size}; S3 allows at most 10000"
+        )));
+    }
+    let recorded: BTreeMap<u32, UploadPart> = db.upload_parts(relkey)?.into_iter().collect();
+    // ListParts, opportunistically (resume only): a part is trusted as
+    // done only when its durable record exists AND the backend lists it
+    // with the recorded ETag. A failed listing falls back to the records.
+    let listed: Option<BTreeMap<u32, String>> = if resuming {
+        list_all_parts(s3, &cfg.bucket, key, &upload.upload_id)
+            .await
+            .ok()
+    } else {
+        None
+    };
+
+    let mut hasher = blake3::Hasher::new();
+    let mut sidecar_bytes: Option<Vec<u8>> = keep_bytes.then(Vec::new);
+    let mut completed: Vec<CompletedPart> = Vec::with_capacity(part_count as usize);
+    for part_no in 1..=part_count as u32 {
+        let offset = u64::from(part_no - 1) * part_size;
+        let len = part_size.min(size - offset);
+        let done = recorded.get(&part_no).filter(|rec| match &listed {
+            Some(parts) => parts.get(&part_no).is_some_and(|etag| *etag == rec.etag),
+            None => true,
+        });
+        // The journal blake3 hashes exactly the sent bytes, in order —
+        // already-sent ranges are re-read from the (unchanged) source
+        // through the same chunk seam, un-sent ranges are read once and
+        // sent as exactly the hashed bytes.
+        let buf = read_range(chunks, source, offset, len).await?;
+        hasher.update(&buf);
+        if let Some(acc) = sidecar_bytes.as_mut() {
+            acc.extend_from_slice(&buf);
+        }
+        if let Some(rec) = done {
+            completed.push(CompletedPart {
+                part_number: part_no,
+                e_tag: rec.etag.clone(),
+            });
+            continue;
+        }
+        let digest = Md5::digest(&buf);
+        let md5_b64 = b64(digest);
+        let body = Bytes::from(buf);
+        let out = match s3
+            .upload_part(
+                &cfg.bucket,
+                key,
+                &upload.upload_id,
+                part_no,
+                PartBody::from(body.clone()),
+                Some(&md5_b64),
+            )
+            .await
+        {
+            Ok(out) => out,
+            Err(first) if first.is_digest_rejection() => {
+                // §2.4: the rejected part is retried exactly once (same
+                // buffered bytes, same MD5 — the hash is NOT re-fed).
+                match s3
+                    .upload_part(
+                        &cfg.bucket,
+                        key,
+                        &upload.upload_id,
+                        part_no,
+                        PartBody::from(body.clone()),
+                        Some(&md5_b64),
+                    )
+                    .await
+                {
+                    Ok(out) => out,
+                    Err(second) if second.is_digest_rejection() => {
+                        return Err(TransferError::DigestRejected {
+                            relkey: relkey.clone(),
+                            part_number: part_no,
+                        });
+                    }
+                    Err(second) => return Err(second.into()),
+                }
+            }
+            Err(first) => return Err(first.into()),
+        };
+        // {part_no, etag, md5} persisted AFTER the part completed and
+        // BEFORE the next part starts (§2.4; the crash suite SIGKILLs
+        // between exactly these points).
+        db.record_upload_part(
+            relkey,
+            part_no,
+            &UploadPart {
+                etag: out.e_tag.clone(),
+                md5_b64,
+            },
+        )?;
+        completed.push(CompletedPart {
+            part_number: part_no,
+            e_tag: out.e_tag,
+        });
+    }
+    let done = s3
+        .complete_multipart_upload(&cfg.bucket, key, &upload.upload_id, &completed)
+        .await?;
+    Ok(SentObject {
+        blake3: Blake3Hex::from_hash(&hasher.finalize()),
+        size,
+        e_tag: done.e_tag,
+        multipart: true,
+        md5_hex: None,
+        sidecar_bytes,
+        mtime_unix,
+    })
+}
+
+/// The `verifying` step (§2.4): HEAD + size check; single-PUT ETag == MD5
+/// on a digest-verifying backend; full GET re-hash when the backend
+/// failed the probe (`requires_readback_verify`). A content disagreement
+/// is [`TransferError::CorruptRemote`]; a transport failure is the
+/// underlying error (retryable).
+async fn verify_remote(
+    s3: &impl S3TransferApi,
+    cfg: &TransferConfig,
+    relkey: &RelKey,
+    key: &str,
+    sent: &SentObject,
+) -> Result<(), TransferError> {
+    let head = s3.head_object(&cfg.bucket, key).await?;
+    if head.content_length != sent.size {
+        return Err(TransferError::CorruptRemote {
+            relkey: relkey.clone(),
+            detail: format!(
+                "stored size {} != sent size {}",
+                head.content_length, sent.size
+            ),
+        });
+    }
+    if cfg.backend.digest_rejection_works {
+        // Parts (multipart) were server-MD5-verified at receipt; a single
+        // PUT's stored ETag must still equal our MD5.
+        if let Some(md5_hex) = &sent.md5_hex {
+            if head.e_tag != *md5_hex {
+                return Err(TransferError::CorruptRemote {
+                    relkey: relkey.clone(),
+                    detail: format!("stored ETag {} != sent MD5 {md5_hex}", head.e_tag),
+                });
+            }
+        }
+    } else {
+        // requires_readback_verify: full GET re-hash against the streamed
+        // hash of what was sent.
+        let out = s3.get_object(&cfg.bucket, key, None).await?;
+        let mut hasher = blake3::Hasher::new();
+        let mut body = out.body;
+        while let Some(chunk) = body.try_next().await? {
+            hasher.update(&chunk);
+        }
+        let actual = Blake3Hex::from_hash(&hasher.finalize());
+        if actual != sent.blake3 {
+            return Err(TransferError::CorruptRemote {
+                relkey: relkey.clone(),
+                detail: format!("read-back blake3 {actual} != sent blake3 {}", sent.blake3),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Every part of `upload_id`, across all `ListParts` pages.
+async fn list_all_parts(
+    s3: &impl S3TransferApi,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+) -> Result<BTreeMap<u32, String>, S3Error> {
+    let mut out = BTreeMap::new();
+    let mut request = ListPartsRequest::default();
+    loop {
+        let page = s3.list_parts(bucket, key, upload_id, &request).await?;
+        for part in page.parts {
+            out.insert(part.part_number, part.e_tag);
+        }
+        if !page.is_truncated || page.next_part_number_marker.is_none() {
+            break;
+        }
+        request.part_number_marker = page.next_part_number_marker;
+    }
+    Ok(out)
 }
 
 /// The atomic tail of the §2.4 upload: in **one** committed state
@@ -431,8 +943,14 @@ pub fn commit_verified(
     mutate: impl FnOnce(&mut ItemRecord),
     build_entry: impl FnOnce(&ItemRecord) -> Result<JournalEntry, TransferError>,
 ) -> Result<u64, TransferError> {
-    let _ = (db, relkey, mutate, build_entry);
-    todo!("P1-U4: single-txn verifying→synced transition + journal staging")
+    db.with_txn_err::<u64, TransferError>(|t| {
+        let record = t.transition(relkey, ItemState::Verifying, ItemState::Synced, |r| {
+            r.verified_remote = true;
+            mutate(r);
+        })?;
+        let entry = build_entry(&record)?;
+        Ok(enqueue_entry_in(t, db.device_id(), &entry)?)
+    })
 }
 
 /// What [`abort_stale_uploads`] cleaned up.
@@ -468,8 +986,67 @@ pub async fn abort_stale_uploads(
     max_age_secs: i64,
     now_unix: i64,
 ) -> Result<StaleUploadReport, TransferError> {
-    let _ = (db, s3, cfg, max_age_secs, now_unix);
-    todo!("P1-U4: §2.4 stale-upload hygiene")
+    let mut report = StaleUploadReport::default();
+    // Our uploads table is the orphan-matching key set regardless of age:
+    // a backend upload on one of OUR keys under a different id can never
+    // be completed by anyone.
+    let mut own_keys: BTreeMap<String, String> = BTreeMap::new();
+    for (relkey, upload) in db.iter_uploads()? {
+        let Some(record) = db.get_item(&relkey)? else {
+            // An uploads row without an item record cannot derive a bucket
+            // key; leave it for corruption recovery.
+            continue;
+        };
+        let key = bucket_key_for(&relkey, record.kind)?;
+        own_keys.insert(key.clone(), upload.upload_id.clone());
+        if upload.started_unix.saturating_add(max_age_secs) > now_unix {
+            continue; // still fresh
+        }
+        // Aged out: abort on the backend, clear locally, and — when the
+        // item still sits in `uploading` — re-mark it dirty (§2.4 "upload
+        // abandoned"). A backend that no longer knows the upload id
+        // (already aborted/completed elsewhere) is treated as done.
+        match s3
+            .abort_multipart_upload(&cfg.bucket, &key, &upload.upload_id)
+            .await
+        {
+            Ok(()) => {}
+            Err(e) if e.code() == Some(&crate::s3::S3ErrorCode::NoSuchUpload) => {}
+            Err(e) => return Err(e.into()),
+        }
+        db.with_txn(|t| {
+            t.clear_upload(&relkey)?;
+            Ok(())
+        })?;
+        if record.state == ItemState::Uploading {
+            demote(db, &relkey, ItemState::Uploading, ItemState::Dirty);
+        }
+        report.aborted_own.push((relkey, upload.upload_id));
+    }
+
+    // Backend scan for own-key orphans (paged). Uploads on keys we hold
+    // no record for are another device's business (§1.2) and are left
+    // alone.
+    let mut request = ListMultipartUploadsRequest::default();
+    loop {
+        let page = s3.list_multipart_uploads(&cfg.bucket, &request).await?;
+        for upload in page.uploads {
+            let orphan = own_keys
+                .get(&upload.key)
+                .is_some_and(|ours| *ours != upload.upload_id);
+            if orphan {
+                s3.abort_multipart_upload(&cfg.bucket, &upload.key, &upload.upload_id)
+                    .await?;
+                report.aborted_orphans.push((upload.key, upload.upload_id));
+            }
+        }
+        if !page.is_truncated || page.next_key_marker.is_none() {
+            break;
+        }
+        request.key_marker = page.next_key_marker;
+        request.upload_id_marker = page.next_upload_id_marker;
+    }
+    Ok(report)
 }
 
 /// What the caller knows the remote object must contain (from the
@@ -543,8 +1120,169 @@ pub async fn download_item(
     dest_root: &Path,
     expected: &ExpectedDownload,
 ) -> Result<DownloadOutcome, TransferError> {
-    let _ = (db, s3, cfg, relkey, dest_root, expected);
-    todo!("P1-U4: §3.5 download/hydration walk")
+    let record = db
+        .get_item(relkey)?
+        .ok_or_else(|| TransferError::MissingItem {
+            relkey: relkey.clone(),
+        })?;
+    let kind = record.kind;
+    let key = bucket_key_for(relkey, kind)?;
+    let final_path = local_target_path(dest_root, relkey, kind);
+    let partial = partial_path(&final_path);
+
+    // Entry: `pending_down`/`stub` → `downloading`, or crash-recovery
+    // re-entry already at `downloading` (with a surviving partial). Any
+    // other state fails the CAS/legality check typed.
+    if record.state != ItemState::Downloading {
+        db.transition(relkey, record.state, ItemState::Downloading, |_| {})?;
+    }
+
+    match run_download(
+        db,
+        s3,
+        cfg,
+        relkey,
+        kind,
+        &key,
+        &final_path,
+        &partial,
+        expected,
+    )
+    .await
+    {
+        Ok(outcome) => Ok(outcome),
+        // Integrity/parse failures are properties of the remote object:
+        // the partial is deleted (it can never verify) and the item moves
+        // to the corrupt_remote lane.
+        Err(
+            e @ (TransferError::IntegrityMismatch { .. } | TransferError::SidecarInvalid { .. }),
+        ) => {
+            let _ = std::fs::remove_file(&partial);
+            demote(db, relkey, ItemState::Downloading, ItemState::CorruptRemote);
+            Err(e)
+        }
+        // Everything else (transport, local I/O) keeps the partial for a
+        // ranged resume and returns the item to `pending_down`.
+        Err(e) => {
+            demote(db, relkey, ItemState::Downloading, ItemState::PendingDown);
+            Err(e)
+        }
+    }
+}
+
+/// The streaming middle of [`download_item`]: partial re-hash, (ranged)
+/// GET, append, final verify, parse-validate, atomic install, mtime
+/// restore, terminal transition. Failure state edges live in the caller.
+#[allow(clippy::too_many_arguments)] // internal seam of one state walk
+async fn run_download(
+    db: &SyncDb,
+    s3: &impl S3TransferApi,
+    cfg: &TransferConfig,
+    relkey: &RelKey,
+    kind: Kind,
+    key: &str,
+    final_path: &Path,
+    partial: &Path,
+    expected: &ExpectedDownload,
+) -> Result<DownloadOutcome, TransferError> {
+    if let Some(parent) = final_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| io_err(parent, e))?;
+    }
+    let mut hasher = blake3::Hasher::new();
+    let mut resumed_from = 0u64;
+    match std::fs::metadata(partial) {
+        Ok(meta) if meta.len() > expected.size => {
+            // An over-long partial can never verify: start fresh.
+            std::fs::remove_file(partial).map_err(|e| io_err(partial, e))?;
+        }
+        Ok(meta) => {
+            // §3.5 resume: re-hash the surviving bytes from disk, then
+            // continue with a ranged GET from exactly this offset.
+            resumed_from = meta.len();
+            hash_file_into(partial, &mut hasher)?;
+        }
+        Err(_) => {}
+    }
+
+    let mut bytes_fetched = 0u64;
+    if resumed_from < expected.size {
+        let range = (resumed_from > 0).then_some(ByteRange::From(resumed_from));
+        let out = s3.get_object(&cfg.bucket, key, range).await?;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(partial)
+            .map_err(|e| io_err(partial, e))?;
+        let mut body = out.body;
+        loop {
+            match body.next().await {
+                Some(Ok(chunk)) => {
+                    use std::io::Write as _;
+                    file.write_all(&chunk).map_err(|e| io_err(partial, e))?;
+                    hasher.update(&chunk);
+                    bytes_fetched += chunk.len() as u64;
+                }
+                Some(Err(e)) => {
+                    // Every received byte is already appended: the partial
+                    // survives for the next ranged resume.
+                    let _ = file.sync_all();
+                    return Err(e.into());
+                }
+                None => break,
+            }
+        }
+        file.sync_all().map_err(|e| io_err(partial, e))?;
+    }
+
+    // The §3.5 backstop for every failure mode, including a mid-download
+    // remote replacement: nothing installs unless the full content hashes
+    // to exactly what the journal advertised.
+    let actual = Blake3Hex::from_hash(&hasher.finalize());
+    if actual != expected.blake3 {
+        return Err(TransferError::IntegrityMismatch {
+            relkey: relkey.clone(),
+            expected: expected.blake3.clone(),
+            actual,
+        });
+    }
+
+    // Sidecars are additionally parse-validated (§2.5 semantic parser):
+    // an invalid sidecar is never installed, whatever its hash says.
+    if kind == Kind::Sidecar {
+        let bytes = std::fs::read(partial).map_err(|e| io_err(partial, e))?;
+        if let Err(source) = sem_hash(&bytes) {
+            return Err(TransferError::SidecarInvalid {
+                relkey: relkey.clone(),
+                source,
+            });
+        }
+    }
+
+    // Atomic install (same directory) + mtime restore (§3.5: keeps the
+    // thumbnail cache hash stable across hydration).
+    std::fs::rename(partial, final_path).map_err(|e| io_err(final_path, e))?;
+    filetime::set_file_mtime(
+        final_path,
+        filetime::FileTime::from_unix_time(expected.mtime_unix, 0),
+    )
+    .map_err(|e| io_err(final_path, e))?;
+
+    let terminal = if kind == Kind::Original {
+        ItemState::Hydrated
+    } else {
+        ItemState::Synced
+    };
+    db.transition(relkey, ItemState::Downloading, terminal, |r| {
+        r.blake3 = Some(expected.blake3.clone());
+        r.size = expected.size;
+        r.mtime_unix_ns = expected.mtime_unix.saturating_mul(1_000_000_000);
+    })?;
+    Ok(DownloadOutcome {
+        relkey: relkey.clone(),
+        path: final_path.to_path_buf(),
+        resumed_from,
+        bytes_fetched,
+    })
 }
 
 /// Cooperative cancellation for the pump, with no new dependency (an
@@ -606,8 +1344,25 @@ pub async fn pump_uploads(
     concurrency: usize,
     cancel: &CancelFlag,
 ) -> Result<PumpSummary, TransferError> {
-    let _ = (db, s3, cfg, concurrency, cancel);
-    todo!("P1-U4: upload queue pump")
+    pump(
+        db,
+        Queue::Up,
+        ItemState::Queued,
+        concurrency,
+        cancel,
+        |relkey| {
+            Box::pin(async move {
+                let record = db
+                    .get_item(&relkey)?
+                    .ok_or_else(|| TransferError::MissingItem {
+                        relkey: relkey.clone(),
+                    })?;
+                let source = local_target_path(&cfg.sync_root, &relkey, record.kind);
+                upload_item(db, s3, cfg, &relkey, &source).await.map(|_| ())
+            })
+        },
+    )
+    .await
 }
 
 /// Drains the download queue with the same admission/concurrency/
@@ -623,8 +1378,108 @@ pub async fn pump_downloads(
     concurrency: usize,
     cancel: &CancelFlag,
 ) -> Result<PumpSummary, TransferError> {
-    let _ = (db, s3, cfg, concurrency, cancel);
-    todo!("P1-U4: download queue pump")
+    pump(
+        db,
+        Queue::Down,
+        ItemState::PendingDown,
+        concurrency,
+        cancel,
+        |relkey| {
+            Box::pin(async move {
+                let record = db
+                    .get_item(&relkey)?
+                    .ok_or_else(|| TransferError::MissingItem {
+                        relkey: relkey.clone(),
+                    })?;
+                let Some(blake3) = record.blake3.clone() else {
+                    return Err(TransferError::MissingExpectedHash {
+                        relkey: relkey.clone(),
+                    });
+                };
+                let expected = ExpectedDownload {
+                    blake3,
+                    size: record.size,
+                    mtime_unix: record.mtime_unix_ns.div_euclid(1_000_000_000),
+                };
+                download_item(db, s3, cfg, &relkey, &cfg.sync_root, &expected)
+                    .await
+                    .map(|_| ())
+            })
+        },
+    )
+    .await
+}
+
+/// One transfer future as the pump holds it: boxed so an empty pass needs
+/// no type inference, `!Send` is fine (the pump never spawns — N futures
+/// are polled concurrently on the caller's task).
+type PumpFuture<'a> = Pin<Box<dyn Future<Output = Result<(), TransferError>> + 'a>>;
+
+/// A [`PumpFuture`] tagged with the queue row it came from, as the pump's
+/// in-flight set holds it.
+type TaggedPumpFuture<'a> =
+    Pin<Box<dyn Future<Output = (RelKey, u8, Result<(), TransferError>)> + 'a>>;
+
+/// The shared pump loop: pops `queue` strictly in (class, arrival) order,
+/// keeps up to `concurrency` transfer futures in flight at once (the
+/// [`FuturesUnordered`] length *is* the §2.4 concurrency cap), records
+/// each item's outcome without stopping the others, and re-queues a
+/// failed item for a **later** pass — only when its state still says it
+/// belongs in the queue (`requeue_state`), so a terminal failure
+/// (`corrupt_remote`, re-marked `dirty`) never loops. A fired
+/// [`CancelFlag`] stops admission; in-flight items are always awaited.
+async fn pump<'a, F>(
+    db: &SyncDb,
+    queue: Queue,
+    requeue_state: ItemState,
+    concurrency: usize,
+    cancel: &CancelFlag,
+    run: F,
+) -> Result<PumpSummary, TransferError>
+where
+    F: Fn(RelKey) -> PumpFuture<'a>,
+{
+    let concurrency = concurrency.max(1);
+    let mut summary = PumpSummary::default();
+    let mut requeue: Vec<(RelKey, u8)> = Vec::new();
+    let mut in_flight: FuturesUnordered<TaggedPumpFuture<'a>> = FuturesUnordered::new();
+    loop {
+        // Admission: strictly queue order, never past the concurrency cap,
+        // and nothing new once the cancel flag is observed.
+        while in_flight.len() < concurrency {
+            if cancel.is_cancelled() {
+                summary.cancelled = true;
+                break;
+            }
+            let Some((relkey, class)) = db.queue_pop(queue)? else {
+                break;
+            };
+            let fut = run(relkey.clone());
+            in_flight.push(Box::pin(async move {
+                let result = fut.await;
+                (relkey, class, result)
+            }));
+        }
+        let Some((relkey, class, result)) = in_flight.next().await else {
+            break;
+        };
+        match result {
+            Ok(()) => summary.completed.push(relkey),
+            Err(e) => {
+                summary.failed.push((relkey.clone(), e.to_string()));
+                requeue.push((relkey, class));
+            }
+        }
+    }
+    // Failed items go back for a later pass (never re-popped in this one),
+    // keeping their class — unless their state left the queueable lane.
+    for (relkey, class) in requeue {
+        let still_queueable = matches!(db.get_item(&relkey)?, Some(r) if r.state == requeue_state);
+        if still_queueable {
+            db.queue_push(queue, &relkey, class)?;
+        }
+    }
+    Ok(summary)
 }
 
 /// The bucket key an item of `kind` at `relkey` transfers to/from:
@@ -639,5 +1494,118 @@ pub fn bucket_key_for(relkey: &RelKey, kind: Kind) -> Result<String, TransferErr
             relkey: relkey.clone(),
             kind: other,
         }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers
+// ---------------------------------------------------------------------------
+
+/// Standard base64 of an MD5 digest — the `Content-MD5` wire form.
+fn b64(digest: impl AsRef<[u8]>) -> String {
+    base64::engine::general_purpose::STANDARD.encode(digest)
+}
+
+fn io_err(path: &Path, source: std::io::Error) -> TransferError {
+    TransferError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
+}
+
+/// Best-effort state demotion on a failure path. The primary error stays
+/// primary: a CAS loss here means a concurrent writer already moved the
+/// item (its state is *its* responsibility now) and must not mask what
+/// actually failed.
+fn demote(db: &SyncDb, relkey: &RelKey, from: ItemState, to: ItemState) {
+    let _ = db.transition(relkey, from, to, |_| {});
+}
+
+/// Local wall clock, unix seconds (saturating; library paths never panic
+/// on a badly set clock).
+fn now_unix() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
+        Err(e) => i64::try_from(e.duration().as_secs())
+            .map(i64::wrapping_neg)
+            .unwrap_or(i64::MIN),
+    }
+}
+
+/// Best server-time estimate in unix seconds (§2.10): the persisted
+/// heartbeat offset applied to the local clock, or the raw local clock
+/// before any measurement exists.
+fn server_ts_estimate(db: &SyncDb) -> Result<i64, TransferError> {
+    let offset_ms = db.server_time_offset_ms()?.unwrap_or(0);
+    Ok(now_unix().saturating_add(offset_ms.div_euclid(1000)))
+}
+
+/// A file's mtime as unix nanoseconds (negative before the epoch).
+fn file_mtime_unix_ns(meta: &std::fs::Metadata) -> i64 {
+    let Ok(mtime) = meta.modified() else {
+        return 0; // platform without mtime support
+    };
+    match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
+        Err(e) => i64::try_from(e.duration().as_nanos())
+            .map(i64::wrapping_neg)
+            .unwrap_or(i64::MIN),
+    }
+}
+
+/// Reads exactly `len` bytes of `path` starting at `offset` through the
+/// chunk seam, buffering them (one part at a time — bounded by the part
+/// size / single-PUT threshold, never the whole object). A source that
+/// ends early is an I/O error (the §2.4 size recheck makes it a race).
+async fn read_range(
+    chunks: &impl ChunkSource,
+    path: &Path,
+    offset: u64,
+    len: u64,
+) -> Result<Vec<u8>, TransferError> {
+    let mut stream = chunks
+        .open(path, offset)
+        .await
+        .map_err(|e| io_err(path, e))?;
+    let mut buf: Vec<u8> = Vec::with_capacity(usize::try_from(len).unwrap_or(0));
+    while (buf.len() as u64) < len {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                let need = len - buf.len() as u64;
+                let take = usize::try_from(need)
+                    .map(|n| n.min(chunk.len()))
+                    .unwrap_or(chunk.len());
+                buf.extend_from_slice(&chunk[..take]);
+            }
+            Some(Err(e)) => return Err(io_err(path, e)),
+            None => {
+                return Err(io_err(
+                    path,
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "source ended after {} of {len} bytes at offset {offset}",
+                            buf.len()
+                        ),
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(buf)
+}
+
+/// Streams `path` into `hasher` (the §3.5 partial re-hash; never buffers
+/// the whole file).
+fn hash_file_into(path: &Path, hasher: &mut blake3::Hasher) -> Result<(), TransferError> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).map_err(|e| io_err(path, e))?;
+    let mut buf = vec![0u8; 256 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| io_err(path, e))?;
+        if n == 0 {
+            return Ok(());
+        }
+        hasher.update(&buf[..n]);
     }
 }

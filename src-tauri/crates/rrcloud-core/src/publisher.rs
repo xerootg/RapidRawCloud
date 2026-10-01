@@ -205,10 +205,37 @@ pub struct PublishReport {
 /// ([`PublisherError::ForeignDevice`] otherwise); `entry.v` is likewise
 /// stamped to [`crate::journal::JOURNAL_VERSION`] at publication.
 pub fn enqueue_entry(db: &SyncDb, entry: &JournalEntry) -> Result<u64, PublisherError> {
-    if entry.device != *db.device_id() {
+    // Delegating to the txn entry point keeps the two staging paths
+    // byte-identical by construction (one normalization + oversize gate).
+    db.with_txn_err::<u64, PublisherError>(|t| enqueue_entry_in(t, db.device_id(), entry))
+}
+
+/// [`enqueue_entry`], but **inside a caller-held transaction** — the §2.4
+/// `verifying → synced` commit needs the journal `put` entry staged in the
+/// *same* committed transaction as the state transition (§2.1.5: a crash
+/// between verify and journal-enqueue must not lose the entry), and
+/// [`enqueue_entry`]'s own `stage_outbound` commit cannot compose with
+/// another transaction.
+///
+/// Identical contract to [`enqueue_entry`] in every other respect: the
+/// staged bytes for a given entry are byte-identical between the two
+/// entry points (same normalization of `v`/`seq`, same oversize refusal
+/// with the same seq-digit headroom), and `entry.device` must equal
+/// `own_device` — the caller passes the db's own identity
+/// ([`crate::state::SyncDb::device_id`]), since the transaction handle
+/// does not carry it. On `Err`, nothing was staged *by this call*;
+/// whether the surrounding transaction commits remains the caller's
+/// decision (the transfer engine propagates the error, which aborts the
+/// whole transaction).
+pub fn enqueue_entry_in(
+    txn: &StateTxn<'_>,
+    own_device: &DeviceId,
+    entry: &JournalEntry,
+) -> Result<u64, PublisherError> {
+    if entry.device != *own_device {
         return Err(PublisherError::ForeignDevice {
             entry_device: entry.device.clone(),
-            ours: db.device_id().clone(),
+            ours: own_device.clone(),
         });
     }
     // Normalize the stamped-at-publication fields before staging, so the
@@ -235,33 +262,7 @@ pub fn enqueue_entry(db: &SyncDb, entry: &JournalEntry) -> Result<u64, Publisher
     if reserved > SEGMENT_MAX_BYTES {
         return Err(PublisherError::OversizedEntry { size: reserved });
     }
-    Ok(db.stage_outbound(line.as_bytes())?)
-}
-
-/// [`enqueue_entry`], but **inside a caller-held transaction** — the §2.4
-/// `verifying → synced` commit needs the journal `put` entry staged in the
-/// *same* committed transaction as the state transition (§2.1.5: a crash
-/// between verify and journal-enqueue must not lose the entry), and
-/// [`enqueue_entry`]'s own `stage_outbound` commit cannot compose with
-/// another transaction.
-///
-/// Identical contract to [`enqueue_entry`] in every other respect: the
-/// staged bytes for a given entry are byte-identical between the two
-/// entry points (same normalization of `v`/`seq`, same oversize refusal
-/// with the same seq-digit headroom), and `entry.device` must equal
-/// `own_device` — the caller passes the db's own identity
-/// ([`crate::state::SyncDb::device_id`]), since the transaction handle
-/// does not carry it. On `Err`, nothing was staged *by this call*;
-/// whether the surrounding transaction commits remains the caller's
-/// decision (the transfer engine propagates the error, which aborts the
-/// whole transaction).
-pub fn enqueue_entry_in(
-    txn: &StateTxn<'_>,
-    own_device: &DeviceId,
-    entry: &JournalEntry,
-) -> Result<u64, PublisherError> {
-    let _ = (txn, own_device, entry);
-    todo!("P1-U4: stage one normalized outbound entry inside the caller's transaction")
+    Ok(txn.stage_outbound(line.as_bytes())?)
 }
 
 /// Decodes one staged outbound record back into a [`JournalEntry`],

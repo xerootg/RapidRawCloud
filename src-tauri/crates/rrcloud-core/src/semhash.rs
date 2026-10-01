@@ -96,6 +96,15 @@ impl ContentId {
         ContentId(blake3::hash(bytes).to_hex().to_string())
     }
 
+    /// A content id naming the same bytes as `digest` — a §1.2 content id
+    /// *is* the full-file blake3, so this is a relabeling, not a rehash.
+    /// Used by the §2.4 upload path, whose running hash is computed
+    /// streaming (no contiguous buffer ever exists to pass to
+    /// [`ContentId::from_bytes`]).
+    pub fn from_blake3(digest: &Blake3Hex) -> Self {
+        ContentId(digest.as_str().to_owned())
+    }
+
     /// Validates `s` as 64 lowercase hex characters and wraps it.
     pub fn parse(s: impl Into<String>) -> Result<Self, SemHashError> {
         let s = s.into();
@@ -152,6 +161,14 @@ impl Blake3Hex {
     /// Hashes `bytes` with blake3 into a digest.
     pub fn from_bytes(bytes: &[u8]) -> Self {
         Blake3Hex(blake3::hash(bytes).to_hex().to_string())
+    }
+
+    /// Wraps an already-finalized blake3 hash (infallible by construction:
+    /// `to_hex` is always 64 lowercase hex characters). This is the
+    /// streaming-hash path of the §2.4 transfer engine, whose running
+    /// digest covers bytes that never exist in one buffer.
+    pub fn from_hash(hash: &blake3::Hash) -> Self {
+        Blake3Hex(hash.to_hex().to_string())
     }
 
     /// Validates `s` as 64 lowercase hex characters and wraps it.
