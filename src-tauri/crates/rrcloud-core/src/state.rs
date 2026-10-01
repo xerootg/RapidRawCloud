@@ -648,6 +648,7 @@ pub fn legal(from: ItemState, to: ItemState) -> bool {
 /// |---|---|
 /// | [`Dirty`](ItemState::Dirty) | local change detected / fresh import (§2.4) |
 /// | [`PendingDown`](ItemState::PendingDown) | remote advertised an item we have no record for (§2.2 apply) |
+/// | [`Synced`](ItemState::Synced) | adopting an existing mirrored library whose local copy matches the advertised head (§3.5 bootstrap over a pre-mirrored tree — the sidecar/meta analogue of `Hydrated`; engine-unit additive entry) |
 /// | [`Stub`](ItemState::Stub) | adopting an existing library where the original is a cloud placeholder (§3.5) |
 /// | [`Hydrated`](ItemState::Hydrated) | adopting an existing library with the original verified locally (§3.5) |
 ///
@@ -659,7 +660,11 @@ pub fn legal(from: ItemState, to: ItemState) -> bool {
 pub fn legal_entry(state: ItemState) -> bool {
     matches!(
         state,
-        ItemState::Dirty | ItemState::PendingDown | ItemState::Stub | ItemState::Hydrated
+        ItemState::Dirty
+            | ItemState::PendingDown
+            | ItemState::Synced
+            | ItemState::Stub
+            | ItemState::Hydrated
     )
 }
 
@@ -1262,7 +1267,8 @@ impl SyncDb {
     /// | Replace | Why there is no [`legal`] edge |
     /// |---|---|
     /// | `Stub` record → `Dirty` record (new `content_id`) | §2.8 out-of-band overwrite of an evicted original: the bytes were *replaced* on disk, not downloaded, so the `Stub → Downloading → …` download rows do not apply |
-    /// | `Dirty` record → `Synced` record (merged vv) | §2.6 apply rule case 1: remote `sem_hash` equals local — converged, adopt metadata and drop the dirt with **no upload**, so the `Dirty → Queued → …` upload rows do not apply |
+    /// | `Dirty` record → `Synced`/`Hydrated` record (merged vv) | §2.6 apply rule case 1: remote `sem_hash` (sidecars) / `content_id` (originals) equals local — converged, adopt metadata and drop the dirt with **no upload**, so the `Dirty → Queued → …` upload rows do not apply |
+    /// | `Synced` original → `Hydrated` record (merged vv) | §2.6 case-1 axis normalization: for an original, the upload pipeline's `Synced` terminal and `Hydrated` describe the same physical fact (bytes present + verified locally); the converged adoption settles the record onto the §3.5 hydration axis — not a pipeline step, so no [`legal`] edge |
     ///
     /// State-machine steps stay on [`SyncDb::transition`];
     /// state-preserving mutations on [`SyncDb::update_item`]; unguarded
@@ -1786,13 +1792,10 @@ impl SyncDb {
     }
 
     /// Removes the deleted-set record for `relkey` (§2.10 retention
-    /// expiry). `Ok(true)` when a record existed.
+    /// expiry, and the §2.7 deletion-superseded withdrawal). `Ok(true)`
+    /// when a record existed.
     pub fn remove_deleted(&self, relkey: &RelKey) -> Result<bool, StateError> {
-        self.with_txn(|t| {
-            let mut deleted = t.txn.open_table(T_DELETED).map_err(db_err)?;
-            let previous = deleted.remove(relkey.as_str()).map_err(db_err)?;
-            Ok(previous.is_some())
-        })
+        self.with_txn(|t| t.remove_deleted(relkey))
     }
 
     // -- multipart upload resume (§2.4) ------------------------------------
@@ -2789,6 +2792,18 @@ impl StateTxn<'_> {
     pub fn get_deleted(&self, relkey: &RelKey) -> Result<Option<DeletedRecord>, StateError> {
         let deleted = self.txn.open_table(T_DELETED).map_err(db_err)?;
         read_deleted(&deleted, relkey)
+    }
+
+    /// [`SyncDb::remove_deleted`] within this transaction — the §2.6/§2.7
+    /// apply composite withdraws a superseded deletion row in the same
+    /// commit that adopts the dominating `put` (a restore/resurrection
+    /// reaching this device must clear the row atomically with the
+    /// un-hiding, or a crash between the two would advertise a deletion
+    /// the item record no longer carries). `Ok(true)` when a row existed.
+    pub fn remove_deleted(&self, relkey: &RelKey) -> Result<bool, StateError> {
+        let mut deleted = self.txn.open_table(T_DELETED).map_err(db_err)?;
+        let previous = deleted.remove(relkey.as_str()).map_err(db_err)?;
+        Ok(previous.is_some())
     }
 
     /// [`SyncDb::queue_push`] within this transaction — the other half of

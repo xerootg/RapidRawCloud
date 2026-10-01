@@ -267,11 +267,14 @@ fn item_relkey_for_inverts_the_library_classifications() {
         item_relkey_for(&classify_key(&library_key(&xmp))),
         Some(xmp)
     );
-    // Control-plane and foreign keys have no item.
+    // Control-plane and foreign keys have no item. (The non-NFC spelling
+    // uses `e\u{301}`, the suite's composable NFD pair — `t\u{301}` has
+    // no precomposition, so a key carrying it is already NFC and
+    // legitimately classifies.)
     for key in [
         ".rrcloud/v1/tombstones/0123456789abcdef0123456789abcdef.json".to_string(),
         "random/garbage".to_string(),
-        "library/not\u{0301}nfc.NEF".to_string(),
+        "library/cafe\u{301}.NEF".to_string(),
     ] {
         assert_eq!(item_relkey_for(&classify_key(&key)), None, "key {key:?}");
     }
@@ -1798,7 +1801,7 @@ fn foreign_and_unclassifiable_keys_are_skipped_not_errors() {
         .with_now(100);
     for key in [
         "library/../escape.NEF".to_string(),
-        "library/not\u{0301}nfc.NEF".to_string(),
+        "library/cafe\u{301}.NEF".to_string(),
         "garbage".to_string(),
     ] {
         let mut entry = put_sidecar(

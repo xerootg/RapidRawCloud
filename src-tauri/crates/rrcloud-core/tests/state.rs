@@ -1973,11 +1973,15 @@ fn insert_item_rejects_non_entry_birth_states() {
         entry,
         vec![
             ItemState::Dirty,
+            ItemState::Synced,
             ItemState::PendingDown,
             ItemState::Stub,
             ItemState::Hydrated,
         ],
-        "update this assertion deliberately when the entry set changes"
+        "update this assertion deliberately when the entry set changes \
+         (P1-U5 added Synced: §3.5 adoption of a pre-mirrored library \
+         whose local copy matches the advertised head — the sidecar \
+         analogue of Hydrated)"
     );
 }
 
@@ -3115,5 +3119,47 @@ fn engine_fields_do_not_change_the_stored_encoding_when_absent() {
     assert!(
         json.contains("\"deleted\":false"),
         "the flag is unconditional: {json}"
+    );
+}
+
+#[test]
+fn txn_remove_deleted_composes_with_the_apply_commit() {
+    // Additive P1-U5 seam: the §2.6/§2.7 apply composite withdraws a
+    // superseded deletion row in the SAME transaction that adopts the
+    // dominating put, through StateTxn::remove_deleted — and an aborted
+    // transaction rolls the withdrawal back with everything else.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let key = rel("gone.NEF");
+    let record = DeletedRecord {
+        vv: [(dev(DEV1), 3u32)].into_iter().collect(),
+        server_ts: 1_769_940_000,
+    };
+    db.record_deleted(&key, &record).expect("record");
+
+    // In-transaction read + remove + re-check, one commit.
+    db.with_txn(|t| {
+        assert_eq!(t.get_deleted(&key)?, Some(record.clone()));
+        assert!(t.remove_deleted(&key)?, "row existed");
+        assert_eq!(t.get_deleted(&key)?, None, "gone within the txn");
+        assert!(!t.remove_deleted(&key)?, "second removal is a no-op");
+        Ok(())
+    })
+    .expect("txn");
+    assert_eq!(db.get_deleted(&key).expect("get"), None, "commit held");
+
+    // An aborted transaction leaves the row untouched.
+    db.record_deleted(&key, &record).expect("re-record");
+    let err = db
+        .with_txn_err::<(), StateError>(|t| {
+            assert!(t.remove_deleted(&key)?);
+            Err(StateError::EmptySegment) // any error aborts
+        })
+        .expect_err("abort");
+    assert!(matches!(err, StateError::EmptySegment));
+    assert_eq!(
+        db.get_deleted(&key).expect("get"),
+        Some(record),
+        "aborted removal rolled back"
     );
 }

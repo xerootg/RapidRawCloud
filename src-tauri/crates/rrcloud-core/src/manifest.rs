@@ -299,11 +299,12 @@ pub struct Manifest {
 ///   bumped vv with the previous version's bytes and poison peer
 ///   idempotency.
 ///
-/// Fields [`crate::state::ItemRecord`] v1 does not carry (`device`,
-/// `rating`, `color_label`) are honestly `None`: a device bootstrapping
-/// from manifests gets strictly less §3.5 badge metadata than one
-/// replaying the journal, until the record schema carries them (the §2.6
-/// vv-engine unit, which owns per-field provenance).
+/// The engine unit's additive record fields (`device`, `rating`,
+/// `color_label` — §2.2/§2.6 provenance) travel on the row when the
+/// record carries them; records written before that unit decode them as
+/// `None` and stay honestly absent. §2.7 soft-deleted records are
+/// withheld from the live rows (their deletion rides the deleted set
+/// instead; see the filter below).
 pub fn build_manifest(db: &SyncDb, written_server_ts: i64) -> Result<Manifest, ManifestError> {
     let mut cursors: BTreeMap<DeviceId, u64> = db.iter_cursors()?.into_iter().collect();
     // The own entry comes from the published cursor, never the cursors
@@ -325,8 +326,12 @@ pub fn build_manifest(db: &SyncDb, written_server_ts: i64) -> Result<Manifest, M
         // Never advertise a key that provably has no remote object; but an
         // in-flight item with a published previous version MUST stay
         // advertised, or the own-cursor attestation above would claim
-        // coverage the rows don't deliver (doc comment).
-        .filter(|(_, record)| record_is_advertisable(record))
+        // coverage the rows don't deliver (doc comment). A §2.7
+        // soft-deleted record is withheld as a LIVE row — its deletion is
+        // what the deleted set below advertises; emitting both would hand
+        // every bootstrapping peer a live/deleted contradiction for the
+        // same key (engine unit; pinned by the engine suite).
+        .filter(|(_, record)| !record.deleted && record_is_advertisable(record))
         .map(|(key, record)| ManifestRow {
             key,
             kind: record.kind,
@@ -334,13 +339,16 @@ pub fn build_manifest(db: &SyncDb, written_server_ts: i64) -> Result<Manifest, M
             blake3: record.blake3,
             sem_hash: record.sem_hash,
             vv: record.vv,
-            device: None,
+            // §2.2/§2.6 provenance, carried since the engine unit landed
+            // the additive record fields; absent (older records, non-head
+            // kinds) stays honestly absent.
+            device: record.device,
             content_id: record.content_id,
             w: record.w,
             h: record.h,
             mtime: Some(record.mtime_unix_ns / 1_000_000_000),
-            rating: None,
-            color_label: None,
+            rating: record.rating,
+            color_label: record.color_label,
         })
         // Withhold rows merge cannot convert (doc comment): emitting them
         // would hand every peer an unusable row.
@@ -731,24 +739,22 @@ fn state_is_remotely_visible(state: ItemState) -> bool {
 /// Rebuilds the bucket key a manifest row's `(kind, relkey)` addresses,
 /// through the [`crate::keys`] constructors.
 ///
-/// **§2.6 coordination note (virtual-copy keys)**: a conflict loser
-/// lives at `library/<rel>.<6hex>.rrdata` — a distinct live bucket key
-/// with its own journal entry and fresh single-component vv — but
-/// [`crate::keys::classify_key`] folds it to `Sidecar { relkey: base,
-/// vc: Some(hex) }` and [`ManifestRow`] carries only `(kind, key)`, so
-/// this function can only ever rebuild the PRIMARY sidecar key. When
-/// loser materialization lands, vc live keys will have no representable
-/// proto-1 row, and [`build_manifest`]'s own-cursor attestation
-/// invariant ("every live effect of a published entry is advertised")
-/// silently breaks for compacted vc entries: a bootstrapping device
-/// learns of loser copies only via full-reconcile foreign adoption.
-/// The obvious extension is a trap: an optional `vc` field on
-/// [`ManifestRow`] is unsafe WITHOUT a proto bump, because proto-1
-/// readers ignore unknown fields (§2.2 min-reader rule) and would
-/// re-aim such a row at the primary sidecar key, clobbering the
-/// primary's vv/hashes with the loser's. The vv-engine unit that first
-/// writes vc rows must bump the manifest proto (or carve a new kind)
-/// before emitting them. No writer of vc rows exists today.
+/// **§2.6 coordination note (virtual-copy keys), resolved by the engine
+/// unit's file-relkey convention**: the engine keys sidecar items —
+/// primaries and conflict losers alike — by the sidecar **file's own**
+/// relkey (`<image>.rrdata`, `<image>.<6hex>.rrdata`;
+/// [`crate::engine`] module docs), so a vc row's `key` carries the full
+/// file path and needs no extra field. This function mirrors the
+/// transfer seam's suffix-aware mapping: a `Sidecar` row whose key
+/// already ends in `.rrdata` rebuilds through plain [`library_key`]
+/// (appending a second suffix would aim the row at a key no journal
+/// entry ever advertised), while image-relkey rows — everything written
+/// before the engine unit — keep the landed [`sidecar_key`] mapping.
+/// Residual caveat for **pre-engine readers only**: they lack the
+/// suffix-aware branch and would double-suffix a file-relkey row; such
+/// a key classifies as a plain (nonexistent) sidecar and creates a
+/// stray `pending_down` record, never a clobber of the primary's
+/// vv/hashes — and no pre-engine build ever shipped outside this repo.
 fn bucket_key_for(row: &ManifestRow) -> Result<String, ManifestError> {
     let unconvertible = || ManifestError::Unconvertible {
         relkey: row.key.clone(),
@@ -756,6 +762,7 @@ fn bucket_key_for(row: &ManifestRow) -> Result<String, ManifestError> {
     };
     Ok(match row.kind {
         Kind::Original => library_key(&row.key),
+        Kind::Sidecar if row.key.as_str().ends_with(".rrdata") => library_key(&row.key),
         Kind::Sidecar => sidecar_key(&row.key),
         // An .xmp projection is a real library file; its relkey carries
         // the extension.

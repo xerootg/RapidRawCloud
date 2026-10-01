@@ -217,6 +217,7 @@ use futures::stream::{BoxStream, FuturesUnordered};
 use futures::{StreamExt as _, TryStreamExt as _};
 use md5::{Digest as _, Md5};
 
+use crate::clock::VersionVector;
 use crate::journal::{JournalEntry, Kind, Op, JOURNAL_VERSION};
 use crate::keys::{library_key, sidecar_key, RelKey};
 use crate::publisher::{enqueue_entry_in, PublisherError};
@@ -705,7 +706,7 @@ pub async fn upload_item_from(
     }
 
     // ---- verifying → synced + journal staging, one transaction ----
-    let ts = server_ts_estimate(db)?;
+    let fallback_ts = server_ts_estimate(db)?;
     let (sem, badges) = match sent.sidecar {
         Some((sem, badges)) => (Some(sem), badges),
         None => (None, crate::semhash::SidecarBadges::default()),
@@ -716,61 +717,73 @@ pub async fn upload_item_from(
     let content_id = (kind == Kind::Original).then(|| ContentId::from_blake3(&blake3));
     let mtime = (kind == Kind::Original).then_some(sent.mtime_unix);
     let device = db.device_id().clone();
-    let outbound_id = {
-        let mutate_blake3 = blake3.clone();
-        let mutate_sem = sem.clone();
-        let mutate_cid = content_id.clone();
-        let entry_blake3 = blake3.clone();
-        let entry_key = key.clone();
-        match commit_verified(
-            db,
-            relkey,
-            move |r| {
-                r.blake3 = Some(mutate_blake3);
-                r.size = size;
-                if mutate_sem.is_some() {
-                    r.sem_hash = mutate_sem;
-                }
-                if mutate_cid.is_some() {
-                    r.content_id = mutate_cid;
-                }
-            },
-            move |r| {
-                Ok(JournalEntry {
-                    v: JOURNAL_VERSION,
-                    seq: 0,
-                    ts,
-                    device,
-                    op: Op::Put,
-                    kind,
-                    key: entry_key,
-                    vv: r.vv.clone(),
-                    size: Some(size),
-                    blake3: Some(entry_blake3),
-                    sem_hash: sem,
-                    // §2.2: sidecar entries carry the badge fields so the
-                    // grid can render before the sidecar bytes download
-                    // (§3.5) — extracted from exactly the sent bytes.
-                    rating: badges.rating,
-                    color_label: badges.color_label,
-                    content_id,
-                    // Measured dimensions travel on original entries when
-                    // the import unit has recorded them (§2.2).
-                    w: (kind == Kind::Original).then_some(r.w).flatten(),
-                    h: (kind == Kind::Original).then_some(r.h).flatten(),
-                    mtime,
-                    from_key: None,
-                })
-            },
-        ) {
-            Ok(id) => id,
-            Err(e) => {
-                // The whole commit rolled back: the item is still
-                // `verifying`; re-queue it so the next pass retries. The
-                // commit failure stays primary (demote doc).
-                let _ = demote(db, relkey, ItemState::Verifying, ItemState::Queued);
-                return Err(e);
+    // §2.6 "one admitted upload = one version" promotion seam (engine
+    // unit): when queue admission snapshotted an intent
+    // (`admitted_vv`/`head_ts`), the staged entry advertises EXACTLY that
+    // admitted `(vv, ts)` — never the record's possibly conflict-merged
+    // vv, which can carry components this version does not descend from —
+    // and the same commit promotes the record: `vv` ← elementwise max of
+    // record vv and the snapshot, snapshot cleared. The snapshot crosses
+    // from `mutate` to `build_entry` through a cell because `build_entry`
+    // sees the already-promoted record. Records without an intent (the
+    // landed pre-admission lanes) keep the landed behavior: entry vv =
+    // record vv, entry ts = the server-time estimate.
+    let admitted_snapshot: std::cell::RefCell<(Option<VersionVector>, Option<i64>)> =
+        std::cell::RefCell::new((None, None));
+    let outbound_id = match commit_verified(
+        db,
+        relkey,
+        |r| {
+            let admitted = r.admitted_vv.take();
+            if let Some(vv) = &admitted {
+                r.vv.merge(vv);
             }
+            *admitted_snapshot.borrow_mut() = (admitted, r.head_ts);
+            r.blake3 = Some(blake3.clone());
+            r.size = size;
+            if sem.is_some() {
+                r.sem_hash = sem.clone();
+            }
+            if content_id.is_some() {
+                r.content_id = content_id.clone();
+            }
+        },
+        |r| {
+            let (admitted, frozen_ts) = std::mem::take(&mut *admitted_snapshot.borrow_mut());
+            Ok(JournalEntry {
+                v: JOURNAL_VERSION,
+                seq: 0,
+                ts: frozen_ts.unwrap_or(fallback_ts),
+                device: device.clone(),
+                op: Op::Put,
+                kind,
+                key: key.clone(),
+                vv: admitted.unwrap_or_else(|| r.vv.clone()),
+                size: Some(size),
+                blake3: Some(blake3.clone()),
+                sem_hash: sem.clone(),
+                // §2.2: sidecar entries carry the badge fields so the
+                // grid can render before the sidecar bytes download
+                // (§3.5) — extracted from exactly the sent bytes.
+                rating: badges.rating,
+                color_label: badges.color_label.clone(),
+                content_id: content_id.clone(),
+                // Measured dimensions travel on original entries when
+                // the import unit has recorded them (§2.2).
+                w: (kind == Kind::Original).then_some(r.w).flatten(),
+                h: (kind == Kind::Original).then_some(r.h).flatten(),
+                mtime,
+                from_key: None,
+            })
+        },
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            // The whole commit rolled back: the item is still
+            // `verifying`; re-queue it so the next pass retries. The
+            // commit failure stays primary (demote doc).
+            let _ = demote(db, relkey, ItemState::Verifying, ItemState::Queued);
+            return Err(e);
         }
     };
 
@@ -1751,19 +1764,31 @@ pub struct DownloadOutcome {
 
 /// The local file a download of `relkey`/`kind` installs under
 /// `dest_root`: [`crate::keys::local_path`] for originals and `.xmp`
-/// projections, plus the `.rrdata` suffix for the primary sidecar
-/// (mirroring [`crate::keys::sidecar_key`]).
+/// projections, plus the `.rrdata` suffix for a primary sidecar addressed
+/// by its **image** relkey (mirroring [`crate::keys::sidecar_key`]).
+///
+/// Suffix-aware (the engine's file-relkey convention,
+/// [`crate::engine`] module docs): a `Kind::Sidecar` relkey that already
+/// ends in `.rrdata` — the engine keys sidecar and virtual-copy items by
+/// the sidecar **file's own** relkey — maps to its plain
+/// [`crate::keys::local_path`] instead of having a second suffix
+/// appended; base relkeys keep the landed behavior.
 pub fn local_target_path(dest_root: &Path, relkey: &RelKey, kind: Kind) -> PathBuf {
     let base = crate::keys::local_path(relkey, dest_root);
     match kind {
-        Kind::Sidecar => {
+        Kind::Sidecar if !relkey.as_str().ends_with(SIDECAR_SUFFIX) => {
             let mut s = base.into_os_string();
-            s.push(".rrdata");
+            s.push(SIDECAR_SUFFIX);
             PathBuf::from(s)
         }
         _ => base,
     }
 }
+
+/// The `.rrdata` suffix that marks a relkey as already being a sidecar
+/// **file** path (the engine's item-keying convention) rather than an
+/// image path awaiting the suffix.
+const SIDECAR_SUFFIX: &str = ".rrdata";
 
 /// The §3.5 temp file a download streams into: `.rr.part-<name>` next to
 /// the final path (same directory, so the final rename is atomic).
@@ -2409,11 +2434,19 @@ where
 
 /// The bucket key an item of `kind` at `relkey` transfers to/from:
 /// [`library_key`] for originals and `.xmp` projections (both are plain
-/// library files), [`sidecar_key`] for the primary sidecar. Other kinds
-/// ride other lanes ([`TransferError::UnsupportedKind`]).
+/// library files), [`sidecar_key`] for a primary sidecar addressed by its
+/// **image** relkey. Other kinds ride other lanes
+/// ([`TransferError::UnsupportedKind`]).
+///
+/// Suffix-aware like [`local_target_path`]: a `Kind::Sidecar` relkey that
+/// already ends in `.rrdata` (an engine-keyed sidecar or virtual-copy
+/// **file** relkey) maps through plain [`library_key`] — appending a
+/// second suffix would aim the transfer at a key no journal entry ever
+/// advertises. Base relkeys keep the landed behavior.
 pub fn bucket_key_for(relkey: &RelKey, kind: Kind) -> Result<String, TransferError> {
     match kind {
         Kind::Original | Kind::Xmp => Ok(library_key(relkey)),
+        Kind::Sidecar if relkey.as_str().ends_with(SIDECAR_SUFFIX) => Ok(library_key(relkey)),
         Kind::Sidecar => Ok(sidecar_key(relkey)),
         other => Err(TransferError::UnsupportedKind {
             relkey: relkey.clone(),
@@ -2467,8 +2500,11 @@ fn now_unix() -> i64 {
 
 /// Best server-time estimate in unix seconds (§2.10): the persisted
 /// heartbeat offset applied to the local clock, or the raw local clock
-/// before any measurement exists.
-fn server_ts_estimate(db: &SyncDb) -> Result<i64, TransferError> {
+/// before any measurement exists. Crate-visible: the engine's admission
+/// freeze (§3.7) and the §2.7 delete/restore stamps must read the same
+/// clock as the upload lane, or the §2.6 case-4 tiebreak would compare
+/// timestamps of different provenance.
+pub(crate) fn server_ts_estimate(db: &SyncDb) -> Result<i64, TransferError> {
     let offset_ms = db.server_time_offset_ms()?.unwrap_or(0);
     Ok(now_unix().saturating_add(offset_ms.div_euclid(1000)))
 }

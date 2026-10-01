@@ -1207,3 +1207,98 @@ async fn an_oversized_manifest_object_is_refused_on_both_fetch_lanes() {
         "expected ObjectTooLarge, got {err:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P1-U5 additive extensions: the engine's file-relkey sidecar rows
+// ---------------------------------------------------------------------------
+
+#[test]
+fn suffix_keyed_sidecar_rows_rebuild_their_own_file_bucket_key() {
+    // The engine unit keys sidecar items — primaries and conflict losers —
+    // by the sidecar FILE's relkey (`<image>.rrdata`,
+    // `<image>.<6hex>.rrdata`). A manifest row carrying such a key must
+    // rebuild through plain library_key on merge: appending a second
+    // `.rrdata` would aim the row at a bucket key no journal entry ever
+    // advertised. Image-relkey rows keep the landed sidecar_key mapping.
+    let a = dev(DEV_A);
+    let b = dev(DEV_B);
+    let (_dir, _path, db) = open_db(&b);
+    let manifest = Manifest {
+        header: header(&[(&a, 1)]),
+        rows: vec![
+            live_row("p/img.NEF.rrdata", Kind::Sidecar, &a),
+            live_row("p/img.NEF.ab12cd.rrdata", Kind::Sidecar, &a),
+            live_row("p/old.NEF", Kind::Sidecar, &a),
+        ],
+        deleted: vec![],
+    };
+    let mut consumer = RecordingConsumer::default();
+    let report = merge(&[(a.clone(), manifest)], &db, &mut consumer).expect("merge");
+    assert_eq!(report.live_rows, 3, "every spelling converts");
+    let keys: Vec<&str> = consumer
+        .transcript
+        .iter()
+        .map(|(_, _, key, _)| key.as_str())
+        .collect();
+    assert_eq!(
+        keys,
+        vec![
+            "library/p/img.NEF.ab12cd.rrdata",
+            "library/p/img.NEF.rrdata",
+            "library/p/old.NEF.rrdata",
+        ],
+        "file-relkey rows rebuild verbatim; image-relkey rows keep the suffix mapping"
+    );
+}
+
+#[test]
+fn build_manifest_advertises_suffix_keyed_sidecar_items() {
+    // An engine-keyed virtual-copy item must survive the convertibility
+    // withhold gate: its row is the manifest's only §2.3 carrier of the
+    // loser's published entry.
+    let a = dev(DEV_A);
+    let (_dir, _path, db) = open_db(&a);
+    let mut record = ItemRecord {
+        kind: Kind::Sidecar,
+        state: ItemState::Synced,
+        size: 64,
+        mtime_unix_ns: 0,
+        blake3: Some(Blake3Hex::parse(BLAKE3_HEX).expect("blake3")),
+        sem_hash: Some(SemHash::parse(SEMHASH_HEX).expect("semhash")),
+        vv: [(a.clone(), 1u32)].into_iter().collect(),
+        content_id: None,
+        w: None,
+        h: None,
+        pinned: false,
+        last_access_unix: 0,
+        verified_remote: true,
+        attested: false,
+        base_unknown: false,
+        rating: Some(2),
+        color_label: Some("red".to_string()),
+        device: Some(a.clone()),
+        head_ts: Some(1_769_900_000),
+        admitted_vv: None,
+        deleted: false,
+    };
+    db.replay_put_item(&rel("p/img.NEF.ab12cd.rrdata"), &record)
+        .expect("vc item");
+    record.deleted = true;
+    db.replay_put_item(&rel("p/hidden.NEF.rrdata"), &record)
+        .expect("hidden item");
+
+    let manifest = build_manifest(&db, 1_769_950_000).expect("build");
+    assert_eq!(
+        manifest
+            .rows
+            .iter()
+            .map(|r| r.key.as_str())
+            .collect::<Vec<_>>(),
+        vec!["p/img.NEF.ab12cd.rrdata"],
+        "the vc row is advertised; the soft-deleted row is withheld"
+    );
+    let row = &manifest.rows[0];
+    assert_eq!(row.rating, Some(2), "badge provenance travels");
+    assert_eq!(row.color_label, Some("red".to_string()));
+    assert_eq!(row.device, Some(a));
+}

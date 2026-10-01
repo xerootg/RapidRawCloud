@@ -156,8 +156,7 @@ fn concurrent_pair<'a>(
     let last_of = |entries: &'a [JournalEntry]| {
         entries
             .iter()
-            .filter(|e| e.op == Op::Put && e.key == key)
-            .next_back()
+            .rfind(|e| e.op == Op::Put && e.key == key)
             .expect("author's sidecar head entry")
     };
     (last_of(entries_a), last_of(entries_b))
@@ -414,8 +413,7 @@ async fn s2_delete_vs_edit_with_evicted_original_resurrects_the_whole_item() {
     assert!(orig_put.blake3.is_some());
     let sidecar_put = entries_b
         .iter()
-        .filter(|e| e.op == Op::Put && e.key == sidecar_key(&image))
-        .next_back()
+        .rfind(|e| e.op == Op::Put && e.key == sidecar_key(&image))
         .expect("sidecar resurrection put published");
     assert_eq!(
         compare(&sidecar_put.vv, &outcome.tombstone.vv),
@@ -562,8 +560,7 @@ async fn s4_uncommitted_dirty_commits_first_and_no_edit_bytes_are_lost() {
     let entries_b = eh::journal_entries_of(&client, &bucket, &dev(DEV_B)).await;
     let head_b = entries_b
         .iter()
-        .filter(|e| e.op == Op::Put && e.key == sidecar_key(&image))
-        .next_back()
+        .rfind(|e| e.op == Op::Put && e.key == sidecar_key(&image))
         .expect("B's head");
     assert_eq!(head_b.vv, admitted);
 
