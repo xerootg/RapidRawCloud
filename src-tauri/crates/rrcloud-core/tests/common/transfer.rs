@@ -281,6 +281,12 @@ pub struct CountingS3 {
     /// stored" (e.g. a sibling device replaced the shared key between
     /// Complete and the verify HEAD).
     pub fake_head_etags: Mutex<HashMap<String, String>>,
+    /// `key` → remaining times `head_object` fails transport-style
+    /// without reaching the backend (a transient verify-HEAD failure).
+    pub fail_heads: Mutex<HashMap<String, u32>>,
+    /// `key` → remaining times `abort_multipart_upload` fails
+    /// transport-style without reaching the backend.
+    pub fail_aborts: Mutex<HashMap<String, u32>>,
     /// Hook run at every `put_object` entry (e.g. to fire a cancel flag
     /// deterministically mid-pump).
     #[allow(clippy::type_complexity)]
@@ -338,6 +344,8 @@ impl CountingS3 {
             cut_get_after: Mutex::new(HashMap::new()),
             ignore_range: false,
             fake_head_etags: Mutex::new(HashMap::new()),
+            fail_heads: Mutex::new(HashMap::new()),
+            fail_aborts: Mutex::new(HashMap::new()),
             on_put: Mutex::new(None),
             gate_first_put_until: AtomicU32::new(0),
         }
@@ -403,6 +411,20 @@ impl CountingS3 {
     fn take_count(map: &Mutex<HashMap<(String, u32), u32>>, key: &str, part: u32) -> bool {
         let mut map = map.lock().expect("lock");
         match map.get_mut(&(key.to_string(), part)) {
+            Some(0) | None => false,
+            Some(n) => {
+                if *n != u32::MAX {
+                    *n -= 1;
+                }
+                true
+            }
+        }
+    }
+
+    /// Takes a pending fault count from a per-key `map`.
+    fn take_key_count(map: &Mutex<HashMap<String, u32>>, key: &str) -> bool {
+        let mut map = map.lock().expect("lock");
+        match map.get_mut(key) {
             Some(0) | None => false,
             Some(n) => {
                 if *n != u32::MAX {
@@ -515,6 +537,11 @@ impl S3Api for CountingS3 {
     }
 
     async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, S3Error> {
+        if Self::take_key_count(&self.fail_heads, key) {
+            return Err(S3Error::InvalidRequest(format!(
+                "injected HEAD failure for {key}"
+            )));
+        }
         let mut out = self.inner.head_object(bucket, key).await?;
         if let Some(etag) = self.fake_head_etags.lock().expect("lock").get(key) {
             out.e_tag = etag.clone();
@@ -619,6 +646,11 @@ impl S3TransferApi for CountingS3 {
         upload_id: &str,
     ) -> Result<(), S3Error> {
         self.abort_calls.fetch_add(1, Ordering::SeqCst);
+        if Self::take_key_count(&self.fail_aborts, key) {
+            return Err(S3Error::InvalidRequest(format!(
+                "injected abort failure for {key}"
+            )));
+        }
         self.inner
             .abort_multipart_upload(bucket, key, upload_id)
             .await
