@@ -6,13 +6,17 @@
 //! child, dispatched on `RRCLOUD_STATE_CRASH_CHILD`:
 //!
 //! - `writer` — opens the db and loops forever: freeze_next_segment
-//!   (single-txn seq allocation + frozen bytes) → one item transition →
-//!   mark applied → set cursor, printing an ACK line to stdout strictly
-//!   **after** each commit returns. The parent SIGKILLs it at a random
-//!   moment and then asserts the reopened db's invariants against the ACK
-//!   log (db state ≥ every ACKed commit, every record parses, frozen bytes
+//!   (single-txn span allocation + frozen bytes; 1–3 per-entry seqs per
+//!   segment, §2.2) → one item transition → mark applied → set cursor,
+//!   printing an ACK line to stdout strictly **after** each commit
+//!   returns. The parent waits for committed progress, SIGKILLs it at a
+//!   random moment (and verifies the child died by exactly that SIGKILL,
+//!   so a panicking child cannot masquerade as a passed crash test), then
+//!   asserts the reopened db's invariants against the ACK log (db state ≥
+//!   every ACKed commit, every record parses, frozen bytes
 //!   byte-identical, and — because allocation and freeze commit together —
-//!   **no seq holes**, ever, regardless of where the kill landed).
+//!   the segment spans tile the allocated seq range exactly: **no holes,
+//!   no overlaps**, regardless of where the kill landed).
 //! - `locker` — attempts to open a db the parent holds and must exit
 //!   quickly with a code describing the typed outcome (the §5.1
 //!   non-blocking refusal).
@@ -69,11 +73,20 @@ mod linux {
         RelKey::new(format!("crash/item-{idx:02}.rrdata")).expect("valid relkey")
     }
 
-    /// Deterministic segment bytes for `seq`: both parent and child compute
-    /// these independently, so byte equality after a crash proves the store
-    /// returned exactly what was frozen (§2.1.5). Includes non-UTF8 bytes.
+    /// Deterministic entry count for the segment whose FIRST seq is
+    /// `first` (1..=3): §2.2 seqs are per-entry, so the writer freezes
+    /// multi-entry spans and both parent and child derive each span's
+    /// width from its first seq alone.
+    fn count_for(first: u64) -> u64 {
+        first % 3 + 1
+    }
+
+    /// Deterministic segment bytes for the segment at first seq `seq`:
+    /// both parent and child compute these independently, so byte equality
+    /// after a crash proves the store returned exactly what was frozen
+    /// (§2.1.5). Includes non-UTF8 bytes.
     fn seg_bytes(seq: u64) -> Vec<u8> {
-        let mut v = format!("segment {seq} \u{0000}").into_bytes();
+        let mut v = format!("segment {seq} x{} \u{0000}", count_for(seq)).into_bytes();
         v.extend((0..(seq % 64 + 16)).map(|i| ((seq.wrapping_mul(31) + i) % 251) as u8));
         v
     }
@@ -187,11 +200,17 @@ mod linux {
             ack(format!("PUT {idx}"));
         }
         loop {
-            // Seq allocation + frozen bytes in ONE committed transaction
-            // (§2.1.5): the parent asserts no-holes on the strength of this.
+            // Span allocation + frozen bytes in ONE committed transaction
+            // (§2.1.5): the parent asserts gapless span tiling on the
+            // strength of this. The entry count varies (1..=3) so the
+            // crash coverage includes multi-entry spans; it is derived
+            // from the first seq, which the child predicts from the
+            // committed counter (freeze_next_segment confirms it).
+            let expected_first = db.last_allocated_seq().expect("last_allocated_seq") + 1;
             let seq = db
-                .freeze_next_segment(seg_bytes)
+                .freeze_next_segment(count_for(expected_first), seg_bytes)
                 .expect("freeze_next_segment");
+            assert_eq!(seq, expected_first, "span allocation is contiguous");
             ack(format!("SEQ {seq}"));
             ack(format!("FROZE {seq}"));
             let idx = seq % ITEM_COUNT;
@@ -307,14 +326,44 @@ mod linux {
                 .expect("spawn writer child");
             let mut guard = KillOnDrop(Some(child));
 
-            std::thread::sleep(Duration::from_millis(pseudo_random_ms(120, 450)));
+            // Progress-gated kill trigger: wait until the child has ACKed
+            // at least one committed span (so the kill window exercises
+            // the main loop even on a loaded box where startup/recovery
+            // eats wall time), then kill a short random moment later so
+            // the SIGKILL lands at an arbitrary point mid-loop.
+            let progress_deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                let raw = std::fs::read(&log_path).expect("read ack log");
+                if complete_lines(&raw)
+                    .iter()
+                    .any(|line| line.starts_with("SEQ "))
+                {
+                    break;
+                }
+                let child = guard.0.as_mut().expect("child present");
+                if let Some(status) = child.try_wait().expect("try_wait") {
+                    panic!("iteration {iteration}: writer child exited on its own: {status:?}");
+                }
+                assert!(
+                    Instant::now() < progress_deadline,
+                    "iteration {iteration}: child made no committed progress within 30s"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            std::thread::sleep(Duration::from_millis(pseudo_random_ms(20, 300)));
 
             let mut child = guard.0.take().expect("child present");
             child.kill().expect("SIGKILL writer child"); // SIGKILL on unix
             let status = child.wait().expect("reap child");
-            assert!(
-                !status.success(),
-                "iteration {iteration}: child must have died by signal, got {status:?}"
+            // The child must have died by OUR SIGKILL. A child that
+            // self-terminated (a panic from a real store failure mid-loop)
+            // also reports !success(), which would silently turn this into
+            // a test of nothing — so pin the exact signal.
+            assert_eq!(
+                std::os::unix::process::ExitStatusExt::signal(&status),
+                Some(libc::SIGKILL),
+                "iteration {iteration}: child must have died by the parent's SIGKILL \
+                 (a panic/self-exit means a store failure, not a crash test), got {status:?}"
             );
 
             // Parse this iteration's ACK log.
@@ -375,43 +424,60 @@ mod linux {
                 "identity survived the crash"
             );
 
-            // (1) §2.2: seq never regresses below the last ACKed allocation.
+            // (1) §2.2: the counter never regresses below the last ACKed
+            // span's END (an ACKed first seq of f with count_for(f)
+            // entries means seqs f..=f+count-1 were committed).
+            let acked_end = max_acked_seq + count_for(max_acked_seq).saturating_sub(1);
             let last = db.last_allocated_seq().expect("last_allocated_seq");
             assert!(
-                last >= max_acked_seq,
-                "iteration {iteration}: last allocated seq {last} < last ACKed {max_acked_seq}"
+                max_acked_seq == 0 || last >= acked_end,
+                "iteration {iteration}: last allocated seq {last} < last ACKed span end {acked_end}"
             );
+            let probe_first = last + 1;
             let next = db
-                .freeze_next_segment(seg_bytes)
+                .freeze_next_segment(count_for(probe_first), seg_bytes)
                 .expect("freeze_next_segment after crash");
+            assert_eq!(
+                next, probe_first,
+                "iteration {iteration}: post-crash allocation must continue the span tiling"
+            );
             assert!(
-                next > max_acked_seq,
-                "iteration {iteration}: post-crash allocation {next} <= ACKed {max_acked_seq}"
+                next > acked_end,
+                "iteration {iteration}: post-crash allocation {next} <= ACKed span end {acked_end}"
             );
             max_acked_seq = next; // the probe freeze is itself committed
             acked_frozen.push(next);
 
-            // (2) §2.1.5: the single-txn freeze means an allocated seq
-            // ALWAYS has frozen bytes, wherever the SIGKILL landed — the
-            // stored segments must be exactly 1..=last_allocated (no holes,
-            // nothing extra, ascending), every ACKed frozen segment among
-            // them, and every one byte-identical to what was frozen for its
-            // seq (nothing is published in this scenario, so
+            // (2) §2.1.5: the single-txn freeze means allocated seqs ALWAYS
+            // have frozen bytes, wherever the SIGKILL landed — the stored
+            // segment spans must tile 1..=last_allocated exactly (no
+            // holes, no overlaps, ascending), every ACKed frozen segment
+            // among them, and every one byte-identical to what was frozen
+            // for its first seq (nothing is published in this scenario, so
             // unpublished_segments sees them all).
             let last_alloc = db.last_allocated_seq().expect("last_allocated_seq");
             let segs = db.unpublished_segments().expect("unpublished_segments");
-            let seq_order: Vec<u64> = segs.iter().map(|(s, _)| *s).collect();
+            let mut expected_first = 1u64;
+            for (seq, _) in &segs {
+                assert_eq!(
+                    *seq, expected_first,
+                    "iteration {iteration}: segment spans must tile the allocated \
+                     range gaplessly (a hole would stall every remote contiguity \
+                     cursor forever; an overlap would reuse per-entry seqs)"
+                );
+                expected_first += count_for(*seq);
+            }
             assert_eq!(
-                seq_order,
-                (1..=last_alloc).collect::<Vec<u64>>(),
-                "iteration {iteration}: allocated seqs and frozen segments must \
-                 correspond one-to-one, in order (a hole would stall every \
-                 remote contiguity cursor forever)"
+                expected_first,
+                last_alloc + 1,
+                "iteration {iteration}: spans must cover exactly 1..=last_allocated"
             );
+            let frozen_firsts: std::collections::BTreeSet<u64> =
+                segs.iter().map(|(s, _)| *s).collect();
             for &seq in &acked_frozen {
                 assert!(
-                    seq <= last_alloc,
-                    "iteration {iteration}: ACKed frozen seq {seq} missing after crash"
+                    frozen_firsts.contains(&seq),
+                    "iteration {iteration}: ACKed frozen segment {seq} missing after crash"
                 );
             }
             for (seq, bytes) in &segs {

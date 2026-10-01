@@ -17,7 +17,8 @@ use rrcloud_core::journal::Kind;
 use rrcloud_core::keys::RelKey;
 use rrcloud_core::semhash::{Blake3Hex, ContentId, SemHash};
 use rrcloud_core::state::{
-    legal, ItemRecord, ItemState, MultipartUploadState, Queue, StateError, SyncDb, UploadPart,
+    legal, legal_entry, ItemRecord, ItemState, MultipartUploadState, Queue, StateError, SyncDb,
+    UploadPart,
 };
 
 const DEV1: &str = "d1f0c2aa-9d2b-4a6e-8f1c-3b7d5e9a0c42";
@@ -225,7 +226,7 @@ fn item_record_full_roundtrip_survives_reopen() {
     let record = full_record();
     {
         let db = open_fresh(&path);
-        db.insert_item(&key, &record).expect("put");
+        db.replay_put_item(&key, &record).expect("put");
         // Visible before reopen too.
         assert_eq!(db.get_item(&key).expect("get"), Some(record.clone()));
     }
@@ -448,7 +449,7 @@ fn transition_illegal_pair_is_illegal_even_when_stored_state_differs_too() {
     let key = rel("a.rrdata");
     let db = open_fresh(&path);
     let before = bare_record(ItemState::Synced);
-    db.insert_item(&key, &before).expect("put");
+    db.replay_put_item(&key, &before).expect("put");
     // (Dirty -> Synced) is statically illegal AND the stored state is
     // Synced, not Dirty. The static check is pinned to run first.
     let err = db
@@ -1090,7 +1091,7 @@ fn insert_item_refuses_to_overwrite_existing_record() {
     let (_dir, path) = scratch();
     let key = rel("a.rrdata");
     let db = open_fresh(&path);
-    let original = bare_record(ItemState::Synced);
+    let original = bare_record(ItemState::Hydrated);
     assert!(db.insert_item(&key, &original).expect("insert"));
     let mut imposter = bare_record(ItemState::Dirty);
     imposter.size = 999;
@@ -1129,7 +1130,7 @@ fn update_item_mutates_fields_and_preserves_state_durably() {
     let key = rel("a.rrdata");
     {
         let db = open_fresh(&path);
-        db.insert_item(&key, &bare_record(ItemState::Synced))
+        db.replay_put_item(&key, &bare_record(ItemState::Synced))
             .expect("insert");
         let committed = db
             .update_item(&key, ItemState::Synced, |r| {
@@ -1197,7 +1198,7 @@ fn update_item_racing_a_transition_never_loses_the_transition() {
     let db = open_fresh(&path);
     for i in 0..20 {
         let key = rel(&format!("race-up-{i}.rrdata"));
-        db.insert_item(&key, &bare_record(ItemState::Synced))
+        db.replay_put_item(&key, &bare_record(ItemState::Synced))
             .expect("insert");
         let barrier = std::sync::Barrier::new(2);
         let (t_res, u_res) = std::thread::scope(|s| {
@@ -1251,7 +1252,7 @@ fn iter_items_and_items_in_state_scan_everything() {
             .expect("insert");
         db.insert_item(&dirty2, &bare_record(ItemState::Dirty))
             .expect("insert");
-        db.insert_item(&uploading, &bare_record(ItemState::Uploading))
+        db.replay_put_item(&uploading, &bare_record(ItemState::Uploading))
             .expect("insert");
     }
     // Scans see committed state across reopen — the post-crash "find the
@@ -1339,12 +1340,12 @@ fn freeze_next_segment_allocates_and_freezes_atomically() {
     let (s1, s2) = {
         let db = open_fresh(&path);
         let s1 = db
-            .freeze_next_segment(|seq| format!("segment-{seq}").into_bytes())
+            .freeze_next_segment(1, |seq| format!("segment-{seq}").into_bytes())
             .expect("freeze");
         assert_eq!(s1, 1, "first allocation is 1");
         assert_eq!(db.last_allocated_seq().expect("last"), s1);
         let s2 = db
-            .freeze_next_segment(|seq| format!("segment-{seq}").into_bytes())
+            .freeze_next_segment(1, |seq| format!("segment-{seq}").into_bytes())
             .expect("freeze");
         assert_eq!(s2, s1 + 1);
         (s1, s2)
@@ -1359,7 +1360,7 @@ fn freeze_next_segment_allocates_and_freezes_atomically() {
     let s3 = db.allocate_seq().expect("alloc");
     assert_eq!(s3, s2 + 1);
     let s4 = db
-        .freeze_next_segment(|seq| vec![seq as u8])
+        .freeze_next_segment(1, |seq| vec![seq as u8])
         .expect("freeze");
     assert_eq!(s4, s3 + 1);
 }
@@ -1374,7 +1375,7 @@ fn freeze_next_segment_unique_across_threads() {
                 s.spawn(|| {
                     (0..25)
                         .map(|_| {
-                            db.freeze_next_segment(|seq| seq.to_le_bytes().to_vec())
+                            db.freeze_next_segment(1, |seq| seq.to_le_bytes().to_vec())
                                 .expect("freeze")
                         })
                         .collect::<Vec<_>>()
@@ -1436,7 +1437,7 @@ fn unpublished_scan_survives_holes_and_out_of_order_publish() {
     assert_eq!(db.unpublished_segments().expect("unpublished"), vec![]);
     // And new work after full publication is seen.
     let s5 = db
-        .freeze_next_segment(|_| b"five".to_vec())
+        .freeze_next_segment(1, |_| b"five".to_vec())
         .expect("freeze");
     assert_eq!(
         db.unpublished_segments().expect("unpublished"),
@@ -1466,7 +1467,7 @@ fn saturated_seq_counter_is_typed_error_not_panic_or_wrap() {
         "got {err:?}"
     );
     let err = db
-        .freeze_next_segment(|_| vec![])
+        .freeze_next_segment(1, |_| vec![])
         .expect_err("must refuse to wrap");
     assert!(
         matches!(err, StateError::CounterSaturated { .. }),
@@ -1604,7 +1605,7 @@ fn with_txn_error_rolls_back_everything() {
         .with_txn(|t| {
             t.transition(&key, ItemState::Dirty, ItemState::Queued, |r| r.size = 42)?;
             t.queue_push(Queue::Up, &key, 0)?;
-            t.freeze_next_segment(|_| b"doomed".to_vec())?;
+            t.freeze_next_segment(1, |_| b"doomed".to_vec())?;
             // A failing CAS on another (missing) item aborts the closure.
             t.transition(
                 &rel("ghost.dng"),
@@ -1636,7 +1637,7 @@ fn with_txn_pop_and_transition_is_atomic() {
     let (_dir, path) = scratch();
     let key = rel("a.rrdata");
     let db = open_fresh(&path);
-    db.insert_item(&key, &bare_record(ItemState::Queued))
+    db.replay_put_item(&key, &bare_record(ItemState::Queued))
         .expect("insert");
     db.queue_push(Queue::Up, &key, 1).expect("push");
     let popped = db
@@ -1708,4 +1709,337 @@ fn set_dcim_seen_prunes_stale_rows_for_the_same_path() {
         None
     );
     assert_eq!(db.remove_dcim_seen("/dcim/IMG_1.jpg").expect("again"), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Review round 1: per-entry seq spans (§2.2), entry-state creation gate,
+// cursor monotonicity, open-gate ordering, panic rollback, mint detection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn freeze_next_segment_multi_entry_spans_never_collide() {
+    // §2.2: seq is a per-ENTRY counter. A 3-entry segment frozen through
+    // the blessed path covers seqs 1..=3 (its entries embed them), so the
+    // NEXT freeze must start at 4 — a remote device's per-entry
+    // (device, seq) applied-dedup can never see a later segment reuse an
+    // earlier segment's entry seqs.
+    let (_dir, path) = scratch();
+    let (first_a, first_b) = {
+        let db = open_fresh(&path);
+        let first_a = db
+            .freeze_next_segment(3, |first| {
+                assert_eq!(first, 1, "builder receives the FIRST entry seq");
+                b"seg-a(1,2,3)".to_vec()
+            })
+            .expect("freeze 3-entry segment");
+        assert_eq!(first_a, 1);
+        assert_eq!(
+            db.last_allocated_seq().expect("last"),
+            3,
+            "the whole span is allocated"
+        );
+        let first_b = db
+            .freeze_next_segment(2, |first| {
+                assert_eq!(first, 4, "no overlap with the previous span");
+                b"seg-b(4,5)".to_vec()
+            })
+            .expect("freeze 2-entry segment");
+        assert_eq!(first_b, 4);
+        assert_eq!(db.last_allocated_seq().expect("last"), 5);
+        (first_a, first_b)
+    };
+    // Spans + bytes durable across reopen, listed by first seq.
+    let db = SyncDb::open(&path, None).expect("reopen");
+    assert_eq!(
+        db.unpublished_segments().expect("unpublished"),
+        vec![
+            (first_a, b"seg-a(1,2,3)".to_vec()),
+            (first_b, b"seg-b(4,5)".to_vec()),
+        ]
+    );
+    // And the counter keeps going from the span end after reopen.
+    let next = db.allocate_seq().expect("alloc");
+    assert_eq!(next, 6);
+}
+
+#[test]
+fn mark_published_advances_cursor_and_floor_over_the_whole_span() {
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let s1 = db
+        .freeze_next_segment(3, |_| b"abc".to_vec())
+        .expect("freeze");
+    let s2 = db
+        .freeze_next_segment(1, |_| b"d".to_vec())
+        .expect("freeze");
+    assert_eq!((s1, s2), (1, 4));
+    db.mark_published(s1).expect("publish span 1..=3");
+    assert_eq!(
+        db.published_cursor().expect("cursor"),
+        3,
+        "cursor covers the span's LAST entry seq, not its filename seq"
+    );
+    assert_eq!(
+        db.unpublished_segments().expect("unpublished"),
+        vec![(s2, b"d".to_vec())],
+        "the floor stepped over the whole span to the next segment"
+    );
+    // Idempotent re-publish of a span.
+    db.mark_published(s1).expect("re-publish is a no-op");
+    assert_eq!(db.published_cursor().expect("cursor"), 3);
+    // Interior seqs of a span are not individually publishable: they are
+    // published with their segment.
+    for interior in [2u64, 3] {
+        let err = db
+            .mark_published(interior)
+            .expect_err("interior seq is not a segment");
+        assert!(
+            matches!(err, StateError::NotFrozen { seq } if seq == interior),
+            "got {err:?}"
+        );
+    }
+    db.mark_published(s2).expect("publish");
+    assert_eq!(db.published_cursor().expect("cursor"), 4);
+    assert_eq!(db.unpublished_segments().expect("unpublished"), vec![]);
+    // New work after the fully-published prefix is still seen (the floor
+    // advanced over spans, it did not stall inside one).
+    let s3 = db
+        .freeze_next_segment(2, |first| vec![first as u8])
+        .expect("freeze");
+    assert_eq!(s3, 5);
+    assert_eq!(
+        db.unpublished_segments().expect("unpublished"),
+        vec![(s3, vec![5u8])]
+    );
+    // All durable.
+    drop(db);
+    let db = SyncDb::open(&path, None).expect("reopen");
+    assert_eq!(db.published_cursor().expect("cursor"), 4);
+    assert_eq!(
+        db.unpublished_segments().expect("unpublished"),
+        vec![(s3, vec![5u8])]
+    );
+}
+
+#[test]
+fn freeze_next_segment_zero_entries_is_typed_error() {
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let err = db
+        .freeze_next_segment(0, |_| vec![])
+        .expect_err("empty segment must refuse");
+    assert!(matches!(err, StateError::EmptySegment), "got {err:?}");
+    assert_eq!(db.last_allocated_seq().expect("last"), 0, "no seq consumed");
+    assert_eq!(db.unpublished_segments().expect("unpublished"), vec![]);
+}
+
+#[test]
+fn legacy_freeze_inside_an_existing_span_is_already_frozen() {
+    // Overlap guard: the legacy pair cannot freeze bytes under a seq a
+    // multi-entry segment's span already covers (first, interior, or
+    // last) — spans never overlap, so frozen bytes stay immutable.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let first = db
+        .freeze_next_segment(3, |_| b"span".to_vec())
+        .expect("freeze");
+    assert_eq!(first, 1);
+    for covered in [1u64, 2, 3] {
+        let err = db
+            .freeze_segment(covered, b"imposter")
+            .expect_err("covered seq must refuse");
+        assert!(
+            matches!(err, StateError::AlreadyFrozen { seq } if seq == covered),
+            "got {err:?}"
+        );
+    }
+    assert_eq!(
+        db.unpublished_segments().expect("unpublished"),
+        vec![(1, b"span".to_vec())],
+        "span bytes untouched"
+    );
+}
+
+#[test]
+fn set_cursor_never_regresses() {
+    // §2.2: the cursor is the highest contiguously-applied seq. §2.3
+    // bootstrap jumps it forward; nothing legitimately moves it back, so a
+    // stale write-back is a committed no-op (max semantics, like
+    // mark_published's cursor).
+    let (_dir, path) = scratch();
+    let d2 = dev(DEV2);
+    {
+        let db = open_fresh(&path);
+        db.set_cursor(&d2, 5).expect("set");
+        db.set_cursor(&d2, 3)
+            .expect("stale set is a no-op, not an error");
+        assert_eq!(db.cursor(&d2).expect("cursor"), 5, "no regression");
+        db.set_cursor(&d2, 9).expect("advance");
+        assert_eq!(db.cursor(&d2).expect("cursor"), 9);
+        db.set_cursor(&d2, 9).expect("equal set is a no-op");
+        assert_eq!(db.cursor(&d2).expect("cursor"), 9);
+    }
+    let db = SyncDb::open(&path, None).expect("reopen");
+    assert_eq!(db.cursor(&d2).expect("cursor"), 9);
+}
+
+#[test]
+fn insert_item_rejects_non_entry_birth_states() {
+    // Creation goes through the state machine too: an item can be born
+    // only in the §2.4 entry states; pipeline-interior births (Uploading,
+    // Verifying, …) would bypass the machine with no greppable marker.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    for (i, state) in ItemState::ALL.into_iter().enumerate() {
+        let key = rel(&format!("entry-{i}.rrdata"));
+        let result = db.insert_item(&key, &bare_record(state));
+        if legal_entry(state) {
+            assert!(
+                matches!(result, Ok(true)),
+                "{state:?} is an entry state, insert must succeed: {result:?}"
+            );
+        } else {
+            let err = result.expect_err("non-entry birth state must refuse");
+            assert!(
+                matches!(
+                    &err,
+                    StateError::IllegalCreationState { relkey, state: s }
+                        if *relkey == key && *s == state
+                ),
+                "got {err:?}"
+            );
+            assert_eq!(
+                db.get_item(&key).expect("get"),
+                None,
+                "refused insert must store nothing"
+            );
+        }
+    }
+    // The documented entry set, pinned exactly.
+    let entry: Vec<ItemState> = ItemState::ALL
+        .into_iter()
+        .filter(|s| legal_entry(*s))
+        .collect();
+    assert_eq!(
+        entry,
+        vec![
+            ItemState::Dirty,
+            ItemState::PendingDown,
+            ItemState::Stub,
+            ItemState::Hydrated,
+        ],
+        "update this assertion deliberately when the entry set changes"
+    );
+}
+
+#[test]
+fn newer_schema_with_corrupt_device_id_is_schema_too_new_not_codec() {
+    // Open-gate ordering: the schema gate runs before ANY identity logic,
+    // including parsing the stored id. A newer-format file whose identity
+    // bytes do not parse as a v1 DeviceId must still be refused as
+    // SchemaTooNew (the future "app update required" branch), never as a
+    // Codec error.
+    let (_dir, path) = scratch();
+    let newer = rrcloud_core::state::SCHEMA_VERSION + 1;
+    {
+        let db = open_fresh(&path);
+        db.force_schema_version(Some(newer)).expect("test override");
+        db.force_corrupt_device_id(b"\xff\x00 not a device id")
+            .expect("test override");
+    }
+    let err = SyncDb::open(&path, None).expect_err("newer schema must refuse");
+    assert!(
+        matches!(err, StateError::SchemaTooNew { found, .. } if found == newer),
+        "schema gate must win over unparseable identity bytes, got {err:?}"
+    );
+    // A v1-stamped file with unparseable identity bytes, by contrast, IS
+    // a codec failure of this build's own format — still typed, never a
+    // panic, never a re-mint.
+    {
+        // Reset to v1 stamp with corrupt id: build the state via a fresh db.
+        let (_dir2, path2) = scratch();
+        let db = SyncDb::open(&path2, Some(dev(DEV1))).expect("fresh");
+        db.force_corrupt_device_id(b"\xff").expect("test override");
+        drop(db);
+        let err = SyncDb::open(&path2, None).expect_err("corrupt v1 id must refuse");
+        assert!(matches!(err, StateError::Codec(_)), "got {err:?}");
+    }
+}
+
+#[test]
+fn with_txn_panic_unwinds_without_committing_and_db_stays_usable() {
+    // A panic inside the closure (a bug, not an Err) must behave like the
+    // Err path: nothing commits, and the store remains usable afterwards.
+    let (_dir, path) = scratch();
+    let key = rel("a.rrdata");
+    let db = open_fresh(&path);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.with_txn(|t| -> Result<(), StateError> {
+            t.insert_item(&key, &bare_record(ItemState::Dirty))?;
+            t.freeze_next_segment(1, |_| b"doomed".to_vec())?;
+            panic!("boom: simulated bug inside the composite step");
+        })
+    }));
+    assert!(
+        unwound.is_err(),
+        "the panic must propagate, not be swallowed"
+    );
+    assert_eq!(db.get_item(&key).expect("get"), None, "insert rolled back");
+    assert_eq!(db.last_allocated_seq().expect("last"), 0, "seq rolled back");
+    assert_eq!(
+        db.unpublished_segments().expect("unpublished"),
+        vec![],
+        "freeze rolled back"
+    );
+    // The store is not poisoned: normal writes still work.
+    assert!(db
+        .insert_item(&key, &bare_record(ItemState::Dirty))
+        .expect("insert after panic"));
+    assert_eq!(
+        db.freeze_next_segment(1, |_| b"ok".to_vec())
+            .expect("freeze after panic"),
+        1
+    );
+}
+
+#[test]
+fn minted_identity_reports_fresh_files_including_silent_db_loss() {
+    // The §2.2 hazard documented on open(): a caller that caches the
+    // device id and passes Some(id) on every open will silently re-mint —
+    // with the seq counter reset — on an unexpectedly fresh file.
+    // minted_identity() is the detection signal.
+    let (_dir, path) = scratch();
+    {
+        let db = open_fresh(&path);
+        assert!(db.minted_identity(), "first open minted");
+        assert_eq!(
+            db.freeze_next_segment(2, |_| b"published-elsewhere".to_vec())
+                .expect("freeze"),
+            1
+        );
+    }
+    {
+        let db = SyncDb::open(&path, None).expect("reopen");
+        assert!(!db.minted_identity(), "reopen of an existing db");
+        drop(db);
+        let db = SyncDb::open(&path, Some(dev(DEV1))).expect("reopen with id");
+        assert!(!db.minted_identity());
+    }
+    // Whole-file loss with a cached id: the open SUCCEEDS silently and the
+    // seq counter restarts — exactly the (device, seq)-reuse hazard. The
+    // minted flag is the only signal, and with None instead the open fails
+    // typed.
+    std::fs::remove_file(&path).expect("simulate whole-file loss");
+    let err = SyncDb::open(&path, None).expect_err("None on a fresh file fails typed");
+    assert!(matches!(err, StateError::DeviceIdRequired), "got {err:?}");
+    let db = SyncDb::open(&path, Some(dev(DEV1))).expect("cached-id reopen re-mints");
+    assert!(
+        db.minted_identity(),
+        "an unexpected mint is detectable — the engine must treat it as db loss"
+    );
+    assert_eq!(
+        db.last_allocated_seq().expect("last"),
+        0,
+        "the counter DID reset: publishing now would reuse (device, seq) pairs"
+    );
 }

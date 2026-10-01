@@ -58,8 +58,20 @@ thiserror = "2"
 time = { version = "0.3", features = ["formatting", "macros"] }
 unicode-normalization = "0.1"
 
+[features]
+# Test-support surface: the `force_*` tamper/corruption helpers in
+# `state.rs` that integration tests use to model meta corruption and
+# counter tampering. Gated so release builds of the library do not carry
+# methods that can corrupt the exact invariants the state store exists to
+# protect; the self-dev-dependency below turns it on for this crate's own
+# test builds only (P1-U2 review finding).
+test-util = []
+
 [dev-dependencies]
 base64 = "0.22"
+# Self-dependency: enables `test-util` when building this crate's tests,
+# without any production build ever carrying the feature.
+rrcloud-core = { path = ".", features = ["test-util"] }
 md-5 = "0.10"
 tempfile = "3"
 tokio = { version = "1", features = [

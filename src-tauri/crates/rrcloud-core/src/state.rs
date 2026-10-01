@@ -18,6 +18,15 @@
 //! - Dropping the [`SyncDb`] releases the lock promptly (drop + reopen in
 //!   one process works).
 //!
+//! Scope: the lock is redb's **advisory** `flock(LOCK_EX | LOCK_NB)` on
+//! the db file (verified in redb 2.6.3's unix file backend). Advisory
+//! means filesystem-dependent — on mounts where flock is a no-op or not
+//! propagated (some FUSE filesystems, old NFS, SMB shares) two processes
+//! can both open the db and interleave commits with no error anywhere.
+//! §5.1's exclusion is therefore guaranteed only on local filesystems with
+//! working flock, which is the normal `app_data_dir` case; exotic network
+//! mounts are out of scope for v1.
+//!
 //! # Durability
 //!
 //! Every write API here is one write transaction committed with
@@ -37,6 +46,29 @@
 //! so the experiment proves the process-death story only. The power-loss
 //! posture rests on the pinned `Immediate` fsync plus the checksummed
 //! commit slot, not on the experiment.
+//!
+//! First creation additionally fsyncs the parent **directory** (unix)
+//! after the init commit: POSIX does not promise that a new file's dirent
+//! is durable just because the file itself was fsynced, and redb's
+//! `Builder::create` does not sync the parent — without this, a power
+//! loss shortly after first open could lose the entire db even though
+//! every commit returned `Ok`.
+//!
+//! # Identity, reopen, and database loss (§2.2 scope)
+//!
+//! The device identity and the seq counter live **only** in this file, so
+//! §2.2's "seq never regresses" claim holds exactly as long as the db
+//! file is the identity's single home. Reopen of an existing db should
+//! pass `None` to [`SyncDb::open`]: an unexpectedly fresh file (user
+//! wipe, restore-from-backup, the file lost some other way) then fails
+//! typed with [`StateError::DeviceIdRequired`] instead of silently
+//! re-minting. A caller that caches the device id outside the db and
+//! passes `Some(id)` on every open converts whole-file loss into silent
+//! seq reuse under the same identity — a §2.2 protocol violation if the
+//! lost seqs were ever published. The store cannot distinguish "freshly
+//! minted" from "reused" ids by itself; [`SyncDb::minted_identity`]
+//! reports whether an open minted, so such a caller can detect unexpected
+//! freshness and refuse to publish.
 //!
 //! `begin_write` from a second thread blocks until the open write
 //! transaction commits — writers are serialized, which is what makes
@@ -151,6 +183,20 @@ pub enum StateError {
         /// The target state the caller passed.
         to: ItemState,
     },
+    /// `insert_item` was asked to create a record in a pipeline-interior
+    /// state. Items are born only in the §2.4 entry states ([`legal_entry`]:
+    /// `Dirty`, `PendingDown`, `Stub`, `Hydrated`); everything else is
+    /// reachable only through [`SyncDb::transition`], so a creation
+    /// elsewhere would bypass the state machine at birth with no greppable
+    /// marker (ingest/replay uses [`SyncDb::replay_put_item`], which is
+    /// named for exactly that visibility).
+    #[error("item {relkey} cannot be created in state {state:?} (not a §2.4 entry state)")]
+    IllegalCreationState {
+        /// The item.
+        relkey: RelKey,
+        /// The non-entry state the caller passed.
+        state: ItemState,
+    },
     /// `transition`/`update_item`'s expected state did not match the stored
     /// state (a concurrent transition won, or the item does not exist).
     /// Nothing was mutated.
@@ -171,14 +217,22 @@ pub enum StateError {
         /// The offending seq.
         seq: u64,
     },
-    /// `freeze_segment` for a seq that already has frozen bytes. A segment
-    /// is frozen exactly once (§2.1.5: the frozen bytes *are* the segment's
-    /// identity); crash replay re-reads them, it never re-freezes.
-    #[error("segment seq {seq} is already frozen")]
+    /// `freeze_segment` for a seq that already has frozen bytes — either a
+    /// segment frozen under exactly that seq, or a multi-entry segment
+    /// whose seq **span** covers it. A segment is frozen exactly once
+    /// (§2.1.5: the frozen bytes *are* the segment's identity); crash
+    /// replay re-reads them, it never re-freezes.
+    #[error("segment seq {seq} is already frozen (or covered by a frozen segment's span)")]
     AlreadyFrozen {
         /// The offending seq.
         seq: u64,
     },
+    /// `freeze_next_segment` was asked to freeze a segment with zero
+    /// entries. §2.2 seqs are per-entry, so an empty segment would consume
+    /// no seq and store unreachable bytes; the journal format has no empty
+    /// segments either.
+    #[error("segment must contain at least one entry")]
+    EmptySegment,
     /// `mark_published` for a seq that was never frozen. Publishing an
     /// unfrozen segment would break the §2.1.5 durability order (bytes
     /// frozen before any network).
@@ -223,6 +277,19 @@ fn db_err(e: impl Into<redb::Error>) -> StateError {
     StateError::Db(Box::new(e.into()))
 }
 
+/// Fsyncs the directory containing `path`, making `path`'s directory
+/// entry durable (first-create power-loss window; module docs).
+#[cfg(unix)]
+fn fsync_parent_dir(path: &Path) -> Result<(), StateError> {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    std::fs::File::open(parent)
+        .and_then(|dir| dir.sync_all())
+        .map_err(|e| db_err(redb::StorageError::Io(e)))
+}
+
 // ---------------------------------------------------------------------------
 // Table definitions (internal; the typed accessors are the public surface)
 // ---------------------------------------------------------------------------
@@ -233,10 +300,15 @@ const T_ITEMS: TableDefinition<&str, &[u8]> = TableDefinition::new("items");
 const T_APPLIED: TableDefinition<(&str, u64), ()> = TableDefinition::new("applied");
 /// `cursors`: device id -> highest contiguously-applied seq.
 const T_CURSORS: TableDefinition<&str, u64> = TableDefinition::new("cursors");
-/// `pending_segments`: seq -> frozen segment bytes (§2.1.5).
-const T_SEGMENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("pending_segments");
-/// `published_segments`: seq -> () — per-seq published flag (out-of-order
-/// publish support; the max also lives in meta as the published cursor).
+/// `pending_segments`: first entry seq -> (entry count, frozen segment
+/// bytes) (§2.1.5). §2.2 seqs are per-**entry**, so a segment with `n`
+/// entries covers the seq span `first..first + n`; the stored count is
+/// what lets [`StateTxn::mark_published`] advance the published cursor
+/// and floor over the whole span without parsing segment bytes.
+const T_SEGMENTS: TableDefinition<u64, (u64, &[u8])> = TableDefinition::new("pending_segments");
+/// `published_segments`: segment first seq -> () — per-segment published
+/// flag (out-of-order publish support; the covered span's max also lives
+/// in meta as the published cursor).
 const T_PUBLISHED: TableDefinition<u64, ()> = TableDefinition::new("published_segments");
 /// `uploads`: relkey -> JSON [`MultipartUploadState`].
 const T_UPLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("uploads");
@@ -265,12 +337,14 @@ const K_DEVICE_ID: &str = "device_id";
 const K_SCHEMA_VERSION: &str = "schema_version";
 const K_LAST_SEQ: &str = "last_seq";
 const K_PUBLISHED_CURSOR: &str = "published_cursor";
-/// Highest seq `F` such that every seq in `1..=F` is frozen **and**
-/// published — the contiguous published prefix. `unpublished_segments`
-/// starts its scan at `F + 1`, so a long-lived device's publish pass costs
-/// O(pending), not O(all segments ever frozen). Maintained by
-/// `mark_published`; an allocated-never-frozen hole (possible only via the
-/// legacy `allocate_seq` + `freeze_segment` pair, never via
+/// Highest seq `F` such that every seq in `1..=F` is covered by a frozen
+/// **and** published segment's span — the contiguous published prefix.
+/// `unpublished_segments` starts its scan at `F + 1`, so a long-lived
+/// device's publish pass costs O(pending), not O(all segments ever
+/// frozen). Maintained by `mark_published`, which walks whole segment
+/// spans (first seq -> stored entry count), so a multi-entry segment's
+/// interior seqs never stall it; an allocated-never-frozen hole (possible
+/// only via the legacy `allocate_seq` + `freeze_segment` pair, never via
 /// `freeze_next_segment`) blocks the floor but not correctness.
 const K_PUBLISHED_FLOOR: &str = "published_floor";
 const K_QUEUE_ARRIVAL: &str = "queue_arrival";
@@ -466,6 +540,28 @@ pub fn legal(from: ItemState, to: ItemState) -> bool {
     )
 }
 
+/// The §2.4 **entry** states — the only states an item record may be
+/// *created* in via [`SyncDb::insert_item`]:
+///
+/// | State | Why creation is legal here |
+/// |---|---|
+/// | [`Dirty`](ItemState::Dirty) | local change detected / fresh import (§2.4) |
+/// | [`PendingDown`](ItemState::PendingDown) | remote advertised an item we have no record for (§2.2 apply) |
+/// | [`Stub`](ItemState::Stub) | adopting an existing library where the original is a cloud placeholder (§3.5) |
+/// | [`Hydrated`](ItemState::Hydrated) | adopting an existing library with the original verified locally (§3.5) |
+///
+/// Pipeline-interior states (`Queued`, `Uploading`, `Verifying`, …) are
+/// reachable only via [`SyncDb::transition`]; birth there would bypass
+/// the state machine invisibly. Ingest/replay paths that must materialize
+/// a record in an arbitrary state use [`SyncDb::replay_put_item`], whose
+/// name makes the bypass greppable.
+pub fn legal_entry(state: ItemState) -> bool {
+    matches!(
+        state,
+        ItemState::Dirty | ItemState::PendingDown | ItemState::Stub | ItemState::Hydrated
+    )
+}
+
 /// One item's durable sync record (the `items` table value, §3.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemRecord {
@@ -566,6 +662,27 @@ fn queue_head(
     }
 }
 
+/// The frozen segment whose seq **span** covers `seq`, as
+/// `(first_seq, entry_count)` — `None` when no span covers it. A segment
+/// frozen at first seq `f` with `n` entries covers `f..f + n` (§2.2
+/// per-entry seqs), so this is the "is this seq already frozen" predicate
+/// both freeze paths guard with.
+fn span_covering(
+    segments: &impl ReadableTable<u64, (u64, &'static [u8])>,
+    seq: u64,
+) -> Result<Option<(u64, u64)>, StateError> {
+    if let Some(entry) = segments.range(..=seq).map_err(db_err)?.next_back() {
+        let (key, value) = entry.map_err(db_err)?;
+        let first = key.value();
+        let (count, _) = value.value();
+        // `first <= seq` by the range bound, so the subtraction is safe.
+        if seq - first < count {
+            return Ok(Some((first, count)));
+        }
+    }
+    Ok(None)
+}
+
 /// Reads an item record from any readable `items` table.
 fn read_item(
     items: &impl ReadableTable<&'static str, &'static [u8]>,
@@ -594,6 +711,7 @@ pub struct SyncDb {
     db: redb::Database,
     device_id: DeviceId,
     path: PathBuf,
+    minted: bool,
 }
 
 /// A scoped write transaction over the state store (see
@@ -631,6 +749,16 @@ impl SyncDb {
     /// `Some(id)` against the stored identity
     /// ([`StateError::DeviceIdMismatch`] on conflict).
     ///
+    /// **Reopen should pass `None`.** Passing the cached id on every open
+    /// makes an unexpectedly fresh file (whole-file loss, restore from
+    /// backup) silently re-mint the same identity with the seq counter
+    /// reset to zero — §2.2 (device, seq) reuse if the lost seqs were
+    /// ever published. With `None`, that situation fails typed with
+    /// [`StateError::DeviceIdRequired`]; a caller that must pass
+    /// `Some(id)` checks [`SyncDb::minted_identity`] afterwards to detect
+    /// unexpected freshness (module docs, "Identity, reopen, and database
+    /// loss").
+    ///
     /// Fails fast and typed when the db is held elsewhere
     /// ([`StateError::AlreadyLocked`]).
     pub fn open(
@@ -653,32 +781,34 @@ impl SyncDb {
         // initialized file byte-for-byte as found (never re-stamped).
         let mut txn = db.begin_write().map_err(db_err)?;
         txn.set_durability(redb::Durability::Immediate);
-        let device_id = {
+        let (device_id, minted) = {
             let mut meta = txn.open_table(T_META).map_err(db_err)?;
             // Schema stamp first. `Some(None)` = present but unreadable.
             let schema: Option<Option<u32>> = meta
                 .get(K_SCHEMA_VERSION)
                 .map_err(db_err)?
                 .map(|guard| serde_json::from_slice(guard.value()).ok());
-            let stored: Option<DeviceId> = match meta.get(K_DEVICE_ID).map_err(db_err)? {
-                Some(guard) => Some(from_json(guard.value())?),
-                None => None,
-            };
+            // Only PRESENCE of the identity is checked before the schema
+            // gate; the value is parsed inside the exact-match arm, so a
+            // refused stamp (newer/older/unreadable) is reported as the
+            // schema error even when the identity bytes are also garbage —
+            // the doc'd "schema gate before any identity logic" ordering.
+            let has_identity = meta.get(K_DEVICE_ID).map_err(db_err)?.is_some();
             match schema {
                 // No stamp at all.
-                None => match stored {
+                None => {
                     // Identity without a stamp: corruption, not fresh.
-                    Some(_) => return Err(StateError::SchemaUnsupported { found: None }),
-                    // Fresh database: stamp the schema + mint identity.
-                    None => {
-                        let minted = mint_device_id.ok_or(StateError::DeviceIdRequired)?;
-                        meta.insert(K_SCHEMA_VERSION, to_json(&SCHEMA_VERSION)?.as_slice())
-                            .map_err(db_err)?;
-                        meta.insert(K_DEVICE_ID, to_json(&minted)?.as_slice())
-                            .map_err(db_err)?;
-                        minted
+                    if has_identity {
+                        return Err(StateError::SchemaUnsupported { found: None });
                     }
-                },
+                    // Fresh database: stamp the schema + mint identity.
+                    let minted = mint_device_id.ok_or(StateError::DeviceIdRequired)?;
+                    meta.insert(K_SCHEMA_VERSION, to_json(&SCHEMA_VERSION)?.as_slice())
+                        .map_err(db_err)?;
+                    meta.insert(K_DEVICE_ID, to_json(&minted)?.as_slice())
+                        .map_err(db_err)?;
+                    (minted, true)
+                }
                 // Stamp present but unreadable.
                 Some(None) => return Err(StateError::SchemaUnsupported { found: None }),
                 Some(Some(v)) if v > SCHEMA_VERSION => {
@@ -690,15 +820,19 @@ impl SyncDb {
                 Some(Some(v)) if v < SCHEMA_VERSION => {
                     return Err(StateError::SchemaUnsupported { found: Some(v) });
                 }
-                // Exact match: identity must exist; verify a supplied id.
+                // Exact match: identity must exist and parse; verify a
+                // supplied id.
                 Some(Some(_)) => {
-                    let stored = stored.ok_or(StateError::DeviceIdMissing)?;
+                    let stored: DeviceId = match meta.get(K_DEVICE_ID).map_err(db_err)? {
+                        Some(guard) => from_json(guard.value())?,
+                        None => return Err(StateError::DeviceIdMissing),
+                    };
                     if let Some(given) = mint_device_id {
                         if given != stored {
                             return Err(StateError::DeviceIdMismatch { stored, given });
                         }
                     }
-                    stored
+                    (stored, false)
                 }
             }
         };
@@ -718,16 +852,38 @@ impl SyncDb {
         txn.open_table(T_DCIM_SEEN).map_err(db_err)?;
         txn.commit().map_err(db_err)?;
 
+        // First creation: make the new file's directory entry itself
+        // durable (module docs, "Durability" — redb fsyncs the file, not
+        // the parent directory, and POSIX does not promise the dirent
+        // survives power loss without this).
+        #[cfg(unix)]
+        if minted {
+            fsync_parent_dir(&path)?;
+        }
+
         Ok(SyncDb {
             db,
             device_id,
             path,
+            minted,
         })
     }
 
     /// This database's device identity (minted on first open).
     pub fn device_id(&self) -> &DeviceId {
         &self.device_id
+    }
+
+    /// `true` when **this** open minted the device identity — i.e. the
+    /// file was fresh and [`SyncDb::open`] stamped it. A caller that
+    /// passes `Some(id)` on reopen (instead of the first-class `None`
+    /// pattern) must check this to detect an unexpectedly fresh file: a
+    /// mint where the caller expected an existing db means the previous
+    /// db — and its seq counter — was lost, and publishing under the
+    /// cached identity would reuse (device, seq) pairs (§2.2; module
+    /// docs, "Identity, reopen, and database loss").
+    pub fn minted_identity(&self) -> bool {
+        self.minted
     }
 
     /// The database file path this store was opened at.
@@ -775,6 +931,13 @@ impl SyncDb {
     /// a record already exists. This is the creation path for the state
     /// machine; existing records change only through
     /// [`SyncDb::transition`] / [`SyncDb::update_item`].
+    ///
+    /// Creation is restricted to the §2.4 **entry states** ([`legal_entry`]:
+    /// `Dirty`, `PendingDown`, `Stub`, `Hydrated`) — a record cannot be
+    /// born in a pipeline-interior state like `Uploading`
+    /// ([`StateError::IllegalCreationState`]); ingest/replay paths that
+    /// need an arbitrary state use the greppable
+    /// [`SyncDb::replay_put_item`] bypass.
     pub fn insert_item(&self, relkey: &RelKey, record: &ItemRecord) -> Result<bool, StateError> {
         self.with_txn(|t| t.insert_item(relkey, record))
     }
@@ -948,32 +1111,54 @@ impl SyncDb {
             .unwrap_or(0))
     }
 
-    /// Sets `device`'s cursor.
+    /// Advances `device`'s cursor to `max(stored, seq)`.
+    ///
+    /// The cursor is §2.2's "highest contiguously-applied seq": §2.3
+    /// bootstrap legitimately jumps it forward, but nothing legitimately
+    /// moves it back, so — like [`SyncDb::mark_published`]'s cursor — a
+    /// lower value is a committed no-op rather than a regression. A
+    /// stale or racing apply-loop write-back therefore cannot rewind the
+    /// invariant; the applied-set dedup already makes any re-apply after
+    /// such a stale write idempotent.
     pub fn set_cursor(&self, device: &DeviceId, seq: u64) -> Result<(), StateError> {
         self.with_txn(|t| t.set_cursor(device, seq))
     }
 
     // -- journal publication (§2.1.5) --------------------------------------
 
-    /// Allocates the next seq and freezes `build(seq)` as its segment bytes
-    /// **in one committed transaction** — the §2.1.5 "persisted
-    /// transactionally with the serialized segment bytes" primitive, and
-    /// the engine's publication path. Because the counter increment and the
-    /// bytes commit together, a crash can never leave an
-    /// allocated-but-never-frozen seq: **holes are impossible by
-    /// construction**, so a remote reader's contiguity cursor (§2.2/§3.2)
+    /// Allocates the next `entry_count` seqs and freezes
+    /// `build(first_seq)` as the segment covering them, **in one committed
+    /// transaction** — the §2.1.5 "persisted transactionally with the
+    /// serialized segment bytes" primitive, and the engine's publication
+    /// path. Because the counter advance and the bytes commit together, a
+    /// crash can never leave allocated-but-never-frozen seqs: **holes are
+    /// impossible by construction** (the frozen spans tile the allocated
+    /// range exactly), so a remote reader's contiguity cursor (§2.2/§3.2)
     /// can always eventually advance past every seq this device publishes.
     ///
-    /// The builder receives the seq (entries embed it, §2.2) and must be
-    /// infallible and side-effect-free — it runs inside the open
-    /// transaction. Returns the allocated seq. Seqs are strictly
-    /// increasing, starting at 1, across threads **and** across
-    /// crash/reopen.
+    /// §2.2 seqs are per-**entry**: a segment holds up to
+    /// [`crate::journal::SEGMENT_MAX_ENTRIES`] entries, each embedding its
+    /// own seq, and the segment's filename is the seq of the *first*
+    /// entry. The builder receives that first seq and must stamp its
+    /// `entry_count` entries with `first_seq..first_seq + entry_count`
+    /// (its own argument), in order; it must be infallible and
+    /// side-effect-free — it runs inside the open transaction. Returns
+    /// the first seq. `entry_count` of zero is
+    /// [`StateError::EmptySegment`]. Spans are strictly increasing and
+    /// never overlap, starting at 1, across threads **and** across
+    /// crash/reopen — so a remote device's per-entry `(device, seq)`
+    /// apply-dedup can never mistake a later segment's entries for
+    /// already-applied ones.
+    ///
+    /// (The store cannot verify the builder's stamping; the journal
+    /// encoder and this method sharing one `entry_count` argument is the
+    /// contract.)
     pub fn freeze_next_segment(
         &self,
+        entry_count: u64,
         build: impl FnOnce(u64) -> Vec<u8>,
     ) -> Result<u64, StateError> {
-        self.with_txn(|t| t.freeze_next_segment(build))
+        self.with_txn(|t| t.freeze_next_segment(entry_count, build))
     }
 
     /// Allocates and durably commits the next journal seq for this device,
@@ -1001,24 +1186,27 @@ impl SyncDb {
         Ok(meta_get(&meta, K_LAST_SEQ)?.unwrap_or(0))
     }
 
-    /// Durably freezes `bytes` as the segment for an already-allocated
-    /// `seq` — the second half of the legacy two-step pair (see
-    /// [`SyncDb::allocate_seq`]; new code uses
+    /// Durably freezes `bytes` as a **single-entry** segment for an
+    /// already-allocated `seq` — the second half of the legacy two-step
+    /// pair (see [`SyncDb::allocate_seq`]; new code uses
     /// [`SyncDb::freeze_next_segment`]). The stored bytes are the segment's
     /// identity: a crash-replayed publish re-reads them via
     /// [`SyncDb::unpublished_segments`] byte-identically.
     ///
     /// `seq` must have been allocated ([`StateError::SeqNotAllocated`]) and
-    /// not already frozen ([`StateError::AlreadyFrozen`] — a segment is
-    /// frozen exactly once, replay never re-freezes).
+    /// not already frozen — neither under exactly `seq` nor covered by a
+    /// multi-entry segment's span ([`StateError::AlreadyFrozen`] — a
+    /// segment is frozen exactly once, replay never re-freezes, and spans
+    /// never overlap).
     pub fn freeze_segment(&self, seq: u64, bytes: &[u8]) -> Result<(), StateError> {
         self.with_txn(|t| t.freeze_segment(seq, bytes))
     }
 
-    /// All frozen-but-unpublished segments, in ascending seq order, each
-    /// with the exact bytes passed to [`SyncDb::freeze_segment`] /
-    /// [`SyncDb::freeze_next_segment`] (byte identity is the §2.1.5
-    /// republish guarantee).
+    /// All frozen-but-unpublished segments as `(first_seq, bytes)`, in
+    /// ascending seq order, each with the exact bytes passed to
+    /// [`SyncDb::freeze_segment`] / [`SyncDb::freeze_next_segment`] (byte
+    /// identity is the §2.1.5 republish guarantee; the first seq is the
+    /// §2.2 segment filename).
     ///
     /// The scan starts at the contiguous published prefix (the "published
     /// floor" maintained by [`SyncDb::mark_published`]), not at seq 1, so a
@@ -1036,26 +1224,34 @@ impl SyncDb {
             let (key, value) = entry.map_err(db_err)?;
             let seq = key.value();
             if published.get(seq).map_err(db_err)?.is_none() {
-                out.push((seq, value.value().to_vec()));
+                let (_, bytes) = value.value();
+                out.push((seq, bytes.to_vec()));
             }
         }
         Ok(out)
     }
 
     /// Marks a frozen segment as published (the post-PUT §2.1.5 step) and
-    /// advances the published cursor to `max(cursor, seq)`.
+    /// advances the published cursor over the segment's whole seq span —
+    /// `max(cursor, first_seq + entry_count - 1)`.
     ///
-    /// Idempotent: re-marking a published seq is a no-op `Ok`. Marking a
-    /// never-frozen seq is [`StateError::NotFrozen`]. Out-of-order marking
-    /// is allowed (crash replay publishes in order, but the store does not
-    /// enforce it); an earlier still-unpublished segment remains in
+    /// `seq` is the segment's **first** seq, the value
+    /// [`SyncDb::freeze_next_segment`] returned (and the §2.2 filename
+    /// seq). Idempotent: re-marking a published segment is a no-op `Ok`.
+    /// Marking a seq that is not a frozen segment's first seq is
+    /// [`StateError::NotFrozen`] — including a multi-entry segment's
+    /// interior seqs, which are published with their segment, never
+    /// individually. Out-of-order marking is allowed (crash replay
+    /// publishes in order, but the store does not enforce it); an earlier
+    /// still-unpublished segment remains in
     /// [`SyncDb::unpublished_segments`]. Frozen bytes are retained after
     /// publish in v1 (pruning is a later unit's GC concern).
     pub fn mark_published(&self, seq: u64) -> Result<(), StateError> {
         self.with_txn(|t| t.mark_published(seq))
     }
 
-    /// The highest published seq (0 when nothing published yet).
+    /// The highest seq covered by any published segment's span (0 when
+    /// nothing published yet).
     pub fn published_cursor(&self) -> Result<u64, StateError> {
         let txn = self.begin_read()?;
         let meta = txn.open_table(T_META).map_err(db_err)?;
@@ -1287,10 +1483,18 @@ impl SyncDb {
     }
 
     // -- test support (not part of the supported API) ----------------------
+    //
+    // The force_* tamper/corruption helpers are compiled only under the
+    // `test-util` cargo feature (enabled for this crate's own tests via a
+    // self-dev-dependency), so release builds of the library do not ship
+    // methods that can corrupt the invariants this store exists to
+    // protect (regress last_seq, strip identity, store unparseable
+    // records).
 
     /// Test support only: overwrite (or remove, with `None`) the stored
     /// schema version so the open-time gates can be exercised. Not part of
     /// the supported API.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn force_schema_version(&self, version: Option<u32>) -> Result<(), StateError> {
         self.with_txn(|t| {
@@ -1311,6 +1515,7 @@ impl SyncDb {
     /// Test support only: remove the stored device identity, modeling meta
     /// corruption / a future layout that moved identity, so the open gate's
     /// schema-first ordering can be exercised.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn force_remove_device_id(&self) -> Result<(), StateError> {
         self.with_txn(|t| {
@@ -1322,6 +1527,7 @@ impl SyncDb {
 
     /// Test support only: overwrite the persisted last-allocated seq
     /// counter (corruption/tamper modeling for the overflow guard).
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn force_last_seq(&self, value: u64) -> Result<(), StateError> {
         self.with_txn(|t| {
@@ -1334,6 +1540,7 @@ impl SyncDb {
 
     /// Test support only: overwrite the persisted queue arrival counter
     /// (corruption/tamper modeling for the overflow guard).
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn force_queue_arrival(&self, value: u64) -> Result<(), StateError> {
         self.with_txn(|t| {
@@ -1347,6 +1554,7 @@ impl SyncDb {
     /// Test support only: store raw (typically unparseable) bytes as the
     /// item record for `relkey`, so the documented
     /// [`StateError::Codec`]-not-panic read behavior can be pinned.
+    #[cfg(feature = "test-util")]
     #[doc(hidden)]
     pub fn force_corrupt_item(&self, relkey: &RelKey, bytes: &[u8]) -> Result<(), StateError> {
         self.with_txn(|t| {
@@ -1355,21 +1563,40 @@ impl SyncDb {
             Ok(())
         })
     }
+
+    /// Test support only: store raw (typically unparseable) bytes as the
+    /// device identity, so the open gate's schema-before-identity ordering
+    /// can be pinned (a refused schema stamp must win over garbage
+    /// identity bytes).
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn force_corrupt_device_id(&self, bytes: &[u8]) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(K_DEVICE_ID, bytes).map_err(db_err)?;
+            Ok(())
+        })
+    }
 }
 
-/// Increments a persisted u64 meta counter, refusing to wrap
-/// ([`StateError::CounterSaturated`]).
-fn bump_counter(
+/// Advances a persisted u64 meta counter by `n` (≥ 1), refusing to wrap
+/// ([`StateError::CounterSaturated`]). Returns the **first** of the `n`
+/// newly-allocated values (`stored + 1`); the counter is left at
+/// `stored + n`.
+fn bump_counter_by(
     meta: &mut redb::Table<'_, &'static str, &'static [u8]>,
     key: &'static str,
+    n: u64,
 ) -> Result<u64, StateError> {
+    debug_assert!(n >= 1, "bump_counter_by requires n >= 1");
     let last: u64 = meta_get(meta, key)?.unwrap_or(0);
-    let next = last
-        .checked_add(1)
+    let new_last = last
+        .checked_add(n)
         .ok_or(StateError::CounterSaturated { key })?;
-    meta.insert(key, to_json(&next)?.as_slice())
+    meta.insert(key, to_json(&new_last)?.as_slice())
         .map_err(db_err)?;
-    Ok(next)
+    // `last < new_last`, so `last + 1` cannot overflow.
+    Ok(last + 1)
 }
 
 impl StateTxn<'_> {
@@ -1382,6 +1609,12 @@ impl StateTxn<'_> {
 
     /// [`SyncDb::insert_item`] within this transaction.
     pub fn insert_item(&self, relkey: &RelKey, record: &ItemRecord) -> Result<bool, StateError> {
+        if !legal_entry(record.state) {
+            return Err(StateError::IllegalCreationState {
+                relkey: relkey.clone(),
+                state: record.state,
+            });
+        }
         let mut items = self.txn.open_table(T_ITEMS).map_err(db_err)?;
         if items.get(relkey.as_str()).map_err(db_err)?.is_some() {
             return Ok(false);
@@ -1500,10 +1733,18 @@ impl StateTxn<'_> {
         Ok(())
     }
 
-    /// [`SyncDb::set_cursor`] within this transaction.
+    /// [`SyncDb::set_cursor`] within this transaction (advance-only:
+    /// `max(stored, seq)` wins, a lower value is a committed no-op).
     pub fn set_cursor(&self, device: &DeviceId, seq: u64) -> Result<(), StateError> {
         let mut cursors = self.txn.open_table(T_CURSORS).map_err(db_err)?;
-        cursors.insert(device.as_str(), seq).map_err(db_err)?;
+        let stored = cursors
+            .get(device.as_str())
+            .map_err(db_err)?
+            .map(|guard| guard.value())
+            .unwrap_or(0);
+        if seq > stored {
+            cursors.insert(device.as_str(), seq).map_err(db_err)?;
+        }
         Ok(())
     }
 
@@ -1512,27 +1753,37 @@ impl StateTxn<'_> {
     /// transitions the item in one commit.
     pub fn freeze_next_segment(
         &self,
+        entry_count: u64,
         build: impl FnOnce(u64) -> Vec<u8>,
     ) -> Result<u64, StateError> {
-        let seq = {
-            let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
-            bump_counter(&mut meta, K_LAST_SEQ)?
-        };
-        let bytes = build(seq);
-        let mut segments = self.txn.open_table(T_SEGMENTS).map_err(db_err)?;
-        // Defensive: a freshly allocated seq cannot be frozen unless the
-        // counter was tampered backwards; refuse rather than overwrite.
-        if segments.get(seq).map_err(db_err)?.is_some() {
-            return Err(StateError::AlreadyFrozen { seq });
+        if entry_count == 0 {
+            return Err(StateError::EmptySegment);
         }
-        segments.insert(seq, bytes.as_slice()).map_err(db_err)?;
-        Ok(seq)
+        let first = {
+            let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
+            bump_counter_by(&mut meta, K_LAST_SEQ, entry_count)?
+        };
+        let bytes = build(first);
+        let mut segments = self.txn.open_table(T_SEGMENTS).map_err(db_err)?;
+        // Defensive: freshly allocated seqs cannot already be covered
+        // unless the counter was tampered backwards; refuse rather than
+        // overwrite (checks both an earlier span reaching into ours and
+        // any segment keyed at or above our first seq).
+        if span_covering(&segments, first)?.is_some()
+            || segments.range(first..).map_err(db_err)?.next().is_some()
+        {
+            return Err(StateError::AlreadyFrozen { seq: first });
+        }
+        segments
+            .insert(first, (entry_count, bytes.as_slice()))
+            .map_err(db_err)?;
+        Ok(first)
     }
 
     /// [`SyncDb::allocate_seq`] within this transaction.
     pub fn allocate_seq(&self) -> Result<u64, StateError> {
         let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
-        bump_counter(&mut meta, K_LAST_SEQ)
+        bump_counter_by(&mut meta, K_LAST_SEQ, 1)
     }
 
     /// [`SyncDb::freeze_segment`] within this transaction.
@@ -1543,37 +1794,53 @@ impl StateTxn<'_> {
             return Err(StateError::SeqNotAllocated { seq });
         }
         let mut segments = self.txn.open_table(T_SEGMENTS).map_err(db_err)?;
-        if segments.get(seq).map_err(db_err)?.is_some() {
+        // Covered by an existing segment — exactly, or inside a
+        // multi-entry span — means already frozen. (A later span cannot
+        // overlap a single-entry segment at `seq`: spans start above the
+        // counter as of their freeze, so any span keyed above `seq` is
+        // disjoint from it.)
+        if span_covering(&segments, seq)?.is_some() {
             return Err(StateError::AlreadyFrozen { seq });
         }
-        segments.insert(seq, bytes).map_err(db_err)?;
+        segments.insert(seq, (1u64, bytes)).map_err(db_err)?;
         Ok(())
     }
 
     /// [`SyncDb::mark_published`] within this transaction.
     pub fn mark_published(&self, seq: u64) -> Result<(), StateError> {
         let segments = self.txn.open_table(T_SEGMENTS).map_err(db_err)?;
-        if segments.get(seq).map_err(db_err)?.is_none() {
-            return Err(StateError::NotFrozen { seq });
-        }
+        // `seq` must be a frozen segment's FIRST seq; interior seqs of a
+        // span publish with their segment, never individually.
+        let count = match segments.get(seq).map_err(db_err)? {
+            Some(guard) => guard.value().0,
+            None => return Err(StateError::NotFrozen { seq }),
+        };
         let mut published = self.txn.open_table(T_PUBLISHED).map_err(db_err)?;
         published.insert(seq, ()).map_err(db_err)?;
         let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
+        // The cursor covers the whole span: its last entry seq, not its
+        // filename seq. (`count >= 1` by construction of both freeze
+        // paths; saturating arithmetic keeps a tampered count from
+        // wrapping.)
+        let span_end = seq.saturating_add(count.saturating_sub(1));
         let cursor: u64 = meta_get(&meta, K_PUBLISHED_CURSOR)?.unwrap_or(0);
-        if seq > cursor {
-            meta.insert(K_PUBLISHED_CURSOR, to_json(&seq)?.as_slice())
+        if span_end > cursor {
+            meta.insert(K_PUBLISHED_CURSOR, to_json(&span_end)?.as_slice())
                 .map_err(db_err)?;
         }
         // Advance the contiguous published floor (the unpublished-scan
-        // start). It only ever crosses published seqs, so a frozen or
-        // allocated-but-unfrozen seq below it is impossible by induction.
+        // start) over whole published spans. It only ever crosses
+        // published segments, so a frozen or allocated-but-unfrozen seq
+        // below it is impossible by induction.
         let mut floor: u64 = meta_get(&meta, K_PUBLISHED_FLOOR)?.unwrap_or(0);
         let start = floor;
         while let Some(next) = floor.checked_add(1) {
-            if published.get(next).map_err(db_err)?.is_some() {
-                floor = next;
-            } else {
-                break;
+            match segments.get(next).map_err(db_err)? {
+                Some(guard) if published.get(next).map_err(db_err)?.is_some() => {
+                    let (next_count, _) = guard.value();
+                    floor = next.saturating_add(next_count.saturating_sub(1));
+                }
+                _ => break,
             }
         }
         if floor != start {
@@ -1641,7 +1908,7 @@ impl StateTxn<'_> {
         }
         let arrival = {
             let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
-            bump_counter(&mut meta, K_QUEUE_ARRIVAL)?
+            bump_counter_by(&mut meta, K_QUEUE_ARRIVAL, 1)?
         };
         let mut entries = self.txn.open_table(entries_def).map_err(db_err)?;
         entries.insert((class, arrival), rel).map_err(db_err)?;
@@ -1684,7 +1951,7 @@ impl StateTxn<'_> {
                 entries.remove((old_class, old_arrival)).map_err(db_err)?;
                 let arrival = {
                     let mut meta = self.txn.open_table(T_META).map_err(db_err)?;
-                    bump_counter(&mut meta, K_QUEUE_ARRIVAL)?
+                    bump_counter_by(&mut meta, K_QUEUE_ARRIVAL, 1)?
                 };
                 entries.insert((class, arrival), rel).map_err(db_err)?;
                 idx.insert(rel, (class, arrival)).map_err(db_err)?;

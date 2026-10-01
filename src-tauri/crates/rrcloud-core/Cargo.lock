@@ -990,6 +990,7 @@ dependencies = [
  "quick-xml",
  "redb",
  "reqwest",
+ "rrcloud-core",
  "serde",
  "serde_json",
  "sha2",
