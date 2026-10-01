@@ -50,7 +50,16 @@
 //!
 //! 1. **Converged** (`vv` equal, or same content: equal `sem_hash` for
 //!    sidecars, equal `blake3` otherwise) → adopt metadata (vv
-//!    elementwise max), no download.
+//!    elementwise max), no download. A strictly dominating converged
+//!    entry additionally hands its `blake3`/`size` to a record whose
+//!    state holds no local bytes, and supersedes a `CorruptRemote`
+//!    condemnation back into the fetch lane (review round 1; see
+//!    [`EngineConsumer::converge`]). Over **uncommitted dirt**, a
+//!    file-equal entry collapses the dirt only when it is a descendant
+//!    of the local base or wins the §2.6 pick against it — a file-equal
+//!    twin that LOSES the pick commits the dirt instead (review round
+//!    1: collapsing parked the device on the fleet's losing branch
+//!    under the identical folded vv).
 //! 2. **Remote dominates** → adopt: record takes the entry's metadata
 //!    and the item queues a download (`PendingDown`; the byte transfer
 //!    is pump-driven, and the §3.5 sidecar install path parse-validates
@@ -74,6 +83,14 @@
 //!    admission + upload lane). Afterwards the path's vv becomes the
 //!    elementwise max of both, so the conflict cannot reopen, and a
 //!    [`ConflictEvent`] fires through the caller's [`EngineEvents`].
+//!    When the REMOTE branch loses, the device that authored the
+//!    winning sidecar head and quiescently holds its bytes re-marks it
+//!    `Dirty`, so the next admission re-publishes the winner as a fresh
+//!    dominating version — the §1.2 shared bucket key is last-writer,
+//!    so a losing upload landing after the winner's would otherwise
+//!    leave the key holding loser bytes under the winner's advertised
+//!    blake3 forever (review round 1; see
+//!    [`EngineConsumer::resolve_concurrent`]).
 //!
 //! `del` entries order through the same machinery (§2.7): a dominating
 //! `del` marks the item deleted (hidden; the record survives with the
@@ -82,9 +99,12 @@
 //! are emitted for the sidecar **and** the image's original (the
 //! original's put re-advertises the known `blake3`/`content_id`; the
 //! bytes are still in the bucket during the grace window, so nothing
-//! re-uploads). When the original was never known locally (no record /
-//! no `blake3`), only the sidecar resurrects and a
-//! [`ResurrectionIncompleteEvent`] surfaces the §2.7 edge.
+//! re-uploads). An original whose own upload intent is **in flight** is
+//! NOT re-advertised — the in-flight put is concurrent with the del and
+//! is itself the resurrection (review round 1; see
+//! [`EngineConsumer::resurrect_original`]). When the original was never
+//! known locally (no record / no `blake3`), only the sidecar resurrects
+//! and a [`ResurrectionIncompleteEvent`] surfaces the §2.7 edge.
 //!
 //! `preview` / `thumb` / `thumbpack` / `albums` / `presets` entries are
 //! recorded as applied with **no state effects** in this unit (download
@@ -1012,7 +1032,8 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         // invariant a stale leftover (every demotion into Dirty withdraws
         // the intent — review round 0), and `commit_dirty` re-mints it.
         if local.state == ItemState::Dirty {
-            if compare(&entry.vv, &local.vv) == VvOrder::Less {
+            let ord = compare(&entry.vv, &local.vv);
+            if ord == VvOrder::Less {
                 return Ok(()); // an ancestor of our base: our dirt supersedes it
             }
             let file_converged = match kind {
@@ -1021,10 +1042,27 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                 }
                 _ => entry.content_id.is_some() && entry.content_id == local.content_id,
             };
-            if file_converged {
+            // A file-equal entry may only COLLAPSE the dirt when adopting
+            // it cannot contradict the §2.6 resolution the rest of the
+            // fleet runs on the same pair (review round 1, probe-verified
+            // permanent divergence): a Greater/Equal entry descends from
+            // our committed base (there is no pick), and a Concurrent one
+            // only when it WINS the (ts, device) pick against that base —
+            // the exact candidate pair every other device resolves. A
+            // file-equal entry that LOSES the pick must not become the
+            // local primary (it is the fleet's losing branch; collapsing
+            // parked this device on it under the identical folded vv,
+            // unhealable and event-less): the dirt commits as a local
+            // version instead — it IS a genuinely newer edit authored
+            // over our base — and the in-flight content-equal lane below
+            // folds the entry as a twin of the committed head.
+            if file_converged
+                && (matches!(ord, VvOrder::Greater | VvOrder::Equal)
+                    || remote_wins_identity(&local, entry))
+            {
                 return self.converge_dirty(txn, entry, item, &local);
             }
-            if compare(&entry.vv, &local.vv) == VvOrder::Equal {
+            if ord == VvOrder::Equal {
                 return Ok(()); // the remote re-advertised our base; dirt stays
             }
             local = self.commit_dirty(txn, item, &local)?;
@@ -1180,6 +1218,12 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         if entry.content_id.is_some() {
             record.content_id = entry.content_id.clone();
         }
+        // The record now names the entry's blake3: integrity facts earned
+        // for the superseded published version are stale — cleared exactly
+        // as `adopt_remote` and `commit_verified` do on their re-points
+        // (review round 1; the §3.5 eviction gate reads both flags).
+        record.verified_remote = false;
+        record.attested = false;
         let ord = compare(&entry.vv, &local.vv);
         if converged_identity_is_remote(local, entry, ord) {
             record.head_ts = Some(entry.ts);
@@ -1193,13 +1237,29 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
 
     /// Case 1 for a committed/clean local head: same content under a
     /// different vv — vv max-merge, deterministic head-identity
-    /// convergence ([`converged_identity_is_remote`]), local bytes stay
-    /// authoritative, no transfer. A hidden record un-hides when the
+    /// convergence ([`converged_identity_is_remote`]), and for a device
+    /// whose state proves it **holds** the head's bytes, local bytes stay
+    /// authoritative with no transfer. A hidden record un-hides when the
     /// entry is `Greater` **or `Concurrent`** with the folded deletion
     /// (§2.7 edits beat deletes / content-equal resurrection — review
     /// round 0: the strictly-Greater predicate kept a re-advertised
     /// original hidden on the deleter when the resurrection vv was
     /// concurrent with the original's own del).
+    ///
+    /// A **strictly dominating** entry IS the newer version, so a record
+    /// whose state holds no local bytes (`PendingDown`/`Downloading`/
+    /// `Stub`/`CorruptRemote`/`Conflict`) adopts the entry's
+    /// `blake3`/`size`/`content_id` (review round 1, probe-verified: a
+    /// churned same-sem rewrite otherwise left a pending fetch verifying
+    /// the key's new bytes against the superseded hash — condemning a
+    /// healthy remote to `CorruptRemote` with the vv already advanced),
+    /// clearing the integrity flags that described the superseded blake3.
+    /// And a `CorruptRemote` record meeting a Greater entry takes the
+    /// §2.4 `CorruptRemote → PendingDown` repair edge ("repair landed
+    /// elsewhere, fetch it") — the condemned advertisement is superseded,
+    /// so the item re-enters the fetch lane instead of staying wedged
+    /// off-queue (review round 1: this is also what heals the receivers
+    /// of the shared-key repair re-advertisement).
     fn converge(
         &mut self,
         txn: &StateTxn<'_>,
@@ -1221,8 +1281,27 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         // the folded deletion was (review round 0, pinned by the
         // asymmetric-resurrection scenario's state-equivalence check).
         let adopt_identity = undelete || converged_identity_is_remote(local, entry, ord);
+        // Content-identity adoption (doc comment): only for a strictly
+        // dominating entry, only when this device has no local bytes to
+        // keep authoritative, and only when the blake3 actually moves
+        // (a re-advertisement of the same hash — restore/resurrection —
+        // keeps the flags it legitimately still describes).
+        let adopt_content = ord == VvOrder::Greater
+            && !state_holds_local_bytes(local.state)
+            && entry.blake3.is_some()
+            && entry.blake3 != local.blake3;
         let mutate = |r: &mut ItemRecord| {
             r.vv.merge(&entry.vv);
+            if adopt_content {
+                r.blake3 = entry.blake3.clone();
+                r.size = entry.size.unwrap_or(local.size);
+                if entry.content_id.is_some() {
+                    r.content_id = entry.content_id.clone();
+                }
+                // Integrity facts described the superseded blake3.
+                r.verified_remote = false;
+                r.attested = false;
+            }
             if adopt_identity {
                 r.head_ts = Some(entry.ts);
                 r.device = Some(entry.device.clone());
@@ -1244,6 +1323,16 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             mutate(&mut record);
             record.state = ItemState::Hydrated;
             txn.replay_put_item_cas(item, ItemState::Synced, &record)?;
+        } else if local.state == ItemState::CorruptRemote && ord == VvOrder::Greater {
+            // The §2.4 repair edge (doc comment): supersede the condemned
+            // advertisement and fetch the newer version.
+            txn.transition(
+                item,
+                ItemState::CorruptRemote,
+                ItemState::PendingDown,
+                mutate,
+            )?;
+            txn.queue_push(Queue::Down, item, transfer_class(local.kind))?;
         } else {
             txn.update_item(item, local.state, mutate)?;
         }
@@ -1406,6 +1495,32 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             // (we hold only the winner) — the path still folds both
             // branches so the conflict cannot reopen.
             txn.update_item(item, local.state, |r| r.vv.merge(&entry.vv))?;
+            // §1.2 shared-key repair (review round 1, probe-verified):
+            // the loser's entry exists, so its bytes LANDED on the shared
+            // bucket key at some point — and landing order is independent
+            // of the §2.6 pick, so when the loser's PUT landed last the
+            // key holds loser bytes while every record adopts the
+            // winner's blake3: every fetcher wedges CorruptRemote and
+            // nothing in this unit would ever re-upload the winner. The
+            // device that AUTHORED the winning head and quiescently holds
+            // its bytes re-marks it Dirty here: the next admission
+            // (§3.7-gated like any edit) re-publishes the winner as a
+            // fresh dominating version, whose upload re-PUTs the bytes
+            // over the key and whose Greater entry rescues wedged
+            // receivers through `converge`'s repair edge. Author-only so
+            // one conflict yields one repair (N holders would mint N
+            // versions); an in-flight committed head (`admitted_vv`
+            // standing) re-PUTs by itself, and non-holding states have
+            // nothing to upload. Scoped to sidecars: original overwrites
+            // adopt the §2.8 displaced-copy lane, and auto re-uploading
+            // multi-GB RAWs is a policy choice this unit does not make.
+            if kind == Kind::Sidecar
+                && local.admitted_vv.is_none()
+                && local.device.as_ref() == Some(&self.own_device)
+                && matches!(local.state, ItemState::Synced | ItemState::Hydrated)
+            {
+                txn.transition(item, local.state, ItemState::Dirty, |_| {})?;
+            }
             if kind == Kind::Sidecar {
                 let winner_device = local
                     .device
@@ -1547,6 +1662,23 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
     /// are still in the bucket during grace — or surface
     /// [`ResurrectionIncompleteEvent`] when this device never knew the
     /// original (no record / no `blake3`).
+    ///
+    /// An original with an **admitted upload intent in flight** is
+    /// skipped outright (review round 1, two probe-verified blockers):
+    /// the in-flight put IS the survival — its admitted vv carries this
+    /// device's unpublished self component, so it is concurrent with
+    /// every del this device had not folded at admission, and
+    /// edits-beat-deletes keeps the item live here (apply_del's
+    /// Concurrent arm) and un-hides it on the deleter (apply_put's
+    /// deleted-record arm). A metadata re-advertisement of the OLD
+    /// published blake3 here would either re-mint the exact self
+    /// component the upload is about to publish (two different versions
+    /// under one vv — permanent fleet divergence on the content of that
+    /// vv) or, folding the snapshot, mint a vv strictly dominating the
+    /// in-flight NEW version — shadowing it fleet-wide while the bucket
+    /// key's bytes stop matching the winning head's hash (every fetcher
+    /// then wedges `CorruptRemote`). No event fires: the resurrection is
+    /// complete, just carried by the upload's own entry.
     fn resurrect_original(
         &mut self,
         txn: &StateTxn<'_>,
@@ -1561,6 +1693,19 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                 });
             return Ok(());
         };
+        if original.admitted_vv.is_some()
+            && matches!(
+                original.state,
+                ItemState::Queued | ItemState::Uploading | ItemState::Verifying
+            )
+        {
+            // In-flight intent: the upload is the resurrection (doc
+            // comment). The Dirty state is deliberately NOT in the gate:
+            // a Dirty record's leftover intent is withdrawn by invariant,
+            // and its own del (if any) commits the dirt through the
+            // ordinary Dirty lane.
+            return Ok(());
+        }
         let Some(blake3) = original.blake3.clone() else {
             self.events
                 .resurrection_incomplete(ResurrectionIncompleteEvent {
@@ -1596,6 +1741,19 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             r.head_ts = Some(now);
             r.device = Some(own.clone());
         })?;
+        // Transfer-lane normalization, mirroring restore_item (review
+        // round 1, minor): when the dels applied [Original, Sidecar],
+        // the original's dominating del removed its Down queue row while
+        // hiding it — un-hiding a `PendingDown` record must re-push the
+        // row or the item is pump-invisible until the next startup
+        // sweep. (The upload lane needs no analogue: a hidden record can
+        // never sit there — a remote del never dominates an admitted
+        // intent, whose snapshot holds an unpublished self component,
+        // and a LOCAL delete also hides the sidecar, whose hidden record
+        // never enters this resurrection lane.)
+        if original.deleted && original.state == ItemState::PendingDown {
+            txn.queue_push(Queue::Down, image, CLASS_ORIGINAL)?;
+        }
         // The original's own deleted-set row (if its del already applied
         // here) is superseded by the resurrection put.
         self.clear_superseded_row(txn, &vv, image)
@@ -1615,7 +1773,9 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
     /// local file holds the losing head, the loser's **canonical
     /// semantic document** ([`crate::semhash::semantic_document`]) is
     /// written to its deterministic vc path and, unless the vc key is
-    /// already known (`(key, sem_hash)` apply dedup), staged for upload
+    /// already known **live** (`(key, sem_hash)` apply dedup; a
+    /// soft-DELETED record with the matching sem is first restored —
+    /// review round 1, [`Self::restore_vc_in_txn`]), staged for upload
     /// with a fresh single-component vv through the ordinary admission
     /// lane. Returns the vc item relkey when this device can name it.
     ///
@@ -1690,6 +1850,22 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                     });
                 return Ok(None);
             }
+            if existing.deleted {
+                // A DELETED record with this sem is not a live
+                // preservation (review round 1, probe-verified): the vc
+                // was materialized by an earlier conflict and then
+                // soft-deleted — "a tombstoned item happens to have this
+                // sem" is a different event from "this loser is already
+                // preserved live", and conflating them left the new
+                // loser reachable through NO live state anywhere while
+                // the ConflictEvent claimed a copy. The new conflict
+                // supersedes the vc's deletion: restore it (the
+                // restore_item body, inside this apply transaction) — a
+                // dominating metadata-only put re-advertising its
+                // published identity, un-hide, transfer-lane
+                // normalization, deletion row cleared.
+                self.restore_vc_in_txn(txn, &vc_rel, &existing)?;
+            }
             // Apply dedup by (key, sem_hash): the vc is already known —
             // our own earlier materialization, or the peer's
             // advertisement (which the ordinary put apply converges with
@@ -1737,6 +1913,77 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
         Ok(Some(vc_rel))
     }
 
+    /// [`restore_item`]'s single-item body, run inside the apply
+    /// transaction for a soft-deleted vc whose deterministic key a new
+    /// conflict's loser needs again (review round 1; see the dedup
+    /// branch of [`Self::materialize_sidecar_loser`]): stages a
+    /// metadata-only [`EnginePut`] whose vv dominates the deletion
+    /// (record vv ∪ deleted-set row, `vv[self]` bumped) when the record
+    /// has a published `blake3` to re-advertise, un-hides the record
+    /// with the fresh head identity, normalizes the transfer lanes the
+    /// deletion emptied (a `PendingDown` vc re-queues its fetch; a
+    /// stranded upload-lane vc demotes to `Dirty` so the next admission
+    /// re-publishes the file this materialization just rewrote), and
+    /// clears this device's deletion row.
+    fn restore_vc_in_txn(
+        &mut self,
+        txn: &StateTxn<'_>,
+        vc_rel: &RelKey,
+        existing: &ItemRecord,
+    ) -> Result<(), EngineError> {
+        let own = self.own_device.clone();
+        let now = self.now_unix;
+        let mut vv = existing.vv.clone();
+        if let Some(row) = txn.get_deleted(vc_rel)? {
+            vv.merge(&row.vv);
+        }
+        vv.bump(&own);
+        if let Some(blake3) = existing.blake3.clone() {
+            let put = EnginePut {
+                device: own.clone(),
+                kind: Kind::Sidecar,
+                item: vc_rel.clone(),
+                vv: vv.clone(),
+                blake3,
+                size: existing.size,
+                ts: now,
+                sem_hash: existing.sem_hash.clone(),
+                rating: existing.rating,
+                color_label: existing.color_label.clone(),
+                content_id: None,
+                w: None,
+                h: None,
+                mtime: None,
+            };
+            enqueue_entry_in(txn, &own, &put.entry())?;
+        }
+        txn.update_item(vc_rel, existing.state, |r| {
+            r.vv = vv.clone();
+            r.deleted = false;
+            r.head_ts = Some(now);
+            r.device = Some(own.clone());
+        })?;
+        match existing.state {
+            ItemState::PendingDown => {
+                if existing.blake3.is_some() {
+                    txn.queue_push(Queue::Down, vc_rel, CLASS_SIDECAR)?;
+                }
+            }
+            state @ (ItemState::Queued | ItemState::Uploading) => {
+                txn.transition(vc_rel, state, ItemState::Dirty, |_| {})?;
+            }
+            ItemState::Verifying => {
+                // No direct Verifying → Dirty edge: via the legal retry
+                // demotion first (mirroring restore_item).
+                txn.transition(vc_rel, ItemState::Verifying, ItemState::Queued, |_| {})?;
+                txn.transition(vc_rel, ItemState::Queued, ItemState::Dirty, |_| {})?;
+            }
+            _ => {}
+        }
+        txn.remove_deleted(vc_rel)?;
+        Ok(())
+    }
+
     /// Writes a materialized vc document to its local path (parents
     /// created as needed).
     fn write_vc_file(&self, vc_rel: &RelKey, canonical: &[u8]) -> Result<(), EngineError> {
@@ -1751,6 +1998,22 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
     /// original's bytes, they are copied to the deterministic conflict
     /// relkey (idempotent), staged for upload with a fresh
     /// single-component vv, and the [`OriginalConflictEvent`] fires.
+    ///
+    /// **Spec deviation, documented per repo convention (review round
+    /// 1)**: ARCHITECTURE.md §2.8 specifies that an original-overwrite
+    /// `put` entry "records the content_id it replaced" as the wire
+    /// mechanism by which a holder of the displaced bytes learns to
+    /// upload the conflict copy. That field was **never implemented** —
+    /// [`crate::journal::JournalEntry`] carries only the NEW
+    /// `content_id`, and no replaced-content field exists on the v1
+    /// wire. Displacement is detected from **vv concurrency** instead:
+    /// the two concurrent overwrite puts meet in §2.6 case 4
+    /// ([`Self::resolve_concurrent`]), which routes the losing holder
+    /// here — reaching §2.8's outcome for its two-concurrent-overwrites
+    /// scenario (pinned by S6 and the `original_overwrite_*` unit
+    /// tests) while correctly NOT preserving superseded *ancestors*,
+    /// which §2.8 does not ask for. A future reconcile/worker unit must
+    /// not go looking for a replaced-content_id field on entries.
     fn stage_displaced_original(
         &mut self,
         txn: &StateTxn<'_>,

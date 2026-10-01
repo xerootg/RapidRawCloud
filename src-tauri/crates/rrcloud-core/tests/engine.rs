@@ -1,4 +1,4 @@
-//! Failing tests for `rrcloud_core::engine` (architecture §2.5–§2.8):
+//! The unit suite for `rrcloud_core::engine` (architecture §2.5–§2.8):
 //! the file-relkey item keying, the §2.5 churn-gated local change
 //! intake, §3.7 quiescence admission (the §2.6 version mint and its
 //! `admitted_vv`/`head_ts` intent snapshot), the §2.6 unified apply
@@ -40,7 +40,7 @@ use rrcloud_core::keys::{
 use rrcloud_core::manifest::build_manifest;
 use rrcloud_core::reader::{ConsumerError, JournalConsumer};
 use rrcloud_core::semhash::{sem_hash, sidecar_badges, Blake3Hex, ContentId};
-use rrcloud_core::state::{ItemRecord, ItemState, Queue, SyncDb};
+use rrcloud_core::state::{DeletedRecord, ItemRecord, ItemState, Queue, SyncDb};
 use rrcloud_core::transfer::{bucket_key_for, local_target_path, upload_item};
 
 // ---------------------------------------------------------------------------
@@ -1117,7 +1117,12 @@ fn case4_local_wins_merges_without_materialization() {
     apply(&db, &mut consumer, &entry);
 
     let record = item(&db, &key);
-    assert_eq!(record.state, ItemState::Synced, "our version stays primary");
+    // Review round 1: the winning AUTHOR is re-marked Dirty so the next
+    // admission re-publishes the winner over the §1.2 shared bucket key
+    // (the loser's upload may have landed after ours; see
+    // remote_loser_resolution_renudges_only_the_quiescent_winning_author).
+    // Our version stays the primary either way.
+    assert_eq!(record.state, ItemState::Dirty, "re-publish nudge (round 1)");
     assert_eq!(
         record.vv,
         vv(&[(DEV_A, 2), (DEV_B, 1)]),
@@ -3595,4 +3600,686 @@ fn manifest_rows_carry_head_ts_and_omit_identity_while_in_flight() {
     assert_eq!(manifest.rows[0].vv, vv(&[(DEV_A, 1)]), "published vv");
     assert_eq!(manifest.rows[0].ts, None, "in-flight: ts withheld");
     assert_eq!(manifest.rows[0].device, None, "in-flight: device withheld");
+}
+
+// ===========================================================================
+// Review round 1 — probe-verified regressions, pinned at unit scale
+// (the end-to-end interleavings live in tests/engine_scenarios.rs s17–s20)
+// ===========================================================================
+
+/// Round 1 blockers 1+3: `resurrect_original` meeting an original whose
+/// upload intent is IN FLIGHT must stage NOTHING — the in-flight put's
+/// admitted vv carries this device's unpublished self component, so it
+/// is concurrent with the del and resurrects the item by itself
+/// (edits-beat-deletes on every side). Pre-fix the re-advertisement of
+/// the OLD blake3 minted the same self component the upload publishes
+/// (probe-verified fleet divergence) or, folding the snapshot, strictly
+/// dominated the in-flight NEW version (probe-verified edit loss +
+/// CorruptRemote poisoning). Both del arrival orders are pinned.
+#[test]
+fn resurrection_skips_the_original_while_its_upload_intent_is_in_flight() {
+    let v1 = th::patterned(2048, 7);
+    let v2 = th::patterned(2048, 8);
+    for order in ["sidecar_first", "original_first"] {
+        let (_d, root, db) = scratch(DEV_B);
+        let image = rel(IMG);
+        let key = sidecar_item_relkey(&image).expect("sidecar item");
+
+        // Sidecar: published {A:1}, locally dirty (held back by §3.7).
+        let published = eh::doc(1, None, 0.0);
+        let edited = eh::doc(5, Some("red"), 0.9);
+        let mut sidecar = rec(Kind::Sidecar, ItemState::Dirty);
+        sidecar.sem_hash = Some(sem_hash(&published).expect("sem"));
+        sidecar.blake3 = Some(Blake3Hex::from_bytes(&published));
+        sidecar.vv = vv(&[(DEV_A, 1)]);
+        db.insert_item(&key, &sidecar).expect("seed sidecar");
+        th::write_file(&item_local_path(root.path(), &key), &edited);
+
+        // Original: v1 published at {A:1}; overwritten out of band (v2)
+        // and ADMITTED — Queued with the intent snapshot {A:1,B:1}, the
+        // record still advertising v1's blake3 (§2.6 coordination note)
+        // while content_id tracks the local v2 bytes.
+        let mut original = rec(Kind::Original, ItemState::Dirty);
+        original.blake3 = Some(Blake3Hex::from_bytes(&v1));
+        original.content_id = Some(ContentId::from_bytes(&v2));
+        original.size = v1.len() as u64;
+        original.vv = vv(&[(DEV_A, 1)]);
+        db.insert_item(&image, &original).expect("seed original");
+        let admitted = vv(&[(DEV_A, 1), (DEV_B, 1)]);
+        let snapshot = admitted.clone();
+        db.transition(&image, ItemState::Dirty, ItemState::Queued, |r| {
+            r.admitted_vv = Some(snapshot.clone());
+            r.admitted_ts = Some(900);
+            r.head_ts = Some(900);
+            r.device = Some(dev(DEV_B));
+        })
+        .expect("admit original");
+        db.queue_push(Queue::Up, &image, 2).expect("queue original");
+
+        let del_sidecar = del(
+            DEV_A,
+            Kind::Sidecar,
+            sidecar_key(&image),
+            vv(&[(DEV_A, 2)]),
+            700,
+        );
+        let del_original = del(
+            DEV_A,
+            Kind::Original,
+            library_key(&image),
+            vv(&[(DEV_A, 2)]),
+            700,
+        );
+        let mut events = RecordedEvents::default();
+        let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+            .expect("consumer")
+            .with_now(1_500);
+        match order {
+            "sidecar_first" => {
+                apply(&db, &mut consumer, &del_sidecar);
+                apply(&db, &mut consumer, &del_original);
+            }
+            _ => {
+                apply(&db, &mut consumer, &del_original);
+                apply(&db, &mut consumer, &del_sidecar);
+            }
+        }
+
+        // The original stays live with the INTENT INTACT: the in-flight
+        // upload is the resurrection. No second B component was minted.
+        let after = item(&db, &image);
+        assert!(!after.deleted, "{order}: live via edits-beat-deletes");
+        assert_eq!(after.state, ItemState::Queued, "{order}: upload owed");
+        assert_eq!(
+            after.admitted_vv,
+            Some(admitted.clone()),
+            "{order}: the intent stands untouched"
+        );
+        assert_eq!(after.admitted_ts, Some(900), "{order}");
+        assert_eq!(
+            after.vv,
+            vv(&[(DEV_A, 2)]),
+            "{order}: the del folded into the published vv (absorbing arm)"
+        );
+        // NOTHING was staged for the original: pre-fix a metadata put
+        // re-advertised v1's blake3 under a vv reusing (or dominating)
+        // the in-flight B:1 component.
+        for (_, bytes) in db.iter_outbound().expect("outbound") {
+            let entry = JournalEntry::from_json_line(std::str::from_utf8(&bytes).expect("utf8"))
+                .expect("decodes");
+            assert_ne!(
+                entry.key,
+                library_key(&image),
+                "{order}: no original re-advertisement while in flight"
+            );
+        }
+        // The sidecar still resurrected normally.
+        let sidecar_after = item(&db, &key);
+        assert!(!sidecar_after.deleted, "{order}");
+        assert_eq!(sidecar_after.state, ItemState::Queued, "{order}");
+        assert_eq!(
+            compare(
+                sidecar_after.admitted_vv.as_ref().expect("admitted"),
+                &vv(&[(DEV_A, 2)])
+            ),
+            VvOrder::Greater,
+            "{order}: the sidecar resurrection dominates the del"
+        );
+        // The original's upload queue row survived (its del never
+        // dominated the in-flight head).
+        assert_eq!(
+            drain_queue(&db, Queue::Up),
+            vec![image.as_str().to_string(), key.as_str().to_string()],
+            "{order}"
+        );
+        assert!(
+            events.resurrection_incomplete.is_empty(),
+            "{order}: the in-flight upload covers the original"
+        );
+    }
+}
+
+/// Round 1 blocker 2: a Concurrent entry whose content matches the
+/// local FILE (uncommitted dirt) collapses the dirt ONLY when it wins
+/// the §2.6 (ts, device) pick against the committed base — the same
+/// pick every other device runs on that pair. A file-equal entry that
+/// LOSES the pick must commit-then-fold instead (pre-fix it silently
+/// became the primary: probe-verified permanent fleet divergence under
+/// identical vvs, with zero events).
+#[test]
+fn concurrent_file_equal_entry_collapses_dirt_only_when_it_wins_the_pick() {
+    let image = rel(IMG);
+    let base_doc = eh::doc(3, None, 0.25); // the committed base (v1)
+    let edited = eh::doc(5, Some("red"), 0.9); // the dirt AND the twin entry
+
+    let seed = |db: &SyncDb, root: &Path| -> RelKey {
+        let key = sidecar_item_relkey(&image).expect("item key");
+        let mut record = rec(Kind::Sidecar, ItemState::Dirty);
+        record.sem_hash = Some(sem_hash(&base_doc).expect("sem"));
+        record.blake3 = Some(Blake3Hex::from_bytes(&base_doc));
+        record.vv = vv(&[(DEV_A, 1)]);
+        record.device = Some(dev(DEV_A));
+        record.head_ts = Some(1_000); // the base version's identity
+        db.insert_item(&key, &record).expect("seed");
+        th::write_file(&item_local_path(root, &key), &edited);
+        key
+    };
+
+    // Entry WINS the pick (ts 5_000 > base 1_000): the collapse is the
+    // fleet's own resolution — adopt, no version minted, no conflict.
+    {
+        let (_d, root, db) = scratch(DEV_X);
+        let key = seed(&db, root.path());
+        let entry = put_sidecar(DEV_B, &image, &edited, vv(&[(DEV_B, 1)]), 5_000);
+        let mut events = RecordedEvents::default();
+        let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+            .expect("consumer")
+            .with_now(9_000);
+        apply(&db, &mut consumer, &entry);
+        let after = item(&db, &key);
+        assert_eq!(after.state, ItemState::Synced, "dirt collapsed");
+        assert_eq!(after.vv, vv(&[(DEV_A, 1), (DEV_B, 1)]));
+        assert_eq!(after.sem_hash, Some(sem_hash(&edited).expect("sem")));
+        assert_eq!(after.head_ts, Some(5_000));
+        assert_eq!(after.device, Some(dev(DEV_B)));
+        assert_eq!(after.admitted_vv, None, "no version minted");
+        assert_eq!(db.queue_len(Queue::Up).expect("len"), 0);
+        assert!(events.conflicts.is_empty(), "twin convergence, no event");
+    }
+
+    // Entry LOSES the pick (ts 500 < base 1_000) — the probe's shape:
+    // collapsing would park this device on the branch the rest of the
+    // fleet resolves as the LOSER, under the identical folded vv. The
+    // dirt commits as a local version (it IS a newer edit over our
+    // base) and the entry folds as a content twin of the committed head.
+    {
+        let (_d, root, db) = scratch(DEV_X);
+        let key = seed(&db, root.path());
+        let entry = put_sidecar(DEV_B, &image, &edited, vv(&[(DEV_B, 1)]), 500);
+        let mut events = RecordedEvents::default();
+        let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+            .expect("consumer")
+            .with_now(9_000);
+        apply(&db, &mut consumer, &entry);
+        let after = item(&db, &key);
+        assert_eq!(
+            after.state,
+            ItemState::Queued,
+            "pre-fix: Synced — the losing branch silently became primary"
+        );
+        assert_eq!(
+            after.admitted_vv,
+            Some(vv(&[(DEV_A, 1), (DEV_X, 1)])),
+            "the dirt committed from the base, concurrent with the entry"
+        );
+        assert_eq!(
+            after.vv,
+            vv(&[(DEV_A, 1), (DEV_B, 1)]),
+            "the entry still folded (content twin of the committed head)"
+        );
+        assert_eq!(after.head_ts, Some(9_000), "the commit's identity");
+        assert_eq!(after.device, Some(dev(DEV_X)));
+        assert_eq!(
+            after.sem_hash,
+            Some(sem_hash(&base_doc).expect("sem")),
+            "record fields keep naming the last PUBLISHED version"
+        );
+        assert_eq!(
+            drain_queue(&db, Queue::Up),
+            vec![key.as_str().to_string()],
+            "the committed version is bound for upload"
+        );
+        assert!(
+            events.conflicts.is_empty(),
+            "content-equal concurrency is convergence, not a conflict"
+        );
+    }
+}
+
+/// Round 1 major 4: a strictly dominating (Greater) content-equal entry
+/// IS the newer version — a record whose state holds no local bytes
+/// (PendingDown here) must adopt its blake3/size, or the pending fetch
+/// verifies churn-divergent bytes against the superseded hash and
+/// condemns a healthy remote (probe-verified CorruptRemote wedge). A
+/// HOLDING record keeps local bytes authoritative, exactly like the
+/// pinned Concurrent twin case.
+#[test]
+fn greater_converge_adopts_content_identity_for_non_holding_records() {
+    let image = rel(IMG);
+    let d1 = eh::doc(3, Some("red"), 0.25);
+    let churned = eh::churned(&d1); // same sem, different bytes
+
+    // Non-holding (PendingDown): adopt blake3/size, clear the stale
+    // integrity flags (they described the superseded blake3).
+    {
+        let (_d, root, db) = scratch(DEV_C);
+        let key = sidecar_item_relkey(&image).expect("item key");
+        let mut record = rec(Kind::Sidecar, ItemState::PendingDown);
+        record.sem_hash = Some(sem_hash(&d1).expect("sem"));
+        record.blake3 = Some(Blake3Hex::from_bytes(&d1));
+        record.size = d1.len() as u64;
+        record.vv = vv(&[(DEV_A, 1)]);
+        record.device = Some(dev(DEV_A));
+        record.head_ts = Some(100);
+        record.verified_remote = true;
+        record.attested = true;
+        db.insert_item(&key, &record).expect("seed");
+        db.queue_push(Queue::Down, &key, 1).expect("queued fetch");
+
+        let entry = put_sidecar(DEV_B, &image, &churned, vv(&[(DEV_A, 1), (DEV_B, 1)]), 200);
+        let mut events = RecordedEvents::default();
+        let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+            .expect("consumer")
+            .with_now(500);
+        apply(&db, &mut consumer, &entry);
+
+        let after = item(&db, &key);
+        assert_eq!(after.state, ItemState::PendingDown);
+        assert_eq!(after.vv, vv(&[(DEV_A, 1), (DEV_B, 1)]));
+        assert_eq!(
+            after.blake3,
+            Some(Blake3Hex::from_bytes(&churned)),
+            "pre-fix: still v1's blake3 — the fetch then wedged CorruptRemote"
+        );
+        assert_eq!(after.size, churned.len() as u64);
+        assert!(!after.verified_remote, "facts described the old blake3");
+        assert!(!after.attested);
+        assert_eq!(after.head_ts, Some(200), "identity adopts (Greater)");
+        assert_eq!(after.device, Some(dev(DEV_B)));
+        assert!(events.conflicts.is_empty());
+    }
+
+    // Holding (Synced): local bytes stay authoritative.
+    {
+        let (_d, root, db) = scratch(DEV_C);
+        let key = seed_synced_sidecar(&db, root.path(), &image, &d1, DEV_A, vv(&[(DEV_A, 1)]), 100);
+        let entry = put_sidecar(DEV_B, &image, &churned, vv(&[(DEV_A, 1), (DEV_B, 1)]), 200);
+        let mut events = RecordedEvents::default();
+        let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+            .expect("consumer")
+            .with_now(500);
+        apply(&db, &mut consumer, &entry);
+        let after = item(&db, &key);
+        assert_eq!(after.state, ItemState::Synced, "no transfer");
+        assert_eq!(
+            after.blake3,
+            Some(Blake3Hex::from_bytes(&d1)),
+            "a holder keeps its own (sem-equal) bytes authoritative"
+        );
+        assert_eq!(after.vv, vv(&[(DEV_A, 1), (DEV_B, 1)]));
+    }
+}
+
+/// Round 1 major 6 (receiver half): a Greater content-equal entry
+/// arriving at a CorruptRemote record is the §2.4 "repair landed
+/// elsewhere" edge — the condemned advertisement is superseded, so the
+/// item re-enters the fetch lane instead of staying wedged off-queue.
+#[test]
+fn greater_converge_rescues_a_corrupt_remote_record_into_the_fetch_lane() {
+    let (_d, root, db) = scratch(DEV_C);
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item key");
+    let d1 = eh::doc(3, Some("red"), 0.25);
+    let mut record = rec(Kind::Sidecar, ItemState::PendingDown);
+    record.sem_hash = Some(sem_hash(&d1).expect("sem"));
+    record.blake3 = Some(Blake3Hex::from_bytes(&d1));
+    record.size = d1.len() as u64;
+    record.vv = vv(&[(DEV_A, 1), (DEV_B, 1)]);
+    record.device = Some(dev(DEV_B));
+    record.head_ts = Some(200);
+    db.insert_item(&key, &record).expect("seed");
+    db.transition(&key, ItemState::PendingDown, ItemState::Downloading, |_| {})
+        .expect("slot");
+    db.transition(
+        &key,
+        ItemState::Downloading,
+        ItemState::CorruptRemote,
+        |_| {},
+    )
+    .expect("condemned");
+
+    // The author re-publishes the same content as a fresh dominating
+    // version (the §1.2 shared-key repair): rescue + re-fetch.
+    let churned = eh::churned(&d1);
+    let entry = put_sidecar(DEV_B, &image, &churned, vv(&[(DEV_A, 1), (DEV_B, 2)]), 900);
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(1_000);
+    apply(&db, &mut consumer, &entry);
+
+    let after = item(&db, &key);
+    assert_eq!(
+        after.state,
+        ItemState::PendingDown,
+        "pre-fix: CorruptRemote forever (converge kept the state and the \
+         item had no queue row left)"
+    );
+    assert_eq!(after.blake3, Some(Blake3Hex::from_bytes(&churned)));
+    assert_eq!(after.vv, vv(&[(DEV_A, 1), (DEV_B, 2)]));
+    assert_eq!(
+        drain_queue(&db, Queue::Down),
+        vec![key.as_str().to_string()],
+        "re-queued for the fetch"
+    );
+    assert!(events.conflicts.is_empty());
+}
+
+/// Round 1 major 6 (author half): resolving a conflict whose REMOTE
+/// branch loses re-marks the item Dirty on exactly the device that
+/// AUTHORED the winning head and quiescently holds its bytes — the next
+/// admission re-publishes the winner as a fresh dominating version, so
+/// the §1.2 shared bucket key ends holding winner bytes whatever order
+/// the two concurrent uploads landed in (probe-verified: a loser upload
+/// landing last poisoned the key and wedged every fetcher). Non-authors
+/// and in-flight heads are left alone (an in-flight upload re-PUTs by
+/// itself).
+#[test]
+fn remote_loser_resolution_renudges_only_the_quiescent_winning_author() {
+    let image = rel(IMG);
+    let ours = eh::doc(3, Some("red"), 0.25);
+    let theirs = eh::doc(5, Some("green"), 0.75);
+
+    // (a) We authored the winning head and sit Synced: re-nudged Dirty.
+    {
+        let (_d, root, db) = scratch(DEV_A);
+        let key = seed_synced_sidecar(
+            &db,
+            root.path(),
+            &image,
+            &ours,
+            DEV_A,
+            vv(&[(DEV_A, 2)]),
+            5_000,
+        );
+        let entry = put_sidecar(DEV_B, &image, &theirs, vv(&[(DEV_A, 1), (DEV_B, 1)]), 2_000);
+        let mut events = RecordedEvents::default();
+        let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+            .expect("consumer")
+            .with_now(6_000);
+        apply(&db, &mut consumer, &entry);
+        let after = item(&db, &key);
+        assert_eq!(
+            after.state,
+            ItemState::Dirty,
+            "pre-fix: Synced and oblivious — nothing in the unit ever \
+             re-uploaded the winner over a loser-last bucket key"
+        );
+        assert_eq!(after.vv, vv(&[(DEV_A, 2), (DEV_B, 1)]), "still folds");
+        assert_eq!(after.sem_hash, Some(sem_hash(&ours).expect("sem")));
+        assert_eq!(after.blake3, Some(Blake3Hex::from_bytes(&ours)));
+        assert_eq!(after.head_ts, Some(5_000), "identity kept");
+        assert_eq!(after.device, Some(dev(DEV_A)));
+        assert_eq!(after.admitted_vv, None, "admission happens later (§3.7)");
+        assert_eq!(db.queue_len(Queue::Up).expect("len"), 0);
+        assert_eq!(events.conflicts.len(), 1);
+        assert_eq!(events.conflicts[0].copy_relkey, None);
+    }
+
+    // (b) We merely HOLD the winner (authored elsewhere): no nudge —
+    // only the author re-publishes, or N holders would mint N versions.
+    {
+        let (_d, root, db) = scratch(DEV_C);
+        let key = seed_synced_sidecar(
+            &db,
+            root.path(),
+            &image,
+            &ours,
+            DEV_A,
+            vv(&[(DEV_A, 2)]),
+            5_000,
+        );
+        let entry = put_sidecar(DEV_B, &image, &theirs, vv(&[(DEV_A, 1), (DEV_B, 1)]), 2_000);
+        let mut events = RecordedEvents::default();
+        let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+            .expect("consumer")
+            .with_now(6_000);
+        apply(&db, &mut consumer, &entry);
+        assert_eq!(item(&db, &key).state, ItemState::Synced, "holder stays");
+    }
+
+    // (c) The winning head is committed IN FLIGHT: its own upload PUTs
+    // the bytes after the fold, repairing the key — no nudge.
+    {
+        let (_d, root, db) = scratch(DEV_A);
+        let key = sidecar_item_relkey(&image).expect("item key");
+        let mut record = rec(Kind::Sidecar, ItemState::Dirty);
+        record.sem_hash = Some(sem_hash(&ours).expect("sem"));
+        record.vv = vv(&[(DEV_A, 2)]);
+        db.insert_item(&key, &record).expect("seed");
+        th::write_file(&item_local_path(root.path(), &key), &ours);
+        db.transition(&key, ItemState::Dirty, ItemState::Queued, |r| {
+            r.admitted_vv = Some(vv(&[(DEV_A, 3)]));
+            r.admitted_ts = Some(5_000);
+            r.head_ts = Some(5_000);
+            r.device = Some(dev(DEV_A));
+        })
+        .expect("admit");
+        db.queue_push(Queue::Up, &key, 1).expect("queue");
+        let entry = put_sidecar(DEV_B, &image, &theirs, vv(&[(DEV_A, 1), (DEV_B, 1)]), 2_000);
+        let mut events = RecordedEvents::default();
+        let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+            .expect("consumer")
+            .with_now(6_000);
+        apply(&db, &mut consumer, &entry);
+        let after = item(&db, &key);
+        assert_eq!(after.state, ItemState::Queued, "in-flight head untouched");
+        assert_eq!(after.admitted_vv, Some(vv(&[(DEV_A, 3)])));
+    }
+}
+
+/// Round 1 major 5: the loser-vc `(key, sem_hash)` apply dedup meeting
+/// a DELETED record at the vc key is not "already preserved" — the new
+/// conflict supersedes the vc's deletion, so the vc is RESTORED (un-hidden
+/// with a dominating metadata put, row cleared), never silently left in
+/// Recently Deleted while the ConflictEvent claims a live copy
+/// (probe-verified: the round-2 losing version was unreachable through
+/// live state on every device).
+#[test]
+fn deleted_vc_at_the_dedup_key_is_restored_not_conflated_with_a_live_copy() {
+    let (_d, root, db) = scratch(DEV_A);
+    let image = rel(IMG);
+    let key = seed_synced_sidecar(
+        &db,
+        root.path(),
+        &image,
+        &eh::doc(3, Some("red"), 0.25),
+        DEV_A,
+        vv(&[(DEV_A, 2)]),
+        1_000,
+    );
+    let our_doc = eh::doc(3, Some("red"), 0.25);
+
+    // The vc for our document's sem already exists — materialized by a
+    // ROUND-1 conflict and then deleted by the user: hidden, with its
+    // deletion row standing.
+    let canonical = eh::semantic(&our_doc);
+    let suffix = loser_vc_suffix(&our_doc).expect("suffix");
+    let vc_rel = vc_item_relkey(&image, &suffix).expect("vc relkey");
+    let mut vc = rec(Kind::Sidecar, ItemState::Synced);
+    vc.sem_hash = Some(sem_hash(&canonical).expect("sem"));
+    vc.blake3 = Some(Blake3Hex::from_bytes(&canonical));
+    vc.size = canonical.len() as u64;
+    vc.vv = vv(&[(DEV_A, 4)]);
+    vc.device = Some(dev(DEV_A));
+    vc.head_ts = Some(2_000);
+    vc.deleted = true;
+    db.insert_item(&vc_rel, &vc).expect("seed vc");
+    db.with_txn(|t| {
+        t.record_deleted(
+            &vc_rel,
+            &DeletedRecord {
+                vv: vv(&[(DEV_A, 4)]),
+                server_ts: 2_500,
+            },
+        )
+    })
+    .expect("seed row");
+
+    // Round-2 conflict: a remote branch wins against our head; we hold
+    // the loser (our_doc) and its deterministic vc key is the deleted one.
+    let winner = eh::doc(5, Some("green"), 0.9);
+    let entry = put_sidecar(DEV_B, &image, &winner, vv(&[(DEV_A, 1), (DEV_B, 1)]), 9_000);
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(9_500);
+    apply(&db, &mut consumer, &entry);
+
+    // The vc is LIVE again, past its deletion.
+    let restored = item(&db, &vc_rel);
+    assert!(
+        !restored.deleted,
+        "pre-fix: still hidden while the event claimed a copy"
+    );
+    assert_eq!(restored.vv, vv(&[(DEV_A, 5)]), "record ∪ row, bumped");
+    assert_eq!(restored.head_ts, Some(9_500));
+    assert_eq!(restored.device, Some(dev(DEV_A)));
+    assert_eq!(
+        db.get_deleted(&vc_rel).expect("row"),
+        None,
+        "the deletion row is superseded"
+    );
+    // The restore was JOURNALED (dominating metadata put re-advertising
+    // the vc's published identity), so every device un-hides it.
+    let staged: Vec<JournalEntry> = db
+        .iter_outbound()
+        .expect("outbound")
+        .into_iter()
+        .map(|(_, bytes)| {
+            JournalEntry::from_json_line(std::str::from_utf8(&bytes).expect("utf8"))
+                .expect("decodes")
+        })
+        .collect();
+    let vc_put = staged
+        .iter()
+        .find(|e| e.op == Op::Put && e.key == library_key(&vc_rel))
+        .expect("pre-fix: nothing staged — outbound unchanged");
+    assert_eq!(vc_put.vv, vv(&[(DEV_A, 5)]));
+    assert_eq!(vc_put.blake3, Some(Blake3Hex::from_bytes(&canonical)));
+    assert_eq!(
+        compare(&vc_put.vv, &vv(&[(DEV_A, 4)])),
+        VvOrder::Greater,
+        "dominates the deletion lineage"
+    );
+    // The local copy healed and the event names a LIVE copy honestly.
+    assert_eq!(
+        eh::read_file(&item_local_path(root.path(), &vc_rel)),
+        canonical
+    );
+    assert_eq!(events.conflicts.len(), 1);
+    assert_eq!(events.conflicts[0].copy_relkey, Some(vc_rel));
+    assert!(events.loser_skipped.is_empty(), "nothing was skipped");
+    // And the primary adopted the round-2 winner as usual.
+    assert_eq!(item(&db, &key).state, ItemState::PendingDown);
+    assert_eq!(
+        item(&db, &key).sem_hash,
+        Some(sem_hash(&winner).expect("sem"))
+    );
+}
+
+/// Round 1 minor 10: when the dels apply in [Original, Sidecar] order,
+/// the original's dominating del removed its Down queue row; the
+/// sidecar-driven resurrection un-hides the PendingDown original and
+/// must re-push that row (mirroring restore_item's lane normalization)
+/// — pre-fix the item was pump-invisible until the next startup sweep.
+#[test]
+fn resurrection_repushes_the_down_row_of_a_hidden_pending_down_original() {
+    let (_d, root, db) = scratch(DEV_B);
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("sidecar item");
+    let published = eh::doc(1, None, 0.0);
+    let edited = eh::doc(5, Some("red"), 0.9);
+    let mut sidecar = rec(Kind::Sidecar, ItemState::Dirty);
+    sidecar.sem_hash = Some(sem_hash(&published).expect("sem"));
+    sidecar.vv = vv(&[(DEV_A, 1)]);
+    db.insert_item(&key, &sidecar).expect("seed sidecar");
+    th::write_file(&item_local_path(root.path(), &key), &edited);
+
+    let orig_bytes = th::patterned(2048, 7);
+    let mut original = rec(Kind::Original, ItemState::PendingDown);
+    original.blake3 = Some(Blake3Hex::from_bytes(&orig_bytes));
+    original.content_id = Some(ContentId::from_bytes(&orig_bytes));
+    original.size = orig_bytes.len() as u64;
+    original.vv = vv(&[(DEV_A, 1)]);
+    db.insert_item(&image, &original).expect("seed original");
+    db.queue_push(Queue::Down, &image, 2)
+        .expect("pending fetch");
+
+    let del_original = del(
+        DEV_A,
+        Kind::Original,
+        library_key(&image),
+        vv(&[(DEV_A, 2)]),
+        700,
+    );
+    let del_sidecar = del(
+        DEV_A,
+        Kind::Sidecar,
+        sidecar_key(&image),
+        vv(&[(DEV_A, 2)]),
+        700,
+    );
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(1_500);
+    apply(&db, &mut consumer, &del_original);
+    assert!(item(&db, &image).deleted, "dominating del hid the original");
+    assert_eq!(
+        db.queue_len(Queue::Down).expect("len"),
+        0,
+        "and dequeued its fetch"
+    );
+    apply(&db, &mut consumer, &del_sidecar);
+
+    let after = item(&db, &image);
+    assert!(!after.deleted, "resurrected");
+    assert_eq!(after.state, ItemState::PendingDown);
+    assert_eq!(
+        drain_queue(&db, Queue::Down),
+        vec![image.as_str().to_string()],
+        "pre-fix: empty — un-hidden but pump-invisible until restart"
+    );
+    assert!(events.resurrection_incomplete.is_empty());
+}
+
+/// Round 1 minor 7: the converged-dirt collapse re-points the record at
+/// the entry's blake3, so integrity facts earned for the superseded
+/// version must clear — exactly as adopt_remote and commit_verified do
+/// on their re-points (the §3.5 eviction gate reads both flags).
+#[test]
+fn converged_dirt_collapse_clears_stale_integrity_flags() {
+    let (_d, root, db) = scratch(DEV_A);
+    let image = rel(IMG);
+    let key = sidecar_item_relkey(&image).expect("item key");
+    let published = eh::doc(1, None, 0.0);
+    let edited = eh::doc(4, Some("red"), 0.5);
+    let mut record = rec(Kind::Sidecar, ItemState::Dirty);
+    record.sem_hash = Some(sem_hash(&published).expect("sem"));
+    record.blake3 = Some(Blake3Hex::from_bytes(&published));
+    record.vv = vv(&[(DEV_A, 1)]);
+    record.verified_remote = true;
+    record.attested = true;
+    db.insert_item(&key, &record).expect("seed");
+    th::write_file(&item_local_path(root.path(), &key), &edited);
+
+    let mut events = RecordedEvents::default();
+    let mut consumer = EngineConsumer::new(&db, root.path(), &mut events)
+        .expect("consumer")
+        .with_now(900);
+    apply(
+        &db,
+        &mut consumer,
+        &put_sidecar(DEV_B, &image, &edited, vv(&[(DEV_A, 1), (DEV_B, 1)]), 300),
+    );
+
+    let after = item(&db, &key);
+    assert_eq!(after.state, ItemState::Synced);
+    assert_eq!(after.blake3, Some(Blake3Hex::from_bytes(&edited)));
+    assert!(
+        !after.verified_remote,
+        "upload-side verify was never performed for the adopted blake3"
+    );
+    assert!(!after.attested, "no attest entry covers the adopted blake3");
 }

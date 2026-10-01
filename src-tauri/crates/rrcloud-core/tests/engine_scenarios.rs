@@ -1,10 +1,14 @@
-//! The P1 acceptance scenarios (architecture §2.11): S1–S8, Garage-backed,
-//! two or three `SyncDb` "devices" inside one test process, driving
+//! The P1 acceptance scenarios (architecture §2.11), Garage-backed, two
+//! or three `SyncDb` "devices" inside one test process, driving
 //! publish / poll / pump manually through the engine's synchronous-async
-//! entry points. Every scenario asserts by **state equivalence** (full
-//! item records or the cross-device [`common::engine::SyncView`]
-//! projection, vv maps, deleted sets) and **bucket inspection** (key
-//! listings and object bytes), never by smoke signals.
+//! entry points: s1–s8 are the plan's original acceptance suite, and
+//! s9–s11, s13–s20 pin review-round failure interleavings end to end
+//! (s12 was never assigned — the review-round numbering jumped from s11
+//! to s13; the gap is deliberate, nothing was removed). Every scenario
+//! asserts by **state equivalence** (full item records or the
+//! cross-device [`common::engine::SyncView`] projection, vv maps,
+//! deleted sets) and **bucket inspection** (key listings and object
+//! bytes), never by smoke signals.
 //!
 //! Determinism: the §2.6 case-4 winner is `(ts, device)`-driven, and
 //! entry `ts` is frozen at admission from the device's server-time
@@ -32,9 +36,9 @@ use rrcloud_core::keys::{library_key, sidecar_key, tombstone_key, RelKey};
 use rrcloud_core::manifest::{build_manifest, merge};
 use rrcloud_core::publisher::publish_pending;
 use rrcloud_core::reader::{ConsumerError, JournalConsumer as _};
-use rrcloud_core::semhash::{sem_hash, ContentId};
+use rrcloud_core::semhash::{sem_hash, Blake3Hex, ContentId};
 use rrcloud_core::state::{ItemRecord, ItemState, Queue, SyncDb};
-use rrcloud_core::transfer::TransferConfig;
+use rrcloud_core::transfer::{pump_downloads, CancelFlag, TransferConfig, TransferError};
 
 /// One scenario device: its state db, sync root, counting S3 wrapper,
 /// transfer config, and recorded engine events.
@@ -1656,4 +1660,458 @@ async fn s16_churn_divergent_holders_materialize_one_identical_vc() {
     }
     assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
     assert_eq!(eh::sync_view(&a.db), eh::sync_view(&c.db));
+}
+
+// ===========================================================================
+// Review round 1 — the probe-verified interleavings, pinned end to end
+// ===========================================================================
+
+/// Round 1 blockers 1+3: a §2.7 resurrection firing while the ORIGINAL
+/// has an admitted upload in flight. B overwrites the RAW out of band
+/// and admits it (the actively-edited sidecar held back by §3.7); A
+/// deletes the image. Pre-fix, B's resurrection re-advertised the OLD
+/// blake3 under a vv that reused (and, published first, dominated) the
+/// in-flight version's self component: the new RAW version was
+/// unreachable fleet-wide while the bucket key held its bytes — every
+/// fetcher of the winning head wedged CorruptRemote, and two devices
+/// held different blake3s under one vv. Now the in-flight upload IS the
+/// resurrection: one original put on the wire, the new content wins
+/// everywhere, and a fresh device converges onto it.
+#[tokio::test]
+async fn s17_resurrection_with_an_in_flight_original_upload_keeps_the_new_version() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s17-inflight-resurrection");
+    let client = g.client();
+    let mut a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+    let (_v1, _base) = {
+        let mut rest = [&mut b];
+        seed_photo(&image, &a, &mut rest).await
+    };
+
+    // B replaces the RAW out of band (v2) and keeps editing the sidecar.
+    let v2 = th::patterned(2048, 77);
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Original, &v2),
+        ChangeOutcome::MarkedDirty
+    );
+    let doc_b = eh::doc(4, Some("green"), 0.8);
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &doc_b),
+        ChangeOutcome::MarkedDirty
+    );
+    // §3.7: the original quiesces and is admitted; the sidecar (open in
+    // the editor) is held back — the probe's exact window: original
+    // Queued with admitted_vv, upload not yet run.
+    let admitted = admit_pending(&b.db, |k, _| *k == image).expect("admit");
+    assert_eq!(admitted, vec![image.clone()]);
+    let in_flight = b.item(&image).admitted_vv.clone().expect("intent");
+
+    // A deletes the image and publishes the dels.
+    delete_item(
+        &a.db,
+        &a.s3,
+        &bucket,
+        &image,
+        &[Kind::Sidecar, Kind::Original],
+    )
+    .await
+    .expect("delete");
+    publish_pending(&a.db, &a.s3, &bucket)
+        .await
+        .expect("publish dels");
+
+    // B polls: the sidecar's dirty resurrection fires, and the original
+    // rides its in-flight intent instead of a stale re-advertisement.
+    b.poll_apply().await;
+    let orig_b = b.item(&image);
+    assert!(!orig_b.deleted, "live via edits-beat-deletes");
+    assert_eq!(orig_b.state, ItemState::Queued, "upload still owed");
+    assert_eq!(
+        orig_b.admitted_vv,
+        Some(in_flight.clone()),
+        "the in-flight intent stands untouched"
+    );
+    for (_, bytes) in b.db.iter_outbound().expect("outbound") {
+        let entry = rrcloud_core::journal::JournalEntry::from_json_line(
+            std::str::from_utf8(&bytes).expect("utf8"),
+        )
+        .expect("decodes");
+        assert!(
+            !(entry.op == Op::Put && entry.key == library_key(&image)),
+            "no metadata re-advertisement of the original (pre-fix: a put \
+             re-advertising v1's blake3 under a colliding/dominating vv)"
+        );
+    }
+    assert!(b.events.resurrection_incomplete.is_empty());
+
+    // B pumps + publishes: the v2 upload is the original's resurrection.
+    b.sync_up().await;
+    let entries_b = eh::journal_entries_of(&client, &bucket, &dev(DEV_B)).await;
+    let orig_puts: Vec<&JournalEntry> = entries_b
+        .iter()
+        .filter(|e| e.op == Op::Put && e.key == library_key(&image))
+        .collect();
+    assert_eq!(
+        orig_puts.len(),
+        1,
+        "exactly ONE original put on B's wire (pre-fix: two — the stale \
+         re-advertisement and the upload — sharing B's self component)"
+    );
+    assert_eq!(orig_puts[0].vv, in_flight);
+    assert_eq!(orig_puts[0].blake3, Some(Blake3Hex::from_bytes(&v2)));
+    assert_eq!(orig_puts[0].content_id, Some(ContentId::from_bytes(&v2)));
+
+    // The deleter converges onto the new content and un-hides.
+    a.poll_apply().await;
+    a.pump_down().await;
+    assert!(!a.item(&image).deleted && !a.item(&sidecar_rel).deleted);
+    assert!(recently_deleted(&a.db).expect("listing").is_empty());
+    assert_eq!(a.file(&image), v2, "the NEW original version won");
+    assert_eq!(a.file(&sidecar_rel), doc_b);
+    assert_eq!(a.item(&image).blake3, Some(Blake3Hex::from_bytes(&v2)));
+
+    // A fresh device converges to the same head and FETCHES it intact —
+    // the probe's divergence ('vv equal, blake3 different') and the
+    // CorruptRemote poisoning are both gone.
+    let mut c = device(g, &bucket, DEV_C);
+    c.poll_apply().await;
+    c.pump_down().await;
+    assert_eq!(c.file(&image), v2);
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&c.db));
+    assert_eq!(
+        th::get_bytes(&client, &bucket, &library_key(&image)).await,
+        v2,
+        "the bucket key's bytes match the fleet-winning head"
+    );
+}
+
+/// Round 1 blocker 2: the same semantic edit authored independently on
+/// a laggard with a slow clock. X holds uncommitted dirt (rating 5 over
+/// v1) when B's identical-content {B:1} arrives with ts < v1.ts —
+/// concurrent with X's base but file-sem-equal. Pre-fix X silently
+/// adopted the branch that loses the fleet's §2.6 pick: A and B ended
+/// on v1 under {A:1,B:1} while X held B's content under the IDENTICAL
+/// vv — an unhealable divergence with zero events. Now X commits its
+/// dirt (a genuinely newer edit over v1) and the whole fleet converges
+/// on it, with v1 preserved as a vc.
+#[tokio::test]
+async fn s18_laggard_twin_of_uncommitted_dirt_commits_instead_of_adopting_the_loser() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s18-laggard-twin");
+    let client = g.client();
+    let mut a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let mut x = device(g, &bucket, DEV_X);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+
+    // A publishes v1; X applies it. B never does (the laggard).
+    let v1 = eh::doc(3, Some("red"), 0.25);
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Sidecar, &v1),
+        ChangeOutcome::MarkedDirty
+    );
+    a.sync_up().await;
+    x.poll_apply().await;
+    x.pump_down().await;
+    assert_eq!(x.file(&sidecar_rel), v1);
+
+    // The same rating-5 edit on both: X as dirt over v1, B from nothing
+    // with its clock an hour BEHIND (its ts loses to v1's).
+    let r5 = eh::doc(5, Some("red"), 0.25);
+    assert_eq!(
+        x.write_and_notify(&image, Kind::Sidecar, &r5),
+        ChangeOutcome::MarkedDirty
+    );
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &r5),
+        ChangeOutcome::MarkedDirty
+    );
+    b.db.set_server_time_offset_ms(-3_600_000).expect("offset");
+    b.sync_up().await;
+
+    // X applies B's {B:1}: concurrent with X's base {A:1}, file-equal,
+    // and it LOSES the (ts, device) pick against v1 — so the dirt
+    // commits instead of collapsing onto the losing branch.
+    x.poll_apply().await;
+    let committed = x.item(&sidecar_rel);
+    assert_eq!(
+        committed.state,
+        ItemState::Queued,
+        "pre-fix: Synced — X silently adopted the fleet-losing branch"
+    );
+    assert_eq!(
+        committed.admitted_vv,
+        Some([(dev(DEV_A), 1), (dev(DEV_X), 1)].into_iter().collect()),
+        "committed from the v1 base"
+    );
+    assert_eq!(
+        committed.vv,
+        [(dev(DEV_A), 1), (dev(DEV_B), 1)]
+            .into_iter()
+            .collect::<rrcloud_core::clock::VersionVector>(),
+        "B's twin branch still folded"
+    );
+    assert!(
+        x.events.conflicts.is_empty(),
+        "content-equal concurrency is convergence, not a conflict"
+    );
+    x.sync_up().await;
+
+    // Full exchange: everyone folds everyone.
+    a.poll_apply().await;
+    a.pump_down().await;
+    a.sync_up().await; // publishes A's loser-vc materialization (v1)
+    b.poll_apply().await;
+    b.pump_down().await;
+    b.sync_up().await; // publishes B's own round-1 loser vc, if any
+    x.poll_apply().await;
+    x.pump_down().await;
+    a.poll_apply().await;
+    a.pump_down().await;
+    b.poll_apply().await;
+    b.pump_down().await;
+
+    // The fleet agrees — the pre-fix end state was A,B on v1 and X on
+    // B's content under the SAME vv, which this equality catches.
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&x.db));
+    assert_eq!(eh::sync_view(&b.db), eh::sync_view(&x.db));
+    let primary = x.item(&sidecar_rel);
+    assert_eq!(
+        primary.sem_hash,
+        Some(sem_hash(&r5).expect("sem")),
+        "the latest real edit (X's commit) is the fleet primary"
+    );
+    assert_eq!(
+        primary.vv,
+        [(dev(DEV_A), 1), (dev(DEV_B), 1), (dev(DEV_X), 1)]
+            .into_iter()
+            .collect::<rrcloud_core::clock::VersionVector>()
+    );
+    // v1 survives as the deterministic loser vc on every device.
+    let vc_v1 = vc_item_relkey(&image, &loser_vc_suffix(&v1).expect("suffix")).expect("vc");
+    for d in [&a, &b, &x] {
+        assert_eq!(d.file(&sidecar_rel), r5, "primary bytes");
+        assert_eq!(
+            d.item(&vc_v1).sem_hash,
+            Some(sem_hash(&v1).expect("sem")),
+            "v1 is preserved, not destroyed"
+        );
+    }
+    assert_eq!(
+        th::get_bytes(&client, &bucket, &library_key(&vc_v1)).await,
+        eh::semantic(&v1)
+    );
+}
+
+/// Round 1 major 4: a PendingDown receiver converging a strictly
+/// dominating sem-equal head whose BYTES differ (B's detour edit plus a
+/// churned revert uploads churned bytes under v1's sem). Pre-fix the
+/// converge kept v1's blake3, so the receiver's fetch condemned the
+/// healthy remote to CorruptRemote; now the Greater converge adopts the
+/// entry's content identity and the fetch verifies.
+#[tokio::test]
+async fn s19_pending_receiver_of_a_churned_revert_fetches_clean() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s19-churned-revert");
+    let client = g.client();
+    let a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let mut c = device(g, &bucket, DEV_C);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+
+    // A publishes v1. C applies WITHOUT pumping (PendingDown). B holds it.
+    let v1 = eh::doc(3, Some("red"), 0.25);
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Sidecar, &v1),
+        ChangeOutcome::MarkedDirty
+    );
+    a.sync_up().await;
+    c.poll_apply().await;
+    assert_eq!(c.item(&sidecar_rel).state, ItemState::PendingDown);
+    b.poll_apply().await;
+    b.pump_down().await;
+
+    // B detours (real edit) then reverts via a churn rewrite: the gate
+    // reports Unchanged but the standing dirt uploads the churned BYTES
+    // under v1's sem — the bucket key no longer holds v1's bytes.
+    let detour = eh::doc(5, Some("blue"), 0.9);
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &detour),
+        ChangeOutcome::MarkedDirty
+    );
+    let churned = eh::churned(&v1);
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &churned),
+        ChangeOutcome::Unchanged,
+        "churn gate: same sem — but the dirt stands"
+    );
+    b.sync_up().await;
+    assert_eq!(
+        th::get_bytes(&client, &bucket, &sidecar_key(&image)).await,
+        churned,
+        "precondition: the shared key holds the churned bytes"
+    );
+
+    // C converges the Greater sem-equal head: it holds NOTHING locally,
+    // so it must adopt the entry's blake3/size.
+    c.poll_apply().await;
+    let converged = c.item(&sidecar_rel);
+    assert_eq!(converged.state, ItemState::PendingDown);
+    assert_eq!(
+        converged.blake3,
+        Some(Blake3Hex::from_bytes(&churned)),
+        "pre-fix: still v1's blake3 — the fetch below then condemned a \
+         healthy remote to CorruptRemote with the vv already advanced"
+    );
+    assert_eq!(converged.size, churned.len() as u64);
+    c.pump_down().await; // pre-fix: IntegrityMismatch wedge
+    assert_eq!(c.file(&sidecar_rel), churned);
+    assert_eq!(c.item(&sidecar_rel).state, ItemState::Synced);
+
+    // The uploader and the receiver agree exactly; the v1-holding author
+    // keeps its own sem-equal bytes authoritative (the pinned twin rule)
+    // while folding the same vv and head identity.
+    let mut a = a;
+    a.poll_apply().await;
+    assert_eq!(eh::sync_view(&b.db), eh::sync_view(&c.db));
+    let (a_rec, c_rec) = (a.item(&sidecar_rel), c.item(&sidecar_rel));
+    assert_eq!(a_rec.vv, c_rec.vv);
+    assert_eq!(a_rec.sem_hash, c_rec.sem_hash);
+    assert_eq!(a_rec.head_ts, c_rec.head_ts);
+    assert_eq!(a_rec.device, c_rec.device);
+    assert_eq!(
+        a_rec.blake3,
+        Some(Blake3Hex::from_bytes(&v1)),
+        "the holder's local bytes stay authoritative"
+    );
+}
+
+/// Round 1 major 6: concurrent sidecar edits whose LOSING upload lands
+/// last on the §1.2 shared bucket key. B (clock ahead) wins the §2.6
+/// pick but syncs FIRST; A syncs second, so the key holds loser bytes
+/// when A (and a fresh C) adopt the winner's blake3 — both wedge
+/// CorruptRemote on a key nothing pre-fix would ever repair, while
+/// winner-author B stayed Synced and oblivious. Now B's remote-loses
+/// resolution re-marks its head Dirty, the next admission re-publishes
+/// the winner as a fresh dominating version (re-PUTting its bytes), and
+/// the Greater converge rescues every CorruptRemote receiver into the
+/// fetch lane.
+#[tokio::test]
+async fn s20_loser_upload_landing_last_is_repaired_by_the_winning_author() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s20-loser-lands-last");
+    let client = g.client();
+    let mut a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+    {
+        let mut rest = [&mut b];
+        seed_photo(&image, &a, &mut rest).await;
+    }
+
+    // Concurrent edits; B wins every pick (clock an hour ahead) and its
+    // upload lands FIRST — then A's losing upload overwrites the key.
+    let doc_a2 = eh::doc(2, Some("red"), 0.2);
+    let doc_b2 = eh::doc(5, Some("blue"), 0.9);
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Sidecar, &doc_a2),
+        ChangeOutcome::MarkedDirty
+    );
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &doc_b2),
+        ChangeOutcome::MarkedDirty
+    );
+    b.db.set_server_time_offset_ms(3_600_000).expect("offset");
+    b.sync_up().await;
+    a.sync_up().await;
+    assert_eq!(
+        th::get_bytes(&client, &bucket, &sidecar_key(&image)).await,
+        doc_a2,
+        "precondition: the shared key holds the LOSER's bytes"
+    );
+
+    // A resolves (remote wins), preserves its loser vc, and fetches the
+    // winner — straight into the poisoned key: CorruptRemote.
+    a.poll_apply().await;
+    let suffix = loser_vc_suffix(&doc_a2).expect("suffix");
+    let vc_rel = vc_item_relkey(&image, &suffix).expect("vc relkey");
+    assert_eq!(a.events.conflicts.len(), 1);
+    assert_eq!(a.events.conflicts[0].copy_relkey, Some(vc_rel.clone()));
+    let summary = pump_downloads(&a.db, &a.s3, &a.cfg, 2, &CancelFlag::new())
+        .await
+        .expect("pump");
+    assert!(
+        summary
+            .failed
+            .iter()
+            .any(|(k, e)| k == &sidecar_rel
+                && matches!(e, TransferError::IntegrityMismatch { .. })),
+        "the winner's holders advertised a blake3 the key's bytes fail: {:?}",
+        summary.failed
+    );
+    assert_eq!(a.item(&sidecar_rel).state, ItemState::CorruptRemote);
+    a.sync_up().await; // the loser vc still uploads + publishes
+
+    // A fresh third device wedges identically (the probe's C).
+    let mut c = device(g, &bucket, DEV_C);
+    c.poll_apply().await;
+    let summary = pump_downloads(&c.db, &c.s3, &c.cfg, 2, &CancelFlag::new())
+        .await
+        .expect("pump");
+    assert!(summary.failed.iter().any(|(k, _)| k == &sidecar_rel));
+    assert_eq!(c.item(&sidecar_rel).state, ItemState::CorruptRemote);
+
+    // B applies A's losing head: it authored the winner and holds its
+    // bytes quiescently — the resolution re-marks it Dirty so the next
+    // admission re-publishes the winner over the poisoned key.
+    b.poll_apply().await;
+    assert_eq!(
+        b.item(&sidecar_rel).state,
+        ItemState::Dirty,
+        "pre-fix: Synced and oblivious — nothing ever re-uploaded the winner"
+    );
+    b.sync_up().await;
+    b.pump_down().await; // A's vc advertisement
+    assert_eq!(
+        th::get_bytes(&client, &bucket, &sidecar_key(&image)).await,
+        doc_b2,
+        "the repair re-PUT the winner's bytes over the key"
+    );
+
+    // The Greater re-advertisement rescues both wedged receivers.
+    a.poll_apply().await;
+    assert_eq!(a.item(&sidecar_rel).state, ItemState::PendingDown);
+    a.pump_down().await;
+    assert_eq!(a.file(&sidecar_rel), doc_b2);
+    assert_eq!(a.item(&sidecar_rel).state, ItemState::Synced);
+    c.poll_apply().await;
+    c.pump_down().await;
+    assert_eq!(c.file(&sidecar_rel), doc_b2);
+
+    // Fleet truth: winner primary everywhere, loser preserved as the vc,
+    // and the shared key's bytes match the advertised head.
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&c.db));
+    let primary = a.item(&sidecar_rel);
+    assert_eq!(primary.sem_hash, Some(sem_hash(&doc_b2).expect("sem")));
+    assert_eq!(primary.blake3, Some(Blake3Hex::from_bytes(&doc_b2)));
+    for d in [&a, &b, &c] {
+        assert_eq!(
+            d.item(&vc_rel).sem_hash,
+            Some(sem_hash(&doc_a2).expect("sem")),
+            "A's edit survives as the vc"
+        );
+    }
+    assert_eq!(
+        b.puts_to(&sidecar_key(&image)),
+        2,
+        "B's original upload + exactly one repair re-upload"
+    );
 }
