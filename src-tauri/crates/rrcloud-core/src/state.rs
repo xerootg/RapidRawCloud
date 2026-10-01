@@ -39,6 +39,8 @@
 
 use std::path::{Path, PathBuf};
 
+use redb::{ReadableTable, ReadableTableMetadata, TableDefinition};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::clock::{DeviceId, VersionVector};
@@ -167,6 +169,90 @@ impl From<redb::Error> for StateError {
     }
 }
 
+/// Wraps any specific redb error (transaction, table, storage, commit, …)
+/// into the boxed [`StateError::Db`] umbrella.
+fn db_err(e: impl Into<redb::Error>) -> StateError {
+    StateError::Db(Box::new(e.into()))
+}
+
+// ---------------------------------------------------------------------------
+// Table definitions (internal; the typed accessors are the public surface)
+// ---------------------------------------------------------------------------
+
+/// `items`: relkey -> JSON [`ItemRecord`].
+const T_ITEMS: TableDefinition<&str, &[u8]> = TableDefinition::new("items");
+/// `applied`: (device id, seq) -> () — §2.2 idempotent-apply dedup set.
+const T_APPLIED: TableDefinition<(&str, u64), ()> = TableDefinition::new("applied");
+/// `cursors`: device id -> highest contiguously-applied seq.
+const T_CURSORS: TableDefinition<&str, u64> = TableDefinition::new("cursors");
+/// `pending_segments`: seq -> frozen segment bytes (§2.1.5).
+const T_SEGMENTS: TableDefinition<u64, &[u8]> = TableDefinition::new("pending_segments");
+/// `published_segments`: seq -> () — per-seq published flag (out-of-order
+/// publish support; the max also lives in meta as the published cursor).
+const T_PUBLISHED: TableDefinition<u64, ()> = TableDefinition::new("published_segments");
+/// `uploads`: relkey -> JSON [`MultipartUploadState`].
+const T_UPLOADS: TableDefinition<&str, &[u8]> = TableDefinition::new("uploads");
+/// `upload_parts`: (relkey, part number) -> JSON [`UploadPart`].
+const T_UPLOAD_PARTS: TableDefinition<(&str, u32), &[u8]> = TableDefinition::new("upload_parts");
+/// `queue_up` entries: (class, arrival counter) -> relkey. The key encoding
+/// makes a plain ascending range scan yield priority-then-FIFO order.
+const T_QUEUE_UP: TableDefinition<(u8, u64), &str> = TableDefinition::new("queue_up");
+/// `queue_up` index: relkey -> (class, arrival counter) — idempotent-push
+/// membership + O(log n) removal.
+const T_QUEUE_UP_IDX: TableDefinition<&str, (u8, u64)> = TableDefinition::new("queue_up_idx");
+/// `queue_down` entries (same encoding as `queue_up`).
+const T_QUEUE_DOWN: TableDefinition<(u8, u64), &str> = TableDefinition::new("queue_down");
+/// `queue_down` index.
+const T_QUEUE_DOWN_IDX: TableDefinition<&str, (u8, u64)> = TableDefinition::new("queue_down_idx");
+/// `xmp_seen`: relkey -> blake3 hex of the last-imported sidecar bytes.
+const T_XMP_SEEN: TableDefinition<&str, &str> = TableDefinition::new("xmp_seen");
+/// `dcim_seen`: (source path, size, mtime) -> content id hex.
+const T_DCIM_SEEN: TableDefinition<(&str, u64, i64), &str> = TableDefinition::new("dcim_seen");
+/// `meta`: string key -> JSON value (device id, schema version, cursors,
+/// counters).
+const T_META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
+
+/// Meta keys.
+const K_DEVICE_ID: &str = "device_id";
+const K_SCHEMA_VERSION: &str = "schema_version";
+const K_LAST_SEQ: &str = "last_seq";
+const K_PUBLISHED_CURSOR: &str = "published_cursor";
+const K_QUEUE_ARRIVAL: &str = "queue_arrival";
+const K_SERVER_TIME_OFFSET_MS: &str = "server_time_offset_ms";
+
+// ---------------------------------------------------------------------------
+// Encoding helpers
+// ---------------------------------------------------------------------------
+
+fn to_json<T: Serialize>(value: &T) -> Result<Vec<u8>, StateError> {
+    Ok(serde_json::to_vec(value)?)
+}
+
+fn from_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, StateError> {
+    Ok(serde_json::from_slice(bytes)?)
+}
+
+/// Rehydrates a validating string newtype ([`RelKey`], [`Blake3Hex`],
+/// [`ContentId`], [`DeviceId`]) from its stored string form through its own
+/// `Deserialize` impl, so the type's validation runs and a corrupt stored
+/// value surfaces as [`StateError::Codec`], never a panic.
+fn from_stored_str<T: DeserializeOwned>(s: &str) -> Result<T, StateError> {
+    Ok(serde_json::from_value(serde_json::Value::String(
+        s.to_owned(),
+    ))?)
+}
+
+/// Reads a JSON-encoded meta value (`None` when the key is absent).
+fn meta_get<T: DeserializeOwned>(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+    key: &str,
+) -> Result<Option<T>, StateError> {
+    match meta.get(key).map_err(db_err)? {
+        Some(guard) => Ok(Some(from_json(guard.value())?)),
+        None => Ok(None),
+    }
+}
+
 /// Per-item sync state (§2.4 upload rows + §3.5 download/hydration rows).
 ///
 /// Mapping to the design doc:
@@ -271,8 +357,40 @@ impl ItemState {
 /// | `Hydrated` | `PendingDown` | remote advertised a newer version |
 /// | `Hydrated` | `CorruptRemote` | local verify against journal failed remotely |
 pub fn legal(from: ItemState, to: ItemState) -> bool {
-    let _ = (from, to);
-    todo!("P1-U2 green: §2.4 transition table")
+    use ItemState::*;
+    matches!(
+        (from, to),
+        (Dirty, Queued)
+            | (Dirty, Conflict)
+            | (Queued, Uploading)
+            | (Queued, Dirty)
+            | (Uploading, Verifying)
+            | (Uploading, Queued)
+            | (Uploading, Dirty)
+            | (Verifying, Synced)
+            | (Verifying, Queued)
+            | (Verifying, CorruptRemote)
+            | (Synced, Dirty)
+            | (Synced, Conflict)
+            | (Synced, PendingDown)
+            | (Synced, CorruptRemote)
+            | (Synced, Stub)
+            | (CorruptRemote, Queued)
+            | (CorruptRemote, PendingDown)
+            | (Conflict, Dirty)
+            | (Conflict, PendingDown)
+            | (PendingDown, Downloading)
+            | (Downloading, Synced)
+            | (Downloading, Hydrated)
+            | (Downloading, PendingDown)
+            | (Downloading, CorruptRemote)
+            | (Stub, PendingDown)
+            | (Stub, Downloading)
+            | (Hydrated, Stub)
+            | (Hydrated, Dirty)
+            | (Hydrated, PendingDown)
+            | (Hydrated, CorruptRemote)
+    )
 }
 
 /// One item's durable sync record (the `items` table value, §3.2).
@@ -344,6 +462,21 @@ pub enum Queue {
     Down,
 }
 
+/// A queue's entry table: (class, arrival counter) -> relkey.
+type QueueEntriesDef = TableDefinition<'static, (u8, u64), &'static str>;
+/// A queue's index table: relkey -> (class, arrival counter).
+type QueueIndexDef = TableDefinition<'static, &'static str, (u8, u64)>;
+
+impl Queue {
+    /// This queue's (entries, index) table pair.
+    fn tables(self) -> (QueueEntriesDef, QueueIndexDef) {
+        match self {
+            Queue::Up => (T_QUEUE_UP, T_QUEUE_UP_IDX),
+            Queue::Down => (T_QUEUE_DOWN, T_QUEUE_DOWN_IDX),
+        }
+    }
+}
+
 /// The device's durable sync state database (§3.2).
 ///
 /// One per device, at `app_data_dir/rrcloud/state.redb`. Opening takes the
@@ -356,7 +489,6 @@ pub enum Queue {
 /// returns `Ok`, the change is durable (survives SIGKILL).
 #[derive(Debug)]
 pub struct SyncDb {
-    #[allow(dead_code)] // consumed in the green phase
     db: redb::Database,
     device_id: DeviceId,
     path: PathBuf,
@@ -383,8 +515,82 @@ impl SyncDb {
         path: impl AsRef<Path>,
         mint_device_id: Option<DeviceId>,
     ) -> Result<Self, StateError> {
-        let _ = (path.as_ref(), mint_device_id);
-        todo!("P1-U2 green: open/create + meta init + lock/schema gates")
+        let path = path.as_ref().to_path_buf();
+        let db = match redb::Database::create(&path) {
+            Ok(db) => db,
+            Err(redb::DatabaseError::DatabaseAlreadyOpen) => {
+                return Err(StateError::AlreadyLocked { path })
+            }
+            Err(e) => return Err(db_err(e)),
+        };
+
+        // One write transaction: inspect/initialize meta, then make sure
+        // every table exists so read paths never see a missing table. A
+        // refusal below drops the txn un-committed, leaving a fresh file
+        // untouched (a later open with an id can still mint).
+        let txn = db.begin_write().map_err(db_err)?;
+        let device_id = {
+            let mut meta = txn.open_table(T_META).map_err(db_err)?;
+            let stored: Option<DeviceId> = match meta.get(K_DEVICE_ID).map_err(db_err)? {
+                Some(guard) => Some(from_json(guard.value())?),
+                None => None,
+            };
+            match stored {
+                // Fresh database: mint identity + stamp the schema.
+                None => {
+                    let minted = mint_device_id.ok_or(StateError::DeviceIdRequired)?;
+                    meta.insert(K_SCHEMA_VERSION, to_json(&SCHEMA_VERSION)?.as_slice())
+                        .map_err(db_err)?;
+                    meta.insert(K_DEVICE_ID, to_json(&minted)?.as_slice())
+                        .map_err(db_err)?;
+                    minted
+                }
+                // Initialized database: gate on schema, verify identity.
+                Some(stored) => {
+                    let found: Option<u32> = meta
+                        .get(K_SCHEMA_VERSION)
+                        .map_err(db_err)?
+                        .and_then(|guard| serde_json::from_slice(guard.value()).ok());
+                    match found {
+                        Some(v) if v == SCHEMA_VERSION => {}
+                        Some(v) if v > SCHEMA_VERSION => {
+                            return Err(StateError::SchemaTooNew {
+                                found: v,
+                                supported: SCHEMA_VERSION,
+                            });
+                        }
+                        other => return Err(StateError::SchemaUnsupported { found: other }),
+                    }
+                    if let Some(given) = mint_device_id {
+                        if given != stored {
+                            return Err(StateError::DeviceIdMismatch { stored, given });
+                        }
+                    }
+                    stored
+                }
+            }
+        };
+        // Create every other table (no-ops when they already exist).
+        txn.open_table(T_ITEMS).map_err(db_err)?;
+        txn.open_table(T_APPLIED).map_err(db_err)?;
+        txn.open_table(T_CURSORS).map_err(db_err)?;
+        txn.open_table(T_SEGMENTS).map_err(db_err)?;
+        txn.open_table(T_PUBLISHED).map_err(db_err)?;
+        txn.open_table(T_UPLOADS).map_err(db_err)?;
+        txn.open_table(T_UPLOAD_PARTS).map_err(db_err)?;
+        txn.open_table(T_QUEUE_UP).map_err(db_err)?;
+        txn.open_table(T_QUEUE_UP_IDX).map_err(db_err)?;
+        txn.open_table(T_QUEUE_DOWN).map_err(db_err)?;
+        txn.open_table(T_QUEUE_DOWN_IDX).map_err(db_err)?;
+        txn.open_table(T_XMP_SEEN).map_err(db_err)?;
+        txn.open_table(T_DCIM_SEEN).map_err(db_err)?;
+        txn.commit().map_err(db_err)?;
+
+        Ok(SyncDb {
+            db,
+            device_id,
+            path,
+        })
     }
 
     /// This database's device identity (minted on first open).
@@ -397,26 +603,52 @@ impl SyncDb {
         &self.path
     }
 
+    fn begin_read(&self) -> Result<redb::ReadTransaction, StateError> {
+        self.db.begin_read().map_err(db_err)
+    }
+
+    fn begin_write(&self) -> Result<redb::WriteTransaction, StateError> {
+        self.db.begin_write().map_err(db_err)
+    }
+
     // -- items ------------------------------------------------------------
 
     /// Inserts or wholesale-replaces an item record. For ingest/replay
     /// paths; state-machine steps go through [`SyncDb::transition`].
     pub fn put_item(&self, relkey: &RelKey, record: &ItemRecord) -> Result<(), StateError> {
-        let _ = (relkey, record);
-        todo!("P1-U2 green")
+        let value = to_json(record)?;
+        let txn = self.begin_write()?;
+        {
+            let mut items = txn.open_table(T_ITEMS).map_err(db_err)?;
+            items
+                .insert(relkey.as_str(), value.as_slice())
+                .map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 
     /// Reads an item record (`None` when absent). A stored value that does
     /// not parse is [`StateError::Codec`], never a panic.
     pub fn get_item(&self, relkey: &RelKey) -> Result<Option<ItemRecord>, StateError> {
-        let _ = relkey;
-        todo!("P1-U2 green")
+        let txn = self.begin_read()?;
+        let items = txn.open_table(T_ITEMS).map_err(db_err)?;
+        match items.get(relkey.as_str()).map_err(db_err)? {
+            Some(guard) => Ok(Some(from_json(guard.value())?)),
+            None => Ok(None),
+        }
     }
 
     /// Deletes an item record; `Ok(true)` when it existed.
     pub fn delete_item(&self, relkey: &RelKey) -> Result<bool, StateError> {
-        let _ = relkey;
-        todo!("P1-U2 green")
+        let txn = self.begin_write()?;
+        let existed = {
+            let mut items = txn.open_table(T_ITEMS).map_err(db_err)?;
+            let previous = items.remove(relkey.as_str()).map_err(db_err)?;
+            previous.is_some()
+        };
+        txn.commit().map_err(db_err)?;
+        Ok(existed)
     }
 
     /// Performs one §2.4 state transition as a single committed write
@@ -450,36 +682,94 @@ impl SyncDb {
         to: ItemState,
         mutate: impl FnOnce(&mut ItemRecord),
     ) -> Result<ItemRecord, StateError> {
-        let _ = (relkey, expected_from, to, &mutate);
-        todo!("P1-U2 green: single-txn CAS transition")
+        // (1) Static legality — before any storage is consulted.
+        if !legal(expected_from, to) {
+            return Err(StateError::IllegalTransition {
+                relkey: relkey.clone(),
+                from: expected_from,
+                to,
+            });
+        }
+        let txn = self.begin_write()?;
+        let record = {
+            let mut items = txn.open_table(T_ITEMS).map_err(db_err)?;
+            // (2) + (3) Compare-and-set against the stored state. An early
+            // return drops the un-committed txn: nothing is mutated.
+            let stored: ItemRecord = match items.get(relkey.as_str()).map_err(db_err)? {
+                None => {
+                    return Err(StateError::StaleState {
+                        relkey: relkey.clone(),
+                        expected: expected_from,
+                        found: None,
+                    });
+                }
+                Some(guard) => from_json(guard.value())?,
+            };
+            if stored.state != expected_from {
+                return Err(StateError::StaleState {
+                    relkey: relkey.clone(),
+                    expected: expected_from,
+                    found: Some(stored.state),
+                });
+            }
+            let mut record = stored;
+            mutate(&mut record);
+            record.state = to; // the transition owns the state field
+            let value = to_json(&record)?;
+            items
+                .insert(relkey.as_str(), value.as_slice())
+                .map_err(db_err)?;
+            record
+        };
+        txn.commit().map_err(db_err)?;
+        Ok(record)
     }
 
     // -- applied / cursors (§2.2 idempotent apply) -------------------------
 
     /// `true` when `(device, seq)` was already applied.
     pub fn has_applied(&self, device: &DeviceId, seq: u64) -> Result<bool, StateError> {
-        let _ = (device, seq);
-        todo!("P1-U2 green")
+        let txn = self.begin_read()?;
+        let applied = txn.open_table(T_APPLIED).map_err(db_err)?;
+        Ok(applied
+            .get((device.as_str(), seq))
+            .map_err(db_err)?
+            .is_some())
     }
 
     /// Records `(device, seq)` as applied. Idempotent: re-marking is a
     /// committed no-op, not an error.
     pub fn mark_applied(&self, device: &DeviceId, seq: u64) -> Result<(), StateError> {
-        let _ = (device, seq);
-        todo!("P1-U2 green")
+        let txn = self.begin_write()?;
+        {
+            let mut applied = txn.open_table(T_APPLIED).map_err(db_err)?;
+            applied.insert((device.as_str(), seq), ()).map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 
     /// The highest contiguously-applied seq recorded for `device`'s journal
     /// prefix (0 when none).
     pub fn cursor(&self, device: &DeviceId) -> Result<u64, StateError> {
-        let _ = device;
-        todo!("P1-U2 green")
+        let txn = self.begin_read()?;
+        let cursors = txn.open_table(T_CURSORS).map_err(db_err)?;
+        Ok(cursors
+            .get(device.as_str())
+            .map_err(db_err)?
+            .map(|guard| guard.value())
+            .unwrap_or(0))
     }
 
     /// Sets `device`'s cursor.
     pub fn set_cursor(&self, device: &DeviceId, seq: u64) -> Result<(), StateError> {
-        let _ = (device, seq);
-        todo!("P1-U2 green")
+        let txn = self.begin_write()?;
+        {
+            let mut cursors = txn.open_table(T_CURSORS).map_err(db_err)?;
+            cursors.insert(device.as_str(), seq).map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 
     // -- journal publication (§2.1.5) --------------------------------------
@@ -492,12 +782,24 @@ impl SyncDb {
     /// monotonicity). Gaps are allowed (an allocated seq whose segment was
     /// never frozen stays a hole; readers dedup by `(device, seq)`).
     pub fn allocate_seq(&self) -> Result<u64, StateError> {
-        todo!("P1-U2 green")
+        let txn = self.begin_write()?;
+        let next = {
+            let mut meta = txn.open_table(T_META).map_err(db_err)?;
+            let last: u64 = meta_get(&meta, K_LAST_SEQ)?.unwrap_or(0);
+            let next = last + 1;
+            meta.insert(K_LAST_SEQ, to_json(&next)?.as_slice())
+                .map_err(db_err)?;
+            next
+        };
+        txn.commit().map_err(db_err)?;
+        Ok(next)
     }
 
     /// The highest seq [`SyncDb::allocate_seq`] has returned (0 when none).
     pub fn last_allocated_seq(&self) -> Result<u64, StateError> {
-        todo!("P1-U2 green")
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(T_META).map_err(db_err)?;
+        Ok(meta_get(&meta, K_LAST_SEQ)?.unwrap_or(0))
     }
 
     /// Durably freezes `bytes` as the segment for `seq` — the §2.1.5 step
@@ -509,15 +811,39 @@ impl SyncDb {
     /// not already frozen ([`StateError::AlreadyFrozen`] — a segment is
     /// frozen exactly once, replay never re-freezes).
     pub fn freeze_segment(&self, seq: u64, bytes: &[u8]) -> Result<(), StateError> {
-        let _ = (seq, bytes);
-        todo!("P1-U2 green")
+        let txn = self.begin_write()?;
+        {
+            let meta = txn.open_table(T_META).map_err(db_err)?;
+            let last: u64 = meta_get(&meta, K_LAST_SEQ)?.unwrap_or(0);
+            if seq == 0 || seq > last {
+                return Err(StateError::SeqNotAllocated { seq });
+            }
+            let mut segments = txn.open_table(T_SEGMENTS).map_err(db_err)?;
+            if segments.get(seq).map_err(db_err)?.is_some() {
+                return Err(StateError::AlreadyFrozen { seq });
+            }
+            segments.insert(seq, bytes).map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 
     /// All frozen-but-unpublished segments, in ascending seq order, each
     /// with the exact bytes passed to [`SyncDb::freeze_segment`] (byte
     /// identity is the §2.1.5 republish guarantee).
     pub fn unpublished_segments(&self) -> Result<Vec<(u64, Vec<u8>)>, StateError> {
-        todo!("P1-U2 green")
+        let txn = self.begin_read()?;
+        let segments = txn.open_table(T_SEGMENTS).map_err(db_err)?;
+        let published = txn.open_table(T_PUBLISHED).map_err(db_err)?;
+        let mut out = Vec::new();
+        for entry in segments.iter().map_err(db_err)? {
+            let (key, value) = entry.map_err(db_err)?;
+            let seq = key.value();
+            if published.get(seq).map_err(db_err)?.is_none() {
+                out.push((seq, value.value().to_vec()));
+            }
+        }
+        Ok(out)
     }
 
     /// Marks a frozen segment as published (the post-PUT §2.1.5 step) and
@@ -530,13 +856,30 @@ impl SyncDb {
     /// [`SyncDb::unpublished_segments`]. Frozen bytes are retained after
     /// publish in v1 (pruning is a later unit's GC concern).
     pub fn mark_published(&self, seq: u64) -> Result<(), StateError> {
-        let _ = seq;
-        todo!("P1-U2 green")
+        let txn = self.begin_write()?;
+        {
+            let segments = txn.open_table(T_SEGMENTS).map_err(db_err)?;
+            if segments.get(seq).map_err(db_err)?.is_none() {
+                return Err(StateError::NotFrozen { seq });
+            }
+            let mut published = txn.open_table(T_PUBLISHED).map_err(db_err)?;
+            published.insert(seq, ()).map_err(db_err)?;
+            let mut meta = txn.open_table(T_META).map_err(db_err)?;
+            let cursor: u64 = meta_get(&meta, K_PUBLISHED_CURSOR)?.unwrap_or(0);
+            if seq > cursor {
+                meta.insert(K_PUBLISHED_CURSOR, to_json(&seq)?.as_slice())
+                    .map_err(db_err)?;
+            }
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 
     /// The highest published seq (0 when nothing published yet).
     pub fn published_cursor(&self) -> Result<u64, StateError> {
-        todo!("P1-U2 green")
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(T_META).map_err(db_err)?;
+        Ok(meta_get(&meta, K_PUBLISHED_CURSOR)?.unwrap_or(0))
     }
 
     // -- multipart upload resume (§2.4) ------------------------------------
@@ -547,14 +890,26 @@ impl SyncDb {
         relkey: &RelKey,
         upload: &MultipartUploadState,
     ) -> Result<(), StateError> {
-        let _ = (relkey, upload);
-        todo!("P1-U2 green")
+        let value = to_json(upload)?;
+        let txn = self.begin_write()?;
+        {
+            let mut uploads = txn.open_table(T_UPLOADS).map_err(db_err)?;
+            uploads
+                .insert(relkey.as_str(), value.as_slice())
+                .map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 
     /// Reads the multipart state for `relkey`.
     pub fn get_upload(&self, relkey: &RelKey) -> Result<Option<MultipartUploadState>, StateError> {
-        let _ = relkey;
-        todo!("P1-U2 green")
+        let txn = self.begin_read()?;
+        let uploads = txn.open_table(T_UPLOADS).map_err(db_err)?;
+        match uploads.get(relkey.as_str()).map_err(db_err)? {
+            Some(guard) => Ok(Some(from_json(guard.value())?)),
+            None => Ok(None),
+        }
     }
 
     /// Records a completed part. Re-recording a part number replaces it
@@ -565,21 +920,53 @@ impl SyncDb {
         part_no: u32,
         part: &UploadPart,
     ) -> Result<(), StateError> {
-        let _ = (relkey, part_no, part);
-        todo!("P1-U2 green")
+        let value = to_json(part)?;
+        let txn = self.begin_write()?;
+        {
+            let mut parts = txn.open_table(T_UPLOAD_PARTS).map_err(db_err)?;
+            parts
+                .insert((relkey.as_str(), part_no), value.as_slice())
+                .map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 
     /// All recorded parts for `relkey`, ascending by part number.
     pub fn upload_parts(&self, relkey: &RelKey) -> Result<Vec<(u32, UploadPart)>, StateError> {
-        let _ = relkey;
-        todo!("P1-U2 green")
+        let txn = self.begin_read()?;
+        let parts = txn.open_table(T_UPLOAD_PARTS).map_err(db_err)?;
+        let rel = relkey.as_str();
+        let mut out = Vec::new();
+        for entry in parts.range((rel, 0u32)..=(rel, u32::MAX)).map_err(db_err)? {
+            let (key, value) = entry.map_err(db_err)?;
+            let (_, part_no) = key.value();
+            out.push((part_no, from_json(value.value())?));
+        }
+        Ok(out)
     }
 
     /// Removes the multipart state **and all recorded parts** for `relkey`
     /// in one transaction (upload completed or aborted). Idempotent.
     pub fn clear_upload(&self, relkey: &RelKey) -> Result<(), StateError> {
-        let _ = relkey;
-        todo!("P1-U2 green")
+        let rel = relkey.as_str();
+        let txn = self.begin_write()?;
+        {
+            let mut uploads = txn.open_table(T_UPLOADS).map_err(db_err)?;
+            uploads.remove(rel).map_err(db_err)?;
+            let mut parts = txn.open_table(T_UPLOAD_PARTS).map_err(db_err)?;
+            let part_nos: Vec<u32> = parts
+                .range((rel, 0u32)..=(rel, u32::MAX))
+                .map_err(db_err)?
+                .map(|entry| entry.map(|(key, _)| key.value().1))
+                .collect::<Result<_, _>>()
+                .map_err(db_err)?;
+            for part_no in part_nos {
+                parts.remove((rel, part_no)).map_err(db_err)?;
+            }
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 
     // -- transfer queues ---------------------------------------------------
@@ -598,28 +985,91 @@ impl SyncDb {
     /// that want to re-prioritize must [`SyncDb::queue_remove`] first).
     /// Returns `Ok(true)` when newly enqueued.
     pub fn queue_push(&self, q: Queue, relkey: &RelKey, class: u8) -> Result<bool, StateError> {
-        let _ = (q, relkey, class);
-        todo!("P1-U2 green")
+        let (entries_def, idx_def) = q.tables();
+        let rel = relkey.as_str();
+        let txn = self.begin_write()?;
+        let pushed = {
+            let mut idx = txn.open_table(idx_def).map_err(db_err)?;
+            if idx.get(rel).map_err(db_err)?.is_some() {
+                false
+            } else {
+                let mut meta = txn.open_table(T_META).map_err(db_err)?;
+                let arrival: u64 = meta_get(&meta, K_QUEUE_ARRIVAL)?.unwrap_or(0) + 1;
+                meta.insert(K_QUEUE_ARRIVAL, to_json(&arrival)?.as_slice())
+                    .map_err(db_err)?;
+                let mut entries = txn.open_table(entries_def).map_err(db_err)?;
+                entries.insert((class, arrival), rel).map_err(db_err)?;
+                idx.insert(rel, (class, arrival)).map_err(db_err)?;
+                true
+            }
+        };
+        if pushed {
+            txn.commit().map_err(db_err)?;
+        }
+        Ok(pushed)
     }
 
     /// Removes and returns the head of queue `q` — lowest class, then
     /// earliest arrival — or `None` when empty.
     pub fn queue_pop(&self, q: Queue) -> Result<Option<(RelKey, u8)>, StateError> {
-        let _ = q;
-        todo!("P1-U2 green")
+        let (entries_def, idx_def) = q.tables();
+        let txn = self.begin_write()?;
+        let popped = {
+            let mut entries = txn.open_table(entries_def).map_err(db_err)?;
+            let head = match entries.first().map_err(db_err)? {
+                None => None,
+                Some((key, value)) => {
+                    let (class, arrival) = key.value();
+                    let rel = value.value().to_owned();
+                    Some((class, arrival, rel))
+                }
+            };
+            match head {
+                None => None,
+                Some((class, arrival, rel)) => {
+                    entries.remove((class, arrival)).map_err(db_err)?;
+                    let mut idx = txn.open_table(idx_def).map_err(db_err)?;
+                    idx.remove(rel.as_str()).map_err(db_err)?;
+                    Some((from_stored_str::<RelKey>(&rel)?, class))
+                }
+            }
+        };
+        if popped.is_some() {
+            txn.commit().map_err(db_err)?;
+        }
+        Ok(popped)
     }
 
     /// Removes `relkey` from queue `q` wherever it sits; `Ok(true)` when it
     /// was queued.
     pub fn queue_remove(&self, q: Queue, relkey: &RelKey) -> Result<bool, StateError> {
-        let _ = (q, relkey);
-        todo!("P1-U2 green")
+        let (entries_def, idx_def) = q.tables();
+        let rel = relkey.as_str();
+        let txn = self.begin_write()?;
+        let removed = {
+            let mut idx = txn.open_table(idx_def).map_err(db_err)?;
+            let slot = idx.remove(rel).map_err(db_err)?.map(|guard| guard.value());
+            match slot {
+                None => false,
+                Some((class, arrival)) => {
+                    let mut entries = txn.open_table(entries_def).map_err(db_err)?;
+                    entries.remove((class, arrival)).map_err(db_err)?;
+                    true
+                }
+            }
+        };
+        if removed {
+            txn.commit().map_err(db_err)?;
+        }
+        Ok(removed)
     }
 
     /// Number of entries in queue `q`.
     pub fn queue_len(&self, q: Queue) -> Result<u64, StateError> {
-        let _ = q;
-        todo!("P1-U2 green")
+        let (entries_def, _) = q.tables();
+        let txn = self.begin_read()?;
+        let entries = txn.open_table(entries_def).map_err(db_err)?;
+        entries.len().map_err(db_err)
     }
 
     // -- change-detection caches (§2.5) ------------------------------------
@@ -630,14 +1080,24 @@ impl SyncDb {
     /// (which names an *original's* identity) — the §3.2 table list writes
     /// "blake3" for this column.
     pub fn xmp_seen(&self, relkey: &RelKey) -> Result<Option<Blake3Hex>, StateError> {
-        let _ = relkey;
-        todo!("P1-U2 green")
+        let txn = self.begin_read()?;
+        let seen = txn.open_table(T_XMP_SEEN).map_err(db_err)?;
+        match seen.get(relkey.as_str()).map_err(db_err)? {
+            Some(guard) => Ok(Some(from_stored_str(guard.value())?)),
+            None => Ok(None),
+        }
     }
 
     /// Records the imported XMP hash for `relkey`.
     pub fn set_xmp_seen(&self, relkey: &RelKey, hash: &Blake3Hex) -> Result<(), StateError> {
-        let _ = (relkey, hash);
-        todo!("P1-U2 green")
+        let txn = self.begin_write()?;
+        {
+            let mut seen = txn.open_table(T_XMP_SEEN).map_err(db_err)?;
+            seen.insert(relkey.as_str(), hash.as_str())
+                .map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 
     /// DCIM import cache: the content id previously computed for a source
@@ -649,8 +1109,12 @@ impl SyncDb {
         size: u64,
         mtime_unix: i64,
     ) -> Result<Option<ContentId>, StateError> {
-        let _ = (path, size, mtime_unix);
-        todo!("P1-U2 green")
+        let txn = self.begin_read()?;
+        let seen = txn.open_table(T_DCIM_SEEN).map_err(db_err)?;
+        match seen.get((path, size, mtime_unix)).map_err(db_err)? {
+            Some(guard) => Ok(Some(from_stored_str(guard.value())?)),
+            None => Ok(None),
+        }
     }
 
     /// Records a DCIM scan result.
@@ -661,8 +1125,14 @@ impl SyncDb {
         mtime_unix: i64,
         content_id: &ContentId,
     ) -> Result<(), StateError> {
-        let _ = (path, size, mtime_unix, content_id);
-        todo!("P1-U2 green")
+        let txn = self.begin_write()?;
+        {
+            let mut seen = txn.open_table(T_DCIM_SEEN).map_err(db_err)?;
+            seen.insert((path, size, mtime_unix), content_id.as_str())
+                .map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 
     // -- meta --------------------------------------------------------------
@@ -671,13 +1141,21 @@ impl SyncDb {
     /// local; §2.10 GC age rules run on server time), or `None` before the
     /// first measurement.
     pub fn server_time_offset_ms(&self) -> Result<Option<i64>, StateError> {
-        todo!("P1-U2 green")
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(T_META).map_err(db_err)?;
+        meta_get(&meta, K_SERVER_TIME_OFFSET_MS)
     }
 
     /// Stores the server-time offset.
     pub fn set_server_time_offset_ms(&self, offset_ms: i64) -> Result<(), StateError> {
-        let _ = offset_ms;
-        todo!("P1-U2 green")
+        let txn = self.begin_write()?;
+        {
+            let mut meta = txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(K_SERVER_TIME_OFFSET_MS, to_json(&offset_ms)?.as_slice())
+                .map_err(db_err)?;
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 
     /// Test support only: overwrite (or remove, with `None`) the stored
@@ -685,7 +1163,20 @@ impl SyncDb {
     /// the supported API.
     #[doc(hidden)]
     pub fn force_schema_version(&self, version: Option<u32>) -> Result<(), StateError> {
-        let _ = version;
-        todo!("P1-U2 green")
+        let txn = self.begin_write()?;
+        {
+            let mut meta = txn.open_table(T_META).map_err(db_err)?;
+            match version {
+                Some(v) => {
+                    meta.insert(K_SCHEMA_VERSION, to_json(&v)?.as_slice())
+                        .map_err(db_err)?;
+                }
+                None => {
+                    meta.remove(K_SCHEMA_VERSION).map_err(db_err)?;
+                }
+            }
+        }
+        txn.commit().map_err(db_err)?;
+        Ok(())
     }
 }
