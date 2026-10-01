@@ -96,6 +96,51 @@ fn relkey_rejects_colon_segments() {
 }
 
 #[test]
+fn relkey_rejects_windows_reserved_names_and_trailing_dot_or_space() {
+    // Review finding (round 1, major): Win32 resolves reserved device
+    // names (CON/PRN/AUX/NUL/COM1-9/LPT1-9, with or without extension) in
+    // any directory to the device, and strips trailing dots/spaces at
+    // create time — so "a.jpg" and "a.jpg." are distinct bucket keys that
+    // collide onto one Windows file (silent cross-key clobber), and a
+    // benign Linux-created "aux.jpg" would hydrate into a device write.
+    // These must be rejected at the mapping layer, not left to bite the
+    // hydration unit.
+    let bad = [
+        "NUL",
+        "nul",
+        "con.jpg",
+        "AUX.NEF",
+        "2026/com1.raw",
+        "LPT9.txt",
+        "prn.tar.gz",
+        "Con.jpg",
+        "a.jpg ",
+        "a.jpg.",
+        "dir./x.jpg",
+        "dir /x.jpg",
+        "...",
+    ];
+    for s in bad {
+        assert!(RelKey::new(s).is_err(), "{s:?} must be rejected");
+    }
+    // Near-misses stay valid: reservation is base-name-exact.
+    let ok = [
+        "console.jpg",
+        "nullable.NEF",
+        "com0.raw",
+        "com10.raw",
+        "lpt.txt",
+        "aux1/file.jpg",
+        "prnter.txt",
+        "a. jpg",
+    ];
+    for s in ok {
+        let k = RelKey::new(s).unwrap_or_else(|e| panic!("{s:?} rejected: {e}"));
+        assert_eq!(k.as_str(), s);
+    }
+}
+
+#[test]
 fn relkey_nfc_normalizes_composed_and_decomposed_to_same_key() {
     // "Käch.jpg": composed U+00E4 vs decomposed 'a' + U+0308.
     let composed = "K\u{e4}ch.jpg";
@@ -283,13 +328,16 @@ fn preview_and_thumb_key_shapes() {
 }
 
 #[test]
-fn thumbpack_key_is_blake3_prefix16_of_folder_relkey() {
+fn thumbpack_key_is_blake3_prefix32_of_folder_relkey() {
+    // Review finding (round 1): 128-bit prefix, same as tombstones — the
+    // previous 64-bit truncation was adversarially collidable at ~2^32
+    // work and birthday-weak around 2^32 folders.
     let folder = rk("2026/10");
     let expected_hex = blake3::hash(folder.as_str().as_bytes()).to_hex();
-    let expected16 = &expected_hex.as_str()[..16];
+    let expected32 = &expected_hex.as_str()[..32];
     assert_eq!(
         thumbpack_key(&folder),
-        format!(".rrcloud/v1/thumbpacks/{expected16}.tar")
+        format!(".rrcloud/v1/thumbpacks/{expected32}.tar")
     );
 }
 
@@ -468,9 +516,9 @@ fn classify_inverts_content_and_hash_keys() {
     }
     let folder = rk("2026/10");
     match classify_key(&thumbpack_key(&folder)) {
-        KeyClass::Thumbpack { hash16 } => {
+        KeyClass::Thumbpack { hash32 } => {
             let expected = blake3::hash(folder.as_str().as_bytes());
-            assert_eq!(hash16, expected.to_hex().as_str()[..16]);
+            assert_eq!(hash32, expected.to_hex().as_str()[..32]);
         }
         other => panic!("thumbpack key classified as {other:?}"),
     }
@@ -505,6 +553,12 @@ fn classify_rejects_foreign_and_malformed_keys() {
         ".rrcloud/v1/devices/d1f0c2aa-9d2b-4a6e-8f1c-3b7d5e9a0c42.toml",
         // 31-char tombstone hash
         ".rrcloud/v1/tombstones/0123456789abcdef0123456789abcde.json",
+        // 16-hex thumbpack hash (pre-round-1 width; schema is now 32)
+        ".rrcloud/v1/thumbpacks/0123456789abcdef.tar",
+        // non-canonical segment version spellings (v01 aliases v1; v0 is
+        // never emitted) — review finding (round 1)
+        ".rrcloud/v1/journal/d1f0c2aa-9d2b-4a6e-8f1c-3b7d5e9a0c42/000000000000019a.v01.ndjson",
+        ".rrcloud/v1/journal/d1f0c2aa-9d2b-4a6e-8f1c-3b7d5e9a0c42/000000000000019a.v0.ndjson",
         // 63-char content id
         ".rrcloud/v1/previews/af1349b9f5f9a1a6a0404dee36dcc9499bcb25c9adc112b7cc9a93cae41f326.pxy.dng",
         ".rrcloud/v1/thumbs/af1349b9f5f9a1a6a0404dee36dcc9499bcb25c9adc112b7cc9a93cae41f3262_large.jpg",
@@ -561,6 +615,43 @@ fn classify_treats_drive_relative_library_keys_as_foreign() {
     ];
     for k in keys {
         assert_eq!(classify_key(k), KeyClass::Foreign, "{k:?} must be Foreign");
+    }
+}
+
+#[test]
+fn classify_treats_windows_hazard_library_keys_as_foreign() {
+    // Companion to relkey_rejects_windows_reserved_names_and_trailing_dot_
+    // or_space: no such remote-controlled bucket key may reach local_path()
+    // — including via the sidecar-stem path.
+    let keys = [
+        "library/NUL",
+        "library/con.jpg",
+        "library/AUX.NEF",
+        "library/2026/com1.raw",
+        "library/a.jpg ",
+        "library/a.jpg.",
+        "library/aux.NEF.rrdata",
+        "library/con.xmp",
+    ];
+    for k in keys {
+        assert_eq!(classify_key(k), KeyClass::Foreign, "{k:?} must be Foreign");
+    }
+}
+
+#[test]
+fn classify_shadows_rrdata_named_originals_as_sidecars() {
+    // Review finding (round 1): the second documented ambiguity of the
+    // suffix-based schema. A library file literally named "foo.rrdata" has
+    // the same bucket key bytes as the sidecar of "foo", so classify_key
+    // reports Sidecar — consistent with upstream, which already treats
+    // every *.rrdata as a sidecar. Pinned so the reconcile loop (§2.3)
+    // inherits an accurate inverse contract.
+    match classify_key(&library_key(&rk("foo.rrdata"))) {
+        KeyClass::Sidecar { relkey, vc } => {
+            assert_eq!(relkey, rk("foo"));
+            assert_eq!(vc, None);
+        }
+        other => panic!("library foo.rrdata classified as {other:?}, want Sidecar"),
     }
 }
 

@@ -62,6 +62,20 @@ pub enum KeyError {
     /// The local path is not valid Unicode.
     #[error("non-Unicode path")]
     NonUnicode,
+    /// A segment ending in `.` or ` `. Win32 strips trailing dots and
+    /// spaces at file-create time, so the distinct bucket keys
+    /// `library/a.jpg` and `library/a.jpg.` would collide onto one local
+    /// file on a Windows receiver — a silent cross-key clobber that the
+    /// engine's blake3 verification would then misreport as corruption.
+    #[error("segment ends with dot or space: {0:?}")]
+    TrailingDotOrSpace(String),
+    /// A segment whose base name is a Win32 reserved device name
+    /// (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, any
+    /// ASCII case, with or without an extension). Win32 resolves these in
+    /// *any* directory to the device itself, so hydrating such a key on a
+    /// Windows receiver would write to a device or fail the item.
+    #[error("Windows-reserved device name segment: {0:?}")]
+    WindowsReserved(String),
     /// A virtual-copy suffix that is not exactly 6 lowercase hex chars.
     #[error("invalid virtual-copy suffix: {0:?}")]
     BadVcSuffix(String),
@@ -80,8 +94,18 @@ impl RelKey {
     /// Validates and NFC-normalizes a relative path string into a [`RelKey`].
     ///
     /// Rejects empty strings, leading `/`, backslashes, colons, control
-    /// characters, and `.`/`..`/empty segments. Composed and decomposed
-    /// spellings of the same Unicode text normalize to the same [`RelKey`].
+    /// characters, `.`/`..`/empty segments, segments ending in a dot or
+    /// space, and Win32 reserved device names — the full set of segment
+    /// shapes that are ambiguous or hazardous on a Windows receiver (§1.1;
+    /// each rejection's rationale is on its [`KeyError`] variant). Composed
+    /// and decomposed spellings of the same Unicode text normalize to the
+    /// same [`RelKey`].
+    ///
+    /// Interop consequence (documented §1.1 limitation): files whose names
+    /// hit any of these rules are creatable on Linux/macOS libraries but
+    /// can never sync — the mapping layer errors, and the corresponding
+    /// bucket keys classify as [`KeyClass::Foreign`] rather than reaching
+    /// [`local_path`] on any platform.
     pub fn new(s: impl Into<String>) -> Result<Self, KeyError> {
         use unicode_normalization::UnicodeNormalization;
         let raw = s.into();
@@ -101,10 +125,16 @@ impl RelKey {
         if s.starts_with('/') {
             return Err(KeyError::LeadingSlash(s));
         }
-        if s.split('/')
-            .any(|seg| seg.is_empty() || seg == "." || seg == "..")
-        {
-            return Err(KeyError::BadSegment(s));
+        for seg in s.split('/') {
+            if seg.is_empty() || seg == "." || seg == ".." {
+                return Err(KeyError::BadSegment(s));
+            }
+            if seg.ends_with('.') || seg.ends_with(' ') {
+                return Err(KeyError::TrailingDotOrSpace(s));
+            }
+            if is_windows_reserved(seg) {
+                return Err(KeyError::WindowsReserved(s));
+            }
         }
         Ok(RelKey(s))
     }
@@ -112,6 +142,31 @@ impl RelKey {
     /// The normalized relative path, `/`-separated.
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+/// `true` when `seg`'s base name — the part before the first `.`, with any
+/// trailing spaces stripped, matching Win32's own name parsing — is a
+/// reserved device name: `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
+/// `LPT1`–`LPT9`, in any ASCII case. Win32 resolves these, with or without
+/// an extension, in any directory, to the device itself.
+fn is_windows_reserved(seg: &str) -> bool {
+    let base = seg
+        .split('.')
+        .next()
+        .unwrap_or(seg)
+        .trim_end_matches(' ')
+        .as_bytes();
+    match base.len() {
+        3 => [&b"con"[..], b"prn", b"aux", b"nul"]
+            .iter()
+            .any(|r| base.eq_ignore_ascii_case(r)),
+        4 => {
+            (base[..3].eq_ignore_ascii_case(b"com") || base[..3].eq_ignore_ascii_case(b"lpt"))
+                && base[3].is_ascii_digit()
+                && base[3] != b'0'
+        }
+        _ => false,
     }
 }
 
@@ -252,11 +307,17 @@ pub fn thumb_key(content_id: &ContentId, size: ThumbSize) -> String {
     format!("{CONTROL_PREFIX}thumbs/{content_id}_{suffix}.jpg")
 }
 
-/// `.rrcloud/v1/thumbpacks/<blake3(folder relkey)[..16]>.tar` — a per-folder
+/// `.rrcloud/v1/thumbpacks/<blake3(folder relkey)[..32]>.tar` — a per-folder
 /// pack of `_small` thumbs (§4.3). `folder` is the folder's relkey.
+///
+/// The prefix is 128 bits, same as [`tombstone_key`] (review finding, round
+/// 1: the original 64-bit truncation was adversarially collidable at ~2^32
+/// work and birthday-weak; a collision only degrades to per-thumb GETs with
+/// wrong-thumb transients, but the wider prefix costs nothing while the
+/// schema is still open).
 pub fn thumbpack_key(folder: &RelKey) -> String {
     let hex = blake3::hash(folder.as_str().as_bytes()).to_hex();
-    format!("{CONTROL_PREFIX}thumbpacks/{}.tar", &hex.as_str()[..16])
+    format!("{CONTROL_PREFIX}thumbpacks/{}.tar", &hex.as_str()[..32])
 }
 
 /// The schema role of a bucket key, as parsed back by [`classify_key`].
@@ -327,10 +388,10 @@ pub enum KeyClass {
         /// Which flavor.
         size: ThumbSize,
     },
-    /// `.rrcloud/v1/thumbpacks/<hash16>.tar`.
+    /// `.rrcloud/v1/thumbpacks/<hash32>.tar`.
     Thumbpack {
-        /// First 16 lowercase hex chars of `blake3(folder relkey)`.
-        hash16: String,
+        /// First 32 lowercase hex chars of `blake3(folder relkey)`.
+        hash32: String,
     },
     /// `.rrcloud/v1/meta/albums.json`.
     MetaAlbums,
@@ -343,13 +404,23 @@ pub enum KeyClass {
 }
 
 /// Parses a bucket key back into its schema role (§1.2). The exact inverse
-/// of every key constructor in this module; anything unrecognized — or
-/// recognized in shape but malformed in content — is [`KeyClass::Foreign`].
+/// of every key constructor in this module — up to the two documented
+/// ambiguities below; anything unrecognized — or recognized in shape but
+/// malformed in content — is [`KeyClass::Foreign`].
 ///
-/// One deliberate ambiguity, inherited from upstream's 6-hex virtual-copy
-/// recognizer: a file literally named `<stem>.<6hex>` would have its primary
-/// sidecar classified as a virtual copy of `<stem>`. Matches
-/// `list_images_in_dir` behavior.
+/// Two deliberate ambiguities, both inherent to the suffix-based schema and
+/// consistent with upstream's recognizers, which the reconcile loop (§2.3)
+/// must inherit as part of the contract:
+///
+/// 1. Upstream's 6-hex virtual-copy recognizer: a file literally named
+///    `<stem>.<6hex>` would have its primary sidecar classified as a
+///    virtual copy of `<stem>`. Matches `list_images_in_dir` behavior.
+/// 2. `.rrdata`-named originals are shadowed: a library file literally
+///    named `foo.rrdata` has the same bucket key as the sidecar of `foo`,
+///    so `classify_key(library_key("foo.rrdata"))` is
+///    `Sidecar { relkey: "foo", vc: None }`, not `Original`. Upstream
+///    already treats every `*.rrdata` as a sidecar, so this matches local
+///    behavior; such a file simply cannot be synced *as an original*.
 pub fn classify_key(bucket_key: &str) -> KeyClass {
     if let Some(rest) = bucket_key.strip_prefix(LIBRARY_PREFIX) {
         return classify_library_key(rest);
@@ -478,8 +549,8 @@ fn classify_control_key(rest: &str) -> KeyClass {
             }
         }
         "thumbpacks" => match tail.strip_suffix(".tar") {
-            Some(h) if is_lower_hex(h, 16) => KeyClass::Thumbpack {
-                hash16: h.to_string(),
+            Some(h) if is_lower_hex(h, 32) => KeyClass::Thumbpack {
+                hash32: h.to_string(),
             },
             _ => KeyClass::Foreign,
         },

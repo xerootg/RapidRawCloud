@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::clock::{DeviceId, VersionVector};
 use crate::keys::RelKey;
-use crate::semhash::{ContentId, SemHash};
+use crate::semhash::{Blake3Hex, ContentId, SemHash};
 
 /// The journal entry/segment format version this reader+writer supports.
 pub const JOURNAL_VERSION: u32 = 1;
@@ -131,6 +131,17 @@ pub struct JournalEntry {
     /// Object kind.
     pub kind: Kind,
     /// Full bucket key the entry is about.
+    ///
+    /// **Unvalidated on decode** — deliberately, unlike
+    /// [`Tombstone::relkey`]: a journal feed carries keys for every schema
+    /// role (library, previews, meta, …), and the engine may later need to
+    /// read entries about keys this build does not recognize. A decoded
+    /// entry's `key` can therefore be anything a foreign/buggy writer put
+    /// there (`library/../x`, NFD text, garbage). The engine **must** route
+    /// it through [`crate::keys::classify_key`] — which rejects all of that
+    /// as `Foreign` — before acting on it; no path can be derived without a
+    /// validated [`RelKey`], since [`crate::keys::local_path`] only accepts
+    /// one.
     pub key: String,
     /// Per-relkey version vector snapshot (§2.6). Required on **every**
     /// entry, including `attest` (where it snapshots the version whose
@@ -140,9 +151,13 @@ pub struct JournalEntry {
     /// Uploaded object size in bytes (`put` entries).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
-    /// Lowercase hex blake3 of the uploaded/verified bytes.
+    /// Lowercase hex blake3 of the uploaded/verified bytes. Typed and
+    /// validated on decode like `sem_hash`/`content_id`: the eviction
+    /// attestation gate (§3.5), verify-state checks (§2.4) and manifest-row
+    /// merge (§2.3) compare this field, and a malformed digest must fail at
+    /// decode, not silently never-match.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blake3: Option<String>,
+    pub blake3: Option<Blake3Hex>,
     /// Semantic hash (`sidecar` entries, §2.5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sem_hash: Option<SemHash>,
@@ -166,7 +181,8 @@ pub struct JournalEntry {
     /// Local file mtime, unix seconds (`original` entries).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mtime: Option<i64>,
-    /// Previous bucket key (`move` entries).
+    /// Previous bucket key (`move` entries). Unvalidated on decode, same
+    /// contract as [`JournalEntry::key`]: classify before use.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_key: Option<String>,
 }
@@ -277,8 +293,13 @@ pub fn format_segment_filename(seq: u64) -> String {
 }
 
 /// Parses a segment filename (the final path component, not the full key).
-/// Strict: exactly 16 lowercase hex chars, `.v<digits>.ndjson`, nothing
-/// else.
+/// Strict and **canonical**: exactly 16 lowercase hex chars,
+/// `.v<version>.ndjson` where the version is a decimal with no leading
+/// zeros (so `v0` and `v01` are rejected — no conforming writer emits
+/// either, versions start at 1, and accepting them would let two distinct
+/// bucket keys alias one segment identity and break
+/// `format(parse(name)) == name`, weakening [`crate::keys::classify_key`]'s
+/// exact-inverse contract).
 pub fn parse_segment_filename(name: &str) -> Result<SegmentFilename, JournalError> {
     let bad = || JournalError::BadSegmentFilename {
         name: name.to_string(),
@@ -290,7 +311,11 @@ pub fn parse_segment_filename(name: &str) -> Result<SegmentFilename, JournalErro
     }
     let seq = u64::from_str_radix(hex, 16).map_err(|_| bad())?;
     let digits = ver.strip_prefix('v').ok_or_else(bad)?;
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    // starts_with('0') rejects both leading zeros and version 0 itself: a
+    // "v0" segment is a malformed name (corruption), not a parseable
+    // version for the apply loop's min-reader gate to misread as "app
+    // update required".
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return Err(bad());
     }
     let version: u32 = digits.parse().map_err(|_| bad())?;

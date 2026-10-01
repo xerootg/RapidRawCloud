@@ -6,7 +6,7 @@
 //! user-visible change (rating, tags, adjustment values, AI patch blobs)
 //! changes the hash. Invalid JSON is an error, never a default.
 
-use rrcloud_core::semhash::{canonical_json, sem_hash, ContentId, SemHash};
+use rrcloud_core::semhash::{canonical_json, sem_hash, Blake3Hex, ContentId, SemHash};
 use serde_json::{json, Value};
 
 const FULL: &str = include_str!("fixtures/sidecar_full.json");
@@ -56,6 +56,20 @@ fn canonical_json_is_formatting_independent() {
 fn canonical_json_preserves_array_order() {
     let v: Value = serde_json::from_str(r#"{"t":["b","a"]}"#).unwrap();
     assert_eq!(canonical_json(&v), r#"{"t":["b","a"]}"#);
+}
+
+#[test]
+fn canonical_json_normalizes_number_spellings() {
+    // Review finding (round 1, major): JS writers (JSON.stringify / Tauri
+    // IPC) spell integral numbers "100" (parsed as u64) while Rust f64
+    // writers spell them "100.0"; the canonical form must collapse every
+    // spelling of one value to one string.
+    let v: Value = serde_json::from_str(r#"{"a":1.0,"b":-0.0,"c":1e2,"d":1,"e":-5.0}"#).unwrap();
+    assert_eq!(canonical_json(&v), r#"{"a":1,"b":0,"c":100,"d":1,"e":-5}"#);
+    // Non-integral doubles keep serde_json's shortest-round-trip spelling,
+    // which is a pure function of the f64 value.
+    let f: Value = serde_json::from_str(r#"{"x":0.25,"y":2.5e-1}"#).unwrap();
+    assert_eq!(canonical_json(&f), r#"{"x":0.25,"y":0.25}"#);
 }
 
 // ---------------------------------------------------------------------------
@@ -218,6 +232,114 @@ fn semantically_empty_adjustments_equals_absent_adjustments() {
 }
 
 #[test]
+fn number_respelling_does_not_change_hash() {
+    // Review finding (round 1, major): a no-edit load/save round trip
+    // through the other runtime (JS integral spelling vs Rust f64 spelling)
+    // must not change sem_hash — otherwise it produces exactly the spurious
+    // dirties, spurious vv bumps, and junk conflict virtual-copies §2.5
+    // exists to kill, and defeats the §2.6 (key, sem_hash) loser dedup.
+    let equal_pairs = [
+        (
+            r#"{"adjustments":{"exposure":1}}"#,
+            r#"{"adjustments":{"exposure":1.0}}"#,
+        ),
+        (
+            r#"{"adjustments":{"exposure":1}}"#,
+            r#"{"adjustments":{"exposure":1e0}}"#,
+        ),
+        (
+            r#"{"adjustments":{"exposure":0}}"#,
+            r#"{"adjustments":{"exposure":-0.0}}"#,
+        ),
+        (
+            r#"{"adjustments":{"exposure":100}}"#,
+            r#"{"adjustments":{"exposure":1e2}}"#,
+        ),
+        (
+            r#"{"adjustments":{"exposure":-100}}"#,
+            r#"{"adjustments":{"exposure":-1.0e2}}"#,
+        ),
+        (
+            r#"{"adjustments":{"exposure":0.25}}"#,
+            r#"{"adjustments":{"exposure":2.5e-1}}"#,
+        ),
+        (r#"{"rating":3}"#, r#"{"rating":3.0}"#),
+        // Integral f64 beyond 2^53 but inside u64 range still matches the
+        // u64 spelling exactly (integral f64 are exact).
+        (
+            r#"{"adjustments":{"big":10000000000000000000}}"#,
+            r#"{"adjustments":{"big":1e19}}"#,
+        ),
+    ];
+    for (a, b) in equal_pairs {
+        assert_eq!(
+            hash_bytes(a.as_bytes()),
+            hash_bytes(b.as_bytes()),
+            "{a} and {b} must hash identically"
+        );
+    }
+    // But distinct values stay distinct.
+    let distinct_pairs = [
+        (
+            r#"{"adjustments":{"exposure":1}}"#,
+            r#"{"adjustments":{"exposure":2}}"#,
+        ),
+        (
+            r#"{"adjustments":{"exposure":0}}"#,
+            r#"{"adjustments":{"exposure":0.5}}"#,
+        ),
+        (
+            r#"{"adjustments":{"exposure":1}}"#,
+            r#"{"adjustments":{"exposure":-1}}"#,
+        ),
+    ];
+    for (a, b) in distinct_pairs {
+        assert_ne!(
+            hash_bytes(a.as_bytes()),
+            hash_bytes(b.as_bytes()),
+            "{a} and {b} must hash differently"
+        );
+    }
+}
+
+#[test]
+fn nested_residue_collapses_recursively() {
+    // Review finding (round 1): the equivalence closure must hold at every
+    // depth. Upstream's frontend default adjustments spell out sections
+    // (masks: [], aiPatches: []) while Rust writers use json!({}) — "no
+    // edits" must hash identically across writers, and a stripped null must
+    // not leave an {}-residue behind.
+    let h0 = hash_bytes(br#"{"rating":3}"#);
+    for spelled in [
+        r#"{"rating":3,"adjustments":{"foo":{"bar":null}}}"#,
+        r#"{"rating":3,"adjustments":{"masks":[],"aiPatches":[]}}"#,
+        r#"{"rating":3,"adjustments":{"a":{"b":{"c":null}},"d":[],"e":{}}}"#,
+        r#"{"rating":3,"adjustments":{"foo":{"lutPath":null}}}"#,
+    ] {
+        assert_eq!(
+            h0,
+            hash_bytes(spelled.as_bytes()),
+            "{spelled} must hash like absent adjustments"
+        );
+    }
+    // The closure also holds inside a non-empty adjustments.
+    assert_eq!(
+        hash_bytes(br#"{"adjustments":{"exposure":1,"masks":[]}}"#),
+        hash_bytes(br#"{"adjustments":{"exposure":1}}"#),
+    );
+    // Non-empty nested content is kept...
+    assert_ne!(
+        h0,
+        hash_bytes(br#"{"rating":3,"adjustments":{"masks":[{"id":1}]}}"#)
+    );
+    // ...and empty array/object *elements* are positional content.
+    assert_ne!(
+        hash_bytes(br#"{"adjustments":{"masks":[{},{"id":1}]}}"#),
+        hash_bytes(br#"{"adjustments":{"masks":[{"id":1}]}}"#),
+    );
+}
+
+#[test]
 fn empty_tags_equals_absent_tags() {
     // Same closure requirement for tags: `[]`, `null`, and absent are one
     // equivalence class.
@@ -348,6 +470,26 @@ fn content_id_parse_validates() {
         "zf1349b9f5f9a1a6a0404dee36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
     ] {
         assert!(ContentId::parse(bad).is_err(), "{bad:?} must be rejected");
+    }
+}
+
+#[test]
+fn blake3_hex_parse_validates() {
+    // Review finding (round 1): the journal's blake3 field is typed like
+    // its sibling hashes, so a malformed digest fails at decode.
+    let good = "4878ca0425c739fa427f7eda20fe845f6b2e46ba5fe2a14df5b1e32f50603215";
+    assert_eq!(Blake3Hex::parse(good).expect("valid").as_str(), good);
+    assert_eq!(
+        Blake3Hex::from_bytes(b"hello world").as_str(),
+        blake3::hash(b"hello world").to_hex().as_str()
+    );
+    for bad in [
+        "",
+        "4878CA0425C739FA427F7EDA20FE845F6B2E46BA5FE2A14DF5B1E32F50603215",
+        "4878ca",
+        "z878ca0425c739fa427f7eda20fe845f6b2e46ba5fe2a14df5b1e32f50603215",
+    ] {
+        assert!(Blake3Hex::parse(bad).is_err(), "{bad:?} must be rejected");
     }
 }
 

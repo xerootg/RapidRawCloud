@@ -15,7 +15,7 @@ This revision incorporates the adversarial review. The headline protocol changes
 RapidRAW embeds absolute paths everywhere (albums.json, settings, thumbnail cache key, `lutPath`). The cloud namespace is **library-relative**:
 
 - **Sync root** = the library root: Android `getExternalMediaDirs()[0]/.library` (from `get_android_internal_library_root()`, `src-tauri/src/android_integration.rs`); desktop a user-chosen folder (default `app_data_dir/library` per `get_or_create_internal_library_root`, `file_management.rs:3142`).
-- `relkey(path)` = path relative to sync root, `/` separators, Unicode NFC-normalized, no leading slash. Keys containing `\`, control chars, or `..` segments are rejected at the mapping layer. Reverse mapping joins onto the local root. Virtual-copy *virtual paths* (`<abs>?vc=<6hex>`) never appear as keys; only their sidecar files (`<name>.<6hex>.rrdata`) do.
+- `relkey(path)` = path relative to sync root, `/` separators, Unicode NFC-normalized, no leading slash. Keys containing `\`, `:`, control chars, or `.`/`..` segments are rejected at the mapping layer, as are segments ending in a dot or space and segments whose base name is a Win32 reserved device name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, any case, with or without extension). Rationale: the `:` rejection is load-bearing on Windows — `PathBuf::push` of a `C:`-style drive-relative segment *replaces* the accumulated path, so a remote-controlled bucket key could otherwise escape the sync root in the reverse mapping; Win32 resolves reserved device names in any directory to the device itself, and strips trailing dots/spaces at create time, so `library/a.jpg` and `library/a.jpg.` — distinct bucket keys — would silently collide onto one local file on a Windows receiver. Interop consequence (documented limitation): files whose names contain `:` or `\`, end in a dot/space, or are reserved device names are creatable in Linux/macOS libraries but can never sync — `relkey()` errors (the engine surfaces them as unsyncable), and such bucket keys classify as foreign (§2.3 adoption lane), never reaching a local path on any platform. Reverse mapping joins onto the local root. Virtual-copy *virtual paths* (`<abs>?vc=<6hex>`) never appear as keys; only their sidecar files (`<name>.<6hex>.rrdata`) do.
 
 ### 1.2 Key schema
 
@@ -34,7 +34,7 @@ The `library/` prefix is a **byte-faithful mirror of the on-disk library tree**.
 | `.rrcloud/v1/tombstones/<blake3(relkey)[..32]>.json` | Deletion markers: `{relkey, vv, device, server_ts, kinds:["original","sidecar",...]}` |
 | `.rrcloud/v1/previews/<content_id>.pxy.dng` | Smart preview: linear LJPEG DNG proxy (§4) |
 | `.rrcloud/v1/thumbs/<content_id>_small.jpg`, `_medium.jpg` | 480/1280px JPEG thumbs, q75, matching `encode_thumbnail` output |
-| `.rrcloud/v1/thumbpacks/<blake3(folder relkey)[..16]>.tar` | Optional worker-produced per-folder packs of `_small` thumbs (bootstrap accelerator, §4.3) |
+| `.rrcloud/v1/thumbpacks/<blake3(folder relkey)[..32]>.tar` | Optional worker-produced per-folder packs of `_small` thumbs (bootstrap accelerator, §4.3); 128-bit prefix, same as tombstones |
 | `.rrcloud/v1/meta/albums.json`, `meta/presets.json` | Relativized albums + presets docs (§2.9) |
 
 `content_id` = lowercase hex `blake3(original file bytes)` (full 64 hex; prefix-free). Keying previews/thumbs by content, not path, means renames/moves never regenerate previews; the journal maps `relkey → content_id`.

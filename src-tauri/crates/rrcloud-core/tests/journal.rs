@@ -12,7 +12,7 @@ use rrcloud_core::journal::{
     SEGMENT_MAX_ENTRIES,
 };
 use rrcloud_core::keys::{journal_segment_key, RelKey};
-use rrcloud_core::semhash::SemHash;
+use rrcloud_core::semhash::{Blake3Hex, SemHash};
 
 const DEV1: &str = "d1f0c2aa-9d2b-4a6e-8f1c-3b7d5e9a0c42";
 const DEV2: &str = "a3b2e1d0-5c4f-4b3a-9e2d-1f0a9b8c7d6e";
@@ -39,7 +39,7 @@ fn entry(seq: u64, key: &str) -> JournalEntry {
         key: key.to_string(),
         vv: vv(&[(DEV1, 9), (DEV2, 4)]),
         size: Some(48_213),
-        blake3: Some(BLAKE3_HEX.to_string()),
+        blake3: Some(Blake3Hex::parse(BLAKE3_HEX).expect("valid blake3")),
         sem_hash: Some(SemHash::parse(SEMHASH_HEX).expect("valid hash")),
         rating: Some(3),
         color_label: Some("red".to_string()),
@@ -82,7 +82,7 @@ fn doc_example_entry_parses() {
     assert_eq!(e.kind, Kind::Sidecar);
     assert_eq!(e.key, "library/2026/10/IMG_0042.NEF.rrdata");
     assert_eq!(e.size, Some(48_213));
-    assert_eq!(e.blake3.as_deref(), Some(BLAKE3_HEX));
+    assert_eq!(e.blake3.as_ref().map(Blake3Hex::as_str), Some(BLAKE3_HEX));
     assert_eq!(
         e.sem_hash,
         Some(SemHash::parse(SEMHASH_HEX).expect("valid"))
@@ -125,7 +125,7 @@ fn move_and_attest_entries_parse() {
     );
     let e = JournalEntry::from_json_line(&attest).expect("attest entry parses");
     assert_eq!(e.op, Op::Attest);
-    assert_eq!(e.blake3.as_deref(), Some(BLAKE3_HEX));
+    assert_eq!(e.blake3.as_ref().map(Blake3Hex::as_str), Some(BLAKE3_HEX));
     assert_eq!(e.size, None);
 }
 
@@ -203,6 +203,20 @@ fn non_integer_version_is_a_distinct_malformed_error() {
             other => panic!("{spelling:?} must be MalformedVersion, got {other:?}"),
         }
     }
+}
+
+#[test]
+fn malformed_blake3_digest_is_rejected_at_decode() {
+    // Review finding (round 1): sem_hash and content_id were typed,
+    // validated newtypes while blake3 was a raw String — a malformed or
+    // uppercase digest from a foreign/buggy writer decoded without error
+    // and would silently never-match in the §3.5 attestation gate and
+    // §2.4 verify checks. Now it fails at decode like its siblings.
+    let upper = doc_example_line().replace(BLAKE3_HEX, &BLAKE3_HEX.to_uppercase());
+    assert_ne!(upper, doc_example_line(), "test premise");
+    assert!(JournalEntry::from_json_line(&upper).is_err());
+    let short = doc_example_line().replace(BLAKE3_HEX, "abc123");
+    assert!(JournalEntry::from_json_line(&short).is_err());
 }
 
 #[test]
@@ -400,6 +414,15 @@ fn segment_filename_parse_is_strict() {
         "x000000000000019a.v1.ndjson",
         "000000000000019a.v.ndjson",
         "000000000000019a.vx.ndjson",
+        // Review finding (round 1): non-canonical version spellings must
+        // not alias a canonical segment identity ("v01" == "v1" would make
+        // two distinct bucket keys classify to one KeyClass::Journal and
+        // break format(parse(name)) == name), and "v0" — which no writer
+        // ever emits — is a malformed name, not a parseable version for
+        // the min-reader gate to surface as "app update required".
+        "000000000000019a.v01.ndjson",
+        "000000000000019a.v0.ndjson",
+        "000000000000019a.v007.ndjson",
     ];
     for name in bad {
         assert!(
