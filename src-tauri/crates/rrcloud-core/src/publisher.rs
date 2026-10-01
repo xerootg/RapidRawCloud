@@ -30,7 +30,7 @@ use crate::journal::{
 };
 use crate::keys::{device_registry_key, journal_segment_key};
 use crate::s3::{PutObjectOptions, S3Api, S3Error};
-use crate::state::{StateError, SyncDb};
+use crate::state::{StateError, StateTxn, SyncDb};
 
 /// The protocol versions this build can read, advertised in the device
 /// registry entry (§2.2 min-reader rule).
@@ -236,6 +236,32 @@ pub fn enqueue_entry(db: &SyncDb, entry: &JournalEntry) -> Result<u64, Publisher
         return Err(PublisherError::OversizedEntry { size: reserved });
     }
     Ok(db.stage_outbound(line.as_bytes())?)
+}
+
+/// [`enqueue_entry`], but **inside a caller-held transaction** — the §2.4
+/// `verifying → synced` commit needs the journal `put` entry staged in the
+/// *same* committed transaction as the state transition (§2.1.5: a crash
+/// between verify and journal-enqueue must not lose the entry), and
+/// [`enqueue_entry`]'s own `stage_outbound` commit cannot compose with
+/// another transaction.
+///
+/// Identical contract to [`enqueue_entry`] in every other respect: the
+/// staged bytes for a given entry are byte-identical between the two
+/// entry points (same normalization of `v`/`seq`, same oversize refusal
+/// with the same seq-digit headroom), and `entry.device` must equal
+/// `own_device` — the caller passes the db's own identity
+/// ([`crate::state::SyncDb::device_id`]), since the transaction handle
+/// does not carry it. On `Err`, nothing was staged *by this call*;
+/// whether the surrounding transaction commits remains the caller's
+/// decision (the transfer engine propagates the error, which aborts the
+/// whole transaction).
+pub fn enqueue_entry_in(
+    txn: &StateTxn<'_>,
+    own_device: &DeviceId,
+    entry: &JournalEntry,
+) -> Result<u64, PublisherError> {
+    let _ = (txn, own_device, entry);
+    todo!("P1-U4: stage one normalized outbound entry inside the caller's transaction")
 }
 
 /// Decodes one staged outbound record back into a [`JournalEntry`],

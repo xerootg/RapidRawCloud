@@ -159,3 +159,213 @@ pub use multipart::{
     ListMultipartUploadsOutput, ListMultipartUploadsRequest, ListPartsOutput, ListPartsRequest,
     MultipartUploadSummary, PartBody, PartSummary, UploadPartOutput,
 };
+
+/// The additional [`S3Client`] operations the §2.4/§3.5 transfer engine
+/// uses on top of [`S3Api`]: the multipart lifecycle (create/upload/
+/// complete/abort, plus the `ListParts`/`ListMultipartUploads` resume and
+/// stale-upload-hygiene listings) and `DeleteObject` (the backend digest
+/// probe must remove its probe object when a non-verifying backend
+/// accepted it).
+///
+/// Split from [`S3Api`] rather than widening it (additive extension): the
+/// journal/manifest/registry lanes never touch multipart, and their
+/// existing test doubles must keep compiling untouched. Same dispatch
+/// contract as [`S3Api`]: static only, callers are generic over
+/// `&impl S3TransferApi`, production code passes the concrete
+/// [`S3Client`], whose impl is pure delegation. Test wrappers (call
+/// counters pinning "completed parts are never re-uploaded", in-flight
+/// gauges pinning the §2.4 concurrency cap, and fault injectors modeling
+/// digest-accepting backends, corrupted parts, and cut streams) interpose
+/// here.
+#[allow(async_fn_in_trait)] // engine-internal seam; no dyn dispatch (see S3Api)
+pub trait S3TransferApi: S3Api {
+    /// [`S3Client::delete_object`].
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3Error>;
+
+    /// [`S3Client::create_multipart_upload`].
+    async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        opts: &PutObjectOptions,
+    ) -> Result<CreateMultipartUploadOutput, S3Error>;
+
+    /// [`S3Client::upload_part`].
+    async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        body: PartBody,
+        content_md5: Option<&str>,
+    ) -> Result<UploadPartOutput, S3Error>;
+
+    /// [`S3Client::complete_multipart_upload`].
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[CompletedPart],
+    ) -> Result<CompleteMultipartUploadOutput, S3Error>;
+
+    /// [`S3Client::abort_multipart_upload`].
+    async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), S3Error>;
+
+    /// [`S3Client::list_multipart_uploads`].
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        request: &ListMultipartUploadsRequest,
+    ) -> Result<ListMultipartUploadsOutput, S3Error>;
+
+    /// [`S3Client::list_parts`].
+    async fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        request: &ListPartsRequest,
+    ) -> Result<ListPartsOutput, S3Error>;
+}
+
+impl S3TransferApi for S3Client {
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
+        let _ = (bucket, key);
+        todo!("P1-U4: delegate to S3Client::delete_object")
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        opts: &PutObjectOptions,
+    ) -> Result<CreateMultipartUploadOutput, S3Error> {
+        let _ = (bucket, key, opts);
+        todo!("P1-U4: delegate to S3Client::create_multipart_upload")
+    }
+
+    async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        body: PartBody,
+        content_md5: Option<&str>,
+    ) -> Result<UploadPartOutput, S3Error> {
+        let _ = (bucket, key, upload_id, part_number, body, content_md5);
+        todo!("P1-U4: delegate to S3Client::upload_part")
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[CompletedPart],
+    ) -> Result<CompleteMultipartUploadOutput, S3Error> {
+        let _ = (bucket, key, upload_id, parts);
+        todo!("P1-U4: delegate to S3Client::complete_multipart_upload")
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), S3Error> {
+        let _ = (bucket, key, upload_id);
+        todo!("P1-U4: delegate to S3Client::abort_multipart_upload")
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        request: &ListMultipartUploadsRequest,
+    ) -> Result<ListMultipartUploadsOutput, S3Error> {
+        let _ = (bucket, request);
+        todo!("P1-U4: delegate to S3Client::list_multipart_uploads")
+    }
+
+    async fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        request: &ListPartsRequest,
+    ) -> Result<ListPartsOutput, S3Error> {
+        let _ = (bucket, key, upload_id, request);
+        todo!("P1-U4: delegate to S3Client::list_parts")
+    }
+}
+
+impl<T: S3TransferApi> S3TransferApi for &T {
+    async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), S3Error> {
+        T::delete_object(self, bucket, key).await
+    }
+
+    async fn create_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        opts: &PutObjectOptions,
+    ) -> Result<CreateMultipartUploadOutput, S3Error> {
+        T::create_multipart_upload(self, bucket, key, opts).await
+    }
+
+    async fn upload_part(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        part_number: u32,
+        body: PartBody,
+        content_md5: Option<&str>,
+    ) -> Result<UploadPartOutput, S3Error> {
+        T::upload_part(self, bucket, key, upload_id, part_number, body, content_md5).await
+    }
+
+    async fn complete_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        parts: &[CompletedPart],
+    ) -> Result<CompleteMultipartUploadOutput, S3Error> {
+        T::complete_multipart_upload(self, bucket, key, upload_id, parts).await
+    }
+
+    async fn abort_multipart_upload(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+    ) -> Result<(), S3Error> {
+        T::abort_multipart_upload(self, bucket, key, upload_id).await
+    }
+
+    async fn list_multipart_uploads(
+        &self,
+        bucket: &str,
+        request: &ListMultipartUploadsRequest,
+    ) -> Result<ListMultipartUploadsOutput, S3Error> {
+        T::list_multipart_uploads(self, bucket, request).await
+    }
+
+    async fn list_parts(
+        &self,
+        bucket: &str,
+        key: &str,
+        upload_id: &str,
+        request: &ListPartsRequest,
+    ) -> Result<ListPartsOutput, S3Error> {
+        T::list_parts(self, bucket, key, upload_id, request).await
+    }
+}

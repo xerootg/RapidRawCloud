@@ -29,6 +29,11 @@ bytes = "1"
 # phone"). The only new dependency added by the journal-engine unit (P1-U3);
 # pure-Rust default backend (miniz_oxide), no C toolchain requirement.
 flate2 = "1"
+# §3.5 mtime restore on download/hydration: stubs and hydrated originals
+# must carry the remote original's mtime so the thumbnail cache hash
+# (blake3(abs path, mtime, adjustments)) stays stable across hydration.
+# Named by the architecture explicitly ("mtime set ... via `filetime`").
+filetime = "0.2"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
@@ -60,6 +65,20 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"
+# Promoted from dev-dependency by the transfer-engine unit (P1-U4): §2.4
+# names `tokio::sync::Semaphore` as the transfer-concurrency primitive, and
+# the streamed per-part reads use `tokio::fs`/`io-util`. No new transitive
+# surface: reqwest 0.13 (above) already drives tokio on every async path,
+# so this only makes the existing runtime dependency explicit. No runtime
+# features (`rt`/`macros`) — the engine never spawns; concurrency is
+# structured (`FuturesUnordered` + `Semaphore`) on the caller's runtime.
+# `tokio_util` (CancellationToken) is deliberately NOT added: the pump's
+# cancel flag is a plain atomic (see `transfer::CancelFlag`).
+tokio = { version = "1", default-features = false, features = [
+    "fs",
+    "io-util",
+    "sync",
+] }
 time = { version = "0.3", features = ["formatting", "macros"] }
 unicode-normalization = "0.1"
 
@@ -74,6 +93,9 @@ test-util = []
 
 [dev-dependencies]
 base64 = "0.22"
+# Tests set source mtimes explicitly (the §2.4 size+mtime source-change
+# recheck must not depend on filesystem timestamp granularity).
+filetime = "0.2"
 # Self-dependency: enables `test-util` when building this crate's tests,
 # without any production build ever carrying the feature.
 rrcloud-core = { path = ".", features = ["test-util"] }
@@ -95,4 +117,14 @@ libc = "0.2"
 # libtest's harness would get in the way of child stdout and exit codes.
 [[test]]
 name = "state_crash"
+harness = false
+
+# Crash-injection suite for the transfer engine (§2.4 multipart resume):
+# the binary re-execs itself as an uploading child against the shared
+# Garage server, the parent SIGKILLs it between completed parts
+# (coordinated by part-complete ACK lines), then resumes with a fresh
+# engine instance and asserts completed parts are never re-uploaded.
+# harness = false for the same reason as state_crash.
+[[test]]
+name = "transfer_crash"
 harness = false

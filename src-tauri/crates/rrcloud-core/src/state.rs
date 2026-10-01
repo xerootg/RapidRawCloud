@@ -2007,6 +2007,24 @@ impl SyncDb {
         })
     }
 
+    /// The persisted outcome of the §2.4 setup probe ("does this backend
+    /// reject a deliberately wrong `Content-MD5`?"), or `None` before the
+    /// probe has ever run against this backend. `Some(false)` is the
+    /// `requires_readback_verify` condition: the `verifying` step must
+    /// perform a full ranged-GET re-hash because the backend performs no
+    /// digest verification of its own.
+    pub fn backend_digest_rejection(&self) -> Result<Option<bool>, StateError> {
+        todo!("P1-U4: read the probed digest-rejection flag from the meta table")
+    }
+
+    /// Persists the §2.4 setup-probe outcome (see
+    /// [`SyncDb::backend_digest_rejection`]). Overwrites any previous
+    /// probe result — re-probing against a reconfigured backend must win.
+    pub fn set_backend_digest_rejection(&self, works: bool) -> Result<(), StateError> {
+        let _ = works;
+        todo!("P1-U4: persist the probed digest-rejection flag in the meta table")
+    }
+
     // -- test support (not part of the supported API) ----------------------
     //
     // The force_* tamper/corruption helpers are compiled only under the

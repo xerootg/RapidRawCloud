@@ -163,6 +163,25 @@ impl PartBody {
             PartBodyInner::Stream { content_length, .. } => *content_length,
         }
     }
+
+    /// Decomposes the body into a chunk stream plus its content length —
+    /// the interposition seam for [`crate::s3::S3TransferApi`] test
+    /// wrappers (which must be able to inspect, tamper with, or re-wrap a
+    /// part body before forwarding it to a real client). A buffered body
+    /// becomes a one-chunk stream.
+    pub fn into_stream(self) -> (BoxStream<'static, Result<Bytes, std::io::Error>>, u64) {
+        use futures::StreamExt as _;
+        match self.inner {
+            PartBodyInner::Bytes(b) => {
+                let len = b.len() as u64;
+                (futures::stream::once(async move { Ok(b) }).boxed(), len)
+            }
+            PartBodyInner::Stream {
+                stream,
+                content_length,
+            } => (stream, content_length),
+        }
+    }
 }
 
 impl From<Bytes> for PartBody {

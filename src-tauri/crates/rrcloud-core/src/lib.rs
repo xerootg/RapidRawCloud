@@ -20,9 +20,13 @@
 //!   cursors (§2.2).
 //! - [`manifest`]: per-writer manifests — build/encode/transfer/merge
 //!   (§2.3).
+//! - [`transfer`]: the per-item transfer engine — resumable
+//!   uploads/downloads, Content-MD5, streamed blake3, temp+verify+rename,
+//!   the backend digest probe, and the concurrency pump (§2.4, §3.5,
+//!   §2.1.5).
 //!
-//! The remaining modules from architecture §3.1 (`engine`, `transfer`,
-//! `tombstone`, `compact`, `proxy`, `thumbs`) land in later units.
+//! The remaining modules from architecture §3.1 (`engine`, `tombstone`,
+//! `compact`, `proxy`, `thumbs`) land in later units.
 
 pub mod clock;
 pub mod journal;
@@ -33,6 +37,7 @@ pub mod reader;
 pub mod s3;
 pub mod semhash;
 pub mod state;
+pub mod transfer;
 
 /// Crate-private helpers shared across modules.
 pub(crate) mod hexutil {
