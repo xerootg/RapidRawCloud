@@ -13,16 +13,18 @@
 //! - [`semhash`]: semantic sidecar hashing and content hashing (§2.5).
 //! - [`clock`]: device identity, version vectors, conflict winner (§2.6).
 //! - [`journal`]: journal entry/segment schema and tombstones (§2.2, §2.7).
+//! - [`state`]: the redb-backed durable state store (§3.2, §2.1.5, §2.4).
 //!
-//! The remaining modules from architecture §3.1 (`manifest`, `state`,
-//! `engine`, `transfer`, `tombstone`, `compact`, `proxy`, `thumbs`) land in
-//! later units.
+//! The remaining modules from architecture §3.1 (`manifest`, `engine`,
+//! `transfer`, `tombstone`, `compact`, `proxy`, `thumbs`) land in later
+//! units.
 
 pub mod clock;
 pub mod journal;
 pub mod keys;
 pub mod s3;
 pub mod semhash;
+pub mod state;
 
 /// Crate-private helpers shared across modules.
 pub(crate) mod hexutil {

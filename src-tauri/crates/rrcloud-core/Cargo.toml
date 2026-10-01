@@ -14,6 +14,13 @@ publish = false
 
 [dependencies]
 blake3 = "1"
+# State store (§3.2). The only runtime dependency added by the state-store
+# unit: pure Rust, shadow-paging B-tree, commits durable at commit() with the
+# default durability — empirically verified (P1-U2): cross-process second
+# open FAILS immediately (~µs) with DatabaseError::DatabaseAlreadyOpen (no
+# blocking), which is exactly the §5.1 app/worker mutual exclusion; the file
+# lock is kernel-released on SIGKILL so crash reopen works.
+redb = "2"
 bytes = "1"
 futures = "0.3"
 hex = "0.4"
@@ -52,6 +59,7 @@ unicode-normalization = "0.1"
 [dev-dependencies]
 base64 = "0.22"
 md-5 = "0.10"
+tempfile = "3"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -61,3 +69,11 @@ tokio = { version = "1", features = [
 
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
+
+# Crash-injection + lock-exclusivity suite for the redb state store (§2.1.5,
+# §5.1). harness = false: the binary re-execs itself as a writer/locker child
+# (dispatched on an env var), and the parent SIGKILLs it mid-commit-loop —
+# libtest's harness would get in the way of child stdout and exit codes.
+[[test]]
+name = "state_crash"
+harness = false
