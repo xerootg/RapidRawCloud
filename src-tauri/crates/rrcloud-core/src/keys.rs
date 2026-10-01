@@ -32,6 +32,16 @@ pub const ALBUMS_META_KEY: &str = ".rrcloud/v1/meta/albums.json";
 /// Key of the relativized presets document (§2.9).
 pub const PRESETS_META_KEY: &str = ".rrcloud/v1/meta/presets.json";
 
+/// Segment prefix of the engine's reserved local temp namespace. The
+/// §3.5 download engine streams into `.rr.part-<name>` next to the final
+/// file (`crate::transfer::partial_path`), so any relkey segment starting
+/// with `.rr.` is rejected ([`KeyError::EngineReserved`]) — the whole
+/// prefix, not just `.rr.part-`, so future engine temp names never
+/// re-open the hole. This is what makes an engine temp path
+/// non-expressible as a relkey (see the variant doc for the collision it
+/// prevents).
+pub const ENGINE_TEMP_PREFIX: &str = ".rr.";
+
 /// Error from relkey mapping or key construction.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeyError {
@@ -77,6 +87,20 @@ pub enum KeyError {
     /// Windows receiver would write to a device or fail the item.
     #[error("Windows-reserved device name segment: {0:?}")]
     WindowsReserved(String),
+    /// A segment beginning with [`ENGINE_TEMP_PREFIX`] (`.rr.`) — the
+    /// engine's own reserved temp namespace. The §3.5 download engine
+    /// streams into `<dir>/.rr.part-<name>` next to the final file, so a
+    /// library file literally named `.rr.part-foo.NEF` would make one
+    /// relkey's *final* path another relkey's *partial* path: downloading
+    /// `dir/foo.NEF` would adopt `dir/.rr.part-foo.NEF`'s installed,
+    /// verified bytes as its own surviving partial, fail the blake3
+    /// backstop, and the scratch retry would delete the sibling's file
+    /// while its record still read `hydrated` (review finding, round 3).
+    /// Rejected by the same standard as [`KeyError::WindowsReserved`]:
+    /// distinct bucket keys must never silently collide onto one local
+    /// file.
+    #[error("engine-reserved temp-namespace segment (`.rr.` prefix): {0:?}")]
+    EngineReserved(String),
     /// A virtual-copy suffix that is not exactly 6 lowercase hex chars.
     #[error("invalid virtual-copy suffix: {0:?}")]
     BadVcSuffix(String),
@@ -110,9 +134,12 @@ impl RelKey {
     ///
     /// Rejects empty strings, leading `/`, backslashes, colons, control
     /// characters, `.`/`..`/empty segments, segments ending in a dot or
-    /// space, and Win32 reserved device names — the full set of segment
-    /// shapes that are ambiguous or hazardous on a Windows receiver (§1.1;
-    /// each rejection's rationale is on its [`KeyError`] variant). Composed
+    /// space, Win32 reserved device names — the full set of segment
+    /// shapes that are ambiguous or hazardous on a Windows receiver — and
+    /// segments in the engine's own reserved temp namespace
+    /// ([`ENGINE_TEMP_PREFIX`], which would collide a relkey's final path
+    /// with a sibling's `.rr.part` partial) (§1.1; each rejection's
+    /// rationale is on its [`KeyError`] variant). Composed
     /// and decomposed spellings of the same Unicode text normalize to the
     /// same [`RelKey`].
     ///
@@ -146,6 +173,9 @@ impl RelKey {
             }
             if seg.ends_with('.') || seg.ends_with(' ') {
                 return Err(KeyError::TrailingDotOrSpace(s));
+            }
+            if seg.starts_with(ENGINE_TEMP_PREFIX) {
+                return Err(KeyError::EngineReserved(s));
             }
             if is_windows_reserved(seg) {
                 return Err(KeyError::WindowsReserved(s));

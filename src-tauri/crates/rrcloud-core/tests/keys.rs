@@ -174,6 +174,51 @@ fn relkey_rejects_superscript_com_lpt_variants() {
 }
 
 #[test]
+fn relkey_rejects_engine_reserved_temp_segments() {
+    // Review finding (round 3, major): the §3.5 download engine streams
+    // into `<dir>/.rr.part-<name>` next to the final file, and nothing
+    // reserved that namespace — so relkey `dir/.rr.part-foo.NEF`'s FINAL
+    // path was relkey `dir/foo.NEF`'s PARTIAL path. Downloading the
+    // latter would adopt the former's installed, verified file as its own
+    // surviving partial, fail the blake3 backstop, and the scratch retry
+    // would DELETE the sibling's bytes while its record still read
+    // Hydrated. Same standard as the Win32 reserved-name rejections:
+    // distinct bucket keys must never silently collide onto one local
+    // file. The whole `.rr.` segment prefix is reserved so future engine
+    // temp names never re-open the hole.
+    let bad = [
+        ".rr.part-foo.NEF",
+        "dir/.rr.part-foo.NEF",
+        "dir/.rr.part-foo.NEF.rrdata",
+        "2026/10/.rr.part-IMG_0042.raw",
+        ".rr.tmp-anything",
+        ".rr.x",
+    ];
+    for s in bad {
+        assert!(RelKey::new(s).is_err(), "{s:?} must be rejected");
+        assert!(
+            RelKey::parse_wire(s).is_err(),
+            "{s:?} must be rejected on the wire too"
+        );
+    }
+    // Near-misses stay valid: the reservation is the `.rr.` segment
+    // PREFIX, exactly the shape the engine's temp names occupy.
+    let ok = [
+        ".rrdata",
+        "dir/.rrdata",
+        ".rrcloud",
+        ".rr",
+        "x.rr.part-foo.NEF",
+        "dir.rr.part/foo.NEF",
+        "rr.part-foo.NEF",
+    ];
+    for s in ok {
+        let k = RelKey::new(s).unwrap_or_else(|e| panic!("{s:?} rejected: {e}"));
+        assert_eq!(k.as_str(), s);
+    }
+}
+
+#[test]
 fn relkey_nfc_normalizes_composed_and_decomposed_to_same_key() {
     // "Käch.jpg": composed U+00E4 vs decomposed 'a' + U+0308.
     let composed = "K\u{e4}ch.jpg";
@@ -702,6 +747,25 @@ fn classify_treats_windows_hazard_library_keys_as_foreign() {
         "library/a.jpg.",
         "library/aux.NEF.rrdata",
         "library/con.xmp",
+    ];
+    for k in keys {
+        assert_eq!(classify_key(k), KeyClass::Foreign, "{k:?} must be Foreign");
+    }
+}
+
+#[test]
+fn classify_treats_engine_temp_library_keys_as_foreign() {
+    // Companion to relkey_rejects_engine_reserved_temp_segments: a bucket
+    // key naming an engine temp file (e.g. synced into the bucket by a
+    // foreign tool like rclone from a library mid-download) must classify
+    // Foreign — adopted, never hydrated onto a path the live engine may
+    // be streaming into. Includes the sidecar-stem path: the sidecar
+    // bucket key of a `.rr.part-` name must not reach local_path either.
+    let keys = [
+        "library/.rr.part-foo.NEF",
+        "library/dir/.rr.part-foo.NEF",
+        "library/dir/.rr.part-foo.NEF.rrdata",
+        "library/dir/.rr.part-foo.NEF.xmp",
     ];
     for k in keys {
         assert_eq!(classify_key(k), KeyClass::Foreign, "{k:?} must be Foreign");

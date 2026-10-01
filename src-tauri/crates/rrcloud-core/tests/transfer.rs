@@ -3296,3 +3296,267 @@ async fn abort_stale_uploads_keeps_the_partial_report_when_one_abort_fails() {
         "only the abort-failed upload remains on the backend"
     );
 }
+
+#[test]
+fn partial_paths_are_never_expressible_as_relkeys() {
+    // Review finding (round 3, major): `partial_path` names the §3.5 temp
+    // file `<dir>/.rr.part-<name>`, and RelKey validation used to accept
+    // that spelling — so relkey `dir/.rr.part-foo.NEF`'s FINAL path was
+    // relkey `dir/foo.NEF`'s PARTIAL path, and downloading the latter
+    // adopted (then, on the hash-backstop scratch retry, DELETED) the
+    // former's installed, verified file while its record still read
+    // Hydrated. The engine's temp namespace must be reserved the same way
+    // §1.1 reserves Win32 device names: the partial of every transferable
+    // target must not map back to any valid relkey.
+    let root = Path::new("/sync");
+    let r = rel("dir/foo.NEF");
+    for kind in [Kind::Original, Kind::Sidecar, Kind::Xmp] {
+        let final_path = local_target_path(root, &r, kind);
+        let partial = partial_path(&final_path);
+        let partial_rel = partial
+            .strip_prefix(root)
+            .expect("partial lives under the root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert!(
+            rrcloud_core::keys::RelKey::new(partial_rel.clone()).is_err(),
+            "{partial_rel:?} (the {kind:?} partial) must be rejected as a relkey"
+        );
+    }
+}
+
+#[tokio::test]
+async fn pump_keeps_the_queue_row_when_a_live_external_driver_later_fails() {
+    // Review finding (round 3, minor): the pump pops an item's row, loses
+    // the entry CAS to a live external driver (the documented §3.5
+    // ensure_local race, typed StaleState), and the end-of-pass requeue
+    // used to DROP the row because the state was pipeline-interior. If
+    // that external transfer then failed — demoting the item back to
+    // `queued` WITHOUT pushing a row (upload_item never pushes rows) —
+    // the item was queueable-but-invisible to every later pump pass until
+    // a process restart re-ran the startup row rebuild. The row must
+    // instead be re-pushed while the state is the queue's own
+    // pipeline-interior counterpart: a still-live or succeeded transfer
+    // just gets the row CAS-rejected and re-dropped next pass.
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-pump-extdrv");
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("pump/ext.NEF");
+    let src = local_target_path(root.path(), &r, Kind::Original);
+    h::write_file(&src, &h::patterned(64 * 1024, 31));
+    h::seed_queued(&db, &r, Kind::Original, &src);
+    db.queue_push(Queue::Up, &r, 0).expect("queue_push");
+    // The external §3.5 driver wins the entry CAS before the pump's own
+    // attempt (it holds the item at `uploading` for the whole pass).
+    h::advance(&db, &r, &[ItemState::Uploading]);
+
+    let s3 = CountingS3::new(g.client());
+    let summary = pump_uploads(&db, &s3, &cfg, 2, &CancelFlag::new())
+        .await
+        .expect("pump survives the lost CAS");
+    assert!(summary.completed.is_empty());
+    assert_eq!(summary.failed.len(), 1);
+    assert!(
+        matches!(
+            summary.failed[0].1,
+            TransferError::State(StateError::StaleState { .. })
+        ),
+        "the lost entry CAS is the typed already-in-flight error, got {:?}",
+        summary.failed[0].1
+    );
+    assert_eq!(
+        db.queue_len(Queue::Up).expect("queue_len"),
+        1,
+        "the row must survive the pass while the external driver is live"
+    );
+
+    // The external transfer now fails with a transport error: its demote
+    // lands the item back in `queued` and pushes NO row — exactly the
+    // hole the kept row covers.
+    db.transition(&r, ItemState::Uploading, ItemState::Queued, |_| {})
+        .expect("external driver's failure demote");
+    let summary = pump_uploads(&db, &s3, &cfg, 2, &CancelFlag::new())
+        .await
+        .expect("pump");
+    assert_eq!(
+        summary.completed,
+        vec![r.clone()],
+        "the next pass must still see and drive the item"
+    );
+    assert_eq!(h::state_of(&db, &r), ItemState::Synced);
+    assert_eq!(db.queue_len(Queue::Up).expect("queue_len"), 0);
+}
+
+#[tokio::test]
+async fn pump_drops_the_kept_row_once_the_external_driver_succeeds() {
+    // Companion to the kept-row test above: when the external driver
+    // SUCCEEDS, the re-pushed row must drain to nothing — one spurious
+    // pop whose entry CAS fails on the terminal state, after which the
+    // requeue gate sees a state outside the queue's lane and drops the
+    // row for good (no infinite requeue loop).
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-pump-extok");
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("pump/ext-ok.NEF");
+    let src = local_target_path(root.path(), &r, Kind::Original);
+    h::write_file(&src, &h::patterned(32 * 1024, 37));
+    h::seed_queued(&db, &r, Kind::Original, &src);
+    db.queue_push(Queue::Up, &r, 0).expect("queue_push");
+    h::advance(&db, &r, &[ItemState::Uploading]);
+
+    let s3 = CountingS3::new(g.client());
+    let summary = pump_uploads(&db, &s3, &cfg, 2, &CancelFlag::new())
+        .await
+        .expect("pump");
+    assert_eq!(summary.failed.len(), 1, "lost CAS recorded");
+    assert_eq!(db.queue_len(Queue::Up).expect("queue_len"), 1, "row kept");
+
+    // The external driver finishes its upload: terminal state.
+    h::advance(&db, &r, &[ItemState::Verifying, ItemState::Synced]);
+    let summary = pump_uploads(&db, &s3, &cfg, 2, &CancelFlag::new())
+        .await
+        .expect("pump");
+    assert!(summary.completed.is_empty());
+    assert_eq!(summary.failed.len(), 1, "one spurious pop, then settled");
+    assert_eq!(
+        db.queue_len(Queue::Up).expect("queue_len"),
+        0,
+        "a terminal state drops the row for good"
+    );
+    assert_eq!(h::state_of(&db, &r), ItemState::Synced);
+}
+
+#[tokio::test]
+async fn abort_stale_uploads_keeps_the_report_when_the_orphan_listing_fails() {
+    // Review finding (round 3, minor coverage gap): the partial-failure
+    // contract for a failing `ListMultipartUploads` page — the sweep ends
+    // the orphan scan early, records a bucket-named entry in `errors`,
+    // and never discards what items 1-2 already cleaned — was documented
+    // but only pinned for a failing ABORT, not a failing LISTING.
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-stale-listfail");
+    let client = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+    let now = 1_769_900_000i64;
+    let max_age = 7 * 24 * 60 * 60;
+
+    let r = rel("stale/listfail.NEF");
+    let key = library_key(&r);
+    let created = client
+        .create_multipart_upload(&bucket, &key, &PutObjectOptions::default())
+        .await
+        .expect("create");
+    let src = h::under(root.path(), "stale-listfail.NEF");
+    h::write_file(&src, &h::patterned(1024, 11));
+    h::seed_queued(&db, &r, Kind::Original, &src);
+    h::advance(&db, &r, &[ItemState::Uploading]);
+    db.set_upload(
+        &r,
+        &MultipartUploadState {
+            upload_id: created.upload_id.clone(),
+            part_size: cfg.part_size,
+            started_unix: now - 8 * 24 * 60 * 60,
+            size: 1024,
+            mtime_unix_ns: h::mtime_unix_ns(&src),
+        },
+    )
+    .expect("set_upload");
+
+    let s3 = CountingS3::new(g.client());
+    s3.fail_list_uploads
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+
+    let report = abort_stale_uploads(&db, &s3, &cfg, max_age, now)
+        .await
+        .expect("the sweep must survive a failing listing");
+    assert_eq!(
+        report.aborted_own,
+        vec![(r.clone(), created.upload_id)],
+        "the aged own row was cleaned before the listing failed and must stay reported"
+    );
+    assert_eq!(report.errors.len(), 1, "the listing failure is reported");
+    assert_eq!(
+        report.errors[0].0, bucket,
+        "a failed listing page is reported under the bucket name"
+    );
+    assert!(
+        report.aborted_orphans.is_empty(),
+        "the orphan scan ended early"
+    );
+    // Item-1 cleanup really happened despite the listing failure.
+    assert_eq!(db.get_upload(&r).expect("get_upload"), None);
+    assert_eq!(h::state_of(&db, &r), ItemState::Dirty);
+    assert!(h::backend_uploads(&client, &bucket).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_mis_ranged_206_resume_is_rescued_by_the_hash_backstop_and_scratch_retry() {
+    // Review finding (round 3, minor coverage gap): a 206 whose
+    // Content-Range starts at a NONZERO offset different from the
+    // partial's length. The engine treats any wrong-offset response as
+    // "not our resume" — partial discarded, body taken from 0 — which for
+    // a genuinely mis-ranged body produces wrong bytes that only the
+    // blake3 backstop catches; the resumed-mismatch scratch retry must
+    // then complete the download with a clean full GET. Only the
+    // full-body (offset-0) range-ignoring case was pinned before.
+    let (g, bucket, root, _dbdir, db) = scaffold!("tr-dl-misrange");
+    let client = g.client();
+    let cfg = h::test_cfg(&bucket, root.path());
+    let r = rel("dl/misrange.NEF");
+    let key = library_key(&r);
+    let bytes = h::patterned(1_000_000, 29);
+    client
+        .put_object(
+            &bucket,
+            &key,
+            Bytes::from(bytes.clone()),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("put");
+
+    let cut_at = 300_000u64;
+    let s3 = CountingS3::new(g.client());
+    s3.cut_get_after.lock().unwrap().insert(key.clone(), cut_at);
+
+    let mtime = 1_700_000_600i64;
+    h::seed_pending_down(&db, &r, Kind::Original, &bytes, mtime);
+    let expected = ExpectedDownload {
+        blake3: h::b3(&bytes),
+        size: bytes.len() as u64,
+        mtime_unix: mtime,
+    };
+    download_item(&db, &s3, &cfg, &r, root.path(), &expected)
+        .await
+        .expect_err("the cut stream must fail the first attempt");
+    let final_path = local_target_path(root.path(), &r, Kind::Original);
+    let partial = partial_path(&final_path);
+    assert_eq!(std::fs::metadata(&partial).expect("partial").len(), cut_at);
+
+    // The resume's ranged GET is served from the WRONG nonzero offset
+    // (Content-Range honestly reports where the served body starts).
+    let wrong_offset = 100_000u64;
+    s3.shift_resume_ranges
+        .lock()
+        .unwrap()
+        .insert(key.clone(), wrong_offset);
+
+    let outcome = download_item(&db, &s3, &cfg, &r, root.path(), &expected)
+        .await
+        .expect("the hash backstop + scratch retry must rescue the mis-ranged resume");
+    assert_eq!(
+        outcome.resumed_from, 0,
+        "the rescue is a from-scratch retry, never a splice"
+    );
+    assert_eq!(std::fs::read(&final_path).expect("installed"), bytes);
+    assert_eq!(h::mtime_unix(&final_path), mtime);
+    assert!(!partial.exists(), "temp gone after install");
+    assert_eq!(h::state_of(&db, &r), ItemState::Hydrated);
+    let ranges = s3.get_ranges_for(&key);
+    assert_eq!(
+        ranges,
+        vec![
+            None,                          // first attempt (cut mid-stream)
+            Some(ByteRange::From(cut_at)), // the resume request that was mis-served
+            None,                          // the scratch-retry full GET
+        ],
+        "the mis-served resume is followed by exactly one clean full GET"
+    );
+}

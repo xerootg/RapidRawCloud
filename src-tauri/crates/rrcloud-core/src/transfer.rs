@@ -77,7 +77,7 @@
 //! multipart parts were server-verified at receipt. When the backend
 //! **failed the setup probe** ([`BackendProfile::digest_rejection_works`]
 //! `== false`, i.e. `requires_readback_verify`), verification additionally
-//! performs a **full ranged-GET re-hash**. `verifying → synced` sets
+//! performs a **full-object GET re-hash**. `verifying → synced` sets
 //! `verified_remote`, stages the journal `put` entry, and clears the
 //! multipart bookkeeping, all **in the same state transaction as the
 //! transition** (§2.1.5; see [`commit_verified`]). The bookkeeping living
@@ -139,7 +139,11 @@
 //! semaphore (and no task spawning) is needed. One item's failure is
 //! recorded in the summary — with its state left resumable — and never
 //! stops the pump. A [`CancelFlag`] stops *admission* deterministically
-//! and waits for in-flight items to finish.
+//! and waits for in-flight items to finish. A failing **state store**
+//! stops admission the same way: even a pass that returns `Err` has
+//! awaited every in-flight transfer first (each ran its own failure
+//! demote), so the pump never strands items at `uploading`/`downloading`
+//! by dropping live futures.
 //!
 //! # Crash recovery ([`recover_interrupted`]) and single-driver entry
 //!
@@ -166,6 +170,14 @@
 //! (skipping deliberately *parked* ones: hashless `pending_down` records
 //! and untransferable kinds). [`recover_interrupted_with`] takes a
 //! per-item class so the §3.5 priority lanes survive the rebuild.
+//!
+//! The matching **no-crash** hole is closed by the pump itself: when its
+//! popped row loses the entry CAS to a live external driver (the §3.5
+//! `ensure_local` race) the end-of-pass requeue keeps the row while the
+//! item sits in the lane's pipeline-interior states, so an external
+//! transfer that later fails — demoting the item queueable without
+//! pushing a row — stays pump-visible without waiting for the next
+//! startup sweep (see [`pump_uploads`]; review finding, round 3).
 //!
 //! Because recovery normalizes every stranded state, the engine entry
 //! points accept **only** the queueable states and admit via transition
@@ -389,7 +401,8 @@ pub struct BackendProfile {
     /// (`BadDigest`/`InvalidDigest` — [`S3Error::is_digest_rejection`]),
     /// so per-part `Content-MD5` is a real integrity backbone. `false`:
     /// the backend accepted it, so every upload verification must
-    /// perform a full ranged-GET re-hash (`requires_readback_verify`).
+    /// perform a full-object GET re-hash (`requires_readback_verify`;
+    /// the §3.5 evictor's read-back is the ranged one).
     pub digest_rejection_works: bool,
 }
 
@@ -1256,6 +1269,22 @@ async fn verify_remote(
                 });
             }
         } else if head.e_tag != sent.e_tag {
+            // Known false-positive window (review finding, round 3): the
+            // §2.4 corrupt_remote repair has a sibling device re-upload
+            // byte-identical content ("same vv, same blake3 target ...
+            // idempotent"), and such a re-PUT — a single PUT, or a
+            // multipart with a different part size — stores the SAME
+            // bytes under a different ETag shape. Landing between our
+            // Complete and this HEAD, it flips this item to
+            // corrupt_remote although local and remote agree bit for
+            // bit. Tolerated deliberately: it is recoverable via the
+            // CorruptRemote → Queued repair edge and never loses data,
+            // while trusting "different ETag, same size" here would wave
+            // through exactly the shape of a genuine mid-window
+            // replacement (a §2.1.5-poisoning different-content PUT)
+            // this check exists to catch. A follow-up may demote the
+            // same-size case to `queued` and let resume/adoption or the
+            // read-back decide instead.
             return Err(TransferError::CorruptRemote {
                 relkey: relkey.clone(),
                 detail: format!(
@@ -1697,6 +1726,14 @@ pub fn local_target_path(dest_root: &Path, relkey: &RelKey, kind: Kind) -> PathB
 
 /// The §3.5 temp file a download streams into: `.rr.part-<name>` next to
 /// the final path (same directory, so the final rename is atomic).
+///
+/// The name lives in the engine's reserved temp namespace
+/// ([`crate::keys::ENGINE_TEMP_PREFIX`]): [`RelKey`] validation rejects
+/// any `.rr.`-prefixed segment, so no relkey's *final* path can ever
+/// equal another relkey's *partial* path (review finding, round 3 — the
+/// collision would make one item's download adopt, and on the scratch
+/// retry delete, a sibling's installed verified file). The `.rr.part-`
+/// prefix below must stay inside that reserved namespace.
 pub fn partial_path(final_path: &Path) -> PathBuf {
     let name = final_path
         .file_name()
@@ -2100,7 +2137,11 @@ pub struct PumpSummary {
 /// item at most once (a failure re-queues for a *later* pass, never a
 /// retry loop within this one); `cancel` stops admission — in-flight
 /// items are awaited, never abandoned mid-transition, and nothing new
-/// starts after the flag is observed.
+/// starts after the flag is observed. A pop that loses the entry CAS to
+/// a live external driver keeps its row (re-pushed while the item sits
+/// anywhere in the upload lane — `queued`/`uploading`/`verifying`), so
+/// the item stays pump-visible if that external transfer later fails
+/// (see [`pump`]'s doc; review finding, round 3).
 pub async fn pump_uploads(
     db: &SyncDb,
     s3: &impl S3TransferApi,
@@ -2111,7 +2152,11 @@ pub async fn pump_uploads(
     pump(
         db,
         Queue::Up,
-        ItemState::Queued,
+        &[
+            ItemState::Queued,
+            ItemState::Uploading,
+            ItemState::Verifying,
+        ],
         concurrency,
         cancel,
         |relkey| {
@@ -2150,7 +2195,7 @@ pub async fn pump_downloads(
     pump(
         db,
         Queue::Down,
-        ItemState::PendingDown,
+        &[ItemState::PendingDown, ItemState::Downloading],
         concurrency,
         cancel,
         |relkey| {
@@ -2193,18 +2238,39 @@ type TaggedPumpFuture<'a> =
 /// keeps up to `concurrency` transfer futures in flight at once (the
 /// [`FuturesUnordered`] length *is* the §2.4 concurrency cap), records
 /// each item's outcome without stopping the others, and re-queues a
-/// failed item for a **later** pass — only when its state still says it
-/// belongs in the queue (`requeue_state`), so a terminal failure
+/// failed item for a **later** pass — only when its state still says the
+/// queue's lane owns it (`requeue_states`: the queueable state plus the
+/// lane's pipeline-interior states), so a terminal failure
 /// (`corrupt_remote`, re-marked `dirty`) never loops, and never when the
 /// failure can never heal inside the engine
 /// ([`TransferError::MissingExpectedHash`],
 /// [`TransferError::UnsupportedKind`] — such an item is parked off the
 /// queue in its queueable state). A fired [`CancelFlag`] stops
 /// admission; in-flight items are always awaited.
+///
+/// The pipeline-interior states are in `requeue_states` for the lost-CAS
+/// race (review finding, round 3): when this pump popped the row but a
+/// live external driver (the §3.5 `ensure_local` race) won the entry CAS,
+/// the item reads `uploading`/`verifying`/`downloading` at end of pass.
+/// Dropping the row then would strand the item if that external transfer
+/// later *failed* — its demote lands the item queueable without pushing a
+/// row ([`upload_item`]/[`download_item`] never push rows), and the
+/// startup sweep's row rebuild only runs at startup. Re-pushing is cheap
+/// and self-correcting: if the external transfer is still live or has
+/// succeeded, the next pass's pop just loses the entry CAS again (or
+/// finds a terminal state) and the row is dropped then.
+///
+/// A failing **state store** stops admission like a cancel: every
+/// in-flight transfer is still awaited (so each runs its own failure
+/// demote — no item is left in a pipeline-interior state *by the pump*),
+/// the end-of-pass requeue runs best-effort, and only then does the pass
+/// return `Err` with the first store failure. Rows the pass could not
+/// re-push are the startup row rebuild's case, like any other
+/// `{state committed, row not pushed}` hole.
 async fn pump<'a, F>(
     db: &SyncDb,
     queue: Queue,
-    requeue_state: ItemState,
+    requeue_states: &[ItemState],
     concurrency: usize,
     cancel: &CancelFlag,
     run: F,
@@ -2216,22 +2282,33 @@ where
     let mut summary = PumpSummary::default();
     let mut requeue: Vec<(RelKey, u8)> = Vec::new();
     let mut in_flight: FuturesUnordered<TaggedPumpFuture<'a>> = FuturesUnordered::new();
+    // The first state-store failure: it stops admission (like a cancel)
+    // but the pass still drains `in_flight` and runs the requeue loop
+    // before returning it — dropping live transfer futures would skip
+    // their failure demotes and leave items wedged at
+    // `uploading`/`downloading` (states the docs promise mean "a live
+    // transfer owns this item") until the next startup recovery sweep.
+    let mut store_failure: Option<TransferError> = None;
     loop {
         // Admission: strictly queue order, never past the concurrency cap,
-        // and nothing new once the cancel flag is observed.
-        while in_flight.len() < concurrency {
+        // and nothing new once the cancel flag (or a store failure) is
+        // observed.
+        while in_flight.len() < concurrency && store_failure.is_none() {
             if cancel.is_cancelled() {
                 summary.cancelled = true;
                 break;
             }
-            let Some((relkey, class)) = db.queue_pop(queue)? else {
-                break;
-            };
-            let fut = run(relkey.clone());
-            in_flight.push(Box::pin(async move {
-                let result = fut.await;
-                (relkey, class, result)
-            }));
+            match db.queue_pop(queue) {
+                Ok(Some((relkey, class))) => {
+                    let fut = run(relkey.clone());
+                    in_flight.push(Box::pin(async move {
+                        let result = fut.await;
+                        (relkey, class, result)
+                    }));
+                }
+                Ok(None) => break,
+                Err(e) => store_failure = Some(e.into()),
+            }
         }
         let Some((relkey, class, result)) = in_flight.next().await else {
             break;
@@ -2260,14 +2337,28 @@ where
         }
     }
     // Failed items go back for a later pass (never re-popped in this one),
-    // keeping their class — unless their state left the queueable lane.
+    // keeping their class — unless their state left the queue's lane
+    // (`requeue_states`; see the doc above for why the lane includes the
+    // pipeline-interior states). Best-effort once a store failure is
+    // pending: the first failure stays primary.
     for (relkey, class) in requeue {
-        let still_queueable = matches!(db.get_item(&relkey)?, Some(r) if r.state == requeue_state);
-        if still_queueable {
-            db.queue_push(queue, &relkey, class)?;
+        let lane_owned = match db.get_item(&relkey) {
+            Ok(record) => matches!(record, Some(r) if requeue_states.contains(&r.state)),
+            Err(e) => {
+                store_failure.get_or_insert(e.into());
+                continue;
+            }
+        };
+        if lane_owned {
+            if let Err(e) = db.queue_push(queue, &relkey, class) {
+                store_failure.get_or_insert(e.into());
+            }
         }
     }
-    Ok(summary)
+    match store_failure {
+        Some(e) => Err(e),
+        None => Ok(summary),
+    }
 }
 
 /// The bucket key an item of `kind` at `relkey` transfers to/from:

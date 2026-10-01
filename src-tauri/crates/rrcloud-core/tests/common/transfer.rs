@@ -276,6 +276,15 @@ pub struct CountingS3 {
     /// every GET is forwarded rangeless and the response carries no
     /// `Content-Range` (a plain 200 with the full object).
     pub ignore_range: bool,
+    /// One-shot per key: the next **ranged** `get_object` of this key is
+    /// served from this (wrong) offset instead of the requested one —
+    /// the inner request is rewritten to `bytes=<offset>-`, so the
+    /// response is an honest 206 whose `Content-Range` names the served
+    /// (mis-matched) start. Models a mis-ranging intermediary.
+    pub shift_resume_ranges: Mutex<HashMap<String, u64>>,
+    /// Remaining times `list_multipart_uploads` fails transport-style
+    /// without reaching the backend.
+    pub fail_list_uploads: AtomicU32,
     /// `key` → ETag `head_object` reports instead of the backend's — a
     /// deterministic stand-in for "the key no longer holds the object we
     /// stored" (e.g. a sibling device replaced the shared key between
@@ -343,6 +352,8 @@ impl CountingS3 {
             corrupt_put_bodies: HashSet::new(),
             cut_get_after: Mutex::new(HashMap::new()),
             ignore_range: false,
+            shift_resume_ranges: Mutex::new(HashMap::new()),
+            fail_list_uploads: AtomicU32::new(0),
             fake_head_etags: Mutex::new(HashMap::new()),
             fail_heads: Mutex::new(HashMap::new()),
             fail_aborts: Mutex::new(HashMap::new()),
@@ -486,12 +497,23 @@ impl S3Api for CountingS3 {
             .expect("lock")
             .push((key.to_string(), range));
         let cut = self.cut_get_after.lock().expect("lock").remove(key);
+        let shifted = if range.is_some() {
+            self.shift_resume_ranges.lock().expect("lock").remove(key)
+        } else {
+            None
+        };
         // The guard rides inside the returned body stream: a GET is
         // in-flight until its bytes are consumed (or the stream dropped),
         // not merely until the response headers arrive — otherwise a
         // max_in_flight assertion over downloads would be vacuous.
         let guard = self.enter();
-        let effective_range = if self.ignore_range { None } else { range };
+        let effective_range = if self.ignore_range {
+            None
+        } else if let Some(wrong) = shifted {
+            Some(ByteRange::From(wrong))
+        } else {
+            range
+        };
         let mut out = self.inner.get_object(bucket, key, effective_range).await?;
         if self.ignore_range {
             out.content_range = None;
@@ -662,6 +684,13 @@ impl S3TransferApi for CountingS3 {
         request: &ListMultipartUploadsRequest,
     ) -> Result<ListMultipartUploadsOutput, S3Error> {
         self.list_uploads_calls.fetch_add(1, Ordering::SeqCst);
+        let pending = self.fail_list_uploads.load(Ordering::SeqCst);
+        if pending > 0 {
+            self.fail_list_uploads.store(pending - 1, Ordering::SeqCst);
+            return Err(S3Error::InvalidRequest(
+                "injected list_multipart_uploads failure".to_string(),
+            ));
+        }
         self.inner.list_multipart_uploads(bucket, request).await
     }
 
