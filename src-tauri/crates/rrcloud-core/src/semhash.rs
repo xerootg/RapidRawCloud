@@ -265,8 +265,15 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) {
 fn write_canonical_number(n: &serde_json::Number, out: &mut String) {
     use std::fmt::Write as _;
     if let (None, None, Some(f)) = (n.as_i64(), n.as_u64(), n.as_f64()) {
-        // Exclusive f64 bounds: 2^64 and -2^63 themselves are not
-        // representable as u64/i64.
+        // Bounds (review finding, round 2 — the old comment wrongly
+        // claimed both ends were exclusive): 2^64 is EXCLUDED (U64_END
+        // itself is not representable as u64), but -2^63 IS exactly
+        // i64::MIN, so the I64_START..0.0 range below deliberately
+        // INCLUDES it (start-inclusive) and the cast is exact. "Fixing"
+        // the range to exclude I64_START would split that one value into
+        // two spellings — the integer "-9223372036854775808" vs ryu's
+        // "-9.223372036854776e18" — desynchronizing sem_hash across the
+        // JS/Rust boundary at exactly i64::MIN.
         const U64_END: f64 = 18_446_744_073_709_551_616.0; // 2^64
         const I64_START: f64 = -9_223_372_036_854_775_808.0; // -2^63
         if f == 0.0 {

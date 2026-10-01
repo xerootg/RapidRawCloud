@@ -519,3 +519,54 @@ fn tombstone_rejects_invalid_relkey() {
     );
     assert!(serde_json::from_str::<Tombstone>(&doc).is_err());
 }
+
+#[test]
+fn tombstone_rejects_non_nfc_relkey() {
+    // Review finding (round 2, major): a tombstone whose relkey arrives in
+    // NFD must FAIL AT DECODE, not be silently NFC-normalized into a
+    // deletion record aimed at the user's distinct NFC object —
+    // tombstone_key(decoded) would then address blake3(NFC)[..32] while
+    // the deletion was recorded against the NFD spelling. Tombstones gate
+    // hiding, Recently Deleted, and GC destruction (§2.7/§2.10), so this
+    // is exactly the class of input the crate's decode contract fails
+    // closed on.
+    let doc = |relkey: &str| {
+        format!(
+            r#"{{"relkey":"{relkey}","vv":{{"{DEV1}":1}},"device":"{DEV1}","server_ts":1,"kinds":["original"]}}"#
+        )
+    };
+    // "Ka\u{308}ch.jpg" is the NFD spelling of "K\u{e4}ch.jpg" ("Käch").
+    assert!(
+        serde_json::from_str::<Tombstone>(&doc("Ka\u{308}ch.jpg")).is_err(),
+        "NFD tombstone relkey must fail to decode"
+    );
+    // Premise check: the NFC spelling of the same document decodes.
+    let t: Tombstone = serde_json::from_str(&doc("K\u{e4}ch.jpg")).expect("NFC tombstone decodes");
+    assert_eq!(t.relkey.as_str(), "K\u{e4}ch.jpg");
+}
+
+#[test]
+fn decode_segment_tolerates_blank_lines_and_missing_trailing_newline() {
+    // Review finding (round 2, minor): these decode leniencies are
+    // load-bearing for interop with any future non-Rust segment
+    // writer/reader and previously held only by accident of
+    // implementation. Pinned: blank lines between entries are skipped, a
+    // segment without a trailing newline decodes, and an empty segment is
+    // zero entries.
+    let e1 = entry(1, "library/a.NEF.rrdata");
+    let e2 = entry(2, "library/b.NEF.rrdata");
+    let l1 = e1.to_json_line().expect("encode");
+    let l2 = e2.to_json_line().expect("encode");
+
+    let blank_between = format!("{l1}\n\n{l2}\n");
+    assert_eq!(
+        decode_segment(blank_between.as_bytes()).expect("decodes"),
+        vec![e1.clone(), e2.clone()]
+    );
+    let no_trailing_newline = format!("{l1}\n{l2}");
+    assert_eq!(
+        decode_segment(no_trailing_newline.as_bytes()).expect("decodes"),
+        vec![e1, e2]
+    );
+    assert_eq!(decode_segment(b"").expect("decodes"), vec![]);
+}

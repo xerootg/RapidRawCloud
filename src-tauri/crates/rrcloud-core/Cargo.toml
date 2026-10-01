@@ -29,9 +29,20 @@ reqwest = { version = "0.13", default-features = false, features = [
     "stream",
 ] }
 serde = { version = "1", features = ["derive"] }
-# NOTE: the `preserve_order` feature must stay OFF (and no dependency may
-# enable it): semantic-hash canonicalization (§2.5) sorts keys itself and
-# must not depend on serde_json's map ordering.
+# NOTE: serde_json feature hygiene for §2.5 hash determinism — load-bearing
+# once this crate joins the src-tauri workspace, where ANY dependency's
+# features unify into this build:
+# - `arbitrary_precision` must stay OFF. Under it, Number::to_string()
+#   preserves the source spelling, so the ryu fallback in
+#   semhash::write_canonical_number becomes spelling-dependent and
+#   sem_hash({"exposure":0.36}) != sem_hash({"exposure":3.6e-1}) — exactly
+#   the churn §2.5 kills. Pinned by tests/semhash.rs
+#   `canonical_json_normalizes_number_spellings` /
+#   `number_respelling_does_not_change_hash` (the 0.25 vs 2.5e-1 cases),
+#   which fail in a unified build that enables the feature.
+# - `preserve_order` is harmless by construction (canonicalization re-sorts
+#   through a BTreeMap, never relying on Map's backing store) but stays off
+#   so nothing comes to depend on map ordering.
 serde_json = "1"
 sha2 = "0.10"
 thiserror = "2"

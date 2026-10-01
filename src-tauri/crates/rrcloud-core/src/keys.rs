@@ -70,8 +70,9 @@ pub enum KeyError {
     #[error("segment ends with dot or space: {0:?}")]
     TrailingDotOrSpace(String),
     /// A segment whose base name is a Win32 reserved device name
-    /// (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, any
-    /// ASCII case, with or without an extension). Win32 resolves these in
+    /// (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, plus
+    /// the superscript variants `COM¹`–`COM³`/`LPT¹`–`LPT³`, any ASCII
+    /// case, with or without an extension). Win32 resolves these in
     /// *any* directory to the device itself, so hydrating such a key on a
     /// Windows receiver would write to a device or fail the item.
     #[error("Windows-reserved device name segment: {0:?}")]
@@ -79,6 +80,15 @@ pub enum KeyError {
     /// A virtual-copy suffix that is not exactly 6 lowercase hex chars.
     #[error("invalid virtual-copy suffix: {0:?}")]
     BadVcSuffix(String),
+    /// Wire input ([`RelKey::parse_wire`], serde) that is not already NFC.
+    /// The wire lane never normalizes: a non-NFC relkey inside a decoded
+    /// document (tombstone §2.7, manifest deleted-set row §2.3) names a
+    /// *different* bucket object than its NFC spelling, and silently
+    /// rewriting it would re-aim the record — e.g. a deletion — at the
+    /// user's distinct NFC object. Fail closed instead, the same stance
+    /// [`classify_key`] takes for non-NFC library keys.
+    #[error("relkey is not NFC-normalized: {0:?}")]
+    NotNfc(String),
 }
 
 /// A validated library-relative key (§1.1): `/`-separated, NFC-normalized,
@@ -92,6 +102,11 @@ pub struct RelKey(String);
 
 impl RelKey {
     /// Validates and NFC-normalizes a relative path string into a [`RelKey`].
+    ///
+    /// This is the **local path-mapping lane** ([`relkey`] from on-disk
+    /// paths), where macOS NFD filenames legitimately need normalization.
+    /// Text arriving off the wire goes through [`RelKey::parse_wire`]
+    /// instead, which rejects non-NFC input rather than rewriting it.
     ///
     /// Rejects empty strings, leading `/`, backslashes, colons, control
     /// characters, `.`/`..`/empty segments, segments ending in a dot or
@@ -139,6 +154,27 @@ impl RelKey {
         Ok(RelKey(s))
     }
 
+    /// Validates a **wire-format** relkey without normalizing: input that
+    /// is not already NFC is rejected with [`KeyError::NotNfc`], then the
+    /// full [`RelKey::new`] rule set applies (on already-NFC input the
+    /// normalization inside is the identity).
+    ///
+    /// This is the decode lane for relkeys arriving inside documents —
+    /// [`crate::journal::Tombstone::relkey`] (§2.7) and the manifest
+    /// deleted-set rows (§2.3) — and is what `Deserialize` /
+    /// `TryFrom<String>` use (review finding, round 2). Normalizing here
+    /// would be validation-by-rewriting: an NFD relkey names a distinct
+    /// bucket object, and a deletion record silently re-aimed at the NFC
+    /// spelling would hide/GC the wrong object. [`RelKey::new`] remains
+    /// the normalizing constructor for the local path-mapping lane.
+    pub fn parse_wire(s: impl Into<String>) -> Result<Self, KeyError> {
+        let raw = s.into();
+        if !unicode_normalization::is_nfc(&raw) {
+            return Err(KeyError::NotNfc(raw));
+        }
+        Self::new(raw)
+    }
+
     /// The normalized relative path, `/`-separated.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -148,33 +184,44 @@ impl RelKey {
 /// `true` when `seg`'s base name — the part before the first `.`, with any
 /// trailing spaces stripped, matching Win32's own name parsing — is a
 /// reserved device name: `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
-/// `LPT1`–`LPT9`, in any ASCII case. Win32 resolves these, with or without
-/// an extension, in any directory, to the device itself.
+/// `LPT1`–`LPT9`, in any ASCII case, plus the Latin-1 superscript variants
+/// `COM¹`/`COM²`/`COM³` and `LPT¹`/`LPT²`/`LPT³` (U+00B9/U+00B2/U+00B3) —
+/// Win32's reserved-name parser treats the superscript digits as digits,
+/// and Microsoft's file-naming documentation lists them alongside
+/// `COM1`–`COM9` (review finding, round 2; NFC does not decompose them,
+/// so they survive relkey normalization). Win32 resolves these, with or
+/// without an extension, in any directory, to the device itself.
 fn is_windows_reserved(seg: &str) -> bool {
-    let base = seg
-        .split('.')
-        .next()
-        .unwrap_or(seg)
-        .trim_end_matches(' ')
-        .as_bytes();
-    match base.len() {
-        3 => [&b"con"[..], b"prn", b"aux", b"nul"]
+    let base = seg.split('.').next().unwrap_or(seg).trim_end_matches(' ');
+    let bytes = base.as_bytes();
+    if bytes.len() == 3 {
+        return [&b"con"[..], b"prn", b"aux", b"nul"]
             .iter()
-            .any(|r| base.eq_ignore_ascii_case(r)),
-        4 => {
-            (base[..3].eq_ignore_ascii_case(b"com") || base[..3].eq_ignore_ascii_case(b"lpt"))
-                && base[3].is_ascii_digit()
-                && base[3] != b'0'
-        }
-        _ => false,
+            .any(|r| bytes.eq_ignore_ascii_case(r));
     }
+    // `com`/`lpt` followed by exactly one digit character: ASCII `1`–`9`
+    // or superscript `¹`/`²`/`³`. (`COM0`/`LPT0` are not reserved, nor is
+    // U+2074 ⁴ — only ¹ ² ³ exist in Latin-1.) The prefix match is pure
+    // ASCII, so index 3 is always a char boundary.
+    if bytes.len() > 3
+        && (bytes[..3].eq_ignore_ascii_case(b"com") || bytes[..3].eq_ignore_ascii_case(b"lpt"))
+    {
+        let mut rest = base[3..].chars();
+        if let (Some(c), None) = (rest.next(), rest.next()) {
+            return matches!(c, '1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}');
+        }
+    }
+    false
 }
 
 impl TryFrom<String> for RelKey {
     type Error = KeyError;
 
+    /// The serde decode path: strict wire parsing via
+    /// [`RelKey::parse_wire`] — non-NFC input is an error, never
+    /// normalized.
     fn try_from(s: String) -> Result<Self, Self::Error> {
-        Self::new(s)
+        Self::parse_wire(s)
     }
 }
 

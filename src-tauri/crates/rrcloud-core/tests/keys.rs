@@ -141,6 +141,39 @@ fn relkey_rejects_windows_reserved_names_and_trailing_dot_or_space() {
 }
 
 #[test]
+fn relkey_rejects_superscript_com_lpt_variants() {
+    // Review finding (round 2, minor): Win32's reserved-name parser treats
+    // the Latin-1 superscript digits as digits, so COM¹/COM²/COM³ and
+    // LPT¹/LPT²/LPT³ (U+00B9/U+00B2/U+00B3) are reserved alongside
+    // COM1–COM9 per Microsoft's current file-naming documentation. NFC
+    // does not decompose them (that is NFKC), so they survive relkey
+    // normalization and must be rejected explicitly.
+    let bad = [
+        "com\u{b9}.jpg",
+        "COM\u{b2}",
+        "Com\u{b3}.NEF",
+        "lpt\u{b9}",
+        "LPT\u{b2}.txt",
+        "2026/lpt\u{b3}.raw",
+    ];
+    for s in bad {
+        assert!(RelKey::new(s).is_err(), "{s:?} must be rejected");
+    }
+    // Near-misses stay valid: only ¹ ² ³ exist in Latin-1 (U+2074 ⁴ is
+    // not in Win32's reserved set), and the digit must be the whole rest
+    // of the base name.
+    let ok = [
+        "com\u{2074}.jpg",
+        "com\u{b9}0.raw",
+        "co\u{b9}.jpg",
+        "lpt\u{b2}x.txt",
+    ];
+    for s in ok {
+        assert!(RelKey::new(s).is_ok(), "{s:?} must stay valid");
+    }
+}
+
+#[test]
 fn relkey_nfc_normalizes_composed_and_decomposed_to_same_key() {
     // "Käch.jpg": composed U+00E4 vs decomposed 'a' + U+0308.
     let composed = "K\u{e4}ch.jpg";
@@ -187,6 +220,41 @@ fn relkey_serde_round_trip_validates() {
     // Deserialization must run the same validation.
     assert!(serde_json::from_str::<RelKey>("\"../etc/passwd\"").is_err());
     assert!(serde_json::from_str::<RelKey>("\"/abs\"").is_err());
+}
+
+#[test]
+fn relkey_wire_decode_rejects_non_nfc() {
+    // Review finding (round 2, major): the wire lane (serde /
+    // TryFrom<String>) must REJECT non-NFC input, never normalize it. A
+    // relkey arriving inside a decoded document (Tombstone §2.7, manifest
+    // deleted-set rows §2.3) names a bucket object; silently rewriting NFD
+    // to NFC re-aims the record at the user's *distinct* NFC object — the
+    // exact conflation classify_key's Foreign lane exists to prevent.
+    // Validation-by-rewriting is not validation.
+    let nfd = "\"Ka\\u0308ch.jpg\""; // JSON spelling of NFD "Käch.jpg"
+    assert!(
+        serde_json::from_str::<RelKey>(nfd).is_err(),
+        "NFD relkey on the wire must fail to decode"
+    );
+    // The NFC spelling decodes fine and matches the constructor's output.
+    let nfc: RelKey = serde_json::from_str("\"K\u{e4}ch.jpg\"").expect("NFC decodes");
+    assert_eq!(nfc, rk("K\u{e4}ch.jpg"));
+
+    // The strict wire parser is the same lane, callable directly.
+    assert!(RelKey::parse_wire("Ka\u{308}ch.jpg").is_err());
+    assert_eq!(
+        RelKey::parse_wire("K\u{e4}ch.jpg").expect("NFC parses"),
+        rk("K\u{e4}ch.jpg")
+    );
+    // ...and it still enforces every other relkey rule.
+    assert!(RelKey::parse_wire("../x").is_err());
+    assert!(RelKey::parse_wire("/abs").is_err());
+    assert!(RelKey::parse_wire("a\\b").is_err());
+
+    // The local path-mapping constructor keeps normalizing (macOS NFD
+    // filenames legitimately need it) — the two lanes are deliberately
+    // asymmetric.
+    assert_eq!(rk("Ka\u{308}ch.jpg").as_str(), "K\u{e4}ch.jpg");
 }
 
 // ---------------------------------------------------------------------------
@@ -628,6 +696,8 @@ fn classify_treats_windows_hazard_library_keys_as_foreign() {
         "library/con.jpg",
         "library/AUX.NEF",
         "library/2026/com1.raw",
+        "library/com\u{b9}.jpg",
+        "library/LPT\u{b2}.txt",
         "library/a.jpg ",
         "library/a.jpg.",
         "library/aux.NEF.rrdata",

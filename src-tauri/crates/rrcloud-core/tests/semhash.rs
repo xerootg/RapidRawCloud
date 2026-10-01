@@ -72,6 +72,37 @@ fn canonical_json_normalizes_number_spellings() {
     assert_eq!(canonical_json(&f), r#"{"x":0.25,"y":0.25}"#);
 }
 
+#[test]
+fn canonical_json_pins_the_integral_range_boundaries() {
+    // Review finding (round 2, minor): the delicate boundary region of
+    // write_canonical_number was untested — exactly where a misleading
+    // bounds comment invited a regression. Pinned:
+    //
+    // i64::MIN (-2^63) IS representable as i64 and is deliberately
+    // INCLUDED in the integer-spelling range: its f64 spelling and its
+    // integer-literal spelling collapse to one canonical form.
+    let v: Value =
+        serde_json::from_str(r#"{"a":-9223372036854775808,"b":-9.223372036854776e18}"#).unwrap();
+    assert_eq!(
+        canonical_json(&v),
+        r#"{"a":-9223372036854775808,"b":-9223372036854775808}"#
+    );
+    // u64::MAX is not f64-representable and keeps its exact integer
+    // spelling.
+    let v: Value = serde_json::from_str(r#"{"m":18446744073709551615}"#).unwrap();
+    assert_eq!(canonical_json(&v), r#"{"m":18446744073709551615}"#);
+    // 2^64 is the EXCLUSIVE upper bound (not representable as u64): both
+    // parse paths yield the same f64 and stay in ryu spelling.
+    let a: Value = serde_json::from_str(r#"{"x":18446744073709551616}"#).unwrap();
+    let b: Value = serde_json::from_str(r#"{"x":1.8446744073709552e19}"#).unwrap();
+    assert_eq!(canonical_json(&a), canonical_json(&b));
+    assert_eq!(canonical_json(&a), r#"{"x":1.8446744073709552e+19}"#);
+    // Just below i64::MIN: integral f64 with no i64 alias stays in ryu
+    // spelling.
+    let v: Value = serde_json::from_str(r#"{"y":-9.223372036854778e18}"#).unwrap();
+    assert_eq!(canonical_json(&v), r#"{"y":-9.223372036854778e+18}"#);
+}
+
 // ---------------------------------------------------------------------------
 // sem_hash shape
 // ---------------------------------------------------------------------------
@@ -270,6 +301,16 @@ fn number_respelling_does_not_change_hash() {
             r#"{"adjustments":{"big":10000000000000000000}}"#,
             r#"{"adjustments":{"big":1e19}}"#,
         ),
+        // Boundary pins (review finding, round 2): i64::MIN spelled as
+        // f64 vs integer literal, and 2^64 on both parse paths.
+        (
+            r#"{"adjustments":{"x":-9223372036854775808}}"#,
+            r#"{"adjustments":{"x":-9.223372036854776e18}}"#,
+        ),
+        (
+            r#"{"adjustments":{"x":18446744073709551616}}"#,
+            r#"{"adjustments":{"x":1.8446744073709552e19}}"#,
+        ),
     ];
     for (a, b) in equal_pairs {
         assert_eq!(
@@ -291,6 +332,13 @@ fn number_respelling_does_not_change_hash() {
         (
             r#"{"adjustments":{"exposure":1}}"#,
             r#"{"adjustments":{"exposure":-1}}"#,
+        ),
+        // u64::MAX and 2^64 are distinct values (u64::MAX is not
+        // f64-representable; it must keep its integer spelling, never be
+        // rounded into the 2^64 ryu spelling).
+        (
+            r#"{"adjustments":{"x":18446744073709551615}}"#,
+            r#"{"adjustments":{"x":1.8446744073709552e19}}"#,
         ),
     ];
     for (a, b) in distinct_pairs {

@@ -329,7 +329,12 @@ pub fn parse_segment_filename(name: &str) -> Result<SegmentFilename, JournalErro
 /// same relkey at the same version writes an equivalent document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tombstone {
-    /// The deleted library-relative key.
+    /// The deleted library-relative key. Decoded through
+    /// [`RelKey::parse_wire`]: validated, **never rewritten** — a non-NFC
+    /// relkey fails the decode (review finding, round 2), because silently
+    /// normalizing it would re-aim this deletion record at the distinct
+    /// NFC bucket object while the deletion was recorded against the NFD
+    /// key.
     pub relkey: RelKey,
     /// The deletion's version vector (bumped past the deleted version, so
     /// delete-vs-edit resolves through the ordinary §2.6 machinery).
