@@ -208,7 +208,7 @@ mod linux {
             // committed counter (freeze_next_segment confirms it).
             let expected_first = db.last_allocated_seq().expect("last_allocated_seq") + 1;
             let seq = db
-                .freeze_next_segment(count_for(expected_first), seg_bytes)
+                .freeze_next_segment(count_for(expected_first), |s| Ok(seg_bytes(s)))
                 .expect("freeze_next_segment");
             assert_eq!(seq, expected_first, "span allocation is contiguous");
             ack(format!("SEQ {seq}"));
@@ -435,7 +435,7 @@ mod linux {
             );
             let probe_first = last + 1;
             let next = db
-                .freeze_next_segment(count_for(probe_first), seg_bytes)
+                .freeze_next_segment(count_for(probe_first), |s| Ok(seg_bytes(s)))
                 .expect("freeze_next_segment after crash");
             assert_eq!(
                 next, probe_first,

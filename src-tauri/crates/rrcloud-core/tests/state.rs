@@ -1340,12 +1340,12 @@ fn freeze_next_segment_allocates_and_freezes_atomically() {
     let (s1, s2) = {
         let db = open_fresh(&path);
         let s1 = db
-            .freeze_next_segment(1, |seq| format!("segment-{seq}").into_bytes())
+            .freeze_next_segment(1, |seq| Ok(format!("segment-{seq}").into_bytes()))
             .expect("freeze");
         assert_eq!(s1, 1, "first allocation is 1");
         assert_eq!(db.last_allocated_seq().expect("last"), s1);
         let s2 = db
-            .freeze_next_segment(1, |seq| format!("segment-{seq}").into_bytes())
+            .freeze_next_segment(1, |seq| Ok(format!("segment-{seq}").into_bytes()))
             .expect("freeze");
         assert_eq!(s2, s1 + 1);
         (s1, s2)
@@ -1360,7 +1360,7 @@ fn freeze_next_segment_allocates_and_freezes_atomically() {
     let s3 = db.allocate_seq().expect("alloc");
     assert_eq!(s3, s2 + 1);
     let s4 = db
-        .freeze_next_segment(1, |seq| vec![seq as u8])
+        .freeze_next_segment(1, |seq| Ok(vec![seq as u8]))
         .expect("freeze");
     assert_eq!(s4, s3 + 1);
 }
@@ -1375,7 +1375,7 @@ fn freeze_next_segment_unique_across_threads() {
                 s.spawn(|| {
                     (0..25)
                         .map(|_| {
-                            db.freeze_next_segment(1, |seq| seq.to_le_bytes().to_vec())
+                            db.freeze_next_segment(1, |seq| Ok(seq.to_le_bytes().to_vec()))
                                 .expect("freeze")
                         })
                         .collect::<Vec<_>>()
@@ -1437,7 +1437,7 @@ fn unpublished_scan_survives_holes_and_out_of_order_publish() {
     assert_eq!(db.unpublished_segments().expect("unpublished"), vec![]);
     // And new work after full publication is seen.
     let s5 = db
-        .freeze_next_segment(1, |_| b"five".to_vec())
+        .freeze_next_segment(1, |_| Ok(b"five".to_vec()))
         .expect("freeze");
     assert_eq!(
         db.unpublished_segments().expect("unpublished"),
@@ -1467,7 +1467,7 @@ fn saturated_seq_counter_is_typed_error_not_panic_or_wrap() {
         "got {err:?}"
     );
     let err = db
-        .freeze_next_segment(1, |_| vec![])
+        .freeze_next_segment(1, |_| Ok(vec![]))
         .expect_err("must refuse to wrap");
     assert!(
         matches!(err, StateError::CounterSaturated { .. }),
@@ -1605,7 +1605,7 @@ fn with_txn_error_rolls_back_everything() {
         .with_txn(|t| {
             t.transition(&key, ItemState::Dirty, ItemState::Queued, |r| r.size = 42)?;
             t.queue_push(Queue::Up, &key, 0)?;
-            t.freeze_next_segment(1, |_| b"doomed".to_vec())?;
+            t.freeze_next_segment(1, |_| Ok(b"doomed".to_vec()))?;
             // A failing CAS on another (missing) item aborts the closure.
             t.transition(
                 &rel("ghost.dng"),
@@ -1729,7 +1729,7 @@ fn freeze_next_segment_multi_entry_spans_never_collide() {
         let first_a = db
             .freeze_next_segment(3, |first| {
                 assert_eq!(first, 1, "builder receives the FIRST entry seq");
-                b"seg-a(1,2,3)".to_vec()
+                Ok(b"seg-a(1,2,3)".to_vec())
             })
             .expect("freeze 3-entry segment");
         assert_eq!(first_a, 1);
@@ -1741,7 +1741,7 @@ fn freeze_next_segment_multi_entry_spans_never_collide() {
         let first_b = db
             .freeze_next_segment(2, |first| {
                 assert_eq!(first, 4, "no overlap with the previous span");
-                b"seg-b(4,5)".to_vec()
+                Ok(b"seg-b(4,5)".to_vec())
             })
             .expect("freeze 2-entry segment");
         assert_eq!(first_b, 4);
@@ -1767,10 +1767,10 @@ fn mark_published_advances_cursor_and_floor_over_the_whole_span() {
     let (_dir, path) = scratch();
     let db = open_fresh(&path);
     let s1 = db
-        .freeze_next_segment(3, |_| b"abc".to_vec())
+        .freeze_next_segment(3, |_| Ok(b"abc".to_vec()))
         .expect("freeze");
     let s2 = db
-        .freeze_next_segment(1, |_| b"d".to_vec())
+        .freeze_next_segment(1, |_| Ok(b"d".to_vec()))
         .expect("freeze");
     assert_eq!((s1, s2), (1, 4));
     db.mark_published(s1).expect("publish span 1..=3");
@@ -1804,7 +1804,7 @@ fn mark_published_advances_cursor_and_floor_over_the_whole_span() {
     // New work after the fully-published prefix is still seen (the floor
     // advanced over spans, it did not stall inside one).
     let s3 = db
-        .freeze_next_segment(2, |first| vec![first as u8])
+        .freeze_next_segment(2, |first| Ok(vec![first as u8]))
         .expect("freeze");
     assert_eq!(s3, 5);
     assert_eq!(
@@ -1826,7 +1826,7 @@ fn freeze_next_segment_zero_entries_is_typed_error() {
     let (_dir, path) = scratch();
     let db = open_fresh(&path);
     let err = db
-        .freeze_next_segment(0, |_| vec![])
+        .freeze_next_segment(0, |_| Ok(vec![]))
         .expect_err("empty segment must refuse");
     assert!(matches!(err, StateError::EmptySegment), "got {err:?}");
     assert_eq!(db.last_allocated_seq().expect("last"), 0, "no seq consumed");
@@ -1841,7 +1841,7 @@ fn legacy_freeze_inside_an_existing_span_is_already_frozen() {
     let (_dir, path) = scratch();
     let db = open_fresh(&path);
     let first = db
-        .freeze_next_segment(3, |_| b"span".to_vec())
+        .freeze_next_segment(3, |_| Ok(b"span".to_vec()))
         .expect("freeze");
     assert_eq!(first, 1);
     for covered in [1u64, 2, 3] {
@@ -1976,7 +1976,7 @@ fn with_txn_panic_unwinds_without_committing_and_db_stays_usable() {
     let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         db.with_txn(|t| -> Result<(), StateError> {
             t.insert_item(&key, &bare_record(ItemState::Dirty))?;
-            t.freeze_next_segment(1, |_| b"doomed".to_vec())?;
+            t.freeze_next_segment(1, |_| Ok(b"doomed".to_vec()))?;
             panic!("boom: simulated bug inside the composite step");
         })
     }));
@@ -1996,7 +1996,7 @@ fn with_txn_panic_unwinds_without_committing_and_db_stays_usable() {
         .insert_item(&key, &bare_record(ItemState::Dirty))
         .expect("insert after panic"));
     assert_eq!(
-        db.freeze_next_segment(1, |_| b"ok".to_vec())
+        db.freeze_next_segment(1, |_| Ok(b"ok".to_vec()))
             .expect("freeze after panic"),
         1
     );
@@ -2013,7 +2013,7 @@ fn minted_identity_reports_fresh_files_including_silent_db_loss() {
         let db = open_fresh(&path);
         assert!(db.minted_identity(), "first open minted");
         assert_eq!(
-            db.freeze_next_segment(2, |_| b"published-elsewhere".to_vec())
+            db.freeze_next_segment(2, |_| Ok(b"published-elsewhere".to_vec()))
                 .expect("freeze"),
             1
         );
@@ -2042,4 +2042,271 @@ fn minted_identity_reports_fresh_files_including_silent_db_loss() {
         0,
         "the counter DID reset: publishing now would reuse (device, seq) pairs"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2: fallible segment builder (journal-encoder composition),
+// StateTxn read accessors, queue_clear corruption recovery, delete_item
+// companion-cleanup composite
+// ---------------------------------------------------------------------------
+
+/// A journal entry stamped with `seq`, as the engine's publisher builds
+/// them inside the freeze builder.
+fn journal_entry(seq: u64) -> rrcloud_core::journal::JournalEntry {
+    rrcloud_core::journal::JournalEntry {
+        v: rrcloud_core::journal::JOURNAL_VERSION,
+        seq,
+        ts: 1_769_900_000,
+        device: dev(DEV1),
+        op: rrcloud_core::journal::Op::Put,
+        kind: Kind::Sidecar,
+        key: format!("library/edit-{seq}.rrdata"),
+        vv: [(dev(DEV1), seq as u32)].into_iter().collect(),
+        size: Some(2048),
+        blake3: Some(Blake3Hex::parse(BLAKE3_HEX).expect("blake3")),
+        sem_hash: None,
+        rating: None,
+        color_label: None,
+        content_id: None,
+        w: None,
+        h: None,
+        mtime: None,
+        from_key: None,
+    }
+}
+
+#[test]
+fn freeze_next_segment_builder_error_aborts_consuming_no_seqs() {
+    // The engine's builder is the FALLIBLE journal encoder: a batch sized
+    // near the byte cap with small placeholder seqs can cross it once the
+    // real seq digits are stamped. That failure must be a typed abort that
+    // consumes nothing — not a release-mode panic escape hatch.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let err = db
+        .freeze_next_segment(1, |_| {
+            Err(rrcloud_core::journal::JournalError::SegmentTooLarge { size: 2_000_000 }.into())
+        })
+        .expect_err("builder failure must abort the freeze");
+    assert!(
+        matches!(
+            err,
+            StateError::SegmentBuild(rrcloud_core::journal::JournalError::SegmentTooLarge {
+                size: 2_000_000
+            })
+        ),
+        "got {err:?}"
+    );
+    assert_eq!(db.last_allocated_seq().expect("last"), 0, "no seq consumed");
+    assert_eq!(
+        db.unpublished_segments().expect("unpublished"),
+        vec![],
+        "nothing stored"
+    );
+    // The caller can shrink the batch and retry: the next freeze still
+    // starts the tiling at 1 (no hole was left).
+    assert_eq!(
+        db.freeze_next_segment(1, |_| Ok(b"retry".to_vec()))
+            .expect("retry"),
+        1
+    );
+
+    // Inside a composite, a builder error aborts the WHOLE transaction.
+    let key = rel("a.rrdata");
+    let err = db
+        .with_txn(|t| {
+            t.insert_item(&key, &bare_record(ItemState::Dirty))?;
+            t.freeze_next_segment(1, |_| {
+                Err(rrcloud_core::journal::JournalError::TooManyEntries { count: 1001 }.into())
+            })?;
+            Ok(())
+        })
+        .expect_err("builder failure must abort the composite");
+    assert!(matches!(err, StateError::SegmentBuild(_)), "got {err:?}");
+    assert_eq!(db.get_item(&key).expect("get"), None, "insert rolled back");
+    assert_eq!(db.last_allocated_seq().expect("last"), 1, "retry seq only");
+}
+
+#[test]
+fn freeze_next_segment_composes_with_the_journal_encoder() {
+    // The mandated publication path: stamp the real seqs inside the
+    // builder (the first seq is only known there) and encode fallibly with
+    // `?` — JournalError converts into StateError::SegmentBuild.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let first = db
+        .freeze_next_segment(3, |first| {
+            let entries: Vec<_> = (0..3).map(|i| journal_entry(first + i)).collect();
+            Ok(rrcloud_core::journal::encode_segment(&entries)?)
+        })
+        .expect("freeze encoded segment");
+    assert_eq!(first, 1, "first allocation is 1");
+    // The stored bytes decode back to entries stamped first..first+3.
+    let segs = db.unpublished_segments().expect("unpublished");
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0].0, first);
+    let decoded = rrcloud_core::journal::decode_segment(&segs[0].1).expect("decode");
+    assert_eq!(
+        decoded.iter().map(|e| e.seq).collect::<Vec<_>>(),
+        vec![first, first + 1, first + 2],
+        "entries embed the allocated span's seqs"
+    );
+    assert_eq!(
+        decoded,
+        vec![journal_entry(1), journal_entry(2), journal_entry(3)]
+    );
+    // And byte-identity survives reopen (§2.1.5 republish guarantee).
+    drop(db);
+    let db = SyncDb::open(&path, None).expect("reopen");
+    assert_eq!(db.unpublished_segments().expect("unpublished"), segs);
+}
+
+#[test]
+fn state_txn_read_accessors_see_uncommitted_writes() {
+    // The §2.2 apply composite ("if !has_applied { mutate; mark_applied;
+    // set_cursor }") and the transfer resume check must be able to run
+    // ENTIRELY inside one transaction — no check-outside-txn pattern.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let d2 = dev(DEV2);
+    let key = rel("a.rrdata");
+    let upload = MultipartUploadState {
+        upload_id: "upl-1".into(),
+        part_size: 16 * 1024 * 1024,
+        started_unix: 1_769_900_000,
+    };
+    let part = UploadPart {
+        etag: "\"abc\"".into(),
+        md5_b64: "md5md5==".into(),
+    };
+    db.with_txn(|t| {
+        // applied / cursor
+        assert!(!t.has_applied(&d2, 7)?);
+        t.mark_applied(&d2, 7)?;
+        assert!(t.has_applied(&d2, 7)?, "sees its own uncommitted apply");
+        assert_eq!(t.cursor(&d2)?, 0);
+        t.set_cursor(&d2, 7)?;
+        assert_eq!(t.cursor(&d2)?, 7);
+        // upload resume state
+        assert_eq!(t.get_upload(&key)?, None);
+        t.set_upload(&key, &upload)?;
+        assert_eq!(t.get_upload(&key)?.as_ref(), Some(&upload));
+        t.record_upload_part(&key, 1, &part)?;
+        assert_eq!(t.upload_parts(&key)?, vec![(1, part.clone())]);
+        // queue peek
+        assert_eq!(t.queue_peek(Queue::Up)?, None);
+        t.queue_push(Queue::Up, &key, 2)?;
+        assert_eq!(t.queue_peek(Queue::Up)?, Some((key.clone(), 2)));
+        // journal counters
+        assert_eq!(t.last_allocated_seq()?, 0);
+        let s = t.freeze_next_segment(2, |_| Ok(b"seg".to_vec()))?;
+        assert_eq!(t.last_allocated_seq()?, s + 1, "whole span allocated");
+        assert_eq!(t.published_cursor()?, 0);
+        t.mark_published(s)?;
+        assert_eq!(t.published_cursor()?, s + 1);
+        Ok(())
+    })
+    .expect("composite");
+    // Everything committed together and matches what the txn reads saw.
+    assert!(db.has_applied(&d2, 7).expect("has_applied"));
+    assert_eq!(db.cursor(&d2).expect("cursor"), 7);
+    assert_eq!(db.get_upload(&key).expect("get_upload"), Some(upload));
+    assert_eq!(db.upload_parts(&key).expect("parts").len(), 1);
+    assert_eq!(
+        db.queue_peek(Queue::Up).expect("peek"),
+        Some((key.clone(), 2))
+    );
+    assert_eq!(db.last_allocated_seq().expect("last"), 2);
+    assert_eq!(db.published_cursor().expect("published"), 2);
+}
+
+#[test]
+fn queue_clear_recovers_a_queue_wedged_by_a_corrupt_row() {
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    // Clearing an empty queue is an idempotent no-op.
+    assert_eq!(db.queue_clear(Queue::Up).expect("clear empty"), 0);
+    // A corrupt row at the HEAD (class 0 beats the good row's class 1).
+    db.queue_push(Queue::Up, &rel("good.rrdata"), 1)
+        .expect("push good");
+    db.force_corrupt_queue_row(Queue::Up, 0, "../not-a-relkey")
+        .expect("corrupt row");
+    // The wedge: every pop fails typed on the same head, the row stays,
+    // and queue_remove cannot name it (it takes a validated RelKey).
+    for _ in 0..2 {
+        let err = db.queue_pop(Queue::Up).expect_err("corrupt head refuses");
+        assert!(matches!(err, StateError::Codec(_)), "got {err:?}");
+    }
+    let err = db.queue_peek(Queue::Up).expect_err("peek refuses too");
+    assert!(matches!(err, StateError::Codec(_)), "got {err:?}");
+    assert_eq!(db.queue_len(Queue::Up).expect("len"), 2, "nothing removed");
+    // The recovery path: raw drain, no decoding, typed count back.
+    assert_eq!(db.queue_clear(Queue::Up).expect("clear"), 2);
+    assert_eq!(db.queue_len(Queue::Up).expect("len"), 0);
+    assert_eq!(db.queue_peek(Queue::Up).expect("peek"), None);
+    // The queue is fully usable again (rebuild from items_in_state).
+    db.queue_push(Queue::Up, &rel("good.rrdata"), 1)
+        .expect("re-push");
+    assert_eq!(
+        db.queue_pop(Queue::Up).expect("pop"),
+        Some((rel("good.rrdata"), 1))
+    );
+    // The other queue was never touched, and the clear is durable.
+    db.queue_push(Queue::Down, &rel("other.NEF"), 0)
+        .expect("push down");
+    drop(db);
+    let db = SyncDb::open(&path, None).expect("reopen");
+    assert_eq!(db.queue_len(Queue::Up).expect("len up"), 0);
+    assert_eq!(db.queue_len(Queue::Down).expect("len down"), 1);
+}
+
+#[test]
+fn delete_item_composite_cleans_companion_tables_atomically() {
+    // The documented §2.7 tombstone-apply composite: delete_item alone
+    // leaves queue/upload/xmp orphans (and an orphaned queue entry wedges
+    // the engine's pop+transition composite), so the full deletion runs
+    // all companion removals in ONE transaction.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let key = rel("a.rrdata");
+    db.replay_put_item(&key, &bare_record(ItemState::Queued))
+        .expect("item");
+    db.queue_push(Queue::Up, &key, 1).expect("queued");
+    db.set_upload(
+        &key,
+        &MultipartUploadState {
+            upload_id: "upl-9".into(),
+            part_size: 16 * 1024 * 1024,
+            started_unix: 1_769_900_000,
+        },
+    )
+    .expect("upload");
+    db.record_upload_part(
+        &key,
+        1,
+        &UploadPart {
+            etag: "\"e\"".into(),
+            md5_b64: "m==".into(),
+        },
+    )
+    .expect("part");
+    db.set_xmp_seen(&key, &Blake3Hex::parse(BLAKE3_HEX).expect("hash"))
+        .expect("xmp");
+    db.with_txn(|t| {
+        t.delete_item(&key)?;
+        t.queue_remove(Queue::Up, &key)?;
+        t.queue_remove(Queue::Down, &key)?;
+        t.clear_upload(&key)?;
+        t.remove_xmp_seen(&key)?;
+        Ok(())
+    })
+    .expect("full deletion composite");
+    assert_eq!(db.get_item(&key).expect("get"), None);
+    assert_eq!(db.queue_len(Queue::Up).expect("len"), 0);
+    assert_eq!(db.get_upload(&key).expect("upload"), None);
+    assert_eq!(db.upload_parts(&key).expect("parts"), vec![]);
+    assert_eq!(db.xmp_seen(&key).expect("xmp"), None);
+    // No orphan: a fresh pop on the emptied queue simply reports empty
+    // instead of wedging on a deleted item's entry.
+    assert_eq!(db.queue_pop(Queue::Up).expect("pop"), None);
 }
