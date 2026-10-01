@@ -1,0 +1,113 @@
+{
+  "version": 2,
+  "rating": 3,
+  "adjustments": {
+    "exposure": 0.35,
+    "contrast": 12,
+    "highlights": -40,
+    "shadows": 25,
+    "whites": 5,
+    "blacks": -10,
+    "saturation": 6,
+    "temperature": 9,
+    "tint": -3,
+    "vibrance": 14,
+    "clarity": 8,
+    "dehaze": 0,
+    "structure": 0,
+    "sharpness": 32,
+    "sharpnessThreshold": 0.5,
+    "lumaNoiseReduction": 10,
+    "colorNoiseReduction": 20,
+    "flipHorizontal": false,
+    "flipVertical": false,
+    "rotation": 0.0,
+    "orientationSteps": 1,
+    "aspectRatio": 1.5,
+    "crop": { "x": 0.0, "y": 118.0, "width": 6048.0, "height": 4032.0 },
+    "showClipping": false,
+    "curves": {
+      "luma": [
+        { "x": 0, "y": 0 },
+        { "x": 128, "y": 136 },
+        { "x": 255, "y": 255 }
+      ],
+      "red": [ { "x": 0, "y": 0 }, { "x": 255, "y": 255 } ],
+      "green": [ { "x": 0, "y": 0 }, { "x": 255, "y": 255 } ],
+      "blue": [ { "x": 0, "y": 0 }, { "x": 255, "y": 255 } ]
+    },
+    "hsl": {
+      "reds": { "hue": 0, "saturation": 0, "luminance": 0 },
+      "oranges": { "hue": 2, "saturation": -5, "luminance": 0 },
+      "yellows": { "hue": 0, "saturation": 0, "luminance": 0 },
+      "greens": { "hue": 0, "saturation": 0, "luminance": 0 },
+      "aquas": { "hue": 0, "saturation": 0, "luminance": 0 },
+      "blues": { "hue": 0, "saturation": 10, "luminance": -4 },
+      "purples": { "hue": 0, "saturation": 0, "luminance": 0 },
+      "magentas": { "hue": 0, "saturation": 0, "luminance": 0 }
+    },
+    "colorGrading": {
+      "shadows": { "h": 220, "s": 8, "lum": 0 },
+      "midtones": { "h": 0, "s": 0, "lum": 0 },
+      "highlights": { "h": 45, "s": 6, "lum": 0 },
+      "blending": 50,
+      "balance": 0
+    },
+    "grainAmount": 12,
+    "grainSize": 25,
+    "grainRoughness": 50,
+    "vignetteAmount": -18,
+    "vignetteMidpoint": 50,
+    "vignetteRoundness": 0,
+    "vignetteFeather": 50,
+    "lensBlurEnabled": false,
+    "lensBlurAmount": 0,
+    "lutPath": "/Users/haley/LUTs/Kodak Gold 200.cube",
+    "lutName": "Kodak Gold 200",
+    "lutIntensity": 80,
+    "lutSize": 33,
+    "sectionVisibility": {
+      "basic": true,
+      "curves": true,
+      "color": true,
+      "effects": true,
+      "details": false
+    },
+    "masks": [
+      {
+        "id": "9b2f6c1e-4f11-4abc-8def-5a6b7c8d9e0f",
+        "name": "Sky",
+        "invert": false,
+        "opacity": 100,
+        "adjustments": { "exposure": -0.5, "saturation": 10 },
+        "subMasks": [
+          {
+            "id": "1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f",
+            "type": "radial",
+            "visible": true,
+            "mode": "additive",
+            "parameters": {
+              "centerX": 0.5,
+              "centerY": 0.3,
+              "radiusX": 0.4,
+              "radiusY": 0.2,
+              "rotation": 0,
+              "feather": 0.5
+            }
+          }
+        ]
+      }
+    ],
+    "aiPatches": []
+  },
+  "tags": ["travel", "alps", "keeper"],
+  "exif": {
+    "Make": "NIKON CORPORATION",
+    "Model": "NIKON Z 6_2",
+    "ExposureTime": "1/250 s",
+    "FNumber": "f/4.0",
+    "ISOSpeedRatings": "400",
+    "FocalLength": "35.0 mm",
+    "DateTimeOriginal": "2026-09-14T10:21:33"
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "version": 2,
+  "rating": 5,
+  "adjustments": {
+    "exposure": -0.2,
+    "contrast": 5,
+    "highlights": 0,
+    "shadows": 0,
+    "saturation": 0,
+    "flipHorizontal": false,
+    "flipVertical": false,
+    "rotation": 0.0,
+    "orientationSteps": 0,
+    "crop": null,
+    "masks": [],
+    "aiPatches": [
+      {
+        "id": "f3a9d2c1-7b8e-4d5f-9a0b-1c2d3e4f5a6b",
+        "name": "Remove person",
+        "prompt": "remove the person on the left",
+        "isLoading": false,
+        "invert": false,
+        "visible": true,
+        "patchData": {
+          "format": "png",
+          "dataBase64": "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJgggiVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJgggiVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJgggiVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+        },
+        "subMasks": [
+          {
+            "id": "0f9e8d7c-6b5a-4f3e-8d1c-2b3a4c5d6e7f",
+            "type": "brush",
+            "visible": true,
+            "mode": "additive",
+            "parameters": { "lines": [] }
+          }
+        ]
+      }
+    ]
+  },
+  "tags": ["people", "beach"],
+  "exif": {
+    "Make": "SONY",
+    "Model": "ILCE-7M4",
+    "ExposureTime": "1/1000 s"
+  }
+}
