@@ -123,6 +123,16 @@ pub struct SyncView {
     pub device: Option<DeviceId>,
     pub head_ts: Option<i64>,
     pub size: u64,
+    // §2.2 original-metadata fleet facts: the journal carries `w`/`h`
+    // (final displayed dimensions, used for §4.4 proxy_scale), so two
+    // converged devices must agree on them exactly — unlike the
+    // local-only facts above the `deleted` line (review round 3, minor).
+    // `mtime` is deliberately NOT here: originals carry it only at
+    // whole-second precision on the wire while a holder keeps its local
+    // file's nanosecond mtime, and sidecar puts carry none at all, so it
+    // is a local fact, not a cross-device one.
+    pub w: Option<u32>,
+    pub h: Option<u32>,
     pub deleted: bool,
 }
 
@@ -139,6 +149,8 @@ impl From<&ItemRecord> for SyncView {
             device: r.device.clone(),
             head_ts: r.head_ts,
             size: r.size,
+            w: r.w,
+            h: r.h,
             deleted: r.deleted,
         }
     }

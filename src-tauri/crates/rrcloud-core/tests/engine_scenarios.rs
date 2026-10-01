@@ -28,8 +28,8 @@ use common::transfer::CountingS3;
 use rrcloud_core::clock::{compare, pick_winner, Candidate, DeviceId, VvOrder};
 use rrcloud_core::engine::{
     admit_pending, delete_item, item_local_path, loser_vc_suffix, notify_local_change,
-    original_conflict_relkey, recently_deleted, restore_item, sidecar_item_relkey, vc_item_relkey,
-    ChangeOutcome, EngineConsumer, LocalScan,
+    original_conflict_relkey, recently_deleted, reconcile_wholeness, restore_item,
+    sidecar_item_relkey, vc_item_relkey, ChangeOutcome, EngineConsumer, LocalScan,
 };
 use rrcloud_core::journal::{JournalEntry, Kind, Op, Tombstone};
 use rrcloud_core::keys::{library_key, sidecar_key, tombstone_key, RelKey};
@@ -2285,4 +2285,401 @@ async fn s21_in_flight_edit_raced_by_whole_photo_delete_resurrects_the_whole_ite
             "fresh C: no standing original row"
         );
     }
+}
+
+/// Round 3, BLOCKER 1: a committed sidecar edit whose author PUBLISHED it
+/// and then went permanently offline — it never applies the concurrent
+/// whole-photo delete, so it publishes NO resurrection put. The surviving
+/// edit un-hides the sidecar everywhere, but the author-only `apply_del`
+/// resurrection lane (round 2) never fires on any non-author device, so
+/// the image's original is left tombstoned while the sidecar is live —
+/// the exact §2.7 live-sidecar-but-dead-RAW state §2.10 GC would destroy.
+///
+/// The fix is the quiescent §2.7/§2.11 wholeness reconciliation
+/// ([`reconcile_wholeness`], the sync loop's post-poll step): the deleter
+/// — a holder of the original — re-advertises it, metadata-only, so the
+/// whole item converges live with no device ever handing GC an orphan.
+#[tokio::test]
+async fn s22_surviving_edit_whose_author_retired_is_resurrected_by_a_holder() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s22-retired-editor");
+    let client = g.client();
+    let mut a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+    let (orig, _base) = {
+        let mut rest = [&mut b];
+        seed_photo(&image, &a, &mut rest).await
+    };
+
+    // B commits + PUBLISHES a sidecar edit (clock ahead so it wins every
+    // tiebreak), then never comes back online — B never applies A's later
+    // delete, so B publishes no resurrection put.
+    let doc_b = eh::doc(4, Some("green"), 0.8);
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &doc_b),
+        ChangeOutcome::MarkedDirty
+    );
+    b.db.set_server_time_offset_ms(7_200_000).expect("offset");
+    b.sync_up().await;
+
+    // A, never having seen B's edit, deletes the whole photo.
+    let outcome = delete_item(
+        &a.db,
+        &a.s3,
+        &bucket,
+        &image,
+        &[Kind::Sidecar, Kind::Original],
+    )
+    .await
+    .expect("delete");
+    publish_pending(&a.db, &a.s3, &bucket)
+        .await
+        .expect("publish dels");
+    assert!(a.item(&image).deleted && a.item(&sidecar_rel).deleted);
+
+    // A polls B's published edit: the sidecar un-hides (edits beat
+    // deletes), but A's ORIGINAL stays tombstoned — B is gone and
+    // published no resurrection, and A's un-hide path mints none. This is
+    // the orphaned state the blocker describes.
+    a.poll_apply().await;
+    assert!(
+        !a.item(&sidecar_rel).deleted,
+        "edit beats delete on the edited key"
+    );
+    assert!(
+        a.item(&image).deleted,
+        "pre-fix: the original is tombstoned while its sidecar is live (orphaned to GC)"
+    );
+
+    // The quiescent wholeness reconciliation re-advertises the original
+    // from the surviving holder (the deleter still holds the RAW).
+    let minted = reconcile_wholeness(&a.db, &mut a.events).expect("reconcile");
+    assert_eq!(
+        minted,
+        vec![image.clone()],
+        "the original was re-advertised by the holding deleter"
+    );
+    assert!(
+        !a.item(&image).deleted,
+        "the original is resurrected whole — no orphan for GC"
+    );
+    assert_eq!(
+        a.db.get_deleted(&image).expect("row"),
+        None,
+        "the original's deleted-set row is superseded by the resurrection"
+    );
+    assert_eq!(
+        compare(&a.item(&image).vv, &outcome.tombstone.vv),
+        VvOrder::Greater,
+        "the resurrection vv dominates the delete"
+    );
+    assert!(recently_deleted(&a.db).expect("listing").is_empty());
+
+    // The resurrection is metadata-only: it adds no original-kind data PUT
+    // (A seeded the RAW once, long before; the resurrection moves nothing).
+    let puts_before = a.puts_to(&library_key(&image));
+    a.sync_up().await;
+    assert_eq!(
+        a.puts_to(&library_key(&image)),
+        puts_before,
+        "the resurrection publishes metadata only — no new original-kind data PUT"
+    );
+    // The RAW is still in the bucket (destruction is §2.10 GC's).
+    assert_eq!(
+        th::get_bytes(&client, &bucket, &library_key(&image)).await,
+        orig
+    );
+    assert!(a.events.resurrection_incomplete.is_empty());
+
+    // §2.11: a fresh device replaying EVERY published journal (B's lone
+    // edit + A's dels + A's resurrection) in EITHER arrival order reaches
+    // the whole live item — nothing re-mints, the published resurrection
+    // is adopted identically.
+    let entries_a = eh::journal_entries_of(&client, &bucket, &dev(DEV_A)).await;
+    let entries_b = eh::journal_entries_of(&client, &bucket, &dev(DEV_B)).await;
+    let a_first: Vec<&JournalEntry> = entries_a.iter().chain(entries_b.iter()).collect();
+    let b_first: Vec<&JournalEntry> = entries_b.iter().chain(entries_a.iter()).collect();
+    let (_d1, root1, db1) = fresh_dev(DEV_C);
+    apply_manually(&db1, root1.path(), &a_first);
+    let (_d2, root2, db2) = fresh_dev(DEV_C);
+    apply_manually(&db2, root2.path(), &b_first);
+    assert_eq!(eh::full_items(&db1), eh::full_items(&db2));
+    assert_eq!(
+        db1.iter_deleted().expect("deleted"),
+        db2.iter_deleted().expect("deleted")
+    );
+    for db in [&db1, &db2] {
+        assert!(
+            !db.get_item(&sidecar_rel)
+                .expect("get")
+                .expect("rec")
+                .deleted,
+            "fresh: sidecar live"
+        );
+        assert!(
+            !db.get_item(&image).expect("get").expect("rec").deleted,
+            "fresh: original live — the whole item survived"
+        );
+        assert!(
+            db.get_deleted(&image).expect("row").is_none(),
+            "fresh: no standing original row"
+        );
+    }
+}
+
+/// Round 3, BLOCKER 2: the device whose sidecar edit survives a
+/// whole-photo delete never learned the image's ORIGINAL (a persistently
+/// unreadable original segment / un-retried fetch_failed — modeled by
+/// pre-marking the original's journal seq applied), so IT cannot
+/// resurrect the original and fires [`ResurrectionIncompleteEvent`]. The
+/// deleter DOES hold the original; the quiescent wholeness reconciliation
+/// makes it re-advertise, so the whole item — original included — reaches
+/// every device, even the editor that never had the RAW.
+#[tokio::test]
+async fn s23_surviving_editor_without_the_original_is_covered_by_the_deleter() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s23-editor-without-original");
+    let client = g.client();
+    let mut a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+
+    // A seeds the original + a base sidecar.
+    let orig = th::patterned(2048, 42);
+    let base = eh::doc(1, None, 0.1);
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Original, &orig),
+        ChangeOutcome::MarkedDirty
+    );
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Sidecar, &base),
+        ChangeOutcome::MarkedDirty
+    );
+    a.sync_up().await;
+
+    // B learns ONLY the sidecar: the original's segment entry is
+    // pre-marked applied, so B creates no original record.
+    let entries_a0 = eh::journal_entries_of(&client, &bucket, &dev(DEV_A)).await;
+    let orig_seq = entries_a0
+        .iter()
+        .find(|e| e.op == Op::Put && e.key == library_key(&image))
+        .expect("original put")
+        .seq;
+    b.db.mark_applied(&dev(DEV_A), orig_seq)
+        .expect("skip the original segment entry on B");
+    b.poll_apply().await;
+    b.pump_down().await;
+    assert!(
+        b.db.get_item(&image).expect("get").is_none(),
+        "precondition: B has the sidecar record but NO original record"
+    );
+    assert!(!b.item(&sidecar_rel).deleted);
+
+    // B edits the sidecar and publishes (clock ahead).
+    let doc_b = eh::doc(5, Some("red"), 0.9);
+    assert_eq!(
+        b.write_and_notify(&image, Kind::Sidecar, &doc_b),
+        ChangeOutcome::MarkedDirty
+    );
+    b.db.set_server_time_offset_ms(7_200_000).expect("offset");
+    b.sync_up().await;
+
+    // A, never having seen B's edit, deletes the whole photo.
+    delete_item(
+        &a.db,
+        &a.s3,
+        &bucket,
+        &image,
+        &[Kind::Sidecar, Kind::Original],
+    )
+    .await
+    .expect("delete");
+    publish_pending(&a.db, &a.s3, &bucket)
+        .await
+        .expect("publish dels");
+
+    // B polls A's dels: the sidecar survives (edits beat deletes), but B
+    // cannot resurrect the original it never had — the incomplete event
+    // fires, and the original stays a bare deleted-set row on B.
+    b.poll_apply().await;
+    assert!(!b.item(&sidecar_rel).deleted, "the edit survives on B");
+    assert_eq!(
+        b.events.resurrection_incomplete.len(),
+        1,
+        "B surfaces that it could not cover the unknown original"
+    );
+    assert!(b.db.get_item(&image).expect("get").is_none());
+
+    // A polls B's edit: A un-hides its sidecar; A's original stays
+    // tombstoned. A holds the RAW, so the quiescent reconciliation
+    // re-advertises it — closing the gap B could not.
+    a.poll_apply().await;
+    let minted = reconcile_wholeness(&a.db, &mut a.events).expect("reconcile A");
+    assert_eq!(minted, vec![image.clone()]);
+    assert!(!a.item(&image).deleted && !a.item(&sidecar_rel).deleted);
+    assert!(
+        a.events.resurrection_incomplete.is_empty(),
+        "the deleter held the original: full resurrection, no event"
+    );
+    a.sync_up().await;
+
+    // B polls A's resurrection: B finally LEARNS the original (whole item).
+    b.poll_apply().await;
+    b.pump_down().await;
+    assert!(
+        !b.item(&image).deleted,
+        "B now has the resurrected original — the editor-without-the-RAW converges whole"
+    );
+    assert_eq!(b.file(&image), orig, "B fetched the resurrected RAW");
+    for d in [&a, &b] {
+        assert!(!d.item(&image).deleted && !d.item(&sidecar_rel).deleted);
+        assert_eq!(
+            d.item(&sidecar_rel).sem_hash,
+            Some(sem_hash(&doc_b).expect("sem")),
+            "B's edit is the surviving head"
+        );
+        assert!(recently_deleted(&d.db).expect("listing").is_empty());
+        assert_eq!(d.db.get_deleted(&image).expect("row"), None);
+    }
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
+
+    // §2.11 order-equivalence on a fresh device.
+    let entries_a = eh::journal_entries_of(&client, &bucket, &dev(DEV_A)).await;
+    let entries_b = eh::journal_entries_of(&client, &bucket, &dev(DEV_B)).await;
+    let a_first: Vec<&JournalEntry> = entries_a.iter().chain(entries_b.iter()).collect();
+    let b_first: Vec<&JournalEntry> = entries_b.iter().chain(entries_a.iter()).collect();
+    let (_d1, root1, db1) = fresh_dev(DEV_C);
+    apply_manually(&db1, root1.path(), &a_first);
+    let (_d2, root2, db2) = fresh_dev(DEV_C);
+    apply_manually(&db2, root2.path(), &b_first);
+    assert_eq!(eh::full_items(&db1), eh::full_items(&db2));
+    for db in [&db1, &db2] {
+        assert!(
+            !db.get_item(&sidecar_rel)
+                .expect("get")
+                .expect("rec")
+                .deleted
+        );
+        assert!(
+            !db.get_item(&image).expect("get").expect("rec").deleted,
+            "fresh: the whole item is live"
+        );
+    }
+}
+
+/// Round 3, MAJOR 3: the CONVERSE resurrection lane. An original-overwrite
+/// (§2.8) that survives a concurrent whole-photo delete used to leave the
+/// photo's committed sidecar edits orphaned — the sidecar's own dominating
+/// del hid it and NO lane re-advertised it, silently losing the develop
+/// edits on a surviving photo. The quiescent wholeness reconciliation
+/// re-advertises the sidecar (holder-based; both holders converge on the
+/// identical semantic head), so the whole item keeps its edits.
+#[tokio::test]
+async fn s24_original_overwrite_surviving_a_delete_resurrects_the_sidecar_edits() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s24-overwrite-vs-delete");
+    let mut a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let image = rel("p/IMG_0042.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+
+    // A seeds the original + a base sidecar carrying REAL develop edits.
+    let orig0 = th::patterned(2048, 42);
+    let edited = eh::doc(3, Some("red"), 0.4);
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Original, &orig0),
+        ChangeOutcome::MarkedDirty
+    );
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Sidecar, &edited),
+        ChangeOutcome::MarkedDirty
+    );
+    a.sync_up().await;
+    b.poll_apply().await;
+    b.pump_down().await;
+
+    // A overwrites the ORIGINAL out of band (new RAW, clock ahead) and
+    // publishes; A does NOT touch the sidecar.
+    let orig1 = th::patterned(2048, 99);
+    a.db.set_server_time_offset_ms(7_200_000).expect("offset");
+    assert_eq!(
+        a.write_and_notify(&image, Kind::Original, &orig1),
+        ChangeOutcome::MarkedDirty
+    );
+    a.sync_up().await;
+
+    // B, never having seen the overwrite, deletes the whole photo.
+    delete_item(
+        &b.db,
+        &b.s3,
+        &bucket,
+        &image,
+        &[Kind::Sidecar, Kind::Original],
+    )
+    .await
+    .expect("delete");
+    publish_pending(&b.db, &b.s3, &bucket)
+        .await
+        .expect("publish dels");
+
+    // Cross-apply: A keeps the overwritten original (concurrent with the
+    // del), but B's sidecar del DOMINATES A's clean sidecar and hides it.
+    a.poll_apply().await;
+    assert!(
+        !a.item(&image).deleted,
+        "the overwritten original survives the concurrent delete"
+    );
+    assert!(
+        a.item(&sidecar_rel).deleted,
+        "pre-fix: the sidecar (its develop edits) is orphaned on the overwriter"
+    );
+    // B un-hides the original on learning the overwrite; its sidecar stays
+    // tombstoned.
+    b.poll_apply().await;
+    b.pump_down().await;
+    assert!(!b.item(&image).deleted);
+    assert!(
+        b.item(&sidecar_rel).deleted,
+        "pre-fix: B's sidecar edits are orphaned too"
+    );
+
+    // The quiescent reconciliation on the holders re-advertises the
+    // sidecar's edits (§2.11 "resurrection restores a whole item").
+    assert_eq!(
+        reconcile_wholeness(&a.db, &mut a.events).expect("reconcile A"),
+        vec![sidecar_rel.clone()]
+    );
+    assert_eq!(
+        reconcile_wholeness(&b.db, &mut b.events).expect("reconcile B"),
+        vec![sidecar_rel.clone()]
+    );
+    assert!(!a.item(&sidecar_rel).deleted && !b.item(&sidecar_rel).deleted);
+
+    // Converge the two holder re-advertisements (identical semantic head).
+    a.sync_up().await;
+    b.sync_up().await;
+    a.poll_apply().await;
+    b.poll_apply().await;
+
+    for d in [&a, &b] {
+        assert!(
+            !d.item(&image).deleted && !d.item(&sidecar_rel).deleted,
+            "the whole item is live with its edits"
+        );
+        assert_eq!(
+            d.item(&sidecar_rel).sem_hash,
+            Some(sem_hash(&edited).expect("sem")),
+            "the committed develop edits are preserved, not silently lost"
+        );
+        assert_eq!(
+            d.item(&image).content_id,
+            Some(ContentId::from_bytes(&orig1)),
+            "the surviving head is the overwrite"
+        );
+        assert!(recently_deleted(&d.db).expect("listing").is_empty());
+    }
+    assert_eq!(eh::sync_view(&a.db), eh::sync_view(&b.db));
 }

@@ -1308,6 +1308,15 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                 if entry.content_id.is_some() {
                     r.content_id = entry.content_id.clone();
                 }
+                // The §2.2 `w`/`h` fleet facts travel with the content the
+                // device is adopting (review round 3, minor:
+                // `adopt_remote`/`create_from_put` already carry them, so
+                // the converge path must not leave them stale — §4.4
+                // proxy_scale reads them). `mtime` is left as-is: a holder
+                // keeps its local file's nanosecond mtime, which the
+                // whole-second wire value would only coarsen.
+                r.w = entry.w;
+                r.h = entry.h;
                 // Integrity facts described the superseded blake3.
                 r.verified_remote = false;
                 r.attested = false;
@@ -2063,21 +2072,21 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
     /// relkey (idempotent), staged for upload with a fresh
     /// single-component vv, and the [`OriginalConflictEvent`] fires.
     ///
-    /// **Spec deviation, documented per repo convention (review round
-    /// 1)**: ARCHITECTURE.md §2.8 specifies that an original-overwrite
-    /// `put` entry "records the content_id it replaced" as the wire
-    /// mechanism by which a holder of the displaced bytes learns to
-    /// upload the conflict copy. That field was **never implemented** —
-    /// [`crate::journal::JournalEntry`] carries only the NEW
-    /// `content_id`, and no replaced-content field exists on the v1
-    /// wire. Displacement is detected from **vv concurrency** instead:
-    /// the two concurrent overwrite puts meet in §2.6 case 4
+    /// **Displacement is detected from vv concurrency, not a
+    /// replaced-content_id field** — and this now MATCHES the design:
+    /// review round 2 rewrote ARCHITECTURE.md §2.8 to specify the
+    /// vv-concurrency mechanism and to state explicitly that "the v1
+    /// `JournalEntry` wire carries only the *new* `content_id`." (The
+    /// earlier spec wording about an entry "recording the content_id it
+    /// replaced" was the one corrected; this is no longer a deviation.)
+    /// The two concurrent overwrite puts meet in §2.6 case 4
     /// ([`Self::resolve_concurrent`]), which routes the losing holder
     /// here — reaching §2.8's outcome for its two-concurrent-overwrites
-    /// scenario (pinned by S6 and the `original_overwrite_*` unit
-    /// tests) while correctly NOT preserving superseded *ancestors*,
-    /// which §2.8 does not ask for. A future reconcile/worker unit must
-    /// not go looking for a replaced-content_id field on entries.
+    /// scenario (pinned by S6 and the `original_overwrite_*` unit tests)
+    /// while correctly NOT preserving superseded *ancestors*, which §2.8
+    /// does not ask for. A future reconcile/worker unit must not go
+    /// looking for a replaced-content_id field on entries: none exists,
+    /// by design.
     fn stage_displaced_original(
         &mut self,
         txn: &StateTxn<'_>,
@@ -2503,6 +2512,197 @@ pub fn restore_item(db: &SyncDb, image: &RelKey) -> Result<Vec<RelKey>, EngineEr
         Ok(())
     })?;
     Ok(restored)
+}
+
+/// The image a **base** sidecar item (`<image>.rrdata`) belongs to, or
+/// `None` for a virtual-copy sidecar (`<image>.<6hex>.rrdata`, whose
+/// original is reached through the base sidecar) or a non-sidecar key.
+/// Used only to enumerate images for [`reconcile_wholeness`]; a RAW whose
+/// own stem happens to end in `.<6hex>` reads as a vc here and is simply
+/// skipped (a harmless miss, never a wrong re-advertisement).
+fn image_of_base_sidecar_item(item: &RelKey) -> Option<RelKey> {
+    let rest = item.as_str().strip_suffix(".rrdata")?;
+    if let Some((_, tail)) = rest.rsplit_once('.') {
+        if crate::hexutil::is_lower_hex(tail, 6) {
+            return None;
+        }
+    }
+    RelKey::new(rest.to_string()).ok()
+}
+
+/// Re-advertise `rec` (a held, tombstoned item) as a live put dominating
+/// its own del — the metadata-only half the resurrection lanes share with
+/// [`restore_item`]. Returns `false` (minting nothing) when this device
+/// does not hold the bytes (no `blake3`): an [`EnginePut`] is
+/// unconstructible without one, so another holder must close the gap.
+///
+/// The resurrection vv is built from the item's **own** lineage
+/// (`rec.vv` ∪ its deleted-set row) plus a self bump — strictly per item
+/// key, never mixing a sibling's lineage.
+fn resurrect_tombstoned_item(
+    t: &StateTxn<'_>,
+    own: &DeviceId,
+    now: i64,
+    item: &RelKey,
+    rec: &ItemRecord,
+) -> Result<bool, EngineError> {
+    let Some(blake3) = rec.blake3.clone() else {
+        return Ok(false);
+    };
+    let mut vv = rec.vv.clone();
+    if let Some(row) = t.get_deleted(item)? {
+        vv.merge(&row.vv);
+    }
+    vv.bump(own);
+    let put = EnginePut {
+        device: own.clone(),
+        kind: rec.kind,
+        item: item.clone(),
+        vv: vv.clone(),
+        blake3,
+        size: rec.size,
+        ts: now,
+        sem_hash: rec.sem_hash.clone(),
+        rating: rec.rating,
+        color_label: rec.color_label.clone(),
+        content_id: rec.content_id.clone(),
+        w: rec.w,
+        h: rec.h,
+        mtime: (rec.kind == Kind::Original).then(|| rec.mtime_unix_ns.div_euclid(1_000_000_000)),
+    };
+    enqueue_entry_in(t, own, &put.entry())?;
+    t.update_item(item, rec.state, |r| {
+        r.vv = vv.clone();
+        r.deleted = false;
+        r.head_ts = Some(now);
+        r.device = Some(own.clone());
+    })?;
+    // Transfer-lane normalization, mirroring restore_item/resurrect_original:
+    // an un-hidden PendingDown record must re-push its Down row or it is
+    // pump-invisible until the next startup sweep.
+    if rec.state == ItemState::PendingDown {
+        t.queue_push(Queue::Down, item, transfer_class(rec.kind))?;
+    }
+    // The item's own deleted-set row is superseded by the resurrection put.
+    if let Some(row) = t.get_deleted(item)? {
+        if matches!(
+            compare(&vv, &row.vv),
+            VvOrder::Greater | VvOrder::Concurrent
+        ) {
+            t.remove_deleted(item)?;
+        }
+    }
+    Ok(true)
+}
+
+/// §2.7/§2.11 whole-item wholeness reconciliation — the quiescent,
+/// order-independent fallback re-advertiser (review round 3; two verified
+/// blockers + one major).
+///
+/// Call it at **quiescence** — after a [`crate::reader::poll`] has applied
+/// every entry currently available, alongside [`publish_pending`] — never
+/// mid-stream: it reads the device's CONVERGED local state, so its
+/// decision is a pure function of that state, identical for every arrival
+/// order (a fresh replay that stops short of quiescence simply adopts the
+/// resurrection puts this already minted on an online device, and never
+/// re-mints — the §2.11 order-equivalence the scenario suite pins). For
+/// every image left in the forbidden half-deleted shape it mints a
+/// metadata-only resurrection (the data keys are still in the bucket
+/// during the §2.10 grace window):
+///
+/// - **sidecar live while the original is tombstoned** (§2.7) — the
+///   original is re-advertised, so §2.10 GC can never destroy a RAW a
+///   live sidecar still references. This is the catch-all the author-only
+///   `apply_del` lanes miss: a committed edit whose author went
+///   permanently offline before applying the delete (BLOCKER 1), or an
+///   edit whose surviving device never learned the original and could
+///   only fire [`ResurrectionIncompleteEvent`] (BLOCKER 2). A device that
+///   does not hold the original either (no record / no `blake3`) re-fires
+///   that event and mints nothing — the deleter, or any holder, or the
+///   §2.10 GC worker (which re-applies journals through the same engine)
+///   closes it.
+/// - **original live while its base sidecar is tombstoned** (§2.11
+///   "resurrection restores a whole item") — the sidecar's develop edits
+///   are re-advertised, the converse lane the engine had no path for: an
+///   original-overwrite (§2.8) that survives a concurrent whole-photo
+///   delete used to drop the photo's edits silently (MAJOR 3).
+///
+/// Holder-based and idempotent: the resurrection put carries the item's
+/// own content hash, so N holders re-advertising the same head emit
+/// byte-identical-content puts that the §2.6 case-1 lane
+/// ([`EngineConsumer::converge`]) vv-max-merges into one live version —
+/// no divergence, exactly the dedup model §2.6 already relies on. Once the
+/// whole item is live everywhere, the shape no longer matches and nothing
+/// is minted, so repeated calls converge to a fixed point. Returns the
+/// item relkeys re-advertised this call (ascending, deduplicated).
+pub fn reconcile_wholeness(
+    db: &SyncDb,
+    events: &mut impl EngineEvents,
+) -> Result<Vec<RelKey>, EngineError> {
+    let own = db.device_id().clone();
+    let now = crate::transfer::server_ts_estimate(db)?;
+    // Enumerate every image with an original or a base sidecar record.
+    let mut images: Vec<RelKey> = Vec::new();
+    for (key, record) in db.iter_items()? {
+        let image = match record.kind {
+            Kind::Original => Some(key.clone()),
+            Kind::Sidecar => image_of_base_sidecar_item(&key),
+            _ => None,
+        };
+        if let Some(image) = image {
+            if !images.contains(&image) {
+                images.push(image);
+            }
+        }
+    }
+    images.sort();
+
+    let mut minted: Vec<RelKey> = Vec::new();
+    let mut incomplete: Vec<RelKey> = Vec::new();
+    db.with_txn_err::<(), EngineError>(|t| {
+        for image in &images {
+            let sidecar_rel = sidecar_item_relkey(image)?;
+            let original = t.get_item(image)?.filter(|r| r.kind == Kind::Original);
+            let sidecar = t
+                .get_item(&sidecar_rel)?
+                .filter(|r| r.kind == Kind::Sidecar);
+            let sidecar_live = sidecar.as_ref().is_some_and(|r| !r.deleted);
+            let original_live = original.as_ref().is_some_and(|r| !r.deleted);
+
+            // §2.7: a live sidecar must never leave its original tombstoned.
+            if sidecar_live {
+                match &original {
+                    Some(rec) if rec.deleted => {
+                        if resurrect_tombstoned_item(t, &own, now, image, rec)? {
+                            minted.push(image.clone());
+                        } else {
+                            incomplete.push(image.clone());
+                        }
+                    }
+                    // The original was never known here (or is unheld): this
+                    // device cannot resurrect it; another holder must.
+                    None => incomplete.push(image.clone()),
+                    _ => {}
+                }
+            }
+            // §2.11: a live original must never leave its base sidecar's
+            // (edits) tombstoned — the converse lane.
+            if original_live {
+                if let Some(rec) = &sidecar {
+                    if rec.deleted && resurrect_tombstoned_item(t, &own, now, &sidecar_rel, rec)? {
+                        minted.push(sidecar_rel.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    })?;
+    for image in incomplete {
+        events.resurrection_incomplete(ResurrectionIncompleteEvent { relkey: image });
+    }
+    minted.sort();
+    minted.dedup();
+    Ok(minted)
 }
 
 /// The §2.7 "Recently Deleted" listing: every item record carrying the
