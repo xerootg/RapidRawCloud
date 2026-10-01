@@ -75,6 +75,36 @@ pub enum PublisherError {
         /// The decode failure.
         source: JournalError,
     },
+    /// [`enqueue_entry`] was handed an entry whose single encoded line
+    /// exceeds [`SEGMENT_MAX_BYTES`]: no conforming segment could ever
+    /// carry it, so staging it would permanently wedge the outbound lane.
+    /// Refused synchronously, where the caller still has the entry in
+    /// hand.
+    #[error(
+        "journal entry encodes to {size} bytes; no segment can carry a line over \
+         {SEGMENT_MAX_BYTES} bytes"
+    )]
+    OversizedEntry {
+        /// The encoded line length including its newline.
+        size: usize,
+    },
+    /// A **staged** record's single encoded line exceeds
+    /// [`SEGMENT_MAX_BYTES`], so freezing cannot proceed (reachable only
+    /// for records staged around [`enqueue_entry`]'s gate, e.g. by an
+    /// older build). Like [`PublisherError::CorruptStaged`], the staging
+    /// id is attached so the engine can surface-and-drop the one bad
+    /// record ([`crate::state::StateTxn::remove_outbound`]) and retry —
+    /// never an unactionable head-of-line wedge.
+    #[error(
+        "staged outbound record {outbound_id} encodes to a {size}-byte segment, \
+         over the {SEGMENT_MAX_BYTES}-byte cap"
+    )]
+    OversizedStaged {
+        /// The staging id of the unfreezable record.
+        outbound_id: u64,
+        /// The single-entry segment size that broke the cap.
+        size: usize,
+    },
     /// The S3 response carried no usable `Date` header, so no server-time
     /// measurement could be taken (§2.10: server time is the only clock
     /// the registry/GC lanes trust).
@@ -123,6 +153,19 @@ pub fn enqueue_entry(db: &SyncDb, entry: &JournalEntry) -> Result<u64, Publisher
     staged.v = crate::journal::JOURNAL_VERSION;
     staged.seq = 0;
     let line = staged.to_json_line()?;
+    // One encoded line (plus its newline) over the §2.2 segment byte cap
+    // could never be frozen: refuse it here — synchronously, with the
+    // caller in context — rather than let it poison-pill every later
+    // publish pass. (The seq stamped at freeze time is at most 20 digits
+    // longer than the staged `0`, which the cap check absorbs: a line
+    // within SEGMENT_MAX_BYTES here can only breach it at freeze time if
+    // it was within ~20 bytes of the cap, and freeze then fails typed
+    // with the staging id — PublisherError::OversizedStaged.)
+    if line.len() + 1 > SEGMENT_MAX_BYTES {
+        return Err(PublisherError::OversizedEntry {
+            size: line.len() + 1,
+        });
+    }
     Ok(db.stage_outbound(line.as_bytes())?)
 }
 
@@ -191,6 +234,18 @@ fn freeze_staged(db: &SyncDb) -> Result<(), PublisherError> {
                         // retry loop always terminates.
                         let estimated = take * SEGMENT_MAX_BYTES / size.max(1);
                         take = estimated.clamp(1, take - 1);
+                    }
+                    // A single staged record over the cap can never
+                    // freeze: fail typed WITH its staging id, so the
+                    // engine can surface-and-drop it (like CorruptStaged)
+                    // instead of wedging the lane on an unactionable
+                    // error. (enqueue_entry refuses these up front; this
+                    // arm covers records staged around that gate.)
+                    Err(StateError::SegmentBuild(JournalError::SegmentTooLarge { size })) => {
+                        return Err(PublisherError::OversizedStaged {
+                            outbound_id: batch[0].0,
+                            size,
+                        })
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -324,9 +379,16 @@ pub struct DeviceEntry {
 /// `last_seen_server_ts` itself is derived from the best server-time
 /// estimate available (the previously stored offset applied to the local
 /// clock, or the local clock on a first-ever heartbeat), then corrected
-/// by this PUT's own measurement for the *next* heartbeat — so the stored
-/// field is always within one round-trip + one heartbeat interval of true
-/// server time.
+/// by this PUT's own measurement for the *next* heartbeat.
+///
+/// **First-heartbeat caveat**: with no stored offset yet, the first-ever
+/// entry's `last_seen_server_ts` is the raw device clock and carries its
+/// full skew until the second heartbeat (~one interval later) corrects
+/// it; every later heartbeat is within one round-trip + one heartbeat
+/// interval of true server time. §2.10/B8 consumers of the registry (GC
+/// horizons, auto-retirement) must tolerate one arbitrarily-skewed
+/// initial value per device — e.g. by never acting on a device whose
+/// registry entry has only ever been written once.
 ///
 /// Returns the entry exactly as written.
 pub async fn put_device_entry(

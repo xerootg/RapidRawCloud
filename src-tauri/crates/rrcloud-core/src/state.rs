@@ -358,6 +358,12 @@ const T_ITEMS: TableDefinition<&str, &[u8]> = TableDefinition::new("items");
 const T_APPLIED: TableDefinition<(&str, u64), ()> = TableDefinition::new("applied");
 /// `cursors`: device id -> highest contiguously-applied seq.
 const T_CURSORS: TableDefinition<&str, u64> = TableDefinition::new("cursors");
+/// `segment_spans`: (device id, segment first seq) -> last entry seq — the
+/// reader's cache of fully-applied foreign segments' spans. A published
+/// segment is immutable (§2.2), so a recorded span lets the §2.2
+/// steady-state poll prove "this segment is covered by the cursor" without
+/// re-GETting it; losing a row costs one redundant GET, never correctness.
+const T_SEGMENT_SPANS: TableDefinition<(&str, u64), u64> = TableDefinition::new("segment_spans");
 /// `pending_segments`: first entry seq -> (entry count, frozen segment
 /// bytes) (§2.1.5). §2.2 seqs are per-**entry**, so a segment with `n`
 /// entries covers the seq span `first..first + n`; the stored count is
@@ -1023,6 +1029,7 @@ impl SyncDb {
         txn.open_table(T_ITEMS).map_err(db_err)?;
         txn.open_table(T_APPLIED).map_err(db_err)?;
         txn.open_table(T_CURSORS).map_err(db_err)?;
+        txn.open_table(T_SEGMENT_SPANS).map_err(db_err)?;
         txn.open_table(T_SEGMENTS).map_err(db_err)?;
         txn.open_table(T_PUBLISHED).map_err(db_err)?;
         txn.open_table(T_UPLOADS).map_err(db_err)?;
@@ -1441,6 +1448,36 @@ impl SyncDb {
             out.push((from_stored_str_at(raw, raw)?, value.value()));
         }
         Ok(out)
+    }
+
+    /// Records that `device`'s segment at filename seq `first_seq` spans
+    /// entries `first_seq..=last_seq`, as observed from a fully-applied
+    /// decode. Published segments are immutable (§2.2), so a recorded span
+    /// is a permanent fact; re-recording overwrites (the values are equal
+    /// for a conforming journal). The §2.2 steady-state poll uses it to
+    /// skip cursor-covered segments without a GET.
+    pub fn set_segment_span(
+        &self,
+        device: &DeviceId,
+        first_seq: u64,
+        last_seq: u64,
+    ) -> Result<(), StateError> {
+        self.with_txn(|t| t.set_segment_span(device, first_seq, last_seq))
+    }
+
+    /// The recorded last entry seq of `device`'s segment at `first_seq`
+    /// (`None` when the segment was never fully applied by this device).
+    pub fn segment_span(
+        &self,
+        device: &DeviceId,
+        first_seq: u64,
+    ) -> Result<Option<u64>, StateError> {
+        let txn = self.begin_read()?;
+        let spans = txn.open_table(T_SEGMENT_SPANS).map_err(db_err)?;
+        Ok(spans
+            .get((device.as_str(), first_seq))
+            .map_err(db_err)?
+            .map(|guard| guard.value()))
     }
 
     // -- journal publication (§2.1.5) --------------------------------------
@@ -2403,6 +2440,20 @@ impl StateTxn<'_> {
         if seq > stored {
             cursors.insert(device.as_str(), seq).map_err(db_err)?;
         }
+        Ok(())
+    }
+
+    /// [`SyncDb::set_segment_span`] within this transaction.
+    pub fn set_segment_span(
+        &self,
+        device: &DeviceId,
+        first_seq: u64,
+        last_seq: u64,
+    ) -> Result<(), StateError> {
+        let mut spans = self.txn.open_table(T_SEGMENT_SPANS).map_err(db_err)?;
+        spans
+            .insert((device.as_str(), first_seq), last_seq)
+            .map_err(db_err)?;
         Ok(())
     }
 

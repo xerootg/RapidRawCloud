@@ -769,6 +769,31 @@ fn cursors_default_zero_set_and_survive_reopen() {
     assert_eq!(db.cursor(&dev(DEV1)).expect("other cursor"), 0);
 }
 
+#[test]
+fn segment_spans_record_and_survive_reopen() {
+    let (_dir, path) = scratch();
+    let d2 = dev(DEV2);
+    {
+        let db = open_fresh(&path);
+        assert_eq!(
+            db.segment_span(&d2, 1).expect("span"),
+            None,
+            "unknown span reads as None"
+        );
+        db.set_segment_span(&d2, 1, 4).expect("set");
+        db.set_segment_span(&d2, 5, 5)
+            .expect("set single-entry span");
+        assert_eq!(db.segment_span(&d2, 1).expect("span"), Some(4));
+        assert_eq!(db.segment_span(&d2, 5).expect("span"), Some(5));
+        // Keyed per (device, first_seq).
+        assert_eq!(db.segment_span(&dev(DEV1), 1).expect("span"), None);
+        assert_eq!(db.segment_span(&d2, 2).expect("span"), None);
+    }
+    let db = SyncDb::open(&path, None).expect("reopen");
+    assert_eq!(db.segment_span(&d2, 1).expect("span after reopen"), Some(4));
+    assert_eq!(db.segment_span(&d2, 5).expect("span after reopen"), Some(5));
+}
+
 // ---------------------------------------------------------------------------
 // Multipart upload resume state (§2.4)
 // ---------------------------------------------------------------------------

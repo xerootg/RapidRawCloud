@@ -48,6 +48,84 @@ fn offline_client() -> S3Client {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn an_entry_too_large_for_any_segment_is_refused_at_enqueue() {
+    let a = dev(DEV_A);
+    let (_dir, _path, db) = open_db(&a);
+    // A single encoded line over SEGMENT_MAX_BYTES could never be frozen
+    // into a conforming segment; staging it would poison-pill the whole
+    // outbound lane. Refuse it synchronously, where the caller has
+    // context.
+    let mut oversized = entry(
+        &a,
+        Op::Put,
+        Kind::Sidecar,
+        sidecar_key(&common::sync::rel("big.NEF")),
+    );
+    oversized.color_label = Some("x".repeat(2 * SEGMENT_MAX_BYTES));
+    let err = enqueue_entry(&db, &oversized).expect_err("oversized entry must be refused");
+    match err {
+        PublisherError::OversizedEntry { size } => assert!(size > SEGMENT_MAX_BYTES),
+        other => panic!("expected OversizedEntry, got {other:?}"),
+    }
+    assert_eq!(db.outbound_len().expect("len"), 0, "nothing staged");
+}
+
+#[tokio::test]
+async fn an_oversized_staged_record_fails_naming_its_id_and_dropping_it_recovers() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("pub-oversized-staged");
+    let client = g.client();
+    let a = dev(DEV_A);
+    let (_dir, _path, db) = open_db(&a);
+
+    // Bypass enqueue's gate (modeling a record staged by an older build):
+    // a decodable v1 entry whose single line exceeds the segment byte cap.
+    let mut giant = entry(
+        &a,
+        Op::Put,
+        Kind::Sidecar,
+        sidecar_key(&common::sync::rel("giant.NEF")),
+    );
+    giant.color_label = Some("x".repeat(2 * SEGMENT_MAX_BYTES));
+    let line = giant.to_json_line().expect("encode");
+    let bad_id = db.stage_outbound(line.as_bytes()).expect("stage raw");
+    enqueue_entry(
+        &db,
+        &entry(
+            &a,
+            Op::Put,
+            Kind::Sidecar,
+            sidecar_key(&common::sync::rel("after.NEF")),
+        ),
+    )
+    .expect("enqueue good entry behind it");
+
+    // The failure must carry the staging id so the engine can
+    // surface-and-drop it — like CorruptStaged, not an unactionable wedge.
+    let err = publish_pending(&db, &client, &bucket)
+        .await
+        .expect_err("an unfreezable staged record must fail typed");
+    match err {
+        PublisherError::OversizedStaged { outbound_id, size } => {
+            assert_eq!(outbound_id, bad_id);
+            assert!(size > SEGMENT_MAX_BYTES);
+        }
+        other => panic!("expected OversizedStaged, got {other:?}"),
+    }
+    assert_eq!(db.outbound_len().expect("len"), 2, "nothing consumed");
+
+    // The documented recovery loop closes: drop the named record, retry.
+    assert!(db
+        .with_txn(|t| t.remove_outbound(bad_id))
+        .expect("remove outbound"));
+    let report = publish_pending(&db, &client, &bucket)
+        .await
+        .expect("retry publishes the healthy entry");
+    assert_eq!(report.entries, 1);
+    assert_eq!(db.outbound_len().expect("len"), 0);
+}
+
+#[test]
 fn enqueue_rejects_foreign_device_entry_and_stages_nothing() {
     let a = dev(DEV_A);
     let (_dir, _path, db) = open_db(&a);

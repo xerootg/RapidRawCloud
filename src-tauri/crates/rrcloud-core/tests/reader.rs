@@ -14,13 +14,15 @@ use bytes::Bytes;
 use common::garage;
 use common::sync::{
     dev, open_db, probe_relkey, put_raw_segment, sidecar_entries, stamped, FakeS3,
-    RecordingConsumer, DEV_A, DEV_B, DEV_X, DEV_Y,
+    RecordingConsumer, DEV_A, DEV_B, DEV_C, DEV_X, DEV_Y,
 };
 use futures::FutureExt as _;
 use rrcloud_core::clock::DeviceId;
 use rrcloud_core::keys::{journal_segment_key, CONTROL_PREFIX};
 use rrcloud_core::publisher::{enqueue_entry, publish_pending};
-use rrcloud_core::reader::{poll, GapDetected, MidStreamGap, PrefixHalted, ReaderError};
+use rrcloud_core::reader::{
+    poll, CorruptSegment, FetchFailed, GapDetected, MidStreamGap, PrefixHalted, ReaderError,
+};
 use rrcloud_core::s3::PutObjectOptions;
 use rrcloud_core::state::SyncDb;
 
@@ -553,6 +555,256 @@ async fn mid_stream_gap_is_typed_never_skipped_and_heals_when_filled() {
 }
 
 // ---------------------------------------------------------------------------
+// Segment-body validation (fail-closed at entry granularity)
+// ---------------------------------------------------------------------------
+
+/// `pred` holds for exactly one corrupt-segment outcome, which names
+/// `(device, seq)`.
+fn assert_one_corrupt(report: &[CorruptSegment], device: &DeviceId, seq: u64) {
+    assert_eq!(report.len(), 1, "exactly one corrupt outcome: {report:?}");
+    assert_eq!(report[0].device, *device);
+    assert_eq!(report[0].seq, seq);
+    assert!(!report[0].detail.is_empty());
+}
+
+#[tokio::test]
+async fn entry_seq_gaps_inside_a_segment_are_corrupt_never_silently_skipped() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-seq-gap");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let x = dev(DEV_X);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // A segment at filename seq 1 whose entries are stamped 1 and 5: seqs
+    // 2-4 exist nowhere, and applying entry 5 would cover them with the
+    // cursor forever. Fail closed instead.
+    let mut entries = sidecar_entries(&x, "gap", 2);
+    entries[0].seq = 1;
+    entries[1].seq = 5;
+    put_raw_segment(&client, &bucket, &x, 1, &entries).await;
+
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_one_corrupt(&report.corrupt, &x, 1);
+    assert_eq!(report.entries_applied, 0);
+    assert!(report.gaps.is_empty() && report.mid_stream_gaps.is_empty());
+    assert!(
+        consumer.transcript.is_empty(),
+        "nothing from a seq-discontiguous segment applies"
+    );
+    assert_eq!(
+        db_b.cursor(&x).expect("cursor"),
+        0,
+        "the cursor must never advance over never-applied seqs"
+    );
+    assert!(!db_b.has_applied(&x, 1).expect("applied"));
+    assert!(!db_b.has_applied(&x, 5).expect("applied"));
+}
+
+#[tokio::test]
+async fn first_entry_seq_mismatching_the_filename_seq_is_corrupt() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-seq-name");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let x = dev(DEV_X);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // Filename says seq 1; the entries claim 100,101. Applying them would
+    // stamp the cursor at 101 with seqs 1-99 silently skipped.
+    put_raw_segment(
+        &client,
+        &bucket,
+        &x,
+        1,
+        &stamped(sidecar_entries(&x, "mis", 2), 100),
+    )
+    .await;
+
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_one_corrupt(&report.corrupt, &x, 1);
+    assert!(consumer.transcript.is_empty());
+    assert_eq!(db_b.cursor(&x).expect("cursor"), 0);
+}
+
+#[tokio::test]
+async fn entry_device_mismatching_the_prefix_owner_is_corrupt() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-dev-mis");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let c = dev(DEV_C);
+    let x = dev(DEV_X);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // A segment under X's prefix whose entries claim device C (§2.2
+    // single-writer: entry.device must equal the prefix owner). Applying
+    // it would feed the consumer forged attribution while dedup/cursor
+    // bookkeeping ran under X.
+    put_raw_segment(
+        &client,
+        &bucket,
+        &x,
+        1,
+        &stamped(sidecar_entries(&c, "forged", 2), 1),
+    )
+    .await;
+
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_one_corrupt(&report.corrupt, &x, 1);
+    assert!(consumer.transcript.is_empty(), "the consumer never sees it");
+    assert_eq!(db_b.cursor(&x).expect("cursor"), 0);
+    assert_eq!(db_b.cursor(&c).expect("cursor"), 0);
+}
+
+#[tokio::test]
+async fn corrupt_and_unfetchable_segments_isolate_to_their_device() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-isolate");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let c = dev(DEV_C); // c0ffee… sorts before deadbeef…
+    let x = dev(DEV_X);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // C's segment is bit-rotted (malformed JSON, not a version halt); X's
+    // is healthy and sorts after C. The pass must complete X.
+    client
+        .put_object(
+            &bucket,
+            &journal_segment_key(&c, 1),
+            Bytes::from_static(b"this is not NDJSON {\n"),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("corrupt put");
+    put_raw_segment(
+        &client,
+        &bucket,
+        &x,
+        1,
+        &stamped(sidecar_entries(&x, "ok", 2), 1),
+    )
+    .await;
+
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("a corrupt segment must not abort the pass");
+    assert_one_corrupt(&report.corrupt, &c, 1);
+    assert_eq!(
+        seqs_for(&consumer, &x),
+        vec![1, 2],
+        "the later-sorted healthy device still applies"
+    );
+    assert_eq!(db_b.cursor(&x).expect("cursor"), 2);
+    assert_eq!(db_b.cursor(&c).expect("cursor"), 0);
+
+    // The condition persists across polls without starving X.
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("re-poll");
+    assert_one_corrupt(&report.corrupt, &c, 1);
+    assert_eq!(report.entries_applied, 0);
+}
+
+#[tokio::test]
+async fn failing_get_isolates_to_its_device_and_recovers() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-get-fail");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let c = dev(DEV_C);
+    let x = dev(DEV_X);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    let c_key = put_raw_segment(
+        &client,
+        &bucket,
+        &c,
+        1,
+        &stamped(sidecar_entries(&c, "c", 2), 1),
+    )
+    .await;
+    put_raw_segment(
+        &client,
+        &bucket,
+        &x,
+        1,
+        &stamped(sidecar_entries(&x, "x", 2), 1),
+    )
+    .await;
+
+    let mut fake = FakeS3::new(g.client());
+    fake.fail_gets.insert(c_key);
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &fake, &bucket, &mut consumer)
+        .await
+        .expect("a per-segment GET failure must not abort the pass");
+    assert_eq!(report.fetch_failed.len(), 1, "{:?}", report.fetch_failed);
+    assert_eq!(
+        report.fetch_failed[0],
+        FetchFailed {
+            device: c.clone(),
+            seq: 1,
+            error: report.fetch_failed[0].error.clone(),
+        }
+    );
+    assert!(!report.fetch_failed[0].error.is_empty());
+    assert_eq!(seqs_for(&consumer, &x), vec![1, 2], "X is unaffected");
+    assert_eq!(db_b.cursor(&c).expect("cursor"), 0);
+
+    // The blight clears (here: a healthy client): C catches up.
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("re-poll");
+    assert!(report.fetch_failed.is_empty());
+    assert_eq!(seqs_for(&consumer, &c), vec![1, 2]);
+    assert_eq!(db_b.cursor(&c).expect("cursor"), 2);
+}
+
+#[tokio::test]
+async fn oversized_segment_object_is_corrupt_without_unbounded_buffering() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-oversize");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let y = dev(DEV_Y);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // No conforming writer emits a segment over SEGMENT_MAX_BYTES; a
+    // bigger object at a segment key is corruption and must be refused —
+    // typed, without the reader buffering it wholesale.
+    let oversized = vec![b'\n'; rrcloud_core::journal::SEGMENT_MAX_BYTES + 10];
+    client
+        .put_object(
+            &bucket,
+            &journal_segment_key(&y, 1),
+            Bytes::from(oversized),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("oversized put");
+
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_one_corrupt(&report.corrupt, &y, 1);
+    assert!(consumer.transcript.is_empty());
+    assert_eq!(db_b.cursor(&y).expect("cursor"), 0);
+}
+
+// ---------------------------------------------------------------------------
 // Steady-state polling cost (§2.2)
 // ---------------------------------------------------------------------------
 
@@ -576,7 +828,10 @@ async fn steady_state_poll_issues_exactly_one_list_page_request() {
     assert_eq!(report.entries_applied, 2);
     assert_eq!(fake.list_count(), 1, "a single-page listing is one request");
 
-    // Steady state: nothing changed — exactly ONE ListObjectsV2 request.
+    // Steady state: nothing changed — exactly ONE ListObjectsV2 request
+    // and NO segment GETs (§2.2 prices the idle poll at one near-empty
+    // page, not O(#devices) calls; a fully-applied segment's span is
+    // recorded, so skipping it needs no re-fetch).
     let fake = FakeS3::new(g.client());
     let report = poll(&db_b, &fake, &bucket, &mut consumer)
         .await
@@ -587,4 +842,62 @@ async fn steady_state_poll_issues_exactly_one_list_page_request() {
         1,
         "the idle steady-state poll must cost exactly one ListObjectsV2 page request"
     );
+    assert_eq!(
+        fake.get_keys(),
+        Vec::<String>::new(),
+        "an idle poll must not re-GET already-applied segments"
+    );
+}
+
+#[tokio::test]
+async fn idle_polls_cost_no_gets_per_caught_up_device() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-idle-gets");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let x = dev(DEV_X);
+    let y = dev(DEV_Y);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // Two foreign devices, two segments each — the newest segment of each
+    // device is the one the span-less skip rule could never prove covered.
+    for d in [&x, &y] {
+        put_raw_segment(
+            &client,
+            &bucket,
+            d,
+            1,
+            &stamped(sidecar_entries(d, "s1", 2), 1),
+        )
+        .await;
+        put_raw_segment(
+            &client,
+            &bucket,
+            d,
+            3,
+            &stamped(sidecar_entries(d, "s2", 2), 3),
+        )
+        .await;
+    }
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("first poll");
+    assert_eq!(report.entries_applied, 8);
+
+    // Fully caught up: repeated idle polls must issue zero GETs — not one
+    // per device's newest segment, every poll, forever.
+    for _ in 0..2 {
+        let fake = FakeS3::new(g.client());
+        let report = poll(&db_b, &fake, &bucket, &mut consumer)
+            .await
+            .expect("idle poll");
+        assert_eq!(report.entries_applied, 0);
+        assert_eq!(fake.list_count(), 1);
+        assert_eq!(
+            fake.get_keys(),
+            Vec::<String>::new(),
+            "idle polls must not hide O(#devices) segment GETs"
+        );
+    }
 }

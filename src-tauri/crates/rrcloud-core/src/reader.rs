@@ -39,11 +39,46 @@
 //! present segment, or between two present segments — is the typed
 //! [`MidStreamGap`] outcome: application for that device stops at the
 //! gap, its cursor never jumps, and nothing past the gap is applied.
+//!
+//! **Routing a [`MidStreamGap`]**: a mid-stream gap is not only an
+//! anomaly — it is also what the *designed* §2.10 laggard catch-up looks
+//! like (a device returns after the owner compacted segments this device
+//! had not yet applied; its cursor > 0 and the lowest surviving segment
+//! starts past it). The two cases are indistinguishable from the journal
+//! alone, so the engine should route a [`MidStreamGap`] exactly like
+//! [`GapDetected`]: merge the owner's manifest (§2.3) — whose header
+//! attests the owner's own published cursor over the compacted seqs and
+//! whose rows fold their effects — then re-poll. Only a gap that
+//! **survives** the merge is a genuine anomaly (a lost segment).
+//!
+//! # Entry-granularity validation (fail-closed)
+//!
+//! A decoded segment's body must agree with its filename and prefix: the
+//! first entry's seq equals the filename seq, every following entry's seq
+//! is exactly +1 contiguous, and every entry's `device` equals the prefix
+//! owner (§2.2 single-writer). No conforming publisher violates any of
+//! these, so a violation is corruption (or a forged/buggy writer) and the
+//! segment is refused **whole** as the typed [`CorruptSegment`] outcome —
+//! applying a misstamped body would silently cover never-applied seqs
+//! with the cursor, and the inflated cursor would then propagate
+//! fleet-wide through the device registry and manifest headers.
+//!
+//! # Per-device isolation
+//!
+//! Version halts, gaps, segment corruption (undecodable or misstamped
+//! bodies, oversized objects) and per-segment GET failures are all
+//! **per-device outcomes** in the [`PollReport`], not pass errors: a
+//! permanently corrupt object in one device's prefix must not starve
+//! every other device's application for as long as the corruption
+//! persists. Only state-store failures, LIST failures and consumer
+//! refusals abort the whole pass.
 
 use std::collections::BTreeMap;
 
 use crate::clock::DeviceId;
-use crate::journal::{decode_segment, JournalEntry, JournalError, JOURNAL_VERSION};
+use crate::journal::{
+    decode_segment, JournalEntry, JournalError, JOURNAL_VERSION, SEGMENT_MAX_BYTES,
+};
 use crate::keys::{classify_key, journal_segment_key, KeyClass, CONTROL_PREFIX};
 use crate::s3::{ListObjectsV2Request, S3Api, S3Error};
 use crate::state::{StateError, StateTxn, SyncDb};
@@ -105,6 +140,12 @@ pub struct GapDetected {
 /// past `cursor + 1` while `cursor > 0`, or past the end of the previous
 /// segment. Never silently skipped — application for the device stops at
 /// the gap.
+///
+/// This is also the §2.10 laggard catch-up case (the owner compacted
+/// segments this device had not applied), so the engine routes it to
+/// §2.3 manifest merge before treating it as an anomaly — see the module
+/// docs ("Routing a MidStreamGap"); the carried fields are what the
+/// merge-then-re-poll decision needs.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("mid-stream journal gap for device {device}: cursor {cursor}, next present seq {next_seq}")]
 pub struct MidStreamGap {
@@ -114,6 +155,43 @@ pub struct MidStreamGap {
     pub cursor: u64,
     /// The first present seq past the gap.
     pub next_seq: u64,
+}
+
+/// A segment that is present but unusable for a reason **other than** an
+/// unsupported version (which is [`PrefixHalted`]): an undecodable body
+/// (malformed JSON/NDJSON), an object over the §2.2 size cap, or a body
+/// that disagrees with its filename or prefix (first entry seq ≠ filename
+/// seq, non-contiguous entry seqs, `entry.device` ≠ prefix owner — the
+/// module docs' entry-granularity validation). Fail-closed: nothing from
+/// the segment applies, the device's application stops here with its
+/// cursor intact, and other devices' prefixes continue. Clears when the
+/// owner (or an operator) replaces the object at the same key with a
+/// conforming segment.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("segment {seq:016x} of device {device} is corrupt: {detail}")]
+pub struct CorruptSegment {
+    /// The owning device (whose prefix application stopped here).
+    pub device: DeviceId,
+    /// The segment's filename seq.
+    pub seq: u64,
+    /// What was wrong (decode failure or validation violation).
+    pub detail: String,
+}
+
+/// A segment GET that failed (transport or backend error). The device's
+/// application stops at its current cursor for this pass; other devices
+/// continue, and the next poll retries. Carried as an outcome rather than
+/// a pass error so one persistently unreadable object cannot starve every
+/// later-sorted device's prefix.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("segment {seq:016x} of device {device} could not be fetched: {error}")]
+pub struct FetchFailed {
+    /// The owning device.
+    pub device: DeviceId,
+    /// The segment's filename seq.
+    pub seq: u64,
+    /// The S3 error, rendered.
+    pub error: String,
 }
 
 /// What one [`poll`] pass did and found.
@@ -130,33 +208,29 @@ pub struct PollReport {
     /// Mid-stream gaps; the gapped devices' application stopped at the
     /// gap.
     pub mid_stream_gaps: Vec<MidStreamGap>,
+    /// Corrupt segments (undecodable, oversized, or misstamped bodies);
+    /// the affected devices' application stopped at the corrupt segment.
+    pub corrupt: Vec<CorruptSegment>,
+    /// Segment GETs that failed this pass; the affected devices'
+    /// application stopped at the unfetchable segment and will retry.
+    pub fetch_failed: Vec<FetchFailed>,
 }
 
 /// Error from the inbound journal lane. Per-device conditions
-/// ([`PrefixHalted`], gaps) are **outcomes** in the [`PollReport`], not
-/// errors — they must not stop other devices' prefixes; these variants
-/// are the failures that abort the whole pass (everything already applied
-/// stays applied; re-polling resumes).
+/// ([`PrefixHalted`], gaps, [`CorruptSegment`], [`FetchFailed`]) are
+/// **outcomes** in the [`PollReport`], not errors — they must not stop
+/// other devices' prefixes; these variants are the failures that abort
+/// the whole pass (everything already applied stays applied; re-polling
+/// resumes).
 #[derive(Debug, thiserror::Error)]
 pub enum ReaderError {
     /// State-store failure.
     #[error(transparent)]
     State(#[from] StateError),
-    /// S3 failure (LIST or segment GET).
+    /// S3 failure on the LIST (a failed segment GET is the per-device
+    /// [`FetchFailed`] outcome instead).
     #[error(transparent)]
     S3(#[from] S3Error),
-    /// A segment's bytes do not decode for a reason **other than** an
-    /// unsupported version (which is a [`PrefixHalted`] outcome):
-    /// malformed JSON/NDJSON — corruption, surfaced loudly.
-    #[error("segment {seq:016x} of device {device} does not decode: {source}")]
-    Segment {
-        /// The owning device.
-        device: DeviceId,
-        /// The segment's first seq (its filename seq).
-        seq: u64,
-        /// The decode failure.
-        source: JournalError,
-    },
     /// The consumer refused entry `(device, seq)`. The entry's
     /// transaction was aborted: the consumer's mutations and the applied
     /// mark both rolled back, the cursor stayed at `seq - 1`'s position,
@@ -305,10 +379,18 @@ async fn apply_device_prefix(
         let next_first = firsts.get(i + 1).copied();
         // A segment is provably fully covered when the NEXT present
         // segment starts at or below cursor + 1 (its span ends at the next
-        // segment's first seq minus one). The last segment's span length is
-        // unknown without a GET, so it is fetched even when it starts at or
-        // below the cursor — its tail may be unapplied.
+        // segment's first seq minus one), or when this device previously
+        // applied it fully and recorded its span (§2.2 steady-state cost:
+        // published segments are immutable, so the recorded span makes the
+        // skip provable without a GET — the newest segment of a caught-up
+        // device must not be re-fetched on every idle poll).
         if next_first.is_some_and(|nf| nf <= cursor.saturating_add(1)) {
+            continue;
+        }
+        if db
+            .segment_span(device, first_seq)?
+            .is_some_and(|last_seq| last_seq <= cursor)
+        {
             continue;
         }
         if first_seq > cursor.saturating_add(1) {
@@ -342,12 +424,47 @@ async fn apply_device_prefix(
             return Ok(());
         }
         let key = journal_segment_key(device, first_seq);
-        let bytes = s3
-            .get_object(bucket, &key, None)
-            .await?
-            .body
-            .collect()
-            .await?;
+        // A failed GET is a per-device outcome: application for this
+        // device stops at the cursor and retries next poll; other devices
+        // are unaffected (module docs, per-device isolation).
+        let output = match s3.get_object(bucket, &key, None).await {
+            Ok(output) => output,
+            Err(error) => {
+                report.fetch_failed.push(FetchFailed {
+                    device: device.clone(),
+                    seq: first_seq,
+                    error: error.to_string(),
+                });
+                return Ok(());
+            }
+        };
+        // Bound reader-side allocation BEFORE buffering: no conforming
+        // writer emits a segment over the §2.2 byte cap, so a bigger
+        // object at a segment key is corruption, refused without being
+        // collected (the capped collect also guards a lying
+        // Content-Length).
+        if output.content_length > SEGMENT_MAX_BYTES as u64 {
+            report.corrupt.push(CorruptSegment {
+                device: device.clone(),
+                seq: first_seq,
+                detail: format!(
+                    "object is {} bytes, segment cap is {SEGMENT_MAX_BYTES}",
+                    output.content_length
+                ),
+            });
+            return Ok(());
+        }
+        let bytes = match output.body.collect_capped(SEGMENT_MAX_BYTES).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                report.fetch_failed.push(FetchFailed {
+                    device: device.clone(),
+                    seq: first_seq,
+                    error: error.to_string(),
+                });
+                return Ok(());
+            }
+        };
         let entries = match decode_segment(&bytes) {
             Ok(entries) => entries,
             // Fail closed: an unsupported entry version anywhere in the
@@ -360,14 +477,29 @@ async fn apply_device_prefix(
                 });
                 return Ok(());
             }
+            // Any other decode failure is corruption: a per-device
+            // outcome, so one bit-rotted object cannot starve every
+            // later-sorted device's prefix for as long as it persists.
             Err(source) => {
-                return Err(ReaderError::Segment {
+                report.corrupt.push(CorruptSegment {
                     device: device.clone(),
                     seq: first_seq,
-                    source,
-                })
+                    detail: source.to_string(),
+                });
+                return Ok(());
             }
         };
+        // Entry-granularity validation (module docs): the body must agree
+        // with its filename and prefix, or applying it would silently
+        // cover never-applied seqs with the cursor / forge attribution.
+        if let Err(detail) = validate_segment_body(device, first_seq, &entries) {
+            report.corrupt.push(CorruptSegment {
+                device: device.clone(),
+                seq: first_seq,
+                detail,
+            });
+            return Ok(());
+        }
         for entry in &entries {
             if entry.seq <= cursor {
                 // Covered by the cursor (applied earlier, or attested by a
@@ -399,6 +531,54 @@ async fn apply_device_prefix(
                     })
                 }
             }
+        }
+        // The whole segment is applied (or cursor-covered): record its
+        // span so future polls can prove coverage without a GET (§2.2
+        // steady-state cost; published segments are immutable). A crash
+        // before this write costs one redundant GET next poll, never
+        // correctness — which is why it need not share the entries'
+        // transactions.
+        if let Some(last) = entries.last() {
+            db.set_segment_span(device, first_seq, last.seq)?;
+        }
+    }
+    Ok(())
+}
+
+/// The module docs' entry-granularity validation: a decoded segment body
+/// must be non-empty, start at its filename seq, carry strictly `+1`
+/// contiguous entry seqs, and be authored entirely by the prefix owner.
+/// `Err` is the human-readable violation for [`CorruptSegment::detail`].
+fn validate_segment_body(
+    device: &DeviceId,
+    first_seq: u64,
+    entries: &[JournalEntry],
+) -> Result<(), String> {
+    let Some(first) = entries.first() else {
+        return Err("segment body holds no entries".to_string());
+    };
+    if first.seq != first_seq {
+        return Err(format!(
+            "first entry seq {} does not match the filename seq {first_seq}",
+            first.seq
+        ));
+    }
+    for (i, entry) in entries.iter().enumerate() {
+        let expected = first_seq.saturating_add(i as u64);
+        if entry.seq != expected {
+            return Err(format!(
+                "entry seq {} where {expected} was required (seqs must be +1 contiguous \
+                 from the filename seq; a skipped seq would be covered by the cursor \
+                 without ever applying)",
+                entry.seq
+            ));
+        }
+        if entry.device != *device {
+            return Err(format!(
+                "entry seq {} is authored by {}, but the prefix owner is {device} \
+                 (§2.2 single-writer)",
+                entry.seq, entry.device
+            ));
         }
     }
     Ok(())

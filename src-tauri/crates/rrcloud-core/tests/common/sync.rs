@@ -266,7 +266,9 @@ pub fn apply_entries_locally(db: &SyncDb, entries: &[JournalEntry]) {
 /// and every **attempted** PUT key (pinning publish ordering), and can
 /// make selected PUTs fail — either without reaching the backend
 /// (`fail_puts`) or after the bytes landed (`put_then_fail`, modeling a
-/// crash/connection loss between the backend's commit and our bookkeeping).
+/// crash/connection loss between the backend's commit and our bookkeeping)
+/// — or selected GETs fail without reaching the backend (`fail_gets`,
+/// modeling a persistently unreadable object).
 pub struct FakeS3 {
     pub inner: S3Client,
     pub lists: AtomicU32,
@@ -274,6 +276,7 @@ pub struct FakeS3 {
     pub put_attempts: Mutex<Vec<String>>,
     pub fail_puts: HashSet<String>,
     pub put_then_fail: HashSet<String>,
+    pub fail_gets: HashSet<String>,
 }
 
 impl FakeS3 {
@@ -285,6 +288,7 @@ impl FakeS3 {
             put_attempts: Mutex::new(Vec::new()),
             fail_puts: HashSet::new(),
             put_then_fail: HashSet::new(),
+            fail_gets: HashSet::new(),
         }
     }
 
@@ -334,6 +338,11 @@ impl S3Api for FakeS3 {
         range: Option<ByteRange>,
     ) -> Result<GetObjectOutput, S3Error> {
         self.gets.lock().expect("lock").push(key.to_string());
+        if self.fail_gets.contains(key) {
+            return Err(S3Error::InvalidRequest(format!(
+                "injected GET failure for {key}"
+            )));
+        }
         self.inner.get_object(bucket, key, range).await
     }
 

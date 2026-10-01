@@ -16,10 +16,11 @@ use common::sync::{
 };
 use rrcloud_core::clock::{DeviceId, VersionVector};
 use rrcloud_core::journal::{Kind, Op};
-use rrcloud_core::keys::{library_key, manifest_key, sidecar_key};
+use rrcloud_core::keys::{journal_segment_key, library_key, manifest_key, sidecar_key};
 use rrcloud_core::manifest::{
     build_manifest, decode_manifest, encode_manifest, get_manifest, head_manifest_etag, merge,
-    put_manifest, DeletedRow, Manifest, ManifestError, ManifestHeader, ManifestRow, MANIFEST_PROTO,
+    put_manifest, DeletedRow, Manifest, ManifestError, ManifestHeader, ManifestRow,
+    MANIFEST_MAX_DECODED_BYTES, MANIFEST_PROTO,
 };
 use rrcloud_core::publisher::{enqueue_entry, publish_pending};
 use rrcloud_core::reader::poll;
@@ -305,9 +306,183 @@ fn build_manifest_snapshots_items_deleted_set_and_cursors() {
     );
 }
 
+#[test]
+fn decode_refuses_a_decompression_bomb_with_a_typed_error() {
+    // A small gzip object expanding past the decode cap: the §2.2-style
+    // allocation bound for the manifest lane. Without it a single corrupt
+    // or hostile object OOMs a phone before the first row parses.
+    let chunk = vec![b'\n'; 1024 * 1024];
+    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    enc.write_all(b"{\"written_server_ts\":1,\"cursors\":{},\"proto\":1}\n")
+        .expect("header");
+    let mut written = 0usize;
+    while written <= MANIFEST_MAX_DECODED_BYTES {
+        enc.write_all(&chunk).expect("bomb body");
+        written += chunk.len();
+    }
+    let bytes = enc.finish().expect("finish");
+    assert!(
+        bytes.len() < 8 * 1024 * 1024,
+        "the bomb must be small on the wire for the test to mean anything"
+    );
+    let err = decode_manifest(&bytes).expect_err("over-cap decompression must be refused");
+    match err {
+        ManifestError::DecodedTooLarge { limit } => assert_eq!(limit, MANIFEST_MAX_DECODED_BYTES),
+        other => panic!("expected DecodedTooLarge, got {other:?}"),
+    }
+}
+
+#[test]
+fn concatenated_gzip_members_never_silently_truncate_the_deleted_set() {
+    // RFC 1952 allows multi-member streams (plain `cat` produces them). A
+    // decoder that stops at the first member would accept a PARTIAL
+    // deleted set — the §2.3 resurrection hazard. Every member must
+    // decode, or the input must be refused; never a silent prefix.
+    let member1 = gzip(concat!(
+        "{\"written_server_ts\":1,\"cursors\":{},\"proto\":1}\n",
+        "{\"del\":\"a.NEF\",\"vv\":{},\"server_ts\":2}\n",
+    ));
+    let member2 = gzip("{\"del\":\"b.NEF\",\"vv\":{},\"server_ts\":3}\n");
+    let mut cat = member1.clone();
+    cat.extend_from_slice(&member2);
+    let m = decode_manifest(&cat).expect("multi-member manifest decodes fully");
+    let dels: Vec<&str> = m.deleted.iter().map(|d| d.del.as_str()).collect();
+    assert_eq!(
+        dels,
+        vec!["a.NEF", "b.NEF"],
+        "the second member's deletion row must not be dropped"
+    );
+
+    // Trailing non-gzip bytes are refused, not ignored.
+    let mut garbage = member1.clone();
+    garbage.extend_from_slice(b"TRAILING GARBAGE, NOT GZIP");
+    let err = decode_manifest(&garbage).expect_err("unconsumed trailing bytes must be refused");
+    assert!(matches!(err, ManifestError::Gzip(_)), "got {err:?}");
+
+    // Two whole manifests concatenated: the second header lands
+    // mid-stream where only rows belong — fail closed, never a partial.
+    let mut two = member1.clone();
+    two.extend_from_slice(&member1);
+    decode_manifest(&two).expect_err("a mid-stream header line is not a row");
+}
+
 // ---------------------------------------------------------------------------
 // Merge through the consumer (no network)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn build_manifest_withholds_rows_its_own_merge_cannot_convert() {
+    let a = dev(DEV_A);
+    let (_dir, _path, db) = open_db(&a);
+    let base = ItemRecord {
+        kind: Kind::Sidecar,
+        state: ItemState::Synced,
+        size: 64,
+        mtime_unix_ns: 0,
+        blake3: None,
+        sem_hash: None,
+        vv: [(a.clone(), 1u32)].into_iter().collect(),
+        content_id: None,
+        w: None,
+        h: None,
+        pinned: false,
+        last_access_unix: 0,
+        verified_remote: false,
+        attested: false,
+        base_unknown: false,
+    };
+    db.replay_put_item(&rel("good.NEF"), &base).expect("put");
+    // A thumb item and a preview item without a content id are legal
+    // ItemRecord state, but no manifest row can round-trip them into a
+    // synthetic apply op. Publishing them would poison every peer's §2.3
+    // bootstrap.
+    let thumb = ItemRecord {
+        kind: Kind::Thumb,
+        ..base.clone()
+    };
+    db.replay_put_item(&rel("thumbed.NEF"), &thumb)
+        .expect("put");
+    let preview = ItemRecord {
+        kind: Kind::Preview,
+        content_id: None,
+        ..base.clone()
+    };
+    db.replay_put_item(&rel("previewed.NEF"), &preview)
+        .expect("put");
+
+    let manifest = build_manifest(&db, 1_769_950_000).expect("build");
+    let keys: Vec<&str> = manifest.rows.iter().map(|r| r.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["good.NEF"],
+        "unconvertible kinds are withheld at build time"
+    );
+
+    // The build's own merge accepts what it wrote — the wedge regression.
+    let b = dev(DEV_B);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+    let mut consumer = ReplayConsumer;
+    let report = merge(&[(a.clone(), manifest)], &db_b, &mut consumer).expect("merge");
+    assert_eq!(report.live_rows, 1);
+    assert!(report.unconvertible.is_empty());
+    assert!(db_b.get_item(&rel("good.NEF")).expect("get").is_some());
+}
+
+#[test]
+fn merge_skips_unconvertible_rows_instead_of_refusing_the_whole_merge() {
+    let a = dev(DEV_A);
+    let b = dev(DEV_B);
+    let (_dir, _path, db) = open_db(&b);
+
+    // A (non-conforming or future) writer shipped a thumb row and a
+    // preview row without a content id. These are additive advisory rows —
+    // skipping one cannot destroy data — so one bad row must not wedge the
+    // whole §2.3 bootstrap lane.
+    let mut manifest = Manifest {
+        header: header(&[(&a, 4)]),
+        rows: vec![
+            live_row("ok.NEF", Kind::Sidecar, &a),
+            live_row("pv.NEF", Kind::Preview, &a),
+            live_row("th.NEF", Kind::Thumb, &a),
+        ],
+        deleted: vec![deleted_row("gone.NEF", &a)],
+    };
+    manifest.rows[1].content_id = None;
+
+    let mut consumer = ReplayConsumer;
+    let report = merge(&[(a.clone(), manifest)], &db, &mut consumer)
+        .expect("unconvertible rows must not refuse the merge");
+    assert_eq!(report.live_rows, 1, "only the convertible row applies");
+    assert_eq!(report.deleted_rows, 1);
+    assert_eq!(
+        report.unconvertible,
+        vec![(rel("pv.NEF"), Kind::Preview), (rel("th.NEF"), Kind::Thumb)],
+        "skipped rows are reported, not silently dropped"
+    );
+    assert!(db.get_item(&rel("ok.NEF")).expect("get").is_some());
+    assert!(db.get_deleted(&rel("gone.NEF")).expect("get").is_some());
+    assert_eq!(db.cursor(&a).expect("cursor"), 4, "cursors still seed");
+}
+
+#[test]
+fn merge_never_seeds_a_cursor_for_the_merging_devices_own_prefix() {
+    let a = dev(DEV_A);
+    let y = dev(DEV_Y);
+    let (_dir, _path, db_y) = open_db(&y);
+
+    // A's manifest attests Y's seqs; Y itself knows better (its own
+    // published cursor), and its cursors table holds peers only.
+    let manifest = Manifest {
+        header: header(&[(&y, 7), (&a, 2)]),
+        rows: vec![],
+        deleted: vec![],
+    };
+    let mut consumer = RecordingConsumer::default();
+    let report = merge(&[(a.clone(), manifest)], &db_y, &mut consumer).expect("merge");
+    assert_eq!(db_y.cursor(&a).expect("cursor"), 2);
+    assert_eq!(db_y.cursor(&y).expect("cursor"), 0, "own prefix untouched");
+    assert!(!report.cursors.contains_key(&y));
+}
 
 #[test]
 fn merge_propagates_deletions_the_receiver_never_saw_a_journal_entry_for() {
@@ -572,6 +747,74 @@ async fn merging_a_manifest_equals_replaying_the_journal() {
         "merge-then-poll is idempotent over the same apply"
     );
     assert_eq!(db_y.cursor(&a).expect("cursor"), 4);
+}
+
+/// §2.10 compaction rule 1 ("A's own manifest has cursors[A] >= s")
+/// requires the writer to attest its OWN published cursor; without it a
+/// bootstrapping device that merges A's manifest after A compacted its
+/// journal prefix wedges in MidStreamGap forever.
+#[tokio::test]
+async fn build_manifest_attests_the_writers_own_published_cursor() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("man-own-cursor");
+    let client = g.client();
+    let a = dev(DEV_A);
+    let b = dev(DEV_B);
+    let x = dev(DEV_C);
+
+    // A publishes seqs 1-3 (one segment) and knows B's cursor.
+    let (_adir, _apath, db_a) = open_db(&a);
+    let entries = common::sync::sidecar_entries(&a, "own", 3);
+    apply_entries_locally(&db_a, &entries);
+    for e in &entries {
+        enqueue_entry(&db_a, e).expect("enqueue");
+    }
+    publish_pending(&db_a, &client, &bucket)
+        .await
+        .expect("publish");
+    db_a.set_cursor(&b, 9).expect("cursor");
+
+    let manifest = build_manifest(&db_a, 1_769_950_000).expect("build");
+    assert_eq!(
+        manifest.header.cursors,
+        [(a.clone(), 3u64), (b.clone(), 9u64)]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+        "the writer's own published cursor is attested alongside its peers'"
+    );
+
+    // Simulate §2.10 compaction of A's whole journal prefix, then the
+    // designed catch-up: X merges A's manifest (rows fold the compacted
+    // entries' effects; cursors[A] covers their seqs), then polls.
+    client
+        .delete_object(&bucket, &journal_segment_key(&a, 1))
+        .await
+        .expect("compact away A's segment");
+    let (_xdir, _xpath, db_x) = open_db(&x);
+    let mut consumer = ReplayConsumer;
+    merge(&[(a.clone(), manifest)], &db_x, &mut consumer).expect("merge");
+    assert_eq!(db_x.cursor(&a).expect("cursor"), 3);
+
+    // A publishes more; X continues contiguously past the compacted
+    // prefix — no gap, no wedge.
+    let more = common::sync::sidecar_entries(&a, "more", 2);
+    apply_entries_locally(&db_a, &more);
+    for e in &more {
+        enqueue_entry(&db_a, e).expect("enqueue");
+    }
+    publish_pending(&db_a, &client, &bucket)
+        .await
+        .expect("publish more");
+    let mut consumer = ReplayConsumer;
+    let report = poll(&db_x, &client, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert!(
+        report.mid_stream_gaps.is_empty() && report.gaps.is_empty(),
+        "the attested cursor covers the compacted prefix: {report:?}"
+    );
+    assert_eq!(report.entries_applied, 2);
+    assert_eq!(db_x.cursor(&a).expect("cursor"), 5);
 }
 
 #[tokio::test]

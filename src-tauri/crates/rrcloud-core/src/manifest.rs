@@ -48,6 +48,20 @@ use crate::state::{StateError, SyncDb};
 /// `proto` field).
 pub const MANIFEST_PROTO: u32 = 1;
 
+/// Cap on a manifest's **decompressed** NDJSON size. Generous —
+/// proportional to the largest plausible library (at the §2.3 ballpark of
+/// a few hundred bytes per row, this covers several hundred thousand
+/// rows) — but a hard bound: gzip expands up to ~1000×, so without it a
+/// single ~1 MiB corrupt or hostile object decompresses to a phone-OOMing
+/// gigabyte before the first row parses. Same fail-closed stance as
+/// [`crate::journal::decode_segment`]'s read-side cap.
+pub const MANIFEST_MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
+
+/// Cap on a manifest's **compressed** (on-the-wire) size, bounding the
+/// [`get_manifest`] network-lane buffer. NDJSON compresses well, so this
+/// comfortably carries [`MANIFEST_MAX_DECODED_BYTES`] of real rows.
+pub const MANIFEST_MAX_FETCH_BYTES: usize = 64 * 1024 * 1024;
+
 /// Error from manifest build/encode/decode/transfer/merge.
 #[derive(Debug, thiserror::Error)]
 pub enum ManifestError {
@@ -58,9 +72,26 @@ pub enum ManifestError {
     #[error(transparent)]
     S3(#[from] S3Error),
     /// gzip compression/decompression failure (truncated or corrupt
-    /// stream).
+    /// stream, or unconsumed trailing bytes after the last gzip member).
     #[error("manifest gzip stream error: {0}")]
     Gzip(std::io::Error),
+    /// The manifest decompresses past [`MANIFEST_MAX_DECODED_BYTES`]
+    /// (fail-closed allocation bound — a decompression bomb, or a
+    /// manifest far beyond any plausible library).
+    #[error("manifest decompresses past the {limit}-byte cap")]
+    DecodedTooLarge {
+        /// The cap that was exceeded ([`MANIFEST_MAX_DECODED_BYTES`]).
+        limit: usize,
+    },
+    /// The stored manifest object exceeds [`MANIFEST_MAX_FETCH_BYTES`]
+    /// (fail-closed network-lane allocation bound).
+    #[error("manifest object is {size} bytes, over the {limit}-byte fetch cap")]
+    ObjectTooLarge {
+        /// The object's size.
+        size: u64,
+        /// The cap that was exceeded ([`MANIFEST_MAX_FETCH_BYTES`]).
+        limit: usize,
+    },
     /// The manifest has no header line (empty document, or a row where
     /// the header belongs). Fail closed: without a verified `proto`
     /// nothing is decoded.
@@ -87,6 +118,10 @@ pub enum ManifestError {
     /// A row cannot be converted into a synthetic journal apply op — e.g.
     /// a `preview` row with no `content_id`, or a `thumb` row (whose
     /// bucket key needs a size this schema does not carry).
+    /// [`build_manifest`] withholds such rows and [`merge`] skips them
+    /// per-row ([`MergeReport::unconvertible`]) rather than refusing the
+    /// merge, so this variant signals conversion failure internally and
+    /// does not surface from those paths.
     #[error("manifest row for {relkey} ({kind:?}) cannot be converted to an apply op")]
     Unconvertible {
         /// The row's relkey.
@@ -191,17 +226,47 @@ pub struct Manifest {
 }
 
 /// Builds this device's manifest from the state db: header
-/// `{written_server_ts, cursors:` [`crate::state::SyncDb::iter_cursors`]`,
-/// proto:` [`MANIFEST_PROTO`]`}`, one live row per
-/// [`crate::state::SyncDb::iter_items`] record (field mapping on
+/// `{written_server_ts, cursors, proto:` [`MANIFEST_PROTO`]`}`, one live
+/// row per [`crate::state::SyncDb::iter_items`] record (field mapping on
 /// [`ManifestRow`]; `mtime` is the record's nanosecond mtime truncated to
 /// seconds), one deleted row per
 /// [`crate::state::SyncDb::iter_deleted`] record. Rows come out ascending
 /// by relkey (the scans' order).
+///
+/// Header cursors are the peer cursors
+/// ([`crate::state::SyncDb::iter_cursors`]) **plus the writer's own
+/// published cursor** ([`crate::state::SyncDb::published_cursor`], when
+/// nonzero): §2.10 compaction rule 1 ("the owner's own manifest has
+/// `cursors[owner] >= s`") makes this entry the one guaranteed §2.3
+/// catch-up attestation over the owner's compacted seqs — the manifest's
+/// rows fold those entries' effects, so the snapshot provably covers
+/// them. Without it, a device bootstrapping after compaction could wedge
+/// in a permanent [`crate::reader::MidStreamGap`].
+///
+/// Rows this build's own [`merge`] could not convert — `thumb` rows
+/// (advertised via thumbpacks per §2.2; the row schema carries no thumb
+/// size), and `preview` rows missing their `content_id` — are
+/// **withheld**: publishing a row no reader can apply would at best be
+/// dead weight and at worst wedge a less lenient peer's bootstrap.
+///
+/// Fields [`crate::state::ItemRecord`] v1 does not carry (`device`,
+/// `rating`, `color_label`) are honestly `None`: a device bootstrapping
+/// from manifests gets strictly less §3.5 badge metadata than one
+/// replaying the journal, until the record schema carries them (the §2.6
+/// vv-engine unit, which owns per-field provenance).
 pub fn build_manifest(db: &SyncDb, written_server_ts: i64) -> Result<Manifest, ManifestError> {
+    let mut cursors: BTreeMap<DeviceId, u64> = db.iter_cursors()?.into_iter().collect();
+    // The own entry comes from the published cursor, never the cursors
+    // table (which holds peers): see the doc comment.
+    let own = db.device_id().clone();
+    cursors.remove(&own);
+    let published = db.published_cursor()?;
+    if published > 0 {
+        cursors.insert(own, published);
+    }
     let header = ManifestHeader {
         written_server_ts,
-        cursors: db.iter_cursors()?.into_iter().collect(),
+        cursors,
         proto: MANIFEST_PROTO,
     };
     let rows = db
@@ -222,6 +287,9 @@ pub fn build_manifest(db: &SyncDb, written_server_ts: i64) -> Result<Manifest, M
             rating: None,
             color_label: None,
         })
+        // Withhold rows merge cannot convert (doc comment): emitting them
+        // would hand every peer an unusable row.
+        .filter(|row| bucket_key_for(row).is_ok())
         .collect();
     let deleted = db
         .iter_deleted()?
@@ -272,10 +340,24 @@ pub fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, ManifestError> {
 /// malformed rows abort naming their line, relkeys take the strict wire
 /// lane.
 pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ManifestError> {
+    // MultiGzDecoder, not GzDecoder: RFC 1952 streams may hold several
+    // members (plain `cat` produces them), and a decoder that stops at
+    // the first member would silently accept a PARTIAL manifest — for the
+    // deleted set, the §2.3 resurrection hazard. MultiGzDecoder decodes
+    // every member and errors on trailing non-gzip bytes, so the result
+    // is always the whole input or a refusal. The `take` bounds
+    // decompressed allocation against bombs (one byte of headroom turns
+    // "hit the cap exactly" into a detectable overflow).
     let mut ndjson = Vec::new();
-    flate2::read::GzDecoder::new(bytes)
+    flate2::read::MultiGzDecoder::new(bytes)
+        .take(MANIFEST_MAX_DECODED_BYTES as u64 + 1)
         .read_to_end(&mut ndjson)
         .map_err(ManifestError::Gzip)?;
+    if ndjson.len() > MANIFEST_MAX_DECODED_BYTES {
+        return Err(ManifestError::DecodedTooLarge {
+            limit: MANIFEST_MAX_DECODED_BYTES,
+        });
+    }
 
     let mut lines = ndjson.split(|&b| b == b'\n').enumerate();
 
@@ -358,14 +440,23 @@ pub async fn put_manifest(
     Ok(output.e_tag)
 }
 
-/// GETs and decodes `device`'s manifest.
+/// GETs and decodes `device`'s manifest. Network-lane allocation is
+/// bounded ([`MANIFEST_MAX_FETCH_BYTES`]): an oversized object is the
+/// typed [`ManifestError::ObjectTooLarge`] before (and while) buffering,
+/// never an unbounded buffer.
 pub async fn get_manifest(
     s3: &impl S3Api,
     bucket: &str,
     device: &DeviceId,
 ) -> Result<Manifest, ManifestError> {
     let output = s3.get_object(bucket, &manifest_key(device), None).await?;
-    let bytes = output.body.collect().await?;
+    if output.content_length > MANIFEST_MAX_FETCH_BYTES as u64 {
+        return Err(ManifestError::ObjectTooLarge {
+            size: output.content_length,
+            limit: MANIFEST_MAX_FETCH_BYTES,
+        });
+    }
+    let bytes = output.body.collect_capped(MANIFEST_MAX_FETCH_BYTES).await?;
     decode_manifest(&bytes)
 }
 
@@ -388,9 +479,19 @@ pub struct MergeReport {
     pub live_rows: u64,
     /// Deleted rows applied through the consumer.
     pub deleted_rows: u64,
-    /// The merged cursor seed (max per device across all headers), as
-    /// committed via [`crate::state::StateTxn::set_cursor`].
+    /// The merged cursor seed (max per device across all headers,
+    /// excluding the merging device's own id — its own prefix is
+    /// authoritative locally), as committed via
+    /// [`crate::state::StateTxn::set_cursor`].
     pub cursors: BTreeMap<DeviceId, u64>,
+    /// Live rows no synthetic apply op could be built for (`thumb` rows,
+    /// `preview` rows without a `content_id`), as `(relkey, kind)`
+    /// ascending by relkey. Skipped, not applied — they are additive
+    /// advisory rows from a non-conforming or future writer, so skipping
+    /// one cannot destroy data, while refusing the whole merge over one
+    /// would wedge the §2.3 bootstrap lane fleet-wide. Surfaced here so
+    /// the engine can log them loudly.
+    pub unconvertible: Vec<(RelKey, Kind)>,
 }
 
 /// §2.3 bootstrap/catch-up merge: applies every manifest's rows through
@@ -433,6 +534,13 @@ pub fn merge(
             deleted.push((owner, row));
         }
         for (device, &seq) in &manifest.header.cursors {
+            // Never seed a cursor for the merging device's own prefix: a
+            // device never applies its own journal, its cursors table
+            // holds peers only, and its own published cursor is the
+            // authoritative local fact.
+            if device == db.device_id() {
+                continue;
+            }
             let slot = cursors.entry(device.clone()).or_insert(0);
             *slot = (*slot).max(seq);
         }
@@ -440,11 +548,22 @@ pub fn merge(
     live.sort_by(|a, b| a.2.key.cmp(&b.2.key));
     deleted.sort_by(|a, b| a.1.del.cmp(&b.1.del));
 
-    // Convert eagerly too, so an unconvertible row refuses the merge
-    // before any consumer side-effect could need rolling back.
+    // Convert eagerly too, so conversion failures surface before any
+    // consumer side-effect could need rolling back. An unconvertible row
+    // (thumb / content-id-less preview, from a non-conforming or future
+    // writer) is skipped and reported, not a refusal: these are additive
+    // advisory rows, and one of them must not wedge the whole §2.3
+    // bootstrap lane ([`MergeReport::unconvertible`]).
     let mut entries: Vec<JournalEntry> = Vec::with_capacity(live.len() + deleted.len());
+    let mut unconvertible: Vec<(RelKey, Kind)> = Vec::new();
     for (owner, header, row) in &live {
-        entries.push(live_row_entry(owner, header, row)?);
+        match live_row_entry(owner, header, row) {
+            Ok(entry) => entries.push(entry),
+            Err(ManifestError::Unconvertible { relkey, kind }) => {
+                unconvertible.push((relkey, kind));
+            }
+            Err(e) => return Err(e),
+        }
     }
     for (owner, row) in &deleted {
         entries.push(deleted_row_entry(owner, row));
@@ -453,9 +572,10 @@ pub fn merge(
     // One committed transaction for every row apply AND the cursor
     // seeding: a failed merge leaves nothing behind.
     let report = MergeReport {
-        live_rows: live.len() as u64,
+        live_rows: (live.len() - unconvertible.len()) as u64,
         deleted_rows: deleted.len() as u64,
         cursors,
+        unconvertible,
     };
     db.with_txn_err::<_, ManifestError>(|txn| {
         for entry in &entries {
