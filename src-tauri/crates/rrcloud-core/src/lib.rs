@@ -24,11 +24,16 @@
 //!   uploads/downloads, Content-MD5, streamed blake3, temp+verify+rename,
 //!   the backend digest probe, and the concurrency pump (§2.4, §3.5,
 //!   §2.1.5).
+//! - [`engine`]: the sync engine for one device — §2.5 churn-gated
+//!   change intake, §3.7 quiescence admission (the §2.6 version mint),
+//!   the §2.6 unified apply rule as a `JournalConsumer`, §2.7 soft
+//!   delete/restore/resurrection, §2.8 original-overwrite conflicts.
 //!
-//! The remaining modules from architecture §3.1 (`engine`, `tombstone`,
-//! `compact`, `proxy`, `thumbs`) land in later units.
+//! The remaining modules from architecture §3.1 (`tombstone`, `compact`,
+//! `proxy`, `thumbs`) land in later units.
 
 pub mod clock;
+pub mod engine;
 pub mod journal;
 pub mod keys;
 pub mod manifest;

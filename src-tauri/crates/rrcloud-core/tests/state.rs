@@ -64,6 +64,12 @@ fn full_record() -> ItemRecord {
         verified_remote: true,
         attested: true,
         base_unknown: false,
+        rating: Some(3),
+        color_label: Some("red".to_string()),
+        device: Some(dev(DEV1)),
+        head_ts: Some(1_769_900_000),
+        admitted_vv: Some([(dev(DEV1), 10u32)].into_iter().collect()),
+        deleted: false,
     }
 }
 
@@ -85,6 +91,12 @@ fn bare_record(state: ItemState) -> ItemRecord {
         verified_remote: false,
         attested: false,
         base_unknown: false,
+        rating: None,
+        color_label: None,
+        device: None,
+        head_ts: None,
+        admitted_vv: None,
+        deleted: false,
     }
 }
 
@@ -2957,5 +2969,151 @@ fn legacy_multipart_rows_without_captured_source_facts_decode_as_changed() {
             size: 0,
             mtime_unix_ns: 0,
         })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P1-U5 additive extensions: engine-unit ItemRecord fields
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v1_records_without_engine_fields_decode_with_defaults() {
+    // A record stored by a pre-engine build carries none of the additive
+    // fields; it must decode with rating/color_label/device/head_ts/
+    // admitted_vv = None and deleted = false — never a codec error, and
+    // never an invented value.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let key = rel("legacy.NEF");
+    let legacy_json = format!(
+        concat!(
+            r#"{{"kind":"original","state":"synced","size":31457280,"#,
+            r#""mtime_unix_ns":1769899000123456789,"blake3":"{BLAKE3}","#,
+            r#""sem_hash":"{SEM}","vv":{{"{D1}":9,"{D2}":4}},"#,
+            r#""content_id":"{CID}","w":6000,"h":4000,"pinned":true,"#,
+            r#""last_access_unix":1769900000,"verified_remote":true,"#,
+            r#""attested":true,"base_unknown":false}}"#
+        ),
+        BLAKE3 = BLAKE3_HEX,
+        SEM = SEMHASH_HEX,
+        D1 = DEV1,
+        D2 = DEV2,
+        CID = CONTENT_HEX,
+    );
+    db.force_corrupt_item(&key, legacy_json.as_bytes())
+        .expect("store legacy record bytes");
+    let record = db.get_item(&key).expect("get").expect("decodes");
+    assert_eq!(record.rating, None);
+    assert_eq!(record.color_label, None);
+    assert_eq!(record.device, None);
+    assert_eq!(record.head_ts, None);
+    assert_eq!(record.admitted_vv, None);
+    assert!(!record.deleted);
+    // And the pre-existing fields still carried through.
+    assert_eq!(record.kind, Kind::Original);
+    assert_eq!(record.state, ItemState::Synced);
+    assert_eq!(record.w, Some(6000));
+}
+
+#[test]
+fn engine_fields_round_trip_across_reopen() {
+    let (_dir, path) = scratch();
+    let key = rel("badged.NEF");
+    let mut record = full_record();
+    record.rating = Some(5);
+    record.color_label = Some("green".to_string());
+    record.device = Some(dev(DEV2));
+    record.head_ts = Some(1_769_901_234);
+    record.admitted_vv = Some([(dev(DEV1), 10u32)].into_iter().collect());
+    record.deleted = true;
+    {
+        let db = open_fresh(&path);
+        // full_record() sits in Synced, which is not a birth state:
+        // ingest through the greppable replay bypass.
+        db.replay_put_item(&key, &record).expect("ingest");
+    }
+    let db = SyncDb::open(&path, None).expect("reopen");
+    assert_eq!(db.get_item(&key).expect("get"), Some(record));
+}
+
+#[test]
+fn transitions_and_updates_preserve_the_engine_fields() {
+    // The deleted flag and the badge/provenance fields are ordinary
+    // record fields: transition()'s CAS carries them unless `mutate`
+    // changes them, and update_item can flip them state-preserving —
+    // §2.7's "items keep their record with a deleted flag" depends on
+    // both.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let key = rel("flagged.NEF");
+    let mut record = bare_record(ItemState::Dirty);
+    record.rating = Some(2);
+    record.color_label = Some("red".to_string());
+    record.device = Some(dev(DEV1));
+    record.head_ts = Some(77);
+    db.insert_item(&key, &record).expect("insert");
+
+    // A state transition leaves them untouched.
+    let after = db
+        .transition(&key, ItemState::Dirty, ItemState::Queued, |_| {})
+        .expect("transition");
+    assert_eq!(after.rating, Some(2));
+    assert_eq!(after.color_label, Some("red".to_string()));
+    assert_eq!(after.device, Some(dev(DEV1)));
+    assert_eq!(after.head_ts, Some(77));
+    assert!(!after.deleted);
+
+    // update_item flips the deleted flag without a state change (§2.7:
+    // deletion composes with every pipeline state — it is a flag, not a
+    // state, so hiding needs no new legal() edges).
+    let hidden = db
+        .update_item(&key, ItemState::Queued, |r| r.deleted = true)
+        .expect("hide");
+    assert!(hidden.deleted);
+    assert_eq!(hidden.state, ItemState::Queued);
+    let shown = db
+        .update_item(&key, ItemState::Queued, |r| r.deleted = false)
+        .expect("unhide");
+    assert!(!shown.deleted);
+
+    // The admitted_vv intent snapshot survives a transition's CAS too
+    // (the §2.4 pipeline moves around it; only the verify-commit's own
+    // mutate clears it).
+    let mut admitted = bare_record(ItemState::Dirty);
+    admitted.admitted_vv = Some([(dev(DEV1), 3u32)].into_iter().collect());
+    let key2 = rel("admitted.NEF");
+    db.insert_item(&key2, &admitted).expect("insert");
+    let moved = db
+        .transition(&key2, ItemState::Dirty, ItemState::Queued, |_| {})
+        .expect("transition");
+    assert_eq!(
+        moved.admitted_vv,
+        Some([(dev(DEV1), 3u32)].into_iter().collect())
+    );
+}
+
+#[test]
+fn engine_fields_do_not_change_the_stored_encoding_when_absent() {
+    // skip_serializing_if keeps a default-valued record's JSON free of
+    // the new optional keys, so records written by this build decode in
+    // an older reader that ignores unknown fields — and byte-stable
+    // hashes over stored records (debug tooling) do not churn.
+    let record = bare_record(ItemState::Dirty);
+    let json = serde_json::to_string(&record).expect("encode");
+    for absent in [
+        "rating",
+        "color_label",
+        "\"device\"",
+        "head_ts",
+        "admitted_vv",
+    ] {
+        assert!(
+            !json.contains(absent),
+            "default-valued {absent} must not serialize: {json}"
+        );
+    }
+    assert!(
+        json.contains("\"deleted\":false"),
+        "the flag is unconditional: {json}"
     );
 }

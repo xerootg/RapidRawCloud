@@ -716,6 +716,50 @@ pub struct ItemRecord {
     /// The local edit's remote base version is unknown (device cursor
     /// predates retention; §2.3 pre-upload quarantine input).
     pub base_unknown: bool,
+    /// Star rating of the current head version (§2.2: sidecar entries and
+    /// manifest rows advertise it so the grid can badge before the sidecar
+    /// bytes download, §3.5). Engine-unit additive field: absent in stored
+    /// v1 records, which decode as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rating: Option<u8>,
+    /// Color label of the current head version (same §2.2 badge contract
+    /// as `rating`). Engine-unit additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_label: Option<String>,
+    /// Authoring device of the current head version — one §2.6 case-4
+    /// tiebreak input (the manifest row's `device` provenance, which
+    /// [`crate::manifest`] documents as owed by the vv-engine unit).
+    /// Engine-unit additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceId>,
+    /// Wall-clock `ts` of the current head version's journal entry — the
+    /// other §2.6 case-4 tiebreak input. Snapshotted at admission for a
+    /// locally authored version (one admitted upload = one `(vv, ts)`
+    /// identity) and adopted from the entry for a remote one, so every
+    /// device orders the same candidate pair identically. Engine-unit
+    /// additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_ts: Option<i64>,
+    /// §2.6 admission snapshot: the version vector the in-flight upload
+    /// will journal (`vv[self]` bumped at queue admission, §3.7). Kept
+    /// separate from `vv` so the record's advertised fields keep naming
+    /// the last **published** version while an upload is in flight (the
+    /// §2.6 coordination note on `size`/`mtime_unix_ns` and in
+    /// [`crate::manifest::build_manifest`]); the §2.4 verify-commit
+    /// promotes it (entry carries exactly this snapshot, record `vv`
+    /// becomes the elementwise max, the snapshot clears). Engine-unit
+    /// additive field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admitted_vv: Option<VersionVector>,
+    /// §2.7 soft-delete marker: a dominating `del` was applied. The item
+    /// keeps its record (hidden from the UI, listed under "Recently
+    /// Deleted"); a deliberate flag, not an [`ItemState`], because
+    /// deletion composes with every pipeline state (a deleted item can
+    /// still be `Stub` or `Synced`) and restore must reproduce the exact
+    /// pre-delete record. Engine-unit additive field: absent in stored v1
+    /// records, which decode as `false`.
+    #[serde(default)]
+    pub deleted: bool,
 }
 
 /// Multipart upload resume state (the `uploads` table value, §2.4).

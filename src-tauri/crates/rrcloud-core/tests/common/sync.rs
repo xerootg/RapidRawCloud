@@ -162,6 +162,12 @@ fn probe_record() -> ItemRecord {
         verified_remote: false,
         attested: false,
         base_unknown: false,
+        rating: None,
+        color_label: None,
+        device: None,
+        head_ts: None,
+        admitted_vv: None,
+        deleted: false,
     }
 }
 
@@ -235,6 +241,18 @@ impl JournalConsumer for ReplayConsumer {
                     verified_remote: false,
                     attested: false,
                     base_unknown: false,
+                    // Deliberately default-valued: this double predates the
+                    // engine-unit additive fields, and the §2.3 merge==replay
+                    // equivalence it serves compares states whose synthetic-
+                    // entry `ts`/`device` provenance legitimately differs
+                    // (manifest.rs docs); the EngineConsumer owns per-field
+                    // provenance.
+                    rating: None,
+                    color_label: None,
+                    device: None,
+                    head_ts: None,
+                    admitted_vv: None,
+                    deleted: false,
                 };
                 txn.replay_put_item(&relkey, &record)?;
             }

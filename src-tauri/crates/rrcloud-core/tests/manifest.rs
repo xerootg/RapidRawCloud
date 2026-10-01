@@ -250,6 +250,12 @@ fn build_manifest_snapshots_items_deleted_set_and_cursors() {
         verified_remote: true,
         attested: true,
         base_unknown: false,
+        rating: None,
+        color_label: None,
+        device: None,
+        head_ts: None,
+        admitted_vv: None,
+        deleted: false,
     };
     db.replay_put_item(&rel("z/last.NEF"), &record)
         .expect("put item");
@@ -390,6 +396,12 @@ fn build_manifest_withholds_rows_its_own_merge_cannot_convert() {
         verified_remote: false,
         attested: false,
         base_unknown: false,
+        rating: None,
+        color_label: None,
+        device: None,
+        head_ts: None,
+        admitted_vv: None,
+        deleted: false,
     };
     db.replay_put_item(&rel("good.NEF"), &base).expect("put");
     // A thumb item and a preview item without a content id are legal
@@ -452,6 +464,12 @@ fn build_manifest_withholds_items_whose_version_never_finished_an_upload() {
         verified_remote: false,
         attested: false,
         base_unknown: false,
+        rating: None,
+        color_label: None,
+        device: None,
+        head_ts: None,
+        admitted_vv: None,
+        deleted: false,
     };
     // A §2.3 live row advertises that the key's version IS in the bucket.
     // States before the first completed upload cannot prove that: a
@@ -519,6 +537,12 @@ fn in_flight_items_with_a_published_version_stay_advertised() {
         verified_remote: true,
         attested: false,
         base_unknown: false,
+        rating: None,
+        color_label: None,
+        device: None,
+        head_ts: None,
+        admitted_vv: None,
+        deleted: false,
     };
     for state in [ItemState::Dirty, ItemState::Queued, ItemState::Uploading] {
         let record = ItemRecord {

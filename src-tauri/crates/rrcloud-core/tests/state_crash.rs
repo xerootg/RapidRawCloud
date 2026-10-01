@@ -187,6 +187,12 @@ mod linux {
                             verified_remote: false,
                             attested: false,
                             base_unknown: false,
+                            rating: None,
+                            color_label: None,
+                            device: None,
+                            head_ts: None,
+                            admitted_vv: None,
+                            deleted: false,
                         },
                     )?;
                     if fresh {
