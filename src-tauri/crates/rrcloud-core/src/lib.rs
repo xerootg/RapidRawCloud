@@ -14,14 +14,22 @@
 //! - [`clock`]: device identity, version vectors, conflict winner (§2.6).
 //! - [`journal`]: journal entry/segment schema and tombstones (§2.2, §2.7).
 //! - [`state`]: the redb-backed durable state store (§3.2, §2.1.5, §2.4).
+//! - [`publisher`]: the outbound journal lane + device-registry heartbeat
+//!   (§2.1.5, §2.2, §1.2).
+//! - [`reader`]: the inbound journal lane — poll, fail-closed apply,
+//!   cursors (§2.2).
+//! - [`manifest`]: per-writer manifests — build/encode/transfer/merge
+//!   (§2.3).
 //!
-//! The remaining modules from architecture §3.1 (`manifest`, `engine`,
-//! `transfer`, `tombstone`, `compact`, `proxy`, `thumbs`) land in later
-//! units.
+//! The remaining modules from architecture §3.1 (`engine`, `transfer`,
+//! `tombstone`, `compact`, `proxy`, `thumbs`) land in later units.
 
 pub mod clock;
 pub mod journal;
 pub mod keys;
+pub mod manifest;
+pub mod publisher;
+pub mod reader;
 pub mod s3;
 pub mod semhash;
 pub mod state;

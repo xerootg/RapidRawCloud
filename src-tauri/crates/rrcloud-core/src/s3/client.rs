@@ -111,6 +111,12 @@ pub struct PutObjectOutput {
     /// simple PUT this is the hex MD5 of the body on every S3
     /// implementation tested (Garage v2.2.0 included).
     pub e_tag: String,
+    /// The response's `Date` header, verbatim (RFC 9110 HTTP-date), when
+    /// present. This is the engine's **server time** source (architecture
+    /// §2.1.4/§2.10: GC age rules and `last_seen_server_ts` run on server
+    /// time, never device clocks); the device-registry heartbeat derives
+    /// its clock offset from it.
+    pub date: Option<String>,
 }
 
 /// Byte range for a ranged `GetObject` (all forms verified against Garage
@@ -483,6 +489,7 @@ impl S3Client {
         let resp = Self::ensure_success(resp).await?;
         Ok(PutObjectOutput {
             e_tag: required_etag(resp.headers())?,
+            date: header_string(resp.headers(), "date"),
         })
     }
 

@@ -48,6 +48,112 @@ pub use client::{
     S3Client, S3Config,
 };
 pub use error::{S3Error, S3ErrorCode};
+
+/// The subset of [`S3Client`] operations the sync engine's journal,
+/// manifest, and device-registry lanes use, lifted into a trait so tests
+/// can interpose thin wrappers — a call counter that pins the §2.2
+/// steady-state polling cost ("exactly one `ListObjectsV2` page when
+/// nothing changed"), and fault injectors that pin the §2.1.5 publish
+/// ordering under PUT failure — without a mock HTTP layer. Production code
+/// passes the concrete [`S3Client`], whose impl is pure delegation.
+///
+/// Static dispatch only (no `dyn`): callers are generic over
+/// `&impl S3Api`.
+#[allow(async_fn_in_trait)] // engine-internal seam; no dyn dispatch, no cross-task Send bound needed
+pub trait S3Api {
+    /// [`S3Client::put_object`].
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: bytes::Bytes,
+        opts: &PutObjectOptions,
+    ) -> Result<PutObjectOutput, S3Error>;
+
+    /// [`S3Client::get_object`].
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<ByteRange>,
+    ) -> Result<GetObjectOutput, S3Error>;
+
+    /// [`S3Client::head_object`].
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, S3Error>;
+
+    /// [`S3Client::list_objects_v2`].
+    async fn list_objects_v2(
+        &self,
+        bucket: &str,
+        request: &ListObjectsV2Request,
+    ) -> Result<ListObjectsV2Output, S3Error>;
+}
+
+impl S3Api for S3Client {
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: bytes::Bytes,
+        opts: &PutObjectOptions,
+    ) -> Result<PutObjectOutput, S3Error> {
+        S3Client::put_object(self, bucket, key, body, opts).await
+    }
+
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<ByteRange>,
+    ) -> Result<GetObjectOutput, S3Error> {
+        S3Client::get_object(self, bucket, key, range).await
+    }
+
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, S3Error> {
+        S3Client::head_object(self, bucket, key).await
+    }
+
+    async fn list_objects_v2(
+        &self,
+        bucket: &str,
+        request: &ListObjectsV2Request,
+    ) -> Result<ListObjectsV2Output, S3Error> {
+        S3Client::list_objects_v2(self, bucket, request).await
+    }
+}
+
+impl<T: S3Api> S3Api for &T {
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: bytes::Bytes,
+        opts: &PutObjectOptions,
+    ) -> Result<PutObjectOutput, S3Error> {
+        T::put_object(self, bucket, key, body, opts).await
+    }
+
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<ByteRange>,
+    ) -> Result<GetObjectOutput, S3Error> {
+        T::get_object(self, bucket, key, range).await
+    }
+
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, S3Error> {
+        T::head_object(self, bucket, key).await
+    }
+
+    async fn list_objects_v2(
+        &self,
+        bucket: &str,
+        request: &ListObjectsV2Request,
+    ) -> Result<ListObjectsV2Output, S3Error> {
+        T::list_objects_v2(self, bucket, request).await
+    }
+}
 pub use multipart::{
     CompleteMultipartUploadOutput, CompletedPart, CreateMultipartUploadOutput,
     ListMultipartUploadsOutput, ListMultipartUploadsRequest, ListPartsOutput, ListPartsRequest,

@@ -2545,3 +2545,349 @@ fn replay_put_item_cas_is_a_guarded_bypass_for_apply_loop_edges() {
     let db = SyncDb::open(&path, None).expect("reopen");
     assert_eq!(db.get_item(&key).expect("get"), Some(synced));
 }
+
+// ---------------------------------------------------------------------------
+// P1-U3 additive extensions: outbound staging, deleted set, with_txn_err,
+// and corruption-recovery raw deletes (inherited U2 review minors).
+// ---------------------------------------------------------------------------
+
+use rrcloud_core::state::DeletedRecord;
+
+#[test]
+fn outbound_staging_is_durable_fifo_with_monotonic_ids() {
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    assert_eq!(db.outbound_len().expect("len"), 0);
+    assert!(db.iter_outbound().expect("iter").is_empty());
+
+    let id1 = db.stage_outbound(b"first").expect("stage");
+    let id2 = db.stage_outbound(b"second").expect("stage");
+    let id3 = db.stage_outbound(b"third").expect("stage");
+    assert!(
+        id1 < id2 && id2 < id3,
+        "strictly increasing ids: {id1} {id2} {id3}"
+    );
+    assert_eq!(db.outbound_len().expect("len"), 3);
+    assert_eq!(
+        db.iter_outbound().expect("iter"),
+        vec![
+            (id1, b"first".to_vec()),
+            (id2, b"second".to_vec()),
+            (id3, b"third".to_vec()),
+        ],
+        "FIFO order, exact bytes"
+    );
+
+    // Durable across reopen; the id counter never regresses.
+    drop(db);
+    let db = SyncDb::open(&path, None).expect("reopen");
+    assert_eq!(db.outbound_len().expect("len"), 3);
+    let id4 = db.stage_outbound(b"fourth").expect("stage");
+    assert!(
+        id4 > id3,
+        "ids stay monotonic across reopen: {id4} vs {id3}"
+    );
+}
+
+#[test]
+fn outbound_remove_composes_atomically_in_a_txn() {
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let id1 = db.stage_outbound(b"one").expect("stage");
+    let id2 = db.stage_outbound(b"two").expect("stage");
+
+    // The publisher's drain shape: consume staged records inside the same
+    // transaction that freezes their segment. An aborted closure must
+    // restore the staged record.
+    let err = db
+        .with_txn(|t| {
+            assert!(t.remove_outbound(id1)?);
+            Err::<(), _>(StateError::EmptySegment) // any error: abort
+        })
+        .expect_err("closure error aborts");
+    assert!(matches!(err, StateError::EmptySegment));
+    assert_eq!(
+        db.outbound_len().expect("len"),
+        2,
+        "aborted removal rolled back"
+    );
+
+    db.with_txn(|t| {
+        assert!(t.remove_outbound(id1)?);
+        assert!(
+            !t.remove_outbound(id1)?,
+            "second removal in-txn reports absent"
+        );
+        Ok(())
+    })
+    .expect("commit removal");
+    assert_eq!(
+        db.iter_outbound().expect("iter"),
+        vec![(id2, b"two".to_vec())],
+        "only the removed record is gone"
+    );
+
+    // Staging composes in a txn too (the §3.4 chokepoint shape).
+    let id3 = db
+        .with_txn(|t| t.stage_outbound(b"three"))
+        .expect("stage in txn");
+    assert!(id3 > id2);
+    assert_eq!(db.outbound_len().expect("len"), 2);
+}
+
+/// A domain error type that is not `StateError`, for `with_txn_err`.
+#[derive(Debug)]
+enum TestTxnErr {
+    #[allow(dead_code)] // constructed via From, carried for the Debug rendering
+    State(StateError),
+    Domain(&'static str),
+}
+
+impl From<StateError> for TestTxnErr {
+    fn from(e: StateError) -> Self {
+        TestTxnErr::State(e)
+    }
+}
+
+#[test]
+fn with_txn_err_commits_on_ok_and_aborts_on_any_error_kind() {
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let key = rel("txn-err.NEF");
+    let record = bare_record(ItemState::Dirty);
+
+    // Ok commits.
+    let out = db
+        .with_txn_err::<u32, TestTxnErr>(|t| {
+            t.replay_put_item(&key, &record)?;
+            Ok(7)
+        })
+        .expect("commit");
+    assert_eq!(out, 7);
+    assert_eq!(db.get_item(&key).expect("get"), Some(record.clone()));
+
+    // A DOMAIN error (not a StateError) aborts everything the closure did
+    // — this is what lets a journal consumer's failure roll back the
+    // whole apply composite.
+    let key2 = rel("txn-err-2.NEF");
+    let err = db
+        .with_txn_err::<(), TestTxnErr>(|t| {
+            t.replay_put_item(&key2, &record)?;
+            t.mark_applied(&dev(DEV2), 41)?;
+            Err(TestTxnErr::Domain("consumer said no"))
+        })
+        .expect_err("domain error aborts");
+    assert!(
+        matches!(err, TestTxnErr::Domain("consumer said no")),
+        "got {err:?}"
+    );
+    assert_eq!(
+        db.get_item(&key2).expect("get"),
+        None,
+        "item write rolled back"
+    );
+    assert!(
+        !db.has_applied(&dev(DEV2), 41).expect("applied"),
+        "applied mark rolled back with it — one transaction"
+    );
+
+    // E = StateError works too (drop-in for with_txn call sites).
+    db.with_txn_err::<(), StateError>(|t| t.set_cursor(&dev(DEV2), 5))
+        .expect("plain StateError closure");
+    assert_eq!(db.cursor(&dev(DEV2)).expect("cursor"), 5);
+}
+
+#[test]
+fn deleted_set_roundtrips_replaces_and_survives_reopen() {
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let gone = rel("albums/gone.NEF");
+    let also = rel("albums/also-gone.NEF");
+    assert_eq!(db.get_deleted(&gone).expect("get"), None);
+    assert!(db.iter_deleted().expect("iter").is_empty());
+    assert!(
+        !db.remove_deleted(&gone).expect("remove"),
+        "removing absent is false"
+    );
+
+    let first = DeletedRecord {
+        vv: [(dev(DEV1), 3u32)].into_iter().collect(),
+        server_ts: 1_769_940_000,
+    };
+    db.record_deleted(&gone, &first).expect("record");
+    db.record_deleted(&also, &first).expect("record");
+    assert_eq!(db.get_deleted(&gone).expect("get"), Some(first.clone()));
+    assert_eq!(
+        db.iter_deleted()
+            .expect("iter")
+            .iter()
+            .map(|(k, _)| k.as_str().to_string())
+            .collect::<Vec<_>>(),
+        vec!["albums/also-gone.NEF", "albums/gone.NEF"],
+        "ascending by relkey"
+    );
+
+    // Re-recording replaces (a later deletion observation wins).
+    let second = DeletedRecord {
+        vv: [(dev(DEV1), 3u32), (dev(DEV2), 1u32)].into_iter().collect(),
+        server_ts: 1_769_941_111,
+    };
+    db.record_deleted(&gone, &second).expect("replace");
+    assert_eq!(db.get_deleted(&gone).expect("get"), Some(second.clone()));
+
+    // Composes in a txn (the §2.7 tombstone-apply shape: delete the item
+    // and record the deletion in one commit).
+    let item_key = rel("albums/tombstoned.NEF");
+    db.insert_item(&item_key, &bare_record(ItemState::Dirty))
+        .expect("insert");
+    db.with_txn(|t| {
+        t.delete_item(&item_key)?;
+        t.record_deleted(&item_key, &first)?;
+        assert_eq!(
+            t.get_deleted(&item_key)?,
+            Some(first.clone()),
+            "txn sees its own write"
+        );
+        Ok(())
+    })
+    .expect("composite");
+    assert_eq!(db.get_item(&item_key).expect("get"), None);
+
+    drop(db);
+    let db = SyncDb::open(&path, None).expect("reopen");
+    assert_eq!(db.get_deleted(&gone).expect("get"), Some(second), "durable");
+    assert!(db.remove_deleted(&gone).expect("remove"));
+    assert_eq!(db.get_deleted(&gone).expect("get"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Inherited U2 verification-review minors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn upload_parts_enumeration_surfaces_codec_at_with_relkey_and_part_number() {
+    // Minor 1: the per-relkey part-range scan is an enumeration like any
+    // other — a corrupt part row must surface as CodecAt naming its row
+    // (relkey + part number, spelled "<relkey>:<part>"; ':' is illegal in
+    // relkeys, so the spelling is unambiguous), never as a bare Codec that
+    // hides WHICH row is bad.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let key = rel("img.NEF");
+    db.set_upload(
+        &key,
+        &MultipartUploadState {
+            upload_id: "uid-1".to_string(),
+            part_size: 16 << 20,
+            started_unix: 1_769_900_000,
+        },
+    )
+    .expect("set upload");
+    db.record_upload_part(
+        &key,
+        1,
+        &UploadPart {
+            etag: "abc".to_string(),
+            md5_b64: "xyz".to_string(),
+        },
+    )
+    .expect("part 1");
+    db.force_corrupt_upload_part(key.as_str(), 2, b"not json")
+        .expect("corrupt part 2");
+
+    let err = db
+        .upload_parts(&key)
+        .expect_err("corrupt part row must fail typed");
+    match &err {
+        StateError::CodecAt { key: at, .. } => {
+            assert_eq!(
+                at, "img.NEF:2",
+                "the row's context is the relkey + part number"
+            );
+        }
+        other => panic!("expected CodecAt naming the part row, got {other:?}"),
+    }
+}
+
+#[test]
+fn key_side_corrupt_item_row_is_surfaced_and_deletable_by_raw_key() {
+    // Minor 2 (items): CodecAt.key can carry a corrupt raw key, but
+    // delete_item takes a validated RelKey — the recovery loop needs a
+    // raw-key delete.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    db.insert_item(&rel("good.NEF"), &bare_record(ItemState::Dirty))
+        .expect("good item");
+    let raw = "bad\\key.NEF"; // backslash: can never be a RelKey
+    let valid_value = serde_json::to_vec(&bare_record(ItemState::Dirty)).expect("encode");
+    db.force_corrupt_item_key(raw, &valid_value)
+        .expect("corrupt key");
+
+    // Surface: the scan names the corrupt raw key.
+    let err = db
+        .iter_items()
+        .expect_err("key-side corruption must fail typed");
+    match &err {
+        StateError::CodecAt { key, .. } => assert_eq!(key, raw),
+        other => panic!("expected CodecAt with the raw key, got {other:?}"),
+    }
+    assert!(
+        rrcloud_core::keys::RelKey::new(raw).is_err(),
+        "precondition: the surfaced key is NOT constructible as a RelKey"
+    );
+
+    // Recover: delete by raw key, then the scan works again.
+    assert!(db.delete_item_raw(raw).expect("raw delete"), "row existed");
+    assert!(
+        !db.delete_item_raw(raw).expect("raw delete again"),
+        "idempotent"
+    );
+    let items = db.iter_items().expect("scan recovers");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0].0,
+        rel("good.NEF"),
+        "healthy rows survive the recovery"
+    );
+}
+
+#[test]
+fn key_side_corrupt_upload_row_is_surfaced_and_clearable_by_raw_key() {
+    // Minor 2 (uploads): same loop for the uploads table; the raw clear
+    // also drops part rows stored under the corrupt key.
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let good = rel("good.NEF");
+    db.set_upload(
+        &good,
+        &MultipartUploadState {
+            upload_id: "uid-good".to_string(),
+            part_size: 16 << 20,
+            started_unix: 1_769_900_000,
+        },
+    )
+    .expect("good upload");
+    let raw = "bad\\upload.NEF";
+    let valid_value = serde_json::to_vec(&MultipartUploadState {
+        upload_id: "uid-bad".to_string(),
+        part_size: 16 << 20,
+        started_unix: 1_769_900_000,
+    })
+    .expect("encode");
+    db.force_corrupt_upload_key(raw, &valid_value)
+        .expect("corrupt key");
+
+    let err = db
+        .iter_uploads()
+        .expect_err("key-side corruption must fail typed");
+    match &err {
+        StateError::CodecAt { key, .. } => assert_eq!(key, raw),
+        other => panic!("expected CodecAt with the raw key, got {other:?}"),
+    }
+
+    db.clear_upload_raw(raw).expect("raw clear");
+    db.clear_upload_raw(raw).expect("raw clear is idempotent");
+    let uploads = db.iter_uploads().expect("scan recovers");
+    assert_eq!(uploads.len(), 1);
+    assert_eq!(uploads[0].0, good, "healthy rows survive the recovery");
+}

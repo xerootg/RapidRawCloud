@@ -386,6 +386,18 @@ const T_QUEUE_DOWN_IDX: TableDefinition<&str, (u8, u64)> = TableDefinition::new(
 const T_XMP_SEEN: TableDefinition<&str, &str> = TableDefinition::new("xmp_seen");
 /// `dcim_seen`: (source path, size, mtime) -> content id hex.
 const T_DCIM_SEEN: TableDefinition<(&str, u64, i64), &str> = TableDefinition::new("dcim_seen");
+/// `outbound_entries`: staging arrival counter -> opaque staged outbound
+/// journal-entry bytes (the publisher's durable outbound lane, §2.1.5).
+/// The key is a persisted monotonic counter ([`K_OUTBOUND_ARRIVAL`]), so a
+/// plain ascending range scan yields strict FIFO staging order; the value
+/// bytes are opaque to this store (the publisher owns the entry encoding),
+/// which keeps the staging table schema-stable across journal versions.
+const T_OUTBOUND: TableDefinition<u64, &[u8]> = TableDefinition::new("outbound_entries");
+/// `deleted_set`: relkey -> JSON [`DeletedRecord`] — the durable §2.3
+/// deleted set this device's manifest publishes (`{del, vv, server_ts}`
+/// rows), retained for 12 months after deletion (pruning is the §2.10 GC
+/// unit's concern, like `applied`).
+const T_DELETED: TableDefinition<&str, &[u8]> = TableDefinition::new("deleted_set");
 /// `meta`: string key -> JSON value (device id, schema version, cursors,
 /// counters).
 const T_META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
@@ -406,6 +418,8 @@ const K_PUBLISHED_CURSOR: &str = "published_cursor";
 /// `freeze_next_segment`) blocks the floor but not correctness.
 const K_PUBLISHED_FLOOR: &str = "published_floor";
 const K_QUEUE_ARRIVAL: &str = "queue_arrival";
+#[allow(dead_code)] // consumed by the P1-U3 green implementation (stage_outbound)
+const K_OUTBOUND_ARRIVAL: &str = "outbound_arrival";
 const K_SERVER_TIME_OFFSET_MS: &str = "server_time_offset_ms";
 
 // ---------------------------------------------------------------------------
@@ -704,6 +718,19 @@ pub struct UploadPart {
     pub md5_b64: String,
 }
 
+/// One entry of the durable §2.3 deleted set (the `deleted_set` table
+/// value): what this device knows about a relkey's deletion, published as
+/// a manifest `{del, vv, server_ts}` row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeletedRecord {
+    /// The deletion's version vector (bumped past the deleted version, so
+    /// delete-vs-edit resolves through the §2.6 machinery).
+    pub vv: VersionVector,
+    /// Server time of the deletion, unix seconds (§2.10 GC age rules run
+    /// on server time).
+    pub server_ts: i64,
+}
+
 /// Which transfer queue (§3.2 `queue_up` / `queue_down`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Queue {
@@ -973,6 +1000,8 @@ impl SyncDb {
         txn.open_table(T_QUEUE_DOWN_IDX).map_err(db_err)?;
         txn.open_table(T_XMP_SEEN).map_err(db_err)?;
         txn.open_table(T_DCIM_SEEN).map_err(db_err)?;
+        txn.open_table(T_OUTBOUND).map_err(db_err)?;
+        txn.open_table(T_DELETED).map_err(db_err)?;
         txn.commit().map_err(db_err)?;
 
         // First creation: make the new file's directory entry itself
@@ -1045,6 +1074,30 @@ impl SyncDb {
         let out = f(&StateTxn { txn: &txn })?;
         txn.commit().map_err(db_err)?;
         Ok(out)
+    }
+
+    /// [`SyncDb::with_txn`] generalized over the closure's error type: `f`
+    /// may fail with any `E: From<StateError>`, and an `Err` of **either**
+    /// origin — a storage/codec failure from the [`StateTxn`] mutators or
+    /// the caller's own domain error — aborts the transaction so nothing
+    /// `f` did is visible.
+    ///
+    /// This is what lets the §2.2 apply composite put a *consumer's* work
+    /// (whose failures are not [`StateError`]s) inside the same commit as
+    /// `mark_applied` + `set_cursor`: the journal reader runs
+    /// `consumer.apply(txn, entry)` through this method, so a consumer
+    /// error — or a consumer panic, which drops the transaction
+    /// un-committed during unwind — leaves neither the consumer's
+    /// mutations nor the applied mark behind, by construction.
+    ///
+    /// The same closure rules as [`SyncDb::with_txn`] apply (no calling
+    /// back into `self`).
+    pub fn with_txn_err<T, E>(&self, f: impl FnOnce(&StateTxn<'_>) -> Result<T, E>) -> Result<T, E>
+    where
+        E: From<StateError>,
+    {
+        let _ = f;
+        todo!("P1-U3: with_txn_err")
     }
 
     // -- items ------------------------------------------------------------
@@ -1129,6 +1182,25 @@ impl SyncDb {
     /// [`StateTxn::clear_upload`] + [`StateTxn::remove_xmp_seen`].
     pub fn delete_item(&self, relkey: &RelKey) -> Result<bool, StateError> {
         self.with_txn(|t| t.delete_item(relkey))
+    }
+
+    /// **Corruption-recovery only**: deletes the `items` row stored under
+    /// the raw key string `raw`, which need **not** be a valid relkey.
+    /// `Ok(true)` when a row existed.
+    ///
+    /// This closes the surface-and-delete loop for **key-side** corruption:
+    /// the item scans' [`StateError::CodecAt`] can name a corrupt raw key,
+    /// but [`SyncDb::delete_item`] takes a validated [`RelKey`], which can
+    /// never be constructed from invalid stored text — so without this
+    /// method a key-side-corrupt row would wedge every enumeration forever
+    /// (the uploads twin is [`SyncDb::clear_upload_raw`]; queues recover
+    /// through [`SyncDb::queue_clear`]). Pass exactly the string
+    /// [`StateError::CodecAt`] reported. Not a general deletion path: for
+    /// valid keys use [`SyncDb::delete_item`], whose doc covers companion
+    /// rows.
+    pub fn delete_item_raw(&self, raw: &str) -> Result<bool, StateError> {
+        let _ = raw;
+        todo!("P1-U3: delete_item_raw")
     }
 
     /// Every item record, ascending by relkey. One consistent snapshot.
@@ -1489,6 +1561,73 @@ impl SyncDb {
         Ok(meta_get(&meta, K_PUBLISHED_CURSOR)?.unwrap_or(0))
     }
 
+    // -- outbound staging (§2.1.5 publisher lane) --------------------------
+
+    /// Durably stages one outbound journal-entry record (opaque `bytes`;
+    /// the publisher owns the encoding) at the back of the FIFO staging
+    /// lane, returning its staging id. Ids are strictly increasing across
+    /// threads and crash/reopen (persisted counter, same overflow refusal
+    /// as the other counters: [`StateError::CounterSaturated`]).
+    ///
+    /// Staged records survive until [`StateTxn::remove_outbound`] — which
+    /// the publisher calls **in the same transaction** as
+    /// [`StateTxn::freeze_next_segment`], so a staged entry is either
+    /// still staged or covered by frozen segment bytes, never neither
+    /// (§2.1.5: no outbound record is ever lost to a crash between
+    /// staging and freezing).
+    pub fn stage_outbound(&self, bytes: &[u8]) -> Result<u64, StateError> {
+        let _ = bytes;
+        todo!("P1-U3: stage_outbound")
+    }
+
+    /// Every staged outbound record as `(staging id, bytes)`, in FIFO
+    /// (ascending-id) order — the publisher's drain scan.
+    pub fn iter_outbound(&self) -> Result<Vec<(u64, Vec<u8>)>, StateError> {
+        todo!("P1-U3: iter_outbound")
+    }
+
+    /// Number of staged outbound records.
+    pub fn outbound_len(&self) -> Result<u64, StateError> {
+        todo!("P1-U3: outbound_len")
+    }
+
+    // -- deleted set (§2.3) ------------------------------------------------
+
+    /// Durably records (or replaces) this device's knowledge of `relkey`'s
+    /// deletion — the row [`crate::manifest`] publishes as
+    /// `{del, vv, server_ts}`. Retention/pruning is the §2.10 GC unit's
+    /// concern.
+    pub fn record_deleted(
+        &self,
+        relkey: &RelKey,
+        record: &DeletedRecord,
+    ) -> Result<(), StateError> {
+        let _ = (relkey, record);
+        todo!("P1-U3: record_deleted")
+    }
+
+    /// Reads the deleted-set record for `relkey` (`None` when this device
+    /// knows of no deletion).
+    pub fn get_deleted(&self, relkey: &RelKey) -> Result<Option<DeletedRecord>, StateError> {
+        let _ = relkey;
+        todo!("P1-U3: get_deleted")
+    }
+
+    /// Every deleted-set record, ascending by relkey (the manifest
+    /// builder's scan). A row that fails to decode aborts with
+    /// [`StateError::CodecAt`] naming its key, like the other
+    /// enumerations.
+    pub fn iter_deleted(&self) -> Result<Vec<(RelKey, DeletedRecord)>, StateError> {
+        todo!("P1-U3: iter_deleted")
+    }
+
+    /// Removes the deleted-set record for `relkey` (§2.10 retention
+    /// expiry). `Ok(true)` when a record existed.
+    pub fn remove_deleted(&self, relkey: &RelKey) -> Result<bool, StateError> {
+        let _ = relkey;
+        todo!("P1-U3: remove_deleted")
+    }
+
     // -- multipart upload resume (§2.4) ------------------------------------
 
     /// Stores (or replaces) the multipart state for `relkey`.
@@ -1551,6 +1690,18 @@ impl SyncDb {
     /// in one transaction (upload completed or aborted). Idempotent.
     pub fn clear_upload(&self, relkey: &RelKey) -> Result<(), StateError> {
         self.with_txn(|t| t.clear_upload(relkey))
+    }
+
+    /// **Corruption-recovery only**: removes the `uploads` row **and every
+    /// `upload_parts` row** stored under the raw key string `raw`, which
+    /// need not be a valid relkey — the key-side-corruption twin of
+    /// [`SyncDb::delete_item_raw`] (see its doc for the rationale;
+    /// [`SyncDb::clear_upload`] takes a validated [`RelKey`] and cannot
+    /// name a corrupt stored key). Idempotent. Pass exactly the string
+    /// [`StateError::CodecAt`] reported.
+    pub fn clear_upload_raw(&self, raw: &str) -> Result<(), StateError> {
+        let _ = raw;
+        todo!("P1-U3: clear_upload_raw")
     }
 
     // -- transfer queues ---------------------------------------------------
@@ -1854,6 +2005,56 @@ impl SyncDb {
             entries.insert((class, arrival), raw).map_err(db_err)?;
             let mut idx = t.txn.open_table(idx_def).map_err(db_err)?;
             idx.insert(raw, (class, arrival)).map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// Test support only: store raw (typically unparseable) bytes as the
+    /// item record under a raw **key** string that need not be a valid
+    /// relkey (modeling key-side on-disk corruption), so the
+    /// [`StateError::CodecAt`]-surface-then-[`SyncDb::delete_item_raw`]
+    /// recovery loop can be pinned.
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn force_corrupt_item_key(&self, raw: &str, bytes: &[u8]) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut items = t.txn.open_table(T_ITEMS).map_err(db_err)?;
+            items.insert(raw, bytes).map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// Test support only: store raw bytes as the multipart upload state
+    /// under a raw key string that need not be a valid relkey, plus one
+    /// part row under the same raw key — the uploads twin of
+    /// [`SyncDb::force_corrupt_item_key`], pinning the
+    /// [`SyncDb::clear_upload_raw`] recovery loop.
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn force_corrupt_upload_key(&self, raw: &str, bytes: &[u8]) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut uploads = t.txn.open_table(T_UPLOADS).map_err(db_err)?;
+            uploads.insert(raw, bytes).map_err(db_err)?;
+            let mut parts = t.txn.open_table(T_UPLOAD_PARTS).map_err(db_err)?;
+            parts.insert((raw, 1u32), bytes).map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// Test support only: store raw (typically unparseable) bytes as one
+    /// recorded part of `raw_rel`'s multipart upload, so the per-part
+    /// enumeration's keyed error contract can be pinned.
+    #[cfg(feature = "test-util")]
+    #[doc(hidden)]
+    pub fn force_corrupt_upload_part(
+        &self,
+        raw_rel: &str,
+        part_no: u32,
+        bytes: &[u8],
+    ) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut parts = t.txn.open_table(T_UPLOAD_PARTS).map_err(db_err)?;
+            parts.insert((raw_rel, part_no), bytes).map_err(db_err)?;
             Ok(())
         })
     }
@@ -2315,6 +2516,43 @@ impl StateTxn<'_> {
             parts.remove((rel, part_no)).map_err(db_err)?;
         }
         Ok(())
+    }
+
+    /// [`SyncDb::stage_outbound`] within this transaction (e.g. the §3.4
+    /// chokepoint's "commit the local version + stage its journal entry"
+    /// composite).
+    pub fn stage_outbound(&self, bytes: &[u8]) -> Result<u64, StateError> {
+        let _ = bytes;
+        todo!("P1-U3: StateTxn::stage_outbound")
+    }
+
+    /// Removes one staged outbound record by id; `Ok(true)` when it was
+    /// staged. The publisher's drain calls this **in the same
+    /// transaction** as [`StateTxn::freeze_next_segment`], so staged
+    /// records convert to frozen segment bytes atomically (§2.1.5) — a
+    /// crash leaves each entry staged or frozen, never both, never
+    /// neither.
+    pub fn remove_outbound(&self, id: u64) -> Result<bool, StateError> {
+        let _ = id;
+        todo!("P1-U3: StateTxn::remove_outbound")
+    }
+
+    /// [`SyncDb::record_deleted`] within this transaction — the §2.7
+    /// tombstone-apply composite records the deletion in the same commit
+    /// that deletes the item row.
+    pub fn record_deleted(
+        &self,
+        relkey: &RelKey,
+        record: &DeletedRecord,
+    ) -> Result<(), StateError> {
+        let _ = (relkey, record);
+        todo!("P1-U3: StateTxn::record_deleted")
+    }
+
+    /// [`SyncDb::get_deleted`] within this transaction.
+    pub fn get_deleted(&self, relkey: &RelKey) -> Result<Option<DeletedRecord>, StateError> {
+        let _ = relkey;
+        todo!("P1-U3: StateTxn::get_deleted")
     }
 
     /// [`SyncDb::queue_push`] within this transaction — the other half of

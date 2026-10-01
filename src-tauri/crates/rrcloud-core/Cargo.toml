@@ -24,6 +24,11 @@ blake3 = "1"
 # file lock is kernel-released on SIGKILL so crash reopen works.
 redb = "2"
 bytes = "1"
+# Manifest gzip NDJSON encode/decode (§2.3: "gzip NDJSON from v1 — a 50k
+# library is ~100k+ rows; plain JSON does not survive contact with a
+# phone"). The only new dependency added by the journal-engine unit (P1-U3);
+# pure-Rust default backend (miniz_oxide), no C toolchain requirement.
+flate2 = "1"
 futures = "0.3"
 hex = "0.4"
 hmac = "0.12"
