@@ -42,7 +42,7 @@ use crate::keys::{
 use crate::reader::{ConsumerError, JournalConsumer};
 use crate::s3::{PutObjectOptions, S3Api, S3Error};
 use crate::semhash::{Blake3Hex, ContentId, SemHash};
-use crate::state::{StateError, SyncDb};
+use crate::state::{ItemState, StateError, SyncDb};
 
 /// The manifest format version this build reads and writes (the header's
 /// `proto` field).
@@ -87,7 +87,9 @@ pub enum ManifestError {
     /// (fail-closed network-lane allocation bound).
     #[error("manifest object is {size} bytes, over the {limit}-byte fetch cap")]
     ObjectTooLarge {
-        /// The object's size.
+        /// The object's declared size (which may understate the true size
+        /// when the refusal came from the capped collect catching a lying
+        /// `Content-Length`).
         size: u64,
         /// The cap that was exceeded ([`MANIFEST_MAX_FETCH_BYTES`]).
         limit: usize,
@@ -249,6 +251,16 @@ pub struct Manifest {
 /// **withheld**: publishing a row no reader can apply would at best be
 /// dead weight and at worst wedge a less lenient peer's bootstrap.
 ///
+/// Rows whose [`crate::state::ItemState`] does not prove a remote object
+/// exists for the recorded version — `Dirty`, `Queued`, `Uploading`
+/// ([`state_is_remotely_visible`]) — are likewise **withheld**: a §2.3
+/// live row is an advertisement that the key's version is in the bucket,
+/// and a freshly imported (or locally re-edited) item that has never
+/// finished an upload would point every bootstrapping peer at an object
+/// that is not there (404 on hydrate, phantom "missing" noise in
+/// reconcile). The items table may hold such rows freely; the manifest
+/// just does not advertise them until their upload completes.
+///
 /// Fields [`crate::state::ItemRecord`] v1 does not carry (`device`,
 /// `rating`, `color_label`) are honestly `None`: a device bootstrapping
 /// from manifests gets strictly less §3.5 badge metadata than one
@@ -272,6 +284,10 @@ pub fn build_manifest(db: &SyncDb, written_server_ts: i64) -> Result<Manifest, M
     let rows = db
         .iter_items()?
         .into_iter()
+        // Never advertise a version that provably may not exist remotely
+        // (doc comment): states before the first completed upload stay
+        // local-only facts.
+        .filter(|(_, record)| state_is_remotely_visible(record.state))
         .map(|(key, record)| ManifestRow {
             key,
             kind: record.kind,
@@ -450,13 +466,26 @@ pub async fn get_manifest(
     device: &DeviceId,
 ) -> Result<Manifest, ManifestError> {
     let output = s3.get_object(bucket, &manifest_key(device), None).await?;
-    if output.content_length > MANIFEST_MAX_FETCH_BYTES as u64 {
+    let declared = output.content_length;
+    if declared > MANIFEST_MAX_FETCH_BYTES as u64 {
         return Err(ManifestError::ObjectTooLarge {
-            size: output.content_length,
+            size: declared,
             limit: MANIFEST_MAX_FETCH_BYTES,
         });
     }
-    let bytes = output.body.collect_capped(MANIFEST_MAX_FETCH_BYTES).await?;
+    let bytes = match output.body.collect_capped(MANIFEST_MAX_FETCH_BYTES).await {
+        Ok(bytes) => bytes,
+        // The body overran the cap behind a lying Content-Length: the same
+        // persistent oversized-object condition as the pre-check catches,
+        // not a transport failure.
+        Err(S3Error::BodyCapExceeded { .. }) => {
+            return Err(ManifestError::ObjectTooLarge {
+                size: declared,
+                limit: MANIFEST_MAX_FETCH_BYTES,
+            })
+        }
+        Err(e) => return Err(e.into()),
+    };
     decode_manifest(&bytes)
 }
 
@@ -592,6 +621,31 @@ pub fn merge(
         Ok(())
     })?;
     Ok(report)
+}
+
+/// Whether an item in this state may be advertised as a §2.3 live row:
+/// `true` iff the recorded version's upload has **completed**, so a
+/// remote object for it provably exists. `Dirty`/`Queued`/`Uploading`
+/// versions have never finished an upload — advertising them would hand
+/// every bootstrapping peer a key (or version) that is not in the bucket.
+/// `Verifying` and later states follow a completed upload (or an
+/// advertisement by another writer, for the download-side states); even
+/// `CorruptRemote` names an object that exists — content verification is
+/// every reader's own job, keyed by the row's `blake3`.
+fn state_is_remotely_visible(state: ItemState) -> bool {
+    // Exhaustive on purpose: a future ItemState must decide its
+    // manifest visibility explicitly.
+    match state {
+        ItemState::Dirty | ItemState::Queued | ItemState::Uploading => false,
+        ItemState::Verifying
+        | ItemState::Synced
+        | ItemState::CorruptRemote
+        | ItemState::Conflict
+        | ItemState::PendingDown
+        | ItemState::Downloading
+        | ItemState::Stub
+        | ItemState::Hydrated => true,
+    }
 }
 
 /// Rebuilds the bucket key a manifest row's `(kind, relkey)` addresses,

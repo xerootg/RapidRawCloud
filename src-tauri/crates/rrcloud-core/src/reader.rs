@@ -29,16 +29,29 @@
 //!
 //! # Gap semantics (pinned)
 //!
-//! Segments present for a device are applied strictly in seq order.
-//! A gap **below the lowest present segment** is accepted only when the
-//! device's cursor is 0 (bootstrap against a compacted journal): the
-//! present segments are applied in order, the cursor ends at the highest
-//! applied seq, and a typed [`GapDetected`] outcome is reported so the
-//! engine can route the gap to §2.3 manifest catch-up (bootstrap = merge
-//! then poll). A gap **anywhere else** — between the cursor and the next
-//! present segment, or between two present segments — is the typed
-//! [`MidStreamGap`] outcome: application for that device stops at the
-//! gap, its cursor never jumps, and nothing past the gap is applied.
+//! Segments present for a device are applied strictly in seq order, and
+//! **no gap is ever applied past**. A gap **below the lowest present
+//! segment** while the device's cursor is 0 is the typed [`GapDetected`]
+//! outcome (bootstrap against a compacted journal): nothing is applied,
+//! the cursor stays at 0, and the engine routes the outcome to §2.3
+//! manifest catch-up (bootstrap = merge then poll — the merged header
+//! cursors seed past the gap, after which the re-poll applies the present
+//! segments normally). A gap **anywhere else** — between the cursor and
+//! the next present segment, or between two present segments — is the
+//! typed [`MidStreamGap`] outcome: application for that device stops at
+//! the gap, its cursor never jumps, and nothing past the gap is applied.
+//!
+//! Both outcomes are deliberately **report-without-apply**, so they are
+//! crash-safe by re-derivation: the cursor does not move, which means the
+//! very evidence that produced the outcome is still there on the next
+//! poll, and the gap keeps re-reporting until the §2.3 merge (or a healed
+//! segment) actually clears it. The rejected alternative — apply the
+//! present segments, jump the cursor, and report once from memory — would
+//! make acting on the one-shot report load-bearing for correctness: a
+//! crash (or a dropped report) between that durable cursor jump and the
+//! completed manifest merge would silently and permanently skip every
+//! item and deleted-set effect folded into the owner's compacted seqs —
+//! exactly the skip-and-diverge §2.1 principle 2 forbids.
 //!
 //! **Routing a [`MidStreamGap`]**: a mid-stream gap is not only an
 //! anomaly — it is also what the *designed* §2.10 laggard catch-up looks
@@ -107,6 +120,24 @@ pub type ConsumerError = Box<dyn std::error::Error + Send + Sync + 'static>;
 /// with synthetic entries (`seq` 0, which merge never marks applied), so
 /// §2.3's "merging manifests is the same idempotent apply operation as
 /// replaying the journal" holds at the type level.
+///
+/// # Error contract (pinned)
+///
+/// `Err` is reserved for **retryable local failures** — state-store
+/// trouble, resource exhaustion, anything where retrying the same entry
+/// later can genuinely succeed. It aborts the whole pass, and the same
+/// entry is retried identically on every later poll (and, from
+/// [`crate::manifest::merge`], aborts the whole merge). A consumer must
+/// therefore treat **content-level rejection** of an entry — an
+/// unclassifiable or foreign `key` (entry content is attacker/buggy-
+/// writer-controlled and deliberately unvalidated at decode; route it
+/// through [`crate::keys::classify_key`]), an op or kind it does not
+/// handle, semantics it chooses not to apply — as a successful **skip**
+/// (`Ok(())` with no effects, logged by the consumer as it sees fit),
+/// never as `Err`: the reader cannot tell "my state store is broken"
+/// from "this entry is poison", so a refusal over one hostile entry in an
+/// otherwise valid segment would permanently starve that device's whole
+/// prefix, re-failing on every poll forever.
 pub trait JournalConsumer {
     /// Applies one entry's effects inside `txn`.
     fn apply(&mut self, txn: &StateTxn<'_>, entry: &JournalEntry) -> Result<(), ConsumerError>;
@@ -127,7 +158,14 @@ pub struct PrefixHalted {
 /// A device's journal starts past the cursor while the cursor is 0: the
 /// below-horizon prefix was compacted away before this device ever
 /// polled. Bootstrap placeholder: the engine routes this to §2.3
-/// manifest catch-up.
+/// manifest catch-up (merge, then re-poll).
+///
+/// Nothing was applied and the cursor stayed at 0 (module docs, gap
+/// semantics): the outcome re-reports on **every** poll until the merged
+/// manifest header seeds the cursor past the gap, so a crash — or a
+/// failed manifest GET — between this report and the completed merge
+/// loses nothing. The signal is durable because it is re-derived, never
+/// because anyone remembered it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GapDetected {
     /// The device whose journal is gapped at the bottom.
@@ -203,7 +241,9 @@ pub struct PollReport {
     /// min-reader rule), one per affected device.
     pub halted: Vec<PrefixHalted>,
     /// Bootstrap gaps (cursor 0, journal starts past seq 1); the gapped
-    /// devices' present segments **were** applied.
+    /// devices' application stopped at the gap — nothing applied, cursor
+    /// untouched — and the outcome re-reports every poll until a §2.3
+    /// merge seeds the cursor past it.
     pub gaps: Vec<GapDetected>,
     /// Mid-stream gaps; the gapped devices' application stopped at the
     /// gap.
@@ -396,9 +436,13 @@ async fn apply_device_prefix(
         if first_seq > cursor.saturating_add(1) {
             if cursor == 0 && i == 0 {
                 // Bootstrap gap (§2.3 placeholder): the below-horizon
-                // prefix was compacted away before we ever polled. The
-                // present segments ARE applied; the engine routes this
-                // outcome to manifest catch-up.
+                // prefix was compacted away before we ever polled.
+                // Report WITHOUT applying (module docs): the cursor stays
+                // at 0, so the outcome re-derives on every poll until the
+                // engine's manifest merge seeds the cursor past the gap —
+                // a crash or a dropped report between this poll and the
+                // completed merge can never silently skip the compacted
+                // seqs' effects.
                 report.gaps.push(GapDetected {
                     device: device.clone(),
                     lowest_seq: first_seq,
@@ -411,8 +455,8 @@ async fn apply_device_prefix(
                     cursor,
                     next_seq: first_seq,
                 });
-                return Ok(());
             }
+            return Ok(());
         }
         // Min-reader gate on the FILENAME version, before any GET.
         let version = segments[&first_seq];
@@ -454,8 +498,28 @@ async fn apply_device_prefix(
             });
             return Ok(());
         }
+        let declared_length = output.content_length;
         let bytes = match output.body.collect_capped(SEGMENT_MAX_BYTES).await {
             Ok(bytes) => bytes,
+            // The capped collect tripping means the body is over the
+            // segment cap even though the declared Content-Length passed
+            // the pre-check above — an oversized object behind a lying
+            // header. That is a persistent property of the stored object
+            // (the module docs classify oversized objects as corruption),
+            // not a fetch problem: reporting it FetchFailed would promise
+            // "will retry" about a condition that never clears and
+            // re-download up to the cap on every poll forever.
+            Err(S3Error::BodyCapExceeded { cap }) => {
+                report.corrupt.push(CorruptSegment {
+                    device: device.clone(),
+                    seq: first_seq,
+                    detail: format!(
+                        "object body exceeds the {cap}-byte segment cap behind a \
+                         declared Content-Length of {declared_length}"
+                    ),
+                });
+                return Ok(());
+            }
             Err(error) => {
                 report.fetch_failed.push(FetchFailed {
                     device: device.clone(),
@@ -546,14 +610,26 @@ async fn apply_device_prefix(
 }
 
 /// The module docs' entry-granularity validation: a decoded segment body
-/// must be non-empty, start at its filename seq, carry strictly `+1`
-/// contiguous entry seqs, and be authored entirely by the prefix owner.
-/// `Err` is the human-readable violation for [`CorruptSegment::detail`].
+/// must be non-empty, belong to a filename seq ≥ 1, start at its filename
+/// seq, carry strictly `+1` contiguous entry seqs, and be authored
+/// entirely by the prefix owner. `Err` is the human-readable violation
+/// for [`CorruptSegment::detail`].
 fn validate_segment_body(
     device: &DeviceId,
     first_seq: u64,
     entries: &[JournalEntry],
 ) -> Result<(), String> {
+    // Conforming writers allocate seqs from 1 (the freeze primitive), so
+    // a segment at filename seq 0 is always a forged or buggy writer.
+    // Refuse it whole: the apply loop skips entries with seq <= cursor,
+    // and a fresh cursor is 0, so accepting it would silently drop its
+    // seq-0 entry while applying the rest — skip-and-continue instead of
+    // fail-closed.
+    if first_seq == 0 {
+        return Err(
+            "segment filename seq is 0 (conforming writers allocate seqs from 1)".to_string(),
+        );
+    }
     let Some(first) = entries.first() else {
         return Err("segment body holds no entries".to_string());
     };

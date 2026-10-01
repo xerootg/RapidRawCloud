@@ -148,6 +148,21 @@ pub enum S3Error {
     #[error("invalid S3 response: {0}")]
     InvalidResponse(String),
 
+    /// A response body overran the byte cap the caller passed to
+    /// [`crate::s3::ByteStream::collect_capped`] — the body is longer than
+    /// the lane's maximum object size (and than whatever `Content-Length`
+    /// declared, when the declared length was pre-checked). Typed
+    /// separately from [`S3Error::InvalidResponse`] so capped lanes
+    /// (journal segments, manifests, the device registry) can classify the
+    /// condition as a **persistent property of the stored object**
+    /// (corruption / an oversized object behind a lying `Content-Length`)
+    /// rather than a transient fetch failure to retry forever.
+    #[error("response body exceeds the caller's {cap}-byte cap")]
+    BodyCapExceeded {
+        /// The cap that was exceeded.
+        cap: usize,
+    },
+
     /// The request could not be constructed (unparsable endpoint, a header
     /// value that is not valid in HTTP, unserializable request body).
     #[error("invalid request: {0}")]

@@ -168,14 +168,15 @@ impl ByteStream {
     /// [`ByteStream::collect`] with an allocation bound: refuses (typed,
     /// without buffering further) a body that exceeds `max_bytes` — the
     /// defense for lanes whose objects have a known maximum size, against
-    /// a response longer than its declared `Content-Length`.
+    /// a response longer than its declared `Content-Length`. The refusal
+    /// is the dedicated [`S3Error::BodyCapExceeded`], so callers can tell
+    /// "the stored object is over my lane's cap" (persistent — corruption
+    /// or a hostile object) apart from transient transport failures.
     pub async fn collect_capped(mut self, max_bytes: usize) -> Result<Bytes, S3Error> {
         let mut buf = BytesMut::new();
         while let Some(chunk) = self.inner.try_next().await? {
             if buf.len().saturating_add(chunk.len()) > max_bytes {
-                return Err(S3Error::InvalidResponse(format!(
-                    "response body exceeds the caller's {max_bytes}-byte cap"
-                )));
+                return Err(S3Error::BodyCapExceeded { cap: max_bytes });
             }
             buf.extend_from_slice(&chunk);
         }

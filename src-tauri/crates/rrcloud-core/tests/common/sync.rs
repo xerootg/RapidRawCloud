@@ -208,7 +208,15 @@ pub fn entry_relkey(key: &str) -> Result<RelKey, ConsumerError> {
 
 impl JournalConsumer for ReplayConsumer {
     fn apply(&mut self, txn: &StateTxn<'_>, entry: &JournalEntry) -> Result<(), ConsumerError> {
-        let relkey = entry_relkey(&entry.key)?;
+        // The JournalConsumer error contract: entry content is
+        // attacker/buggy-writer-controlled, so content-level rejection
+        // (an unclassifiable key) is a SKIP, never an Err — Err is
+        // reserved for retryable local failures, and returning it here
+        // would permanently starve the whole device prefix on an entry
+        // that will never change.
+        let Ok(relkey) = entry_relkey(&entry.key) else {
+            return Ok(());
+        };
         match entry.op {
             Op::Put => {
                 let record = ItemRecord {
@@ -277,6 +285,10 @@ pub struct FakeS3 {
     pub fail_puts: HashSet<String>,
     pub put_then_fail: HashSet<String>,
     pub fail_gets: HashSet<String>,
+    /// GETs of these keys report a `content_length` of 1 regardless of
+    /// the true body size (modeling a lying `Content-Length`, so capped
+    /// collects must catch what the declared-length pre-check cannot).
+    pub lie_content_length: HashSet<String>,
 }
 
 impl FakeS3 {
@@ -289,6 +301,7 @@ impl FakeS3 {
             fail_puts: HashSet::new(),
             put_then_fail: HashSet::new(),
             fail_gets: HashSet::new(),
+            lie_content_length: HashSet::new(),
         }
     }
 
@@ -343,7 +356,11 @@ impl S3Api for FakeS3 {
                 "injected GET failure for {key}"
             )));
         }
-        self.inner.get_object(bucket, key, range).await
+        let mut output = self.inner.get_object(bucket, key, range).await?;
+        if self.lie_content_length.contains(key) {
+            output.content_length = 1;
+        }
+        Ok(output)
     }
 
     async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, S3Error> {

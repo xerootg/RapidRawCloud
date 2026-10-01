@@ -19,10 +19,13 @@ use rrcloud_core::journal::{
 use rrcloud_core::keys::{device_registry_key, journal_segment_key, sidecar_key, CONTROL_PREFIX};
 use rrcloud_core::publisher::{
     enqueue_entry, get_device_entry, publish_pending, put_device_entry, DeviceProfile,
-    PublisherError, PROTO_READ, PROTO_WRITE,
+    PublisherError, DEVICE_ENTRY_MAX_BYTES, PROTO_READ, PROTO_WRITE,
 };
 use rrcloud_core::reader::poll;
-use rrcloud_core::s3::{PutObjectOptions, S3Client, S3Config};
+use rrcloud_core::s3::{
+    ByteRange, GetObjectOutput, HeadObjectOutput, ListObjectsV2Output, ListObjectsV2Request,
+    PutObjectOptions, PutObjectOutput, S3Api, S3Client, S3Config, S3Error,
+};
 
 fn md5_hex(data: &[u8]) -> String {
     hex::encode(Md5::digest(data))
@@ -123,6 +126,142 @@ async fn an_oversized_staged_record_fails_naming_its_id_and_dropping_it_recovers
         .expect("retry publishes the healthy entry");
     assert_eq!(report.entries, 1);
     assert_eq!(db.outbound_len().expect("len"), 0);
+}
+
+#[tokio::test]
+async fn a_foreign_authored_staged_record_fails_at_freeze_naming_its_id_and_dropping_it_recovers() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("pub-foreign-staged");
+    let client = g.client();
+    let a = dev(DEV_A);
+    let b = dev(DEV_B);
+    let (_dir, _path, db) = open_db(&a);
+
+    // Bypass enqueue_entry's ForeignDevice gate the way the §3.4 composite
+    // path can: stage_outbound takes opaque bytes. A decodable v1 entry
+    // authored by B must NOT freeze into A's lane — published, every
+    // reader would refuse the segment forever (entry.device != prefix
+    // owner), and the frozen bytes being the segment's identity means no
+    // replay could ever heal the wedge.
+    let foreign = entry(
+        &b,
+        Op::Put,
+        Kind::Sidecar,
+        sidecar_key(&common::sync::rel("foreign.NEF")),
+    );
+    let line = foreign.to_json_line().expect("encode");
+    let bad_id = db.stage_outbound(line.as_bytes()).expect("stage raw");
+    enqueue_entry(
+        &db,
+        &entry(
+            &a,
+            Op::Put,
+            Kind::Sidecar,
+            sidecar_key(&common::sync::rel("own.NEF")),
+        ),
+    )
+    .expect("enqueue own entry behind it");
+
+    // Freezing happens before any network I/O, so the gate must fire even
+    // offline — and carry the staging id for surface-and-drop recovery.
+    let err = publish_pending(&db, &offline_client(), &bucket)
+        .await
+        .expect_err("a foreign-authored staged record must fail typed at freeze");
+    match err {
+        PublisherError::ForeignStaged {
+            outbound_id,
+            entry_device,
+            ours,
+        } => {
+            assert_eq!(outbound_id, bad_id);
+            assert_eq!(entry_device, b);
+            assert_eq!(ours, a.clone());
+        }
+        other => panic!("expected ForeignStaged, got {other:?}"),
+    }
+    assert_eq!(db.outbound_len().expect("len"), 2, "nothing consumed");
+    assert!(
+        db.unpublished_segments().expect("unpublished").is_empty(),
+        "nothing frozen"
+    );
+
+    // The documented recovery loop closes: drop the named record, retry.
+    assert!(db
+        .with_txn(|t| t.remove_outbound(bad_id))
+        .expect("remove outbound"));
+    let report = publish_pending(&db, &client, &bucket)
+        .await
+        .expect("retry publishes the healthy entry");
+    assert_eq!(report.entries, 1);
+    assert_eq!(db.outbound_len().expect("len"), 0);
+
+    // What landed is readable by a conforming reader (no wedge).
+    let decoded = decode_segment(
+        &client
+            .get_object(&bucket, &journal_segment_key(&a, 1), None)
+            .await
+            .expect("get")
+            .body
+            .collect()
+            .await
+            .expect("body"),
+    )
+    .expect("decode");
+    assert_eq!(decoded.len(), 1);
+    assert_eq!(decoded[0].device, a);
+}
+
+#[test]
+fn enqueue_reserves_seq_digit_headroom_so_a_staged_entry_can_always_freeze() {
+    let a = dev(DEV_A);
+    let (_dir, _path, db) = open_db(&a);
+
+    // Freeze-time stamping replaces the staged seq "0" (1 digit) with up
+    // to u64::MAX's 20 digits. An entry whose line passes a naive cap
+    // check but sits within those 19 bytes of the cap could be staged yet
+    // never freeze — and the documented OversizedStaged recovery would
+    // discard a legitimately staged entry. Enqueue must reserve the
+    // headroom instead.
+    let line_len_for = |pad: usize| {
+        let mut e = entry(
+            &a,
+            Op::Put,
+            Kind::Sidecar,
+            sidecar_key(&common::sync::rel("pad.NEF")),
+        );
+        e.color_label = Some("x".repeat(pad));
+        let len = e_line_len(&e);
+        (e, len)
+    };
+    fn e_line_len(e: &rrcloud_core::journal::JournalEntry) -> usize {
+        let mut staged = e.clone();
+        staged.v = JOURNAL_VERSION;
+        staged.seq = 0;
+        staged.to_json_line().expect("encode").len()
+    }
+
+    // Tune padding so the staged line is exactly SEGMENT_MAX_BYTES - 19:
+    // within the raw cap (line + newline <= cap), but refused because max
+    // seq stamping could push it over.
+    let (probe, probe_len) = line_len_for(0);
+    let _ = probe;
+    let target_refused = SEGMENT_MAX_BYTES - 19;
+    let (refused, refused_len) = line_len_for(target_refused - probe_len);
+    assert_eq!(refused_len, target_refused, "test calibration");
+    assert!(refused_len < SEGMENT_MAX_BYTES, "within the raw cap");
+    let err = enqueue_entry(&db, &refused).expect_err("blind-spot entry must be refused");
+    match err {
+        PublisherError::OversizedEntry { size } => assert!(size > SEGMENT_MAX_BYTES),
+        other => panic!("expected OversizedEntry, got {other:?}"),
+    }
+    assert_eq!(db.outbound_len().expect("len"), 0, "nothing staged");
+
+    // One byte smaller is accepted — and can always freeze, whatever seq
+    // it is stamped with.
+    let (accepted, accepted_len) = line_len_for(target_refused - probe_len - 1);
+    assert_eq!(accepted_len, target_refused - 1, "test calibration");
+    enqueue_entry(&db, &accepted).expect("an entry outside the reserve is staged");
+    assert_eq!(db.outbound_len().expect("len"), 1);
 }
 
 #[test]
@@ -668,4 +807,129 @@ async fn device_registry_entry_roundtrips_and_records_server_time_offset() {
     assert_eq!(json["applied"][DEV_B], 7);
     assert_eq!(json["proto"]["read"], serde_json::json!([1]));
     assert_eq!(json["proto"]["write"], 1);
+}
+
+/// An [`S3Api`] wrapper that rewrites the `Date` header of PUT responses
+/// (`None` strips it), for pinning the [`PublisherError::NoServerDate`]
+/// surface without a backend that misbehaves.
+struct DateOverrideS3 {
+    inner: S3Client,
+    date: Option<String>,
+}
+
+impl S3Api for DateOverrideS3 {
+    async fn put_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        body: Bytes,
+        opts: &PutObjectOptions,
+    ) -> Result<PutObjectOutput, S3Error> {
+        let mut out = self.inner.put_object(bucket, key, body, opts).await?;
+        out.date = self.date.clone();
+        Ok(out)
+    }
+
+    async fn get_object(
+        &self,
+        bucket: &str,
+        key: &str,
+        range: Option<ByteRange>,
+    ) -> Result<GetObjectOutput, S3Error> {
+        self.inner.get_object(bucket, key, range).await
+    }
+
+    async fn head_object(&self, bucket: &str, key: &str) -> Result<HeadObjectOutput, S3Error> {
+        self.inner.head_object(bucket, key).await
+    }
+
+    async fn list_objects_v2(
+        &self,
+        bucket: &str,
+        request: &ListObjectsV2Request,
+    ) -> Result<ListObjectsV2Output, S3Error> {
+        self.inner.list_objects_v2(bucket, request).await
+    }
+}
+
+#[tokio::test]
+async fn heartbeat_without_a_usable_date_header_is_a_typed_error_and_records_no_offset() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("dev-no-date");
+    let a = dev(DEV_A);
+    let profile = DeviceProfile {
+        name: "desk".to_string(),
+        platform: "linux".to_string(),
+        created: 1_700_000_000,
+    };
+
+    // Absent Date header.
+    let (_dir, _path, db) = open_db(&a);
+    let stripped = DateOverrideS3 {
+        inner: g.client(),
+        date: None,
+    };
+    let err = put_device_entry(&db, &stripped, &bucket, &profile)
+        .await
+        .expect_err("no Date header must surface typed");
+    match &err {
+        PublisherError::NoServerDate { reason } => {
+            assert!(reason.contains("absent"), "reason: {reason}")
+        }
+        other => panic!("expected NoServerDate, got {other:?}"),
+    }
+    assert_eq!(
+        db.server_time_offset_ms().expect("meta"),
+        None,
+        "no bogus offset recorded"
+    );
+
+    // Unparsable Date header (an obsolete rfc850 spelling).
+    let garbled = DateOverrideS3 {
+        inner: g.client(),
+        date: Some("Sunday, 06-Nov-94 08:49:37 GMT".to_string()),
+    };
+    let err = put_device_entry(&db, &garbled, &bucket, &profile)
+        .await
+        .expect_err("unparsable Date header must surface typed");
+    match &err {
+        PublisherError::NoServerDate { reason } => {
+            assert!(reason.contains("unparsable"), "reason: {reason}")
+        }
+        other => panic!("expected NoServerDate, got {other:?}"),
+    }
+    assert_eq!(db.server_time_offset_ms().expect("meta"), None);
+}
+
+#[tokio::test]
+async fn an_oversized_registry_entry_is_refused_before_buffering() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("dev-oversized");
+    let client = g.client();
+    let a = dev(DEV_A);
+
+    // A corrupt or hostile devices/<id>.json far over the cap: the only
+    // other network lanes in the unit (segments, manifests) already bound
+    // their buffers, and this one must too — typed, before (and while)
+    // buffering, never collected wholesale.
+    let oversized = vec![b'x'; DEVICE_ENTRY_MAX_BYTES + 10];
+    client
+        .put_object(
+            &bucket,
+            &device_registry_key(&a),
+            Bytes::from(oversized),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("oversized put");
+
+    let err = get_device_entry(&client, &bucket, &a)
+        .await
+        .expect_err("an oversized registry entry must be refused");
+    match err {
+        PublisherError::OversizedRegistryEntry { declared } => {
+            assert_eq!(declared, DEVICE_ENTRY_MAX_BYTES as u64 + 10);
+        }
+        other => panic!("expected OversizedRegistryEntry, got {other:?}"),
+    }
 }

@@ -429,6 +429,64 @@ fn build_manifest_withholds_rows_its_own_merge_cannot_convert() {
 }
 
 #[test]
+fn build_manifest_withholds_items_whose_version_never_finished_an_upload() {
+    let a = dev(DEV_A);
+    let (_dir, _path, db) = open_db(&a);
+    let base = ItemRecord {
+        kind: Kind::Sidecar,
+        state: ItemState::Synced,
+        size: 64,
+        mtime_unix_ns: 0,
+        blake3: None,
+        sem_hash: None,
+        vv: [(a.clone(), 1u32)].into_iter().collect(),
+        content_id: None,
+        w: None,
+        h: None,
+        pinned: false,
+        last_access_unix: 0,
+        verified_remote: false,
+        attested: false,
+        base_unknown: false,
+    };
+    // A §2.3 live row advertises that the key's version IS in the bucket.
+    // States before the first completed upload cannot prove that: a
+    // freshly imported item in Dirty/Queued/Uploading has no remote
+    // object yet, and advertising it would 404 every bootstrapping peer's
+    // hydrate. States at or past upload completion stay advertised.
+    for (name, state, advertised) in [
+        ("dirty.NEF", ItemState::Dirty, false),
+        ("queued.NEF", ItemState::Queued, false),
+        ("uploading.NEF", ItemState::Uploading, false),
+        ("verifying.NEF", ItemState::Verifying, true),
+        ("synced.NEF", ItemState::Synced, true),
+        ("stub.NEF", ItemState::Stub, true),
+        ("hydrated.NEF", ItemState::Hydrated, true),
+    ] {
+        let record = ItemRecord {
+            state,
+            ..base.clone()
+        };
+        db.replay_put_item(&rel(name), &record).expect("put");
+        let manifest = build_manifest(&db, 1_769_950_000).expect("build");
+        assert_eq!(
+            manifest.rows.iter().any(|r| r.key == rel(name)),
+            advertised,
+            "{name} in state {state:?}: advertised should be {advertised}"
+        );
+    }
+
+    // The final manifest advertises exactly the remotely-visible rows.
+    let manifest = build_manifest(&db, 1_769_950_000).expect("build");
+    let keys: Vec<&str> = manifest.rows.iter().map(|r| r.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["hydrated.NEF", "stub.NEF", "synced.NEF", "verifying.NEF"],
+        "never-uploaded versions are withheld; uploaded ones ascend by relkey"
+    );
+}
+
+#[test]
 fn merge_skips_unconvertible_rows_instead_of_refusing_the_whole_merge() {
     let a = dev(DEV_A);
     let b = dev(DEV_B);

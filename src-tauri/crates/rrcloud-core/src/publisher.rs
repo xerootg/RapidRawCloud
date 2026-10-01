@@ -39,6 +39,13 @@ pub const PROTO_READ: &[u32] = &[1];
 /// The protocol version this build writes.
 pub const PROTO_WRITE: u32 = 1;
 
+/// Cap on a fetched `devices/<id>.json` object, bounding the
+/// [`get_device_entry`] network-lane buffer (fail-closed allocation
+/// stance, like the journal segment and manifest fetch caps). A
+/// conforming registry entry is a few hundred bytes even with many peers
+/// in `applied`; 64 KiB is orders of magnitude of headroom.
+pub const DEVICE_ENTRY_MAX_BYTES: usize = 64 * 1024;
+
 /// Error from the outbound journal lane.
 #[derive(Debug, thiserror::Error)]
 pub enum PublisherError {
@@ -75,17 +82,43 @@ pub enum PublisherError {
         /// The decode failure.
         source: JournalError,
     },
-    /// [`enqueue_entry`] was handed an entry whose single encoded line
-    /// exceeds [`SEGMENT_MAX_BYTES`]: no conforming segment could ever
-    /// carry it, so staging it would permanently wedge the outbound lane.
-    /// Refused synchronously, where the caller still has the entry in
-    /// hand.
+    /// A **staged** record is authored by a different device than this
+    /// db's own identity, caught at freeze time. The §2.2 single-writer
+    /// gate lives in [`enqueue_entry`], but [`crate::state::StateTxn::stage_outbound`]
+    /// takes opaque bytes (it is the §3.4 composite's designed staging
+    /// path), so freezing re-checks authorship: publishing a foreign-
+    /// authored entry under this device's prefix would make every
+    /// conforming reader refuse the segment forever (their entry-device
+    /// validation), permanently wedging this journal prefix — and the
+    /// frozen bytes are the segment's identity, so no replay could ever
+    /// heal it. Like [`PublisherError::CorruptStaged`], the staging id is
+    /// attached so the engine can surface-and-drop the one bad record
+    /// ([`crate::state::StateTxn::remove_outbound`]) and retry.
     #[error(
-        "journal entry encodes to {size} bytes; no segment can carry a line over \
-         {SEGMENT_MAX_BYTES} bytes"
+        "staged outbound record {outbound_id} is authored by {entry_device}, \
+         but this db's device is {ours} (§2.2 single-writer)"
+    )]
+    ForeignStaged {
+        /// The staging id of the foreign-authored record.
+        outbound_id: u64,
+        /// The staged entry's `device` field.
+        entry_device: DeviceId,
+        /// The state db's own identity.
+        ours: DeviceId,
+    },
+    /// [`enqueue_entry`] was handed an entry whose encoded line — with
+    /// its newline and the maximal seq-digit headroom freeze-time
+    /// stamping could add — exceeds [`SEGMENT_MAX_BYTES`]: no conforming
+    /// segment could ever carry it, so staging it would permanently wedge
+    /// the outbound lane. Refused synchronously, where the caller still
+    /// has the entry in hand.
+    #[error(
+        "journal entry encodes to {size} bytes (incl. newline and maximal seq \
+         stamping); no segment can carry a line over {SEGMENT_MAX_BYTES} bytes"
     )]
     OversizedEntry {
-        /// The encoded line length including its newline.
+        /// The encoded line length including its newline and the reserved
+        /// maximal seq-digit headroom.
         size: usize,
     },
     /// A **staged** record's single encoded line exceeds
@@ -112,6 +145,20 @@ pub enum PublisherError {
     NoServerDate {
         /// What was wrong (absent, or unparsable spelling).
         reason: String,
+    },
+    /// The stored `devices/<id>.json` object exceeds
+    /// [`DEVICE_ENTRY_MAX_BYTES`] (fail-closed network-lane allocation
+    /// bound, same stance as the journal segment and manifest fetch caps:
+    /// a registry entry is a few hundred bytes, so a bigger object is
+    /// corrupt or hostile and is refused before — and while — buffering).
+    #[error(
+        "device registry entry exceeds the {DEVICE_ENTRY_MAX_BYTES}-byte cap \
+         (declared Content-Length {declared})"
+    )]
+    OversizedRegistryEntry {
+        /// The response's declared `Content-Length` (which may understate
+        /// the true size when the refusal came from the capped collect).
+        declared: u64,
     },
 }
 
@@ -156,15 +203,19 @@ pub fn enqueue_entry(db: &SyncDb, entry: &JournalEntry) -> Result<u64, Publisher
     // One encoded line (plus its newline) over the §2.2 segment byte cap
     // could never be frozen: refuse it here — synchronously, with the
     // caller in context — rather than let it poison-pill every later
-    // publish pass. (The seq stamped at freeze time is at most 20 digits
-    // longer than the staged `0`, which the cap check absorbs: a line
-    // within SEGMENT_MAX_BYTES here can only breach it at freeze time if
-    // it was within ~20 bytes of the cap, and freeze then fails typed
-    // with the staging id — PublisherError::OversizedStaged.)
-    if line.len() + 1 > SEGMENT_MAX_BYTES {
-        return Err(PublisherError::OversizedEntry {
-            size: line.len() + 1,
-        });
+    // publish pass. The seq stamped at freeze time replaces the staged
+    // single-digit `0` with up to u64::MAX's 20 digits, so reserve that
+    // headroom now: without it, an entry within 19 bytes of the cap would
+    // pass this gate but could never freeze, and the documented
+    // OversizedStaged recovery (drop the staged record) would discard a
+    // legitimately staged entry — a journaled-state/local-state
+    // divergence for its key. With the reserve, OversizedStaged is
+    // reachable only for records staged around this gate (a foreign or
+    // older writer).
+    const SEQ_DIGIT_HEADROOM: usize = 19; // "0" (1 digit) -> u64::MAX (20 digits)
+    let reserved = line.len() + 1 + SEQ_DIGIT_HEADROOM;
+    if reserved > SEGMENT_MAX_BYTES {
+        return Err(PublisherError::OversizedEntry { size: reserved });
     }
     Ok(db.stage_outbound(line.as_bytes())?)
 }
@@ -196,7 +247,21 @@ fn freeze_staged(db: &SyncDb) -> Result<(), PublisherError> {
         let staged = t.iter_outbound()?;
         let mut pending = Vec::with_capacity(staged.len());
         for (id, bytes) in &staged {
-            pending.push((*id, decode_staged(*id, bytes)?));
+            let entry = decode_staged(*id, bytes)?;
+            // The §2.2 single-writer authorship gate, re-checked at freeze
+            // time: enqueue_entry refuses foreign entries up front, but
+            // stage_outbound takes opaque bytes, so a record staged around
+            // that gate must be caught HERE — once frozen, the bytes are
+            // the segment's identity and every reader would refuse the
+            // whole prefix forever (see PublisherError::ForeignStaged).
+            if entry.device != *db.device_id() {
+                return Err(PublisherError::ForeignStaged {
+                    outbound_id: *id,
+                    entry_device: entry.device,
+                    ours: db.device_id().clone(),
+                });
+            }
+            pending.push((*id, entry));
         }
         let mut rest = pending.as_slice();
         while !rest.is_empty() {
@@ -501,7 +566,11 @@ fn parse_http_date(s: &str) -> Option<i64> {
 
 /// GETs and decodes `device`'s registry entry (§1.2). Unknown JSON fields
 /// are ignored (min-reader rule for a v1 document); a missing key
-/// surfaces as the underlying typed [`S3Error`].
+/// surfaces as the underlying typed [`S3Error`]. Network-lane allocation
+/// is bounded ([`DEVICE_ENTRY_MAX_BYTES`]) like every other fetch lane in
+/// this unit: an oversized object is the typed
+/// [`PublisherError::OversizedRegistryEntry`] before (and, against a
+/// lying `Content-Length`, while) buffering — never an unbounded buffer.
 pub async fn get_device_entry(
     s3: &impl S3Api,
     bucket: &str,
@@ -510,6 +579,70 @@ pub async fn get_device_entry(
     let output = s3
         .get_object(bucket, &device_registry_key(device), None)
         .await?;
-    let bytes = output.body.collect().await?;
+    let declared = output.content_length;
+    if declared > DEVICE_ENTRY_MAX_BYTES as u64 {
+        return Err(PublisherError::OversizedRegistryEntry { declared });
+    }
+    let bytes = match output.body.collect_capped(DEVICE_ENTRY_MAX_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(S3Error::BodyCapExceeded { .. }) => {
+            return Err(PublisherError::OversizedRegistryEntry { declared })
+        }
+        Err(e) => return Err(e.into()),
+    };
     Ok(serde_json::from_slice(&bytes).map_err(StateError::from)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_http_date;
+
+    #[test]
+    fn imf_fixdate_parses_to_unix_seconds() {
+        // The RFC 9110 example date.
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
+        assert_eq!(
+            parse_http_date("Mon, 01 Jan 2024 00:00:00 GMT"),
+            Some(1_704_067_200)
+        );
+        assert_eq!(
+            parse_http_date("Tue, 29 Feb 2000 23:59:59 GMT"),
+            Some(951_868_799),
+            "leap day round-trips"
+        );
+    }
+
+    #[test]
+    fn obsolete_http_date_forms_are_rejected() {
+        // The two obsolete forms RFC 9110 readers may accept but this
+        // parser's doc promises to refuse (no S3 backend emits them; the
+        // caller surfaces None as the typed NoServerDate).
+        assert_eq!(parse_http_date("Sunday, 06-Nov-94 08:49:37 GMT"), None);
+        assert_eq!(parse_http_date("Sun Nov  6 08:49:37 1994"), None);
+    }
+
+    #[test]
+    fn malformed_dates_are_rejected_not_misread() {
+        for s in [
+            "",
+            "Sun",
+            "Sun, ",
+            "Sun; 06 Nov 1994 08:49:37 GMT", // no ", " separator
+            "Sun, 06 Nov 1994 08:49:37 UTC", // non-GMT zone
+            "Sun, 06 Nov 1994 08:49:37 GMT extra", // trailing field
+            "Sun, 06 Nov 1994 08:49:37",     // zone missing
+            "Sun, 32 Nov 1994 08:49:37 GMT", // no such day
+            "Sun, 06 Foo 1994 08:49:37 GMT", // no such month
+            "Sun, 06 Nov 1994 24:00:00 GMT", // no such hour
+            "Sun, 06 Nov 1994 08:49 GMT",    // seconds missing
+            "Sun, 06 Nov 1994 08:49:37:00 GMT", // extra hms field
+            "Sun, xx Nov 1994 08:49:37 GMT", // non-numeric day
+            "Sun, 06 Nov year 08:49:37 GMT", // non-numeric year
+        ] {
+            assert_eq!(parse_http_date(s), None, "must reject {s:?}");
+        }
+    }
 }

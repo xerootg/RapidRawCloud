@@ -426,7 +426,7 @@ async fn consumer_panic_aborts_entry_txn_leaving_neither_mutation_nor_applied_ma
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn bootstrap_gap_below_lowest_segment_is_accepted_and_reported() {
+async fn bootstrap_gap_is_reported_without_applying_until_a_merge_seeds_the_cursor() {
     let Some(g) = garage::shared() else { return };
     let bucket = g.create_unique_bucket("rdr-gap-boot");
     let client = g.client();
@@ -457,23 +457,52 @@ async fn bootstrap_gap_below_lowest_segment_is_accepted_and_reported() {
         "cursor 0 + journal starting past 1 is the typed bootstrap outcome"
     );
     assert!(report.mid_stream_gaps.is_empty());
-    assert_eq!(
-        seqs_for(&consumer, &x),
-        vec![5, 6],
-        "present segments ARE applied in order"
+    assert_eq!(report.entries_applied, 0);
+    assert!(
+        consumer.transcript.is_empty(),
+        "nothing applies past a bootstrap gap: applying would durably jump \
+         the cursor and make acting on the one-shot report load-bearing"
     );
     assert_eq!(
         db_b.cursor(&x).expect("cursor"),
-        6,
-        "cursor jumps via contiguous application"
+        0,
+        "the cursor never jumps a gap, so the signal survives any crash"
     );
 
-    // Settled: a re-poll reports no gap and applies nothing new.
+    // Crash-safety by re-derivation: a re-poll (e.g. after a crash, or a
+    // failed manifest GET dropped the first report) reports the SAME gap
+    // again — the evidence is still in the bucket and the cursor.
     let report = poll(&db_b, &client, &bucket, &mut consumer)
         .await
         .expect("re-poll");
-    assert!(report.gaps.is_empty());
+    assert_eq!(
+        report.gaps,
+        vec![GapDetected {
+            device: x.clone(),
+            lowest_seq: 5
+        }],
+        "the outcome re-reports on every poll until the merge heals it"
+    );
     assert_eq!(report.entries_applied, 0);
+
+    // The engine's §2.3 route: merge X's manifest, whose header attests
+    // X's published cursor over the compacted seqs (here: seed the cursor
+    // the way merge does). The next poll then applies the present
+    // segments normally — same end state as apply-then-merge, but
+    // crash-safe and symmetric with MidStreamGap.
+    db_b.set_cursor(&x, 4)
+        .expect("seed cursor (as a §2.3 merge would)");
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("post-merge poll");
+    assert!(report.gaps.is_empty(), "the gap cleared: {report:?}");
+    assert_eq!(report.entries_applied, 2);
+    assert_eq!(
+        seqs_for(&consumer, &x),
+        vec![5, 6],
+        "present segments apply in order once the cursor covers the gap"
+    );
+    assert_eq!(db_b.cursor(&x).expect("cursor"), 6);
 }
 
 #[tokio::test]
@@ -770,6 +799,146 @@ async fn failing_get_isolates_to_its_device_and_recovers() {
     assert!(report.fetch_failed.is_empty());
     assert_eq!(seqs_for(&consumer, &c), vec![1, 2]);
     assert_eq!(db_b.cursor(&c).expect("cursor"), 2);
+}
+
+#[tokio::test]
+async fn oversized_body_behind_a_lying_content_length_is_corrupt_not_a_retryable_fetch() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-lying-len");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let y = dev(DEV_Y);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // The object really is oversized, but the response's Content-Length
+    // lies (FakeS3 reports 1 byte), so only the capped collect can catch
+    // it mid-stream. The condition is a permanent property of the stored
+    // object: it must be the persistent CorruptSegment outcome, not a
+    // FetchFailed that promises "will retry" and re-downloads up to the
+    // cap on every poll forever.
+    let oversized = vec![b'\n'; rrcloud_core::journal::SEGMENT_MAX_BYTES + 10];
+    let key = journal_segment_key(&y, 1);
+    client
+        .put_object(
+            &bucket,
+            &key,
+            Bytes::from(oversized),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("oversized put");
+
+    let mut fake = FakeS3::new(g.client());
+    fake.lie_content_length.insert(key.clone());
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &fake, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_one_corrupt(&report.corrupt, &y, 1);
+    assert_eq!(
+        report.fetch_failed,
+        Vec::<FetchFailed>::new(),
+        "a persistent oversized object must not be classified transient"
+    );
+    assert!(consumer.transcript.is_empty());
+    assert_eq!(db_b.cursor(&y).expect("cursor"), 0);
+
+    // Still corrupt — not retried into a different outcome.
+    let mut fake = FakeS3::new(g.client());
+    fake.lie_content_length.insert(key.clone());
+    let report = poll(&db_b, &fake, &bucket, &mut consumer)
+        .await
+        .expect("re-poll");
+    assert_one_corrupt(&report.corrupt, &y, 1);
+    assert!(report.fetch_failed.is_empty());
+}
+
+#[tokio::test]
+async fn a_segment_at_filename_seq_zero_is_corrupt_never_partially_applied() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-seq-zero");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let x = dev(DEV_X);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // Conforming writers allocate seqs from 1; a segment at filename seq
+    // 0 with entries 0,1,2 is a forged/buggy writer. The apply loop skips
+    // entries with seq <= cursor and a fresh cursor is 0, so accepting
+    // the segment would silently drop entry 0 while applying 1-2 —
+    // skip-and-continue. It must be refused whole instead.
+    put_raw_segment(
+        &client,
+        &bucket,
+        &x,
+        0,
+        &stamped(sidecar_entries(&x, "zero", 3), 0),
+    )
+    .await;
+
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_one_corrupt(&report.corrupt, &x, 0);
+    assert_eq!(report.entries_applied, 0);
+    assert!(
+        consumer.transcript.is_empty(),
+        "nothing from a seq-0 segment applies — not even its valid tail"
+    );
+    assert_eq!(db_b.cursor(&x).expect("cursor"), 0);
+    assert!(!db_b.has_applied(&x, 1).expect("applied"));
+    assert!(!db_b.has_applied(&x, 2).expect("applied"));
+}
+
+#[tokio::test]
+async fn a_seq_present_under_two_filename_versions_prefers_the_readable_lowest() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-dual-ver");
+    let client = g.client();
+    let b = dev(DEV_B);
+    let x = dev(DEV_X);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // Seq 1 exists both as a readable v1 segment and under a v2 filename
+    // (e.g. a future writer double-publishing during a migration). The
+    // reader keeps the lowest version per seq — the readable spelling —
+    // so the prefix applies instead of halting on the v2 twin.
+    put_raw_segment(
+        &client,
+        &bucket,
+        &x,
+        1,
+        &stamped(sidecar_entries(&x, "dual", 2), 1),
+    )
+    .await;
+    let v2_key = format!("{CONTROL_PREFIX}journal/{x}/{:016x}.v2.ndjson", 1);
+    client
+        .put_object(
+            &bucket,
+            &v2_key,
+            Bytes::from_static(b"future spelling of the same seq\n"),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("v2 twin put");
+
+    let fake = FakeS3::new(g.client());
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &fake, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_eq!(
+        report.halted,
+        Vec::<PrefixHalted>::new(),
+        "the readable v1 spelling wins; no halt on the v2 twin"
+    );
+    assert_eq!(seqs_for(&consumer, &x), vec![1, 2]);
+    assert_eq!(db_b.cursor(&x).expect("cursor"), 2);
+    assert!(
+        !fake.get_keys().contains(&v2_key),
+        "the v2 twin is never fetched"
+    );
 }
 
 #[tokio::test]
