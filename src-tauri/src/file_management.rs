@@ -94,16 +94,21 @@ fn resolve_image_metadata(
     enable_xmp_sync: bool,
     settings: &AppSettings,
 ) -> ImageFileMetadata {
-    let mut metadata = crate::exif_processing::load_sidecar(sidecar_path);
-
-    if enable_xmp_sync && sync_metadata_from_xmp(image_path, &mut metadata) {
-        let _ = crate::exif_processing::save_sidecar(
+    // When XMP sync is on, merge-and-persist under the per-path lock (the
+    // closure returns whether the merge changed anything, so a no-op merge
+    // writes nothing); otherwise a plain read. Routing the write through the
+    // chokepoint keeps it from clobbering a concurrent AI-tagging edit.
+    let metadata = if enable_xmp_sync {
+        crate::exif_processing::update_sidecar(
             None,
             sidecar_path,
-            &metadata,
             crate::sync::WriteOrigin::XmpImport,
-        );
-    }
+            |metadata| sync_metadata_from_xmp(image_path, metadata),
+        )
+        .unwrap_or_else(|_| crate::exif_processing::load_sidecar(sidecar_path))
+    } else {
+        crate::exif_processing::load_sidecar(sidecar_path)
+    };
 
     let is_raw = crate::formats::is_raw_file(image_path);
     let tm_override = crate::image_processing::resolve_tonemapper_override(settings, is_raw);
@@ -2532,25 +2537,28 @@ pub fn save_metadata_and_update_thumbnail(
 ) -> Result<(), String> {
     let (source_path, sidecar_path) = parse_virtual_path(&path);
 
-    let mut metadata = crate::exif_processing::load_sidecar_with_exif(&sidecar_path, &source_path);
-
-    let mut final_adjustments = adjustments;
-    {
-        let lens_db_guard = state.lens_db.lock().unwrap();
-        resolve_lens_params_in_adjustments(
-            &mut final_adjustments,
-            &metadata.exif,
-            lens_db_guard.as_deref(),
-        );
-    }
-
-    metadata.adjustments = final_adjustments;
-
-    crate::exif_processing::save_sidecar(
+    // Read-modify-write under the per-path lock: load the sidecar fresh,
+    // merge EXIF + resolve lens params, set the new adjustments, and write —
+    // all while holding the lock, so a concurrent background AI-tagging pass
+    // on the same image cannot clobber these adjustments (and vice versa).
+    let metadata = crate::exif_processing::update_sidecar(
         Some(&app_handle),
         &sidecar_path,
-        &metadata,
         crate::sync::WriteOrigin::User,
+        |metadata| {
+            crate::exif_processing::merge_exif_from_source(metadata, &source_path);
+            let mut final_adjustments = adjustments;
+            {
+                let lens_db_guard = state.lens_db.lock().unwrap();
+                resolve_lens_params_in_adjustments(
+                    &mut final_adjustments,
+                    &metadata.exif,
+                    lens_db_guard.as_deref(),
+                );
+            }
+            metadata.adjustments = final_adjustments;
+            true
+        },
     )?;
 
     if let Ok(settings) = load_settings(app_handle.clone())
@@ -2647,39 +2655,41 @@ pub async fn apply_adjustments_to_paths(
         paths.par_iter().for_each(|path| {
             let (source_path, sidecar_path) = parse_virtual_path(path);
 
-            let mut existing_metadata =
-                crate::exif_processing::load_sidecar_with_exif(&sidecar_path, &source_path);
-
-            let mut new_adjustments = existing_metadata.adjustments;
-            if new_adjustments.is_null() {
-                new_adjustments = serde_json::json!({});
-            }
-
-            if let (Some(new_map), Some(pasted_map)) =
-                (new_adjustments.as_object_mut(), adjustments.as_object())
-            {
-                for (k, v) in pasted_map {
-                    new_map.insert(k.clone(), v.clone());
-                }
-            }
-
-            resolve_lens_params_in_adjustments(
-                &mut new_adjustments,
-                &existing_metadata.exif,
-                lens_db.as_deref(),
-            );
-
-            existing_metadata.adjustments = new_adjustments;
-
-            let _ = crate::exif_processing::save_sidecar(
+            let updated = crate::exif_processing::update_sidecar(
                 None,
                 &sidecar_path,
-                &existing_metadata,
                 crate::sync::WriteOrigin::Batch,
+                |existing_metadata| {
+                    crate::exif_processing::merge_exif_from_source(existing_metadata, &source_path);
+
+                    let mut new_adjustments =
+                        std::mem::take(&mut existing_metadata.adjustments);
+                    if new_adjustments.is_null() {
+                        new_adjustments = serde_json::json!({});
+                    }
+
+                    if let (Some(new_map), Some(pasted_map)) =
+                        (new_adjustments.as_object_mut(), adjustments.as_object())
+                    {
+                        for (k, v) in pasted_map {
+                            new_map.insert(k.clone(), v.clone());
+                        }
+                    }
+
+                    resolve_lens_params_in_adjustments(
+                        &mut new_adjustments,
+                        &existing_metadata.exif,
+                        lens_db.as_deref(),
+                    );
+
+                    existing_metadata.adjustments = new_adjustments;
+                    true
+                },
             );
 
-            if enable_xmp_sync {
-                let source_path = parse_virtual_path(path).0;
+            if enable_xmp_sync
+                && let Ok(existing_metadata) = updated
+            {
                 sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
             }
         });
@@ -2746,18 +2756,19 @@ pub async fn reset_adjustments_for_paths(
         paths.par_iter().for_each(|path| {
             let (_, sidecar_path) = parse_virtual_path(path);
 
-            let mut existing_metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-            existing_metadata.adjustments = serde_json::json!({});
-
-            let _ = crate::exif_processing::save_sidecar(
+            let updated = crate::exif_processing::update_sidecar(
                 None,
                 &sidecar_path,
-                &existing_metadata,
                 crate::sync::WriteOrigin::Batch,
+                |existing_metadata| {
+                    existing_metadata.adjustments = serde_json::json!({});
+                    true
+                },
             );
 
-            if enable_xmp_sync {
+            if enable_xmp_sync
+                && let Ok(existing_metadata) = updated
+            {
                 let source_path = parse_virtual_path(path).0;
                 sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
             }
@@ -2839,34 +2850,36 @@ pub async fn apply_auto_lens_correction_to_paths(
 
         paths.par_iter().for_each(|path| {
             let (source_path, sidecar_path) = parse_virtual_path(path);
-            let mut existing_metadata =
-                crate::exif_processing::load_sidecar_with_exif(&sidecar_path, &source_path);
-
-            if existing_metadata.adjustments.is_null() {
-                existing_metadata.adjustments = serde_json::json!({});
-            }
-
-            if let Some(obj) = existing_metadata.adjustments.as_object_mut() {
-                obj.insert("lensCorrectionMode".to_string(), serde_json::json!("auto"));
-                obj.insert("lensDistortionEnabled".to_string(), serde_json::json!(true));
-                obj.insert("lensTcaEnabled".to_string(), serde_json::json!(true));
-                obj.insert("lensVignetteEnabled".to_string(), serde_json::json!(true));
-            }
-
-            resolve_lens_params_in_adjustments(
-                &mut existing_metadata.adjustments,
-                &existing_metadata.exif,
-                lens_db.as_deref(),
-            );
-
-            let _ = crate::exif_processing::save_sidecar(
+            let updated = crate::exif_processing::update_sidecar(
                 None,
                 &sidecar_path,
-                &existing_metadata,
                 crate::sync::WriteOrigin::Batch,
+                |existing_metadata| {
+                    crate::exif_processing::merge_exif_from_source(existing_metadata, &source_path);
+
+                    if existing_metadata.adjustments.is_null() {
+                        existing_metadata.adjustments = serde_json::json!({});
+                    }
+
+                    if let Some(obj) = existing_metadata.adjustments.as_object_mut() {
+                        obj.insert("lensCorrectionMode".to_string(), serde_json::json!("auto"));
+                        obj.insert("lensDistortionEnabled".to_string(), serde_json::json!(true));
+                        obj.insert("lensTcaEnabled".to_string(), serde_json::json!(true));
+                        obj.insert("lensVignetteEnabled".to_string(), serde_json::json!(true));
+                    }
+
+                    resolve_lens_params_in_adjustments(
+                        &mut existing_metadata.adjustments,
+                        &existing_metadata.exif,
+                        lens_db.as_deref(),
+                    );
+                    true
+                },
             );
 
-            if enable_xmp_sync {
+            if enable_xmp_sync
+                && let Ok(existing_metadata) = updated
+            {
                 sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
             }
 
@@ -2946,43 +2959,44 @@ pub async fn apply_auto_adjustments_to_paths(
                 let auto_results = perform_auto_analysis(&image);
                 let auto_adjustments_json = auto_results_to_json(&auto_results);
 
-                let mut existing_metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-                if existing_metadata.adjustments.is_null() {
-                    existing_metadata.adjustments = serde_json::json!({});
-                }
-
-                if let (Some(existing_map), Some(auto_map)) = (
-                    existing_metadata.adjustments.as_object_mut(),
-                    auto_adjustments_json.as_object(),
-                ) {
-                    for (k, v) in auto_map {
-                        if k == "sectionVisibility" {
-                            if let Some(existing_vis_val) = existing_map.get_mut(k) {
-                                if let (Some(existing_vis), Some(auto_vis)) =
-                                    (existing_vis_val.as_object_mut(), v.as_object())
-                                {
-                                    for (vis_k, vis_v) in auto_vis {
-                                        existing_vis.insert(vis_k.clone(), vis_v.clone());
-                                    }
-                                }
-                            } else {
-                                existing_map.insert(k.clone(), v.clone());
-                            }
-                        } else {
-                            existing_map.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-
-                let _ = crate::exif_processing::save_sidecar(
+                let updated = crate::exif_processing::update_sidecar(
                     None,
                     &sidecar_path,
-                    &existing_metadata,
                     crate::sync::WriteOrigin::Batch,
+                    |existing_metadata| {
+                        if existing_metadata.adjustments.is_null() {
+                            existing_metadata.adjustments = serde_json::json!({});
+                        }
+
+                        if let (Some(existing_map), Some(auto_map)) = (
+                            existing_metadata.adjustments.as_object_mut(),
+                            auto_adjustments_json.as_object(),
+                        ) {
+                            for (k, v) in auto_map {
+                                if k == "sectionVisibility" {
+                                    if let Some(existing_vis_val) = existing_map.get_mut(k) {
+                                        if let (Some(existing_vis), Some(auto_vis)) =
+                                            (existing_vis_val.as_object_mut(), v.as_object())
+                                        {
+                                            for (vis_k, vis_v) in auto_vis {
+                                                existing_vis.insert(vis_k.clone(), vis_v.clone());
+                                            }
+                                        }
+                                    } else {
+                                        existing_map.insert(k.clone(), v.clone());
+                                    }
+                                } else {
+                                    existing_map.insert(k.clone(), v.clone());
+                                }
+                            }
+                        }
+                        true
+                    },
                 );
 
-                if enable_xmp_sync {
+                if enable_xmp_sync
+                    && let Ok(existing_metadata) = updated
+                {
                     sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
                 }
                 Ok(image)
@@ -3031,31 +3045,28 @@ pub fn set_color_label_for_paths(
     paths.par_iter().for_each(|path| {
         let (_, sidecar_path) = parse_virtual_path(path);
 
-        let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-        let mut tags = metadata.tags.unwrap_or_default();
-        tags.retain(|tag| !tag.starts_with(COLOR_TAG_PREFIX));
-
-        if let Some(c) = &color
-            && !c.is_empty()
-        {
-            tags.push(format!("{}{}", COLOR_TAG_PREFIX, c));
-        }
-
-        if tags.is_empty() {
-            metadata.tags = None;
-        } else {
-            metadata.tags = Some(tags);
-        }
-
-        let _ = crate::exif_processing::save_sidecar(
+        let updated = crate::exif_processing::update_sidecar(
             None,
             &sidecar_path,
-            &metadata,
             crate::sync::WriteOrigin::Batch,
+            |metadata| {
+                let mut tags = metadata.tags.take().unwrap_or_default();
+                tags.retain(|tag| !tag.starts_with(COLOR_TAG_PREFIX));
+
+                if let Some(c) = &color
+                    && !c.is_empty()
+                {
+                    tags.push(format!("{}{}", COLOR_TAG_PREFIX, c));
+                }
+
+                metadata.tags = if tags.is_empty() { None } else { Some(tags) };
+                true
+            },
         );
 
-        if enable_xmp_sync {
+        if enable_xmp_sync
+            && let Ok(metadata) = updated
+        {
             let source_path = parse_virtual_path(path).0;
             sync_metadata_to_xmp(&source_path, &metadata, create_xmp_if_missing);
         }
@@ -3077,18 +3088,19 @@ pub fn set_rating_for_paths(
     paths.par_iter().for_each(|path| {
         let (_, sidecar_path) = parse_virtual_path(path);
 
-        let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-        metadata.rating = rating;
-
-        let _ = crate::exif_processing::save_sidecar(
+        let updated = crate::exif_processing::update_sidecar(
             None,
             &sidecar_path,
-            &metadata,
             crate::sync::WriteOrigin::Batch,
+            |metadata| {
+                metadata.rating = rating;
+                true
+            },
         );
 
-        if enable_xmp_sync {
+        if enable_xmp_sync
+            && let Ok(metadata) = updated
+        {
             let source_path = parse_virtual_path(path).0;
             sync_metadata_to_xmp(&source_path, &metadata, create_xmp_if_missing);
         }
@@ -3103,18 +3115,22 @@ pub fn load_metadata(path: String, app_handle: AppHandle) -> Result<ImageMetadat
     let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
 
     let (source_path, sidecar_path) = parse_virtual_path(&path);
-    let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
 
-    if enable_xmp_sync && sync_metadata_from_xmp(&source_path, &mut metadata) {
-        let _ = crate::exif_processing::save_sidecar(
+    if enable_xmp_sync {
+        // XMP merge-and-persist under the per-path lock; the closure returns
+        // whether the merge changed anything, so a no-op merge writes
+        // nothing. A quarantined-corrupt sidecar falls back to a plain read
+        // (defaults) rather than surfacing an error on this read-path.
+        Ok(crate::exif_processing::update_sidecar(
             None,
             &sidecar_path,
-            &metadata,
             crate::sync::WriteOrigin::XmpImport,
-        );
+            |metadata| sync_metadata_from_xmp(&source_path, metadata),
+        )
+        .unwrap_or_else(|_| crate::exif_processing::load_sidecar(&sidecar_path)))
+    } else {
+        Ok(crate::exif_processing::load_sidecar(&sidecar_path))
     }
-
-    Ok(metadata)
 }
 
 fn get_presets_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
@@ -4101,18 +4117,22 @@ pub fn create_virtual_copy(
     let new_virtual_path = format!("{}?vc={}", source_path.to_string_lossy(), new_copy_id);
     let (_, new_sidecar_path) = parse_virtual_path(&new_virtual_path);
 
-    if source_sidecar_path.exists() {
-        fs::copy(&source_sidecar_path, &new_sidecar_path)
-            .map_err(|e| format!("Failed to copy sidecar file: {}", e))?;
+    // Route both branches through the chokepoint (atomic write + engine
+    // intake for the new `vc=` key) rather than a raw `fs::copy` on the
+    // common "source sidecar exists" path, which bypassed both
+    // (ARCHITECTURE.md §3.4 lists `create_virtual_copy` as a chokepoint
+    // site). The destination is a fresh `vc=` key, so there is no clobber.
+    let copy_metadata = if source_sidecar_path.exists() {
+        crate::exif_processing::load_sidecar(&source_sidecar_path)
     } else {
-        let default_metadata = ImageMetadata::default();
-        crate::exif_processing::save_sidecar(
-            None,
-            &new_sidecar_path,
-            &default_metadata,
-            crate::sync::WriteOrigin::VirtualCopy,
-        )?;
-    }
+        ImageMetadata::default()
+    };
+    crate::exif_processing::save_sidecar(
+        None,
+        &new_sidecar_path,
+        &copy_metadata,
+        crate::sync::WriteOrigin::VirtualCopy,
+    )?;
 
     if let Some(album_id) = target_album_id {
         let _ = add_to_album(album_id, vec![new_virtual_path.clone()], app_handle);

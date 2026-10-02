@@ -212,27 +212,27 @@ pub fn truncate_large_exif(value: &str) -> String {
     value.to_string()
 }
 
-pub fn load_sidecar(sidecar_path: &Path) -> ImageMetadata {
-    if !sidecar_path.exists() {
-        return ImageMetadata::default();
-    }
-
-    let Ok(content) = fs::read_to_string(sidecar_path) else {
-        return ImageMetadata::default();
-    };
-
-    let mut meta = match serde_json::from_str::<ImageMetadata>(&content) {
+/// Parse sidecar `bytes` leniently (defaults + a `log::warn!` on parse
+/// failure) and truncate bloated EXIF values in place. Returns
+/// `(meta, healed)` where `healed` is true iff an EXIF value was truncated.
+///
+/// Unlike [`load_sidecar`] this does **not** perform the auto-heal re-save:
+/// the [`update_sidecar`] read-modify-write path calls this while holding
+/// the per-path lock and then writes the healed value itself, so re-entering
+/// `save_sidecar` here would deadlock that (non-reentrant) lock. `path` is
+/// used only for the parse-failure log line.
+fn parse_and_heal_sidecar(bytes: &[u8], path: Option<&Path>) -> (ImageMetadata, bool) {
+    let mut meta = match serde_json::from_slice::<ImageMetadata>(bytes) {
         Ok(m) => m,
         Err(e) => {
-            log::warn!(
-                "Failed to parse sidecar {}: {e}; using defaults",
-                sidecar_path.display()
-            );
+            if let Some(p) = path {
+                log::warn!("Failed to parse sidecar {}: {e}; using defaults", p.display());
+            }
             ImageMetadata::default()
         }
     };
-    let mut healed = false;
 
+    let mut healed = false;
     if let Some(ref mut exif_map) = meta.exif {
         for val in exif_map.values_mut() {
             if val.len() > 500 {
@@ -241,6 +241,15 @@ pub fn load_sidecar(sidecar_path: &Path) -> ImageMetadata {
             }
         }
     }
+    (meta, healed)
+}
+
+pub fn load_sidecar(sidecar_path: &Path) -> ImageMetadata {
+    let Ok(bytes) = fs::read(sidecar_path) else {
+        return ImageMetadata::default();
+    };
+
+    let (meta, healed) = parse_and_heal_sidecar(&bytes, Some(sidecar_path));
 
     if healed {
         let _ = save_sidecar(
@@ -261,15 +270,34 @@ pub fn load_sidecar(sidecar_path: &Path) -> ImageMetadata {
 /// The single sidecar-write chokepoint (ARCHITECTURE.md §3.4). Every
 /// `.rrdata` write in the app routes through here:
 ///
-/// 1. Acquire the per-path async-aware lock (`AppState` / global
-///    `sync::sidecar_locks`) — closes the AI-tagging-vs-user-edit race and
-///    serializes sync's third writer.
+/// 1. Acquire the per-path lock (global `sync::sidecar_locks`). This
+///    serializes the *writes* to one sidecar. It does **not**, on its own,
+///    close a read-modify-write race: `save_sidecar` takes an
+///    already-formed `meta`, so a caller that does `load_sidecar` → mutate →
+///    `save_sidecar` with the load *outside* the lock can still lose a
+///    concurrent writer's field (lost update). Callers that read-modify-
+///    write a sidecar — the user rating/label/tag/adjustment edits and the
+///    background AI-tagging pass, the actual "AI-tagging-vs-user-edit race"
+///    — therefore go through [`update_sidecar`], which performs the whole
+///    load+mutate+write under this one lock. The sync engine's inbound apply
+///    is a *third* writer, but it installs via rrcloud-core's own atomic
+///    rename (`transfer.rs`) and does not take this lock; torn writes are
+///    impossible either way (atomic rename), and sync-vs-local concurrency
+///    is reconciled by the §2.6 version-vector apply, not by this lock.
+///    (Having the engine take this same per-path lock across its install is
+///    a worthwhile follow-up but is a cross-crate change, not done in P1.)
 /// 2. Corruption guard (incl. 0-byte): if the on-disk sidecar fails to
-///    parse — or disagrees with a non-default synced head — quarantine it
-///    to `<name>.rrdata.corrupt-<ts>`, trigger a priority re-download, and
-///    **abort** (feature-gated). With sync off, upstream behavior is kept
-///    (proceed), but the atomic write and the `load_sidecar` parse warning
-///    are always present.
+///    parse (empty or unparseable bytes), quarantine it to
+///    `<name>.rrdata.corrupt-<ts>`, emit `sync-error`, and **abort**
+///    (feature-gated, and only when sync is configured). Recovery is
+///    passive: the next sync cycle's apply pulls the real remote head back
+///    down — this step does **not** itself trigger a priority re-download.
+///    The valid-but-stale case (a parseable local sidecar that merely
+///    *disagrees* with a non-default synced head) is **not** guarded here —
+///    that comparison is deferred (§2.6 version-vector apply is the P1
+///    backstop). With sync off, upstream behavior is kept (proceed), but
+///    the atomic write and the `load_sidecar` parse warning are always
+///    present.
 /// 3. Remote-head guard (DEFERRED to P2, not implemented here): once
 ///    `pending_down` stub semantics exist, a write against a still-
 ///    downloading remote head would download first (offline: flag
@@ -372,6 +400,126 @@ pub fn save_sidecar(
     }
 
     Ok(())
+}
+
+/// Read-modify-write a sidecar **atomically under the per-path lock**
+/// (ARCHITECTURE.md §3.4 step 1). Loads the current on-disk metadata,
+/// applies `mutate`, and writes the result — all while holding the one
+/// [`crate::sync::sidecar_lock_for`] lock for `sidecar_path` — so a
+/// concurrent writer (e.g. the background AI-tagging pass adding a tag while
+/// the user sets a rating/label/adjustment on the same image) can never
+/// lose the other's field. This is the race the `save_sidecar` doc-comment
+/// step 1 describes: `save_sidecar` alone only serializes the final write,
+/// but a caller that loads *outside* the lock and then calls `save_sidecar`
+/// still clobbers whatever landed between its load and its write. Every
+/// read-modify-write site routes through here instead.
+///
+/// `mutate` returns whether a write is wanted: it returns `false` to abort
+/// cleanly without writing (e.g. an XMP merge that changed nothing), and the
+/// loaded-but-unmodified metadata is returned. On a write, the same
+/// corruption guard and §2.5 churn gate as [`save_sidecar`] apply, and the
+/// written metadata is returned so the caller can keep using it (XMP mirror,
+/// command return value).
+///
+/// The base metadata is parsed with the same lenient, EXIF-truncating logic
+/// as [`load_sidecar`] but **without** its auto-heal re-save (re-entering
+/// `save_sidecar` under the already-held, non-reentrant lock would
+/// deadlock); the truncated value is written out by this call directly.
+pub fn update_sidecar<F>(
+    app: Option<&tauri::AppHandle>,
+    sidecar_path: &Path,
+    origin: crate::sync::WriteOrigin,
+    mutate: F,
+) -> Result<ImageMetadata, String>
+where
+    F: FnOnce(&mut ImageMetadata) -> bool,
+{
+    // Prune the global lock-map entry once this writer releases it (declared
+    // before `lock` so it drops after it — identical discipline to
+    // `save_sidecar`).
+    let _prune = SidecarLockPrune(sidecar_path);
+
+    let lock = crate::sync::sidecar_lock_for(sidecar_path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // Read the current bytes once, under the lock: they feed the corruption
+    // guard, the read-modify-write base, and the churn gate.
+    let prior_bytes = std::fs::read(sidecar_path).ok();
+
+    // (2) Corruption guard — sync feature only, matching `save_sidecar`: a
+    // locally corrupt / 0-byte sidecar must never become the base for a
+    // read-modify-write that then re-persists it (or a defaults-based
+    // document) over the real edit. Quarantine + abort when sync is
+    // configured; otherwise keep upstream behavior and parse-to-default.
+    #[cfg(feature = "sync")]
+    if let Some(ref prior) = prior_bytes {
+        let parsed_ok =
+            !prior.is_empty() && serde_json::from_slice::<ImageMetadata>(prior).is_ok();
+        if !parsed_ok {
+            let configured = crate::sync::global_manager()
+                .map(|m| m.is_configured())
+                .unwrap_or(false);
+            if configured {
+                quarantine_corrupt_sidecar(sidecar_path)?;
+                if let Some(app) = app {
+                    crate::sync::events::emit_error(
+                        app,
+                        Some(sidecar_path.to_string_lossy().as_ref()),
+                        "sidecar restored — please retry",
+                    );
+                }
+                return Err(format!(
+                    "corrupt sidecar quarantined, write aborted: {}",
+                    sidecar_path.display()
+                ));
+            }
+        }
+    }
+
+    // The read-modify-write base: lenient parse + EXIF truncation, no
+    // auto-heal re-save (we write below).
+    let (mut meta, _healed) = match prior_bytes.as_deref() {
+        Some(bytes) => parse_and_heal_sidecar(bytes, Some(sidecar_path)),
+        None => (ImageMetadata::default(), false),
+    };
+
+    let wants_write = mutate(&mut meta);
+    if !wants_write {
+        return Ok(meta);
+    }
+
+    let new_bytes = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
+
+    // (5) churn-gate decision (§2.5), identical policy to `save_sidecar`.
+    #[cfg(feature = "sync")]
+    let changed = match prior_bytes.as_deref() {
+        Some(prior) if !prior.is_empty() => {
+            match (
+                rrcloud_core::semhash::sem_hash(prior),
+                rrcloud_core::semhash::sem_hash(&new_bytes),
+            ) {
+                (Ok(prior_sem), Ok(new_sem)) => prior_sem != new_sem,
+                _ => true,
+            }
+        }
+        _ => true,
+    };
+
+    // (4) Atomic write (same contract as `save_sidecar`).
+    atomic_write_sidecar(sidecar_path, &new_bytes)?;
+
+    #[cfg(feature = "sync")]
+    {
+        if changed {
+            crate::sync::hooks::notify_sidecar_saved(sidecar_path, &meta, origin);
+        }
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = (app, origin);
+    }
+
+    Ok(meta)
 }
 
 /// Atomically writes `bytes` to `sidecar_path` via a same-directory temp
@@ -495,30 +643,34 @@ fn quarantine_corrupt_sidecar(sidecar_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn load_sidecar_with_exif(sidecar_path: &Path, source_path: &Path) -> ImageMetadata {
-    let mut meta = load_sidecar(sidecar_path);
-
-    if meta.exif.is_none() {
-        if let Some(cached_exif) = read_rrexif_sidecar(source_path) {
-            meta.exif = Some(cached_exif);
-        } else {
-            let source_path_str = source_path.to_string_lossy();
-            let extracted_exif =
-                if let Ok(mmap) = crate::file_management::read_file_mapped(source_path) {
-                    read_exif_data(&source_path_str, &mmap)
-                } else if let Ok(bytes) = std::fs::read(source_path) {
-                    read_exif_data(&source_path_str, &bytes)
-                } else {
-                    std::collections::HashMap::new()
-                };
-
-            if !extracted_exif.is_empty() {
-                meta.exif = Some(extracted_exif);
-            }
-        }
+/// Populate `meta.exif` from `source_path` (a cached `.rrexif` sidecar, else
+/// a fresh EXIF read) **only when it is currently absent**. Composed with
+/// [`load_sidecar`] this is the old `load_sidecar_with_exif`; factored out so
+/// the [`update_sidecar`] read-modify-write sites (the editor autosave and
+/// the batch-adjustment commands) can run the EXIF merge on the base they
+/// loaded *under the lock* rather than on a stale pre-lock load.
+pub fn merge_exif_from_source(meta: &mut ImageMetadata, source_path: &Path) {
+    if meta.exif.is_some() {
+        return;
     }
 
-    meta
+    if let Some(cached_exif) = read_rrexif_sidecar(source_path) {
+        meta.exif = Some(cached_exif);
+        return;
+    }
+
+    let source_path_str = source_path.to_string_lossy();
+    let extracted_exif = if let Ok(mmap) = crate::file_management::read_file_mapped(source_path) {
+        read_exif_data(&source_path_str, &mmap)
+    } else if let Ok(bytes) = std::fs::read(source_path) {
+        read_exif_data(&source_path_str, &bytes)
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    if !extracted_exif.is_empty() {
+        meta.exif = Some(extracted_exif);
+    }
 }
 
 fn to_ur64(val: &exif::Rational) -> uR64 {

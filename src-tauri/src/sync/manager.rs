@@ -121,6 +121,19 @@ impl SyncManager {
     /// store under `state_dir`, builds the S3 client from `settings` +
     /// `creds`, and arms the supervisor. Inert (no network) — a bad
     /// endpoint surfaces at [`run_once`](Self::run_once), not here.
+    ///
+    /// **Reconfigure-while-running hazard (for the next unit's command
+    /// layer):** this opens a *fresh* [`imp::Configured`] (a new redb
+    /// `Database` on `state_dir/state.redb`) and only then swaps it into
+    /// `inner`. [`run_once`](Self::run_once) / [`status`](Self::status) clone
+    /// the current `Arc<Configured>` out of the lock and hold it across their
+    /// `.await`s, so a `configure()` call made *while a cycle is still in
+    /// flight* would try to open a second redb handle on the same file before
+    /// the in-flight `Arc` releases the first — redb's advisory file lock
+    /// then makes this return `Err` rather than cleanly rebinding. P1 drives
+    /// these sequentially with no supervisor, so it is not reachable yet; the
+    /// P2 command layer must stop/await any running cycle (or tear down the
+    /// prior `Configured`) before calling `configure` again.
     pub fn configure(
         &self,
         settings: SyncSettings,

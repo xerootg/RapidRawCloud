@@ -19,6 +19,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use rapidraw_lib::sync::{
     self, Credentials, ImageMetadata, SyncManager, SyncSettings, WriteOrigin, save_sidecar,
+    update_sidecar,
 };
 
 /// Serializes the tests that install the process-global `SyncManager`, so
@@ -230,6 +231,73 @@ fn per_path_lock_entry_is_pruned_after_write() {
         !sync::sidecar_locks().contains_key(sidecar.as_path()),
         "the per-path lock entry must be pruned once no writer holds it"
     );
+}
+
+#[test]
+fn concurrent_read_modify_write_preserves_every_writer() {
+    // Regression for the P1-U7 review's lost-update finding: the per-path
+    // lock only serializes the *write*, so a caller that loads OUTSIDE the
+    // lock and then calls `save_sidecar` still clobbers whatever a concurrent
+    // writer persisted between its load and its write (the
+    // AI-tagging-vs-user-edit race). `update_sidecar` performs load+mutate+
+    // write under the one lock; this test drives two concurrent
+    // read-modify-write writers on disjoint fields of the SAME sidecar — one
+    // keeps setting the rating, the other keeps appending a distinct tag —
+    // and asserts NEITHER writer's field is lost. The old pattern this
+    // replaced loses both (reproduced red before the fix).
+    let _g = global_guard();
+    let root = tempfile::tempdir().expect("root");
+    let state = tempfile::tempdir().expect("state");
+    let mgr = configured_manager(root.path(), state.path());
+    sync::install_global_manager(mgr);
+
+    let sidecar = root.path().join("rmw/contended.NEF.rrdata");
+    std::fs::create_dir_all(sidecar.parent().unwrap()).expect("mkdir");
+    // Seed a valid sidecar: rating 0, no tags.
+    save_sidecar(None, &sidecar, &edit(0, 0.0), WriteOrigin::User).expect("seed");
+
+    const N: usize = 50;
+    let rater_path = sidecar.clone();
+    let rater = std::thread::spawn(move || {
+        for _ in 0..N {
+            let _ = update_sidecar(None, &rater_path, WriteOrigin::Batch, |m| {
+                m.rating = 5;
+                true
+            });
+        }
+    });
+    let tagger_path = sidecar.clone();
+    let tagger = std::thread::spawn(move || {
+        for i in 0..N {
+            let _ = update_sidecar(None, &tagger_path, WriteOrigin::AiTagging, |m| {
+                let mut tags = m.tags.take().unwrap_or_default();
+                tags.push(format!("tag-{i}"));
+                m.tags = Some(tags);
+                true
+            });
+        }
+    });
+    rater.join().expect("rater");
+    tagger.join().expect("tagger");
+
+    let bytes = std::fs::read(&sidecar).expect("sidecar present");
+    let final_meta: ImageMetadata =
+        serde_json::from_slice(&bytes).expect("the final sidecar must be a parseable document");
+
+    // The rating writer's value survived (not reset by a concurrent tag write).
+    assert_eq!(
+        final_meta.rating, 5,
+        "the rating writer's update was lost — clobbered by a concurrent read-modify-write"
+    );
+    // Every tag the tagger added survived (not dropped by a concurrent rating write).
+    let tags = final_meta.tags.unwrap_or_default();
+    for i in 0..N {
+        assert!(
+            tags.contains(&format!("tag-{i}")),
+            "tag-{i} was lost — a concurrent writer clobbered it (have {} of {N} tags)",
+            tags.len()
+        );
+    }
 }
 
 #[test]

@@ -332,7 +332,7 @@ pub async fn start_background_indexing(
                     let path_str = path.to_string_lossy().to_string();
                     let (_, sidecar_path) = parse_virtual_path(&path_str);
 
-                    let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
+                    let metadata = crate::exif_processing::load_sidecar(&sidecar_path);
 
                     let should_generate_tags = match &metadata.tags {
                         None => true,
@@ -357,24 +357,34 @@ pub async fn start_background_indexing(
                                 ) {
                                     println!("Found AI tags for {}: {:?}", path_str, ai_tags);
 
-                                    let mut existing_tags: HashSet<String> =
-                                        metadata.tags.unwrap_or_default().into_iter().collect();
-
-                                    for tag in ai_tags {
-                                        existing_tags.insert(tag);
-                                    }
-
-                                    let mut final_tags: Vec<String> =
-                                        existing_tags.into_iter().collect();
-                                    final_tags.sort_unstable();
-
-                                    metadata.tags = Some(final_tags);
-
-                                    let _ = crate::exif_processing::save_sidecar(
+                                    // Merge the generated tags under the
+                                    // per-path lock (§3.4 step 1): the slow
+                                    // CLIP inference ran *outside* the lock,
+                                    // but the final union re-loads the sidecar
+                                    // fresh inside the lock so a concurrent
+                                    // user rating/label/tag/adjustment edit on
+                                    // the same image is not clobbered (the
+                                    // AI-tagging-vs-user-edit race).
+                                    let _ = crate::exif_processing::update_sidecar(
                                         None,
                                         &sidecar_path,
-                                        &metadata,
                                         crate::sync::WriteOrigin::AiTagging,
+                                        |metadata| {
+                                            let mut existing_tags: HashSet<String> = metadata
+                                                .tags
+                                                .take()
+                                                .unwrap_or_default()
+                                                .into_iter()
+                                                .collect();
+                                            for tag in ai_tags {
+                                                existing_tags.insert(tag);
+                                            }
+                                            let mut final_tags: Vec<String> =
+                                                existing_tags.into_iter().collect();
+                                            final_tags.sort_unstable();
+                                            metadata.tags = Some(final_tags);
+                                            true
+                                        },
                                     );
                                 }
                             }
@@ -422,25 +432,21 @@ fn modify_tags_for_path(
 ) -> Result<(), String> {
     let (source_path, sidecar_path) = parse_virtual_path(path_str);
 
-    let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-    let mut tags = metadata.tags.unwrap_or_default();
-    modify_fn(&mut tags);
-
-    tags.sort_unstable();
-    tags.dedup();
-
-    if tags.is_empty() {
-        metadata.tags = None;
-    } else {
-        metadata.tags = Some(tags);
-    }
-
-    crate::exif_processing::save_sidecar(
+    // Read-modify-write under the per-path lock so a concurrent background
+    // AI-tagging pass on the same image cannot lose this tag edit (and vice
+    // versa) — the §3.4 step 1 AI-tagging-vs-user-edit race.
+    let metadata = crate::exif_processing::update_sidecar(
         None,
         &sidecar_path,
-        &metadata,
         crate::sync::WriteOrigin::UserTag,
+        |metadata| {
+            let mut tags = metadata.tags.take().unwrap_or_default();
+            modify_fn(&mut tags);
+            tags.sort_unstable();
+            tags.dedup();
+            metadata.tags = if tags.is_empty() { None } else { Some(tags) };
+            true
+        },
     )?;
 
     if let Ok(settings) = crate::load_settings(app_handle.clone())

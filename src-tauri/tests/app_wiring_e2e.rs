@@ -15,14 +15,37 @@
 mod common;
 
 use std::path::Path;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use common::garage;
+use tokio::sync::{Mutex, MutexGuard};
 use rapidraw_lib::rrcloud_core::keys::{CONTROL_PREFIX, LIBRARY_PREFIX};
 use rapidraw_lib::rrcloud_core::s3::{ListObjectsV2Request, S3Client};
 use rapidraw_lib::sync::{
     self, Credentials, ImageMetadata, SyncManager, SyncSettings, WriteOrigin, save_sidecar,
 };
+
+/// Serializes the tests that install the process-global [`SyncManager`]
+/// (`sync::install_global_manager`). libtest runs both `#[tokio::test]`s in
+/// this binary in parallel, so without this guard they race to overwrite
+/// the one process-global `GLOBAL_MANAGER`: if the exit-flush test's manager
+/// wins the global between this test's `install_global_manager` and its
+/// `save_sidecar`, the chokepoint routes `note_local_sidecar` to the wrong
+/// manager, `relkey` resolves against a foreign sync-root and fails, nothing
+/// is marked dirty, and `run_once` uploads nothing — the `got []` panic at
+/// :116 (P1-U7 review, reproduced 5/16 before this guard). Mirrors
+/// `app_wiring_chokepoint.rs::global_guard` and `hooks.rs`'s `serial`.
+///
+/// The guard is held for the whole test, across the async `run_once` /
+/// `exit_flush` awaits — so it is an await-aware [`tokio::sync::Mutex`]
+/// (rather than the sibling files' `std::sync::Mutex`, which would trip
+/// `clippy::await_holding_lock` and risks blocking the runtime when held
+/// across an await). It simply ensures the two tests never overlap.
+async fn global_guard() -> MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().await
+}
 
 fn settings_for(garage: &garage::Garage, bucket: &str) -> SyncSettings {
     SyncSettings {
@@ -80,6 +103,10 @@ async fn keys_under(client: &S3Client, bucket: &str, prefix: &str) -> Vec<String
 
 #[tokio::test]
 async fn two_sync_managers_converge_through_a_real_bucket() {
+    // Serialize installers of the one process-global manager (see
+    // `global_guard`): held for the whole test so the sibling exit-flush
+    // test cannot overwrite `GLOBAL_MANAGER` mid-cycle.
+    let _global = global_guard().await;
     let Some(garage) = garage::shared() else {
         eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run the e2e test");
         return;
@@ -155,6 +182,10 @@ async fn two_sync_managers_converge_through_a_real_bucket() {
 
 #[tokio::test]
 async fn bounded_exit_flush_drains_or_times_out_without_hanging() {
+    // Serialize installers of the one process-global manager (see
+    // `global_guard`): held for the whole test so it cannot overwrite
+    // `GLOBAL_MANAGER` while the convergence test is mid-cycle.
+    let _global = global_guard().await;
     let Some(garage) = garage::shared() else {
         eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run the e2e test");
         return;

@@ -38,7 +38,7 @@ pub use manager::{SyncError, SyncManager, SyncState, SyncStatus};
 // Re-exports so the integration tests (and future command layer) reach the
 // chokepoint and settings types through one module path.
 pub use crate::app_settings::SyncSettings;
-pub use crate::exif_processing::save_sidecar;
+pub use crate::exif_processing::{save_sidecar, update_sidecar};
 pub use crate::image_processing::ImageMetadata;
 
 /// Where a sidecar write came from, threaded through the [`save_sidecar`]
