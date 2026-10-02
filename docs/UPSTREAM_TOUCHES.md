@@ -14,7 +14,7 @@ Status legend: [ ] planned (phase) · [x] landed
 | `src-tauri/src/lib.rs` | `pub mod sync;` + `#[cfg(sync)] pub use ::rrcloud_core;` + SyncManager start in `setup()` + `RunEvent::ExitRequested` exit flush. (command registration + `ensure_local` guards in merge commands remain P2) | [x] P1 (partial) |
 | `src-tauri/src/app_state.rs` | `sync_manager` field + sidecar lock map | [x] P1 |
 | `src-tauri/src/app_settings.rs` | `sync: SyncSettings` field (`#[serde(default)]`; credentials excluded) | [x] P1 |
-| `src-tauri/src/exif_processing.rs` | `save_sidecar` chokepoint (per-path lock, 0-byte/corrupt quarantine + abort, atomic temp+rename, churn-gated notify); `load_sidecar` warn on parse failure + auto-heal routes through chokepoint | [x] P1 |
+| `src-tauri/src/exif_processing.rs` | `save_sidecar` chokepoint (per-path lock + bounded lock-map prune, 0-byte/corrupt quarantine + abort, atomic temp+rename with `fs::write`-matching mode + fsync for §7 perm-parity, churn-gated notify); `load_sidecar` warn on parse failure + auto-heal routes through chokepoint | [x] P1 |
 | `src-tauri/src/file_management.rs` | ~11 sidecar write sites → chokepoint (`is_cloud_placeholder` `\|\| sync::is_stub`; `ensure_local` guards; import/derived/delete hooks; XMP-import hash gate; `ImageFile.sync_state` remain P1/P2) | [x] P1 (sidecar sites) |
 | `src-tauri/src/tagging.rs` | 4 sidecar write sites → chokepoint | [x] P1 |
 | `src-tauri/src/image_loader.rs` | proxy branch + `ensure_local` at the iCloud error branch; pin `(apply_ungamma, apply_calibration)` for tagged proxies; `proxy_scale`-scaled enhance amounts | [ ] P2/P3 |

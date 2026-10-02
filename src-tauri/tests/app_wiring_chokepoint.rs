@@ -193,6 +193,45 @@ fn churn_rewrite_does_not_notify_but_real_edit_does() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn atomic_write_preserves_existing_sidecar_mode_on_overwrite() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sidecar = dir.path().join("keepmode.NEF.rrdata");
+    // Seed a valid sidecar with an unusual, tighter-than-default mode.
+    std::fs::write(&sidecar, serde_json::to_vec_pretty(&edit(0, 0.0)).unwrap())
+        .expect("seed valid sidecar");
+    std::fs::set_permissions(&sidecar, std::fs::Permissions::from_mode(0o640)).expect("chmod");
+
+    save_sidecar(None, &sidecar, &edit(3, 0.2), WriteOrigin::User).expect("overwrite");
+
+    let mode = std::fs::metadata(&sidecar)
+        .expect("stat")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(
+        mode, 0o640,
+        "overwriting a sidecar must preserve its existing mode (like fs::write), got {mode:o}"
+    );
+}
+
+#[test]
+fn per_path_lock_entry_is_pruned_after_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let sidecar = dir.path().join("prune-me.NEF.rrdata");
+
+    save_sidecar(None, &sidecar, &edit(1, 0.0), WriteOrigin::User).expect("save");
+
+    // Once no writer holds the lock, its process-global map entry must be
+    // gone — the map does not grow one permanent entry per distinct path.
+    assert!(
+        !sync::sidecar_locks().contains_key(sidecar.as_path()),
+        "the per-path lock entry must be pruned once no writer holds it"
+    );
+}
+
 #[test]
 fn per_path_lock_serializes_concurrent_writers() {
     let dir = tempfile::tempdir().expect("tempdir");

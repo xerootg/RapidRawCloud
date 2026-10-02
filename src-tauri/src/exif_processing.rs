@@ -270,10 +270,16 @@ pub fn load_sidecar(sidecar_path: &Path) -> ImageMetadata {
 ///    **abort** (feature-gated). With sync off, upstream behavior is kept
 ///    (proceed), but the atomic write and the `load_sidecar` parse warning
 ///    are always present.
-/// 3. Remote-head guard: when a known remote head is still `pending_down`,
-///    download first; offline, flag `base=unknown` (§2.6 case 4).
+/// 3. Remote-head guard (DEFERRED to P2, not implemented here): once
+///    `pending_down` stub semantics exist, a write against a still-
+///    downloading remote head would download first (offline: flag
+///    `base=unknown`, §2.6 case 4). In P1 sidecars are eagerly mirrored and
+///    never stubbed, so there is no pending head to guard; the §2.6 unified
+///    apply rule backstops the offline path (worst case a spurious loser
+///    virtual copy, never loss). This step is intentionally absent below.
 /// 4. Atomic write via `tempfile::NamedTempFile` + `persist` (rename) in
-///    the same directory.
+///    the same directory, with `fs::write`-matching permissions and an
+///    fsync of the temp and its parent dir (see `atomic_write_sidecar`).
 /// 5. Compute the rrcloud-core semantic hash; if changed, notify the sync
 ///    engine (`sync::hooks::notify_sidecar_saved`) — the §2.5 churn gate.
 ///
@@ -285,6 +291,13 @@ pub fn save_sidecar(
     meta: &ImageMetadata,
     origin: crate::sync::WriteOrigin,
 ) -> Result<(), String> {
+    // Prune this path's entry from the process-global lock map on every exit
+    // once this writer releases it (keeps the map bounded — §3.4 / P1-U7
+    // review). Declared *before* `lock` so, by reverse drop order, it drops
+    // after `lock`, when the entry's only remaining strong ref may be the
+    // map's own — the removal is a no-op while any concurrent writer holds it.
+    let _prune = SidecarLockPrune(sidecar_path);
+
     // (1) Per-path lock — serializes the three writers to one sidecar (user
     // edit, AI tagging, sync's inbound apply). Always held, feature or not;
     // a poisoned lock is recovered (the data it guards is on disk, not in
@@ -364,6 +377,24 @@ pub fn save_sidecar(
 /// Atomically writes `bytes` to `sidecar_path` via a same-directory temp
 /// file plus rename (ARCHITECTURE.md §3.4 step 4). Any failure leaves the
 /// destination and directory exactly as they were.
+///
+/// Permission parity (§7): `tempfile` creates its temp at mode 0600, but
+/// upstream's old `fs::write` created a *new* sidecar at `0o666 & !umask`
+/// (typically 0644) and *preserved* an existing sidecar's mode on overwrite.
+/// We mirror that on the temp before the rename so the chokepoint never
+/// silently tightens sidecar permissions — in either feature configuration,
+/// including `--no-default-features`.
+///
+/// Durability: the temp's data is fsync'd before the rename (so a crash can
+/// never surface the destination name pointing at unflushed, zero-length
+/// content) and the parent directory is fsync'd after (so the rename itself
+/// is durable). The rename stays atomic against torn content either way.
+///
+/// Note (vs upstream's in-place `fs::write`): the rename replaces the
+/// destination inode, so a pre-existing hard link to the old sidecar is not
+/// updated and a symlink at `sidecar_path` is replaced by a regular file
+/// rather than followed. This is inherent to atomic temp+rename and accepted
+/// for sidecars (ARCHITECTURE.md §3.4).
 fn atomic_write_sidecar(sidecar_path: &Path, bytes: &[u8]) -> Result<(), String> {
     let dir = sidecar_path.parent().ok_or_else(|| {
         format!(
@@ -372,13 +403,72 @@ fn atomic_write_sidecar(sidecar_path: &Path, bytes: &[u8]) -> Result<(), String>
         )
     })?;
     let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // Overwrite preserves the existing mode (like `fs::write`); a new
+        // sidecar gets `0o666 & !umask` (the create default `fs::write` uses).
+        let mode = match std::fs::metadata(sidecar_path) {
+            Ok(existing) => existing.mode() & 0o7777,
+            Err(_) => 0o666u32 & !process_umask(),
+        };
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(mode))
+            .map_err(|e| e.to_string())?;
+    }
+
     {
         use std::io::Write;
         tmp.write_all(bytes).map_err(|e| e.to_string())?;
         tmp.flush().map_err(|e| e.to_string())?;
     }
+    tmp.as_file().sync_all().map_err(|e| e.to_string())?;
     tmp.persist(sidecar_path).map_err(|e| e.error.to_string())?;
+    #[cfg(unix)]
+    {
+        // Best-effort directory fsync: the rename is already durable-or-not
+        // as a unit; failing to open the dir must not fail the write.
+        if let Ok(dir_file) = std::fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+    }
     Ok(())
+}
+
+/// The process file-creation mask, read the way `fs::write` implicitly uses
+/// it (a new file is created `0o666 & !umask`). `libc::umask` has no
+/// read-only form, so the value is captured once via set-then-restore and
+/// cached: `OnceLock` runs the swap exactly once for the process, so the
+/// brief window where the mask is 0 for concurrent file creations cannot
+/// recur.
+#[cfg(unix)]
+fn process_umask() -> u32 {
+    use std::sync::OnceLock;
+    static UMASK: OnceLock<u32> = OnceLock::new();
+    *UMASK.get_or_init(|| {
+        // SAFETY: `umask` only swaps the process file-creation mask and
+        // cannot fail; the original value is restored immediately.
+        #[allow(clippy::unnecessary_cast)] // `mode_t` width is platform-dependent
+        unsafe {
+            let mask = libc::umask(0);
+            libc::umask(mask);
+            mask as u32
+        }
+    })
+}
+
+/// RAII guard that prunes the per-path lock-map entry for `sidecar_path`
+/// once this writer releases it (keeps the process-global map bounded —
+/// ARCHITECTURE.md §3.4 / P1-U7 review). The removal is conditional on no
+/// other writer holding the lock, so the per-path serialization guarantee is
+/// never broken (see [`crate::sync::prune_sidecar_lock`]).
+struct SidecarLockPrune<'a>(&'a Path);
+
+impl Drop for SidecarLockPrune<'_> {
+    fn drop(&mut self) {
+        crate::sync::prune_sidecar_lock(self.0);
+    }
 }
 
 /// Quarantines a corrupt on-disk sidecar to `<name>.corrupt-<ts>` so the

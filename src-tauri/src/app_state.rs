@@ -252,7 +252,12 @@ pub struct AppState {
     /// Cloud sync lifecycle object (ARCHITECTURE.md §3.3). Inert until
     /// `SyncManager::configure`.
     pub sync_manager: Arc<crate::sync::SyncManager>,
-    /// Per-path sidecar lock map (§3.4 step 1): serializes the three
-    /// writers to one sidecar (user edit, AI tagging, sync apply).
+    /// Shared handle to the process-global per-path sidecar lock map (§3.4
+    /// step 1). It deliberately aliases the same `Arc` the chokepoint locks
+    /// through (`sync::sidecar_locks()`), exposed on `AppState` so the P2
+    /// command surface can reach the same locks without the process-global.
+    /// The chokepoint itself uses the global directly (it must serialize at
+    /// the batch write sites that hold no `AppHandle`), so this field is not
+    /// yet read — reserved, not accidental dead code (P1-U7 review).
     pub sidecar_locks: crate::sync::SidecarLockMap,
 }

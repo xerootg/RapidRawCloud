@@ -239,8 +239,9 @@ impl SyncManager {
         }
     }
 
-    /// A local item was deleted (§2.7 soft delete). Records the intent; the
-    /// async remote tombstone rides the supervisor in a later pass.
+    /// A local item was deleted (§2.7 soft delete). DEFERRED: currently only
+    /// logs — nothing durable is recorded and no remote tombstone is produced
+    /// yet (v1 debt; `EngineConsumer` applies only Put/Del inbound in P1).
     pub fn note_deleted(&self, path: &std::path::Path) {
         #[cfg(feature = "sync")]
         {
@@ -254,8 +255,9 @@ impl SyncManager {
         }
     }
 
-    /// A local item was moved/renamed (§2.7). Records the intent; the async
-    /// remote move rides the supervisor in a later pass.
+    /// A local item was moved/renamed (§2.7). DEFERRED: currently only logs —
+    /// nothing durable is recorded and no remote move is produced yet (same
+    /// status as `note_deleted`).
     pub fn note_moved(&self, from: &std::path::Path, to: &std::path::Path) {
         #[cfg(feature = "sync")]
         {

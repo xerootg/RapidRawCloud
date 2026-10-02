@@ -44,6 +44,32 @@ fn sync_off_chokepoint_is_byte_identical_to_upstream_fs_write() {
         dir.path().join("img.NEF.rrdata"),
         "the sidecar path must be unchanged"
     );
+
+    // ...and the same *permissions*. Upstream's old `fs::write` created a new
+    // sidecar at `0o666 & !umask`; the chokepoint's temp+rename must not
+    // tighten that to tempfile's 0600. Compare against a real `fs::write`
+    // reference so the assertion holds under any umask (ARCHITECTURE.md §7).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let reference = dir.path().join("reference.NEF.rrdata");
+        std::fs::write(&reference, &expected).expect("fs::write reference");
+        let got = std::fs::metadata(&sidecar)
+            .expect("stat sidecar")
+            .permissions()
+            .mode()
+            & 0o777;
+        let want = std::fs::metadata(&reference)
+            .expect("stat reference")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            got, want,
+            "with sync off, save_sidecar must create the sidecar with the \
+             same mode as fs::write (want {want:o}, got {got:o})"
+        );
+    }
 }
 
 #[test]

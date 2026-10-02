@@ -41,7 +41,9 @@ pub fn notify_new_original(path: &Path) {
     }
 }
 
-/// An item was deleted locally → soft delete + tombstone (§2.7).
+/// An item was deleted locally → soft delete + tombstone (§2.7). Deferred:
+/// the real body currently only logs (no durable tombstone yet) and has no
+/// upstream call site.
 pub fn notify_deleted(path: &Path) {
     #[cfg(feature = "sync")]
     {
@@ -53,7 +55,9 @@ pub fn notify_deleted(path: &Path) {
     }
 }
 
-/// An item was moved/renamed → remote move (§2.7).
+/// An item was moved/renamed → remote move (§2.7). Deferred: the real body
+/// currently only logs (no durable move recorded yet) and has no upstream
+/// call site.
 pub fn notify_moved(from: &Path, to: &Path) {
     #[cfg(feature = "sync")]
     {
@@ -157,17 +161,21 @@ mod imp {
     }
 
     pub fn notify_deleted(path: &Path) {
-        // §2.7 soft delete + tombstone. The full remote tombstone is an
-        // async S3 effect driven by the supervisor; the hook records the
-        // local intent for the next cycle. Best-effort, never panics.
+        // §2.7 soft delete + tombstone — DEFERRED. `EngineConsumer` applies
+        // only Put/Del inbound in P1; local delete→tombstone propagation is
+        // documented v1 debt. For now `note_deleted` only logs the event —
+        // nothing durable is recorded and no tombstone is produced. The hook
+        // is also not yet wired at any upstream call site. Best-effort,
+        // never panics.
         if let Some(mgr) = global_manager() {
             mgr.note_deleted(path);
         }
     }
 
     pub fn notify_moved(from: &Path, to: &Path) {
-        // §2.7 remote move. Same deferral as `notify_deleted`: the hook
-        // records intent; the async move effect rides the supervisor.
+        // §2.7 remote move — DEFERRED, same status as `notify_deleted`:
+        // `note_moved` only logs; nothing durable is recorded and the hook
+        // has no upstream call site yet.
         if let Some(mgr) = global_manager() {
             mgr.note_moved(from, to);
         }
@@ -198,32 +206,124 @@ mod imp {
     }
 
     pub fn sync_exit_flush(app: &tauri::AppHandle) {
-        // Bounded (<=2s) opportunistic drain of queued small sidecar
-        // uploads on `RunEvent::ExitRequested` (§3.3). Runs the async flush
-        // to completion on a transient current-thread runtime so the
-        // synchronous Tauri run-event callback can call it directly, and is
-        // itself hard-bounded so shutdown never hangs.
+        // Bounded (<=2s) opportunistic drain of queued small sidecar uploads
+        // on `RunEvent::ExitRequested` (§3.3). The `AppHandle` is accepted
+        // for call-site symmetry only; the drain routes through the
+        // process-global manager.
         let _ = app;
+        run_exit_flush(EXIT_FLUSH_BUDGET);
+    }
+
+    /// Drives the bounded exit flush to completion from a *synchronous*
+    /// caller, hard-bounded so shutdown can never hang.
+    ///
+    /// The async drain is always run on a dedicated thread that owns a fresh
+    /// current-thread runtime, rather than a `block_on` on the calling
+    /// thread. Today the Tauri `RunEvent::ExitRequested` callback is not
+    /// inside a tokio runtime, so a direct `block_on` would be fine; but once
+    /// the P2 `configure` command lands this may be invoked from within the
+    /// app's runtime, where a nested `block_on` panics with "Cannot start a
+    /// runtime from within a runtime" (P1-U7 latent finding). Running on a
+    /// separate thread removes that ambient runtime entirely, so it is safe
+    /// from either context. The join is bounded because `exit_flush` itself
+    /// times out at `budget`.
+    pub(crate) fn run_exit_flush(budget: Duration) {
         let Some(mgr) = global_manager() else {
             return;
         };
         if !mgr.is_configured() {
             return;
         }
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                log::warn!("exit flush: could not build runtime: {e}");
-                return;
-            }
-        };
-        runtime.block_on(async {
-            if let Err(e) = mgr.exit_flush(EXIT_FLUSH_BUDGET).await {
-                log::warn!("exit flush: {e}");
-            }
+        let worker = std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::warn!("exit flush: could not build runtime: {e}");
+                    return;
+                }
+            };
+            runtime.block_on(async {
+                if let Err(e) = mgr.exit_flush(budget).await {
+                    log::warn!("exit flush: {e}");
+                }
+            });
         });
+        // Bounded by `exit_flush`'s own timeout; a join error (worker panic)
+        // must not propagate onto the shutdown path.
+        if worker.join().is_err() {
+            log::warn!("exit flush: worker thread panicked");
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::sync::{Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+
+        use crate::sync::{Credentials, SyncManager, SyncSettings};
+
+        /// Serializes the tests that install the process-global manager.
+        fn serial() -> std::sync::MutexGuard<'static, ()> {
+            static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+            LOCK.get_or_init(|| Mutex::new(()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// A manager configured against an unreachable endpoint with nothing
+        /// queued: `exit_flush` returns quickly (empty drain) and, even if it
+        /// touched the network, is hard-bounded by its own timeout.
+        fn configured() -> std::sync::Arc<SyncManager> {
+            let root = tempfile::tempdir().expect("root");
+            let state = tempfile::tempdir().expect("state");
+            // Keep the state dir on disk for the lifetime of the test; the
+            // manager opens a redb file under it.
+            let root = root.keep();
+            let state = state.keep();
+            let mgr = SyncManager::new_inert();
+            mgr.configure(
+                SyncSettings {
+                    enabled: true,
+                    endpoint: "http://127.0.0.1:1".to_string(),
+                    bucket: "exitflush-unit".to_string(),
+                    region: "garage".to_string(),
+                    ..SyncSettings::default()
+                },
+                Credentials {
+                    access_key: "AKIATEST".to_string(),
+                    secret_key: "secrettest".to_string(),
+                },
+                root,
+                state,
+            )
+            .expect("configure");
+            mgr
+        }
+
+        #[test]
+        fn run_exit_flush_from_sync_context_returns_bounded() {
+            let _g = serial();
+            crate::sync::install_global_manager(configured());
+            let start = Instant::now();
+            super::run_exit_flush(Duration::from_millis(200));
+            assert!(
+                start.elapsed() < Duration::from_secs(8),
+                "the exit-flush wrapper must return within its bound, got {:?}",
+                start.elapsed()
+            );
+        }
+
+        #[tokio::test]
+        async fn run_exit_flush_within_a_tokio_runtime_does_not_panic() {
+            let _g = serial();
+            crate::sync::install_global_manager(configured());
+            // Regression for the P1-U7 latent finding: invoking the exit-flush
+            // wrapper from *inside* a tokio runtime must not panic with
+            // "Cannot start a runtime from within a runtime".
+            super::run_exit_flush(Duration::from_millis(200));
+        }
     }
 }

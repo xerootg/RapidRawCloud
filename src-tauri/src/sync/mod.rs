@@ -89,6 +89,21 @@ pub fn sidecar_lock_for(path: &std::path::Path) -> Arc<std::sync::Mutex<()>> {
         .clone()
 }
 
+/// Removes `path`'s lock entry iff no writer currently holds it (its only
+/// remaining strong ref is the map's own, `strong_count == 1`). Keeps the
+/// map from growing one permanent entry per distinct sidecar path for the
+/// process lifetime (P1-U7 review).
+///
+/// Safe w.r.t. the per-path serialization guarantee: `remove_if` and
+/// `sidecar_lock_for`'s `entry` both take the same DashMap shard write lock,
+/// so a concurrent `sidecar_lock_for(path)` cannot clone the `Arc` between
+/// the count check and the removal. Removal therefore happens only when no
+/// live writer holds the lock; a subsequent writer re-creates a fresh lock,
+/// and two live writers for one path can never hold different mutexes.
+pub fn prune_sidecar_lock(path: &std::path::Path) {
+    SIDECAR_LOCKS.remove_if(path, |_, lock| Arc::strong_count(lock) == 1);
+}
+
 // The process-global manager handle. The chokepoint's hook bodies route
 // through this so a `save_sidecar` call reaches the configured engine even
 // at call sites that never see the Tauri `AppHandle` (the ~15 batch write
