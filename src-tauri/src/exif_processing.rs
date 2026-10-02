@@ -659,11 +659,20 @@ pub fn merge_exif_from_source(meta: &mut ImageMetadata, source_path: &Path) {
         return;
     }
 
+    // Pure extraction only: this runs INSIDE the caller's `update_sidecar`
+    // closure, which already holds this path's per-path lock. `read_exif_data`
+    // has a write side effect (it persists freshly-read EXIF back into the
+    // primary sidecar via `save_sidecar`), which would re-enter the held,
+    // non-reentrant lock and self-deadlock (P1-U7 round-3 blocker). We only
+    // need the map in memory — the enclosing `update_sidecar` writes the
+    // merged document out under the lock — so read the bytes without the
+    // persist. `read_exif_data_from_bytes` matches `read_exif_data`'s
+    // extraction exactly, minus the caching write.
     let source_path_str = source_path.to_string_lossy();
     let extracted_exif = if let Ok(mmap) = crate::file_management::read_file_mapped(source_path) {
-        read_exif_data(&source_path_str, &mmap)
+        read_exif_data_from_bytes(&source_path_str, &mmap)
     } else if let Ok(bytes) = std::fs::read(source_path) {
-        read_exif_data(&source_path_str, &bytes)
+        read_exif_data_from_bytes(&source_path_str, &bytes)
     } else {
         std::collections::HashMap::new()
     };
@@ -1976,12 +1985,6 @@ fn load_primary_metadata(image_path: &Path) -> ImageMetadata {
     load_sidecar(&primary)
 }
 
-fn save_primary_metadata(image_path: &Path, metadata: &ImageMetadata) -> std::io::Result<()> {
-    let primary = get_primary_sidecar_path(image_path);
-    save_sidecar(None, &primary, metadata, crate::sync::WriteOrigin::Primary)
-        .map_err(std::io::Error::other)
-}
-
 pub fn read_rrexif_sidecar(image_path: &Path) -> Option<HashMap<String, String>> {
     let primary = get_primary_sidecar_path(image_path);
 
@@ -2049,9 +2052,26 @@ pub fn read_exif_data(path: &str, file_bytes: &[u8]) -> HashMap<String, String> 
     if !exif_map.is_empty() {
         let primary = get_primary_sidecar_path(source_path);
         if primary.exists() {
-            let mut metadata = load_primary_metadata(source_path);
-            metadata.exif = Some(exif_map.clone());
-            let _ = save_primary_metadata(source_path, &metadata);
+            // Cache the extracted EXIF into the primary sidecar UNDER the
+            // per-path lock (P1-U7 round-3 major): loading outside the lock
+            // and writing via `save_sidecar` would clobber any rating/tag/
+            // adjustment a concurrent writer committed between the load and
+            // the write. `update_sidecar` re-reads the base under the lock and
+            // only fills `exif` when still absent, preserving the concurrent
+            // edit. (Never called while this path's lock is already held —
+            // `merge_exif_from_source` uses `read_exif_data_from_bytes`.)
+            let _ = update_sidecar(
+                None,
+                &primary,
+                crate::sync::WriteOrigin::ExifCache,
+                |metadata| {
+                    if metadata.exif.is_some() {
+                        return false;
+                    }
+                    metadata.exif = Some(exif_map.clone());
+                    true
+                },
+            );
         } else {
             save_exif_to_rrcache(source_path, exif_map.clone());
         }
@@ -2073,11 +2093,21 @@ pub fn persist_exif_if_missing(source_path: &Path, source_path_str: &str, file_b
     let primary = get_primary_sidecar_path(source_path);
 
     if primary.exists() {
-        let mut metadata = load_primary_metadata(source_path);
-        if metadata.exif.is_none() {
-            metadata.exif = Some(exif_map);
-            let _ = save_primary_metadata(source_path, &metadata);
-        }
+        // RMW under the per-path lock (P1-U7 round-3 major): re-check `exif`
+        // under the lock and only fill it when still absent, so a concurrent
+        // rating/tag/adjustment write is never clobbered by this cache fill.
+        let _ = update_sidecar(
+            None,
+            &primary,
+            crate::sync::WriteOrigin::ExifCache,
+            |metadata| {
+                if metadata.exif.is_some() {
+                    return false;
+                }
+                metadata.exif = Some(exif_map.clone());
+                true
+            },
+        );
     } else {
         save_exif_to_rrcache(source_path, exif_map);
     }
@@ -2098,8 +2128,194 @@ pub fn write_rrexif_sidecar(source_path_str: &str, target_image_path: &Path) -> 
         return Ok(());
     }
 
-    let mut metadata = load_primary_metadata(target_image_path);
-    metadata.exif = Some(exif_data);
-    save_primary_metadata(target_image_path, &metadata)
-        .map_err(|e| format!("Failed to write sidecar: {}", e))
+    // Seed the target's `exif` UNDER the per-path lock (P1-U7 round-3 major):
+    // load + set + `save_sidecar` outside the lock would clobber any field a
+    // concurrent writer committed on the target between the load and the
+    // write. `update_sidecar` re-reads the target's base under the lock and
+    // overwrites only `exif`, preserving every other field.
+    let primary = get_primary_sidecar_path(target_image_path);
+    update_sidecar(
+        None,
+        &primary,
+        crate::sync::WriteOrigin::ExifCache,
+        |metadata| {
+            metadata.exif = Some(exif_data.clone());
+            true
+        },
+    )
+    .map(|_| ())
+    .map_err(|e| format!("Failed to write sidecar: {}", e))
+}
+
+#[cfg(test)]
+mod round3_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Minimal JPEG carrying one EXIF ASCII field (`Make = "TestCam"`), so
+    /// `read_exif_data_from_bytes` yields a non-empty map on a path the
+    /// EXIF-population code treats as a real image.
+    fn exif_jpeg() -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0xFF, 0xD8]); // SOI
+        v.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x2A]); // APP1, len = 42
+        v.extend_from_slice(b"Exif\x00\x00");
+        // TIFF header (little-endian), IFD0 at offset 8.
+        v.extend_from_slice(&[0x49, 0x49, 0x2A, 0x00, 0x08, 0x00, 0x00, 0x00]);
+        // IFD0: 1 entry.
+        v.extend_from_slice(&[0x01, 0x00]);
+        // entry: tag 0x010F (Make), type 2 (ASCII), count 8, value offset 0x1A.
+        v.extend_from_slice(&[
+            0x0F, 0x01, 0x02, 0x00, 0x08, 0x00, 0x00, 0x00, 0x1A, 0x00, 0x00, 0x00,
+        ]);
+        // next IFD offset = 0.
+        v.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
+        // value data: "TestCam\0".
+        v.extend_from_slice(b"TestCam\x00");
+        v.extend_from_slice(&[0xFF, 0xD9]); // EOI
+        v
+    }
+
+    fn seed(path: &Path, meta: &ImageMetadata) {
+        std::fs::write(path, serde_json::to_vec_pretty(meta).unwrap()).unwrap();
+    }
+
+    /// Regression for the P1-U7 round-3 review (BLOCKER): the chokepoint's
+    /// per-path lock is non-reentrant, so nothing reached from inside an
+    /// `update_sidecar` closure may re-enter `save_sidecar`/`update_sidecar`
+    /// on the same path. `merge_exif_from_source` is called inside that
+    /// closure by the editor-autosave and the batch-adjustment RMW sites
+    /// (file_management.rs). Before the fix it called `read_exif_data`, which
+    /// — when the primary sidecar exists but holds `exif = None` and the
+    /// original has extractable EXIF — persisted the freshly-read EXIF back
+    /// into the primary sidecar via `save_sidecar(None, primary, ..)` on the
+    /// SAME path, re-locking the per-path mutex the enclosing `update_sidecar`
+    /// already held and self-deadlocking. This drives that exact path under a
+    /// watchdog: a deadlock never returns.
+    #[test]
+    fn merge_exif_from_source_under_held_lock_does_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("photo.jpg");
+        std::fs::write(&source, exif_jpeg()).unwrap();
+
+        // A primary sidecar that exists with `exif = None` — exactly what
+        // set_rating / set_color_label / tag edits produce (they never merge
+        // EXIF) — and no rrcache/.rrexif entry for the image.
+        let primary = get_primary_sidecar_path(&source);
+        seed(
+            &primary,
+            &ImageMetadata {
+                rating: 3,
+                exif: None,
+                ..ImageMetadata::default()
+            },
+        );
+
+        // The real editor-autosave / batch-adjustment shape: merge EXIF on
+        // the base loaded under the lock, then write.
+        let primary_in = primary.clone();
+        let handle = std::thread::spawn(move || {
+            update_sidecar(None, &primary_in, crate::sync::WriteOrigin::User, |meta| {
+                merge_exif_from_source(meta, &source);
+                true
+            })
+        });
+
+        let start = Instant::now();
+        while !handle.is_finished() {
+            if start.elapsed() > Duration::from_secs(8) {
+                panic!(
+                    "merge_exif_from_source re-entered save_sidecar under the held per-path \
+                     lock and self-deadlocked (the edit never persists, the lock is wedged)"
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let written = handle
+            .join()
+            .expect("update_sidecar thread panicked")
+            .expect("update_sidecar must succeed");
+        assert!(
+            written.exif.is_some(),
+            "the EXIF merge must populate exif in the written document"
+        );
+        assert_eq!(written.rating, 3, "the pre-existing rating must be preserved");
+
+        let on_disk: ImageMetadata =
+            serde_json::from_slice(&std::fs::read(&primary).unwrap()).unwrap();
+        assert!(on_disk.exif.is_some(), "the merged EXIF must land on disk");
+        assert_eq!(on_disk.rating, 3);
+    }
+
+    /// Regression for the P1-U7 round-3 review (MAJOR, lost-update): the
+    /// EXIF-population RMW sites must persist UNDER the per-path lock. Before
+    /// the fix, `read_exif_data` loaded the primary sidecar OUTSIDE the lock,
+    /// set only `exif`, and wrote the whole document back via `save_sidecar`,
+    /// so a rating/tag/adjustment edit a concurrent writer committed between
+    /// that stale load and the locked write was silently clobbered — the very
+    /// AI-tagging-vs-user-edit lost update the chokepoint claims to close.
+    ///
+    /// Deterministic (no sleep-race for the pass/fail signal): hold the path's
+    /// lock, start `read_exif_data` (its persist must block before it reads
+    /// the base), commit a concurrent `rating = 5` edit to disk, release the
+    /// lock. With the RMW under the lock it re-reads `rating = 5` and keeps it
+    /// while adding exif; with the load outside the lock it had already read
+    /// the stale `rating = 0` and writes it back, losing the committed edit.
+    #[test]
+    fn read_exif_data_persist_does_not_clobber_concurrent_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("shot.jpg");
+        std::fs::write(&source, exif_jpeg()).unwrap();
+        let source_str = source.to_string_lossy().to_string();
+        let bytes = exif_jpeg();
+
+        let primary = get_primary_sidecar_path(&source);
+        seed(
+            &primary,
+            &ImageMetadata {
+                rating: 0,
+                exif: None,
+                ..ImageMetadata::default()
+            },
+        );
+
+        // Hold the per-path lock so the EXIF-population RMW cannot write until
+        // the concurrent edit has landed and we release it.
+        let lock = crate::sync::sidecar_lock_for(&primary);
+        let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        let handle =
+            std::thread::spawn(move || read_exif_data(&source_str, &bytes));
+
+        // Let the read thread reach its lock-wait (and, for the old
+        // load-outside-the-lock pattern, perform its stale read of rating=0).
+        std::thread::sleep(Duration::from_millis(300));
+
+        // A concurrent writer commits rating=5 while the EXIF persist is
+        // blocked. exif stays None, so the EXIF-population path still writes.
+        seed(
+            &primary,
+            &ImageMetadata {
+                rating: 5,
+                exif: None,
+                ..ImageMetadata::default()
+            },
+        );
+
+        drop(guard);
+        let returned = handle.join().expect("read_exif_data thread panicked");
+        assert!(!returned.is_empty(), "read_exif_data must return the EXIF map");
+
+        let on_disk: ImageMetadata =
+            serde_json::from_slice(&std::fs::read(&primary).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.rating, 5,
+            "the EXIF-population persist clobbered a concurrently-committed rating edit — \
+             its read-modify-write did not run under the per-path lock"
+        );
+        assert!(
+            on_disk.exif.is_some(),
+            "the EXIF-population persist must have run (exif populated on disk)"
+        );
+    }
 }

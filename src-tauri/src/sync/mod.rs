@@ -61,8 +61,6 @@ pub enum WriteOrigin {
     XmpImport,
     /// A new virtual copy's sidecar.
     VirtualCopy,
-    /// The primary-metadata save path (`save_primary_metadata`).
-    Primary,
     /// `load_sidecar`'s auto-heal rewrite (bloated-exif truncation).
     AutoHeal,
 }

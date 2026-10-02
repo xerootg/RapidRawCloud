@@ -480,37 +480,44 @@ pub async fn update_exif_fields(
         paths.par_iter().for_each(|path| {
             let original_path = Path::new(&path);
             let primary_path = crate::exif_processing::get_primary_sidecar_path(original_path);
-            let temp_metadata = crate::exif_processing::load_sidecar(&primary_path);
 
-            let mut exif_data = temp_metadata.exif.unwrap_or_else(|| {
-                if let Some(existing) = crate::exif_processing::read_rrexif_sidecar(original_path) {
-                    existing
-                } else if let Ok(mmap) = read_file_mapped(original_path) {
-                    crate::exif_processing::read_exif_data_from_bytes(path, &mmap)
-                } else if let Ok(bytes) = fs::read(original_path) {
-                    crate::exif_processing::read_exif_data_from_bytes(path, &bytes)
-                } else {
-                    HashMap::new()
-                }
-            });
-
-            for (k, v) in &updates {
-                let trimmed = v.trim();
-                if trimmed.is_empty() {
-                    exif_data.remove(k);
-                } else {
-                    exif_data.insert(k.clone(), trimmed.to_string());
-                }
-            }
-
-            let mut final_metadata = crate::exif_processing::load_sidecar(&primary_path);
-
-            final_metadata.exif = Some(exif_data);
-            let _ = crate::exif_processing::save_sidecar(
+            // Read-modify-write the EXIF field UNDER the per-path lock (P1-U7
+            // round-3 major): the old pattern loaded the document outside the
+            // lock and wrote it back through `save_sidecar`, clobbering any
+            // rating/tag/adjustment a concurrent writer committed between the
+            // load and the write. `update_sidecar` re-reads the base under the
+            // lock, so only `exif` is replaced and every other field survives.
+            let _ = crate::exif_processing::update_sidecar(
                 None,
                 &primary_path,
-                &final_metadata,
                 crate::sync::WriteOrigin::ExifCache,
+                |metadata| {
+                    let mut exif_data = metadata.exif.take().unwrap_or_else(|| {
+                        if let Some(existing) =
+                            crate::exif_processing::read_rrexif_sidecar(original_path)
+                        {
+                            existing
+                        } else if let Ok(mmap) = read_file_mapped(original_path) {
+                            crate::exif_processing::read_exif_data_from_bytes(path, &mmap)
+                        } else if let Ok(bytes) = fs::read(original_path) {
+                            crate::exif_processing::read_exif_data_from_bytes(path, &bytes)
+                        } else {
+                            HashMap::new()
+                        }
+                    });
+
+                    for (k, v) in &updates {
+                        let trimmed = v.trim();
+                        if trimmed.is_empty() {
+                            exif_data.remove(k);
+                        } else {
+                            exif_data.insert(k.clone(), trimmed.to_string());
+                        }
+                    }
+
+                    metadata.exif = Some(exif_data);
+                    true
+                },
             );
         });
         Ok(())
@@ -4122,6 +4129,16 @@ pub fn create_virtual_copy(
     // common "source sidecar exists" path, which bypassed both
     // (ARCHITECTURE.md §3.4 lists `create_virtual_copy` as a chokepoint
     // site). The destination is a fresh `vc=` key, so there is no clobber.
+    //
+    // Two behavior changes vs. the old `fs::copy` (both intentional and
+    // benign, P1-U7 round-3 minor): (1) the copy is a re-serialization of the
+    // parsed `ImageMetadata`, not a byte copy, so any forward-compat JSON a
+    // newer app wrote that `ImageMetadata` does not model is dropped on the
+    // copy — marginal, since serde already drops unknown fields on every
+    // other load path and `ImageMetadata` is the canonical schema; (2)
+    // `load_sidecar` auto-heals a bloated-EXIF SOURCE sidecar, so making a
+    // virtual copy can trigger a write — and, when sync is configured, a
+    // churn notification — on the *source* item. Both are rare and idempotent.
     let copy_metadata = if source_sidecar_path.exists() {
         crate::exif_processing::load_sidecar(&source_sidecar_path)
     } else {

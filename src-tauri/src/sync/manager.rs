@@ -448,6 +448,19 @@ mod imp {
                 other => other.map_err(se)?,
             };
 
+            // Timeouts are all `None` here (no reqwest network bound).
+            // `exit_flush` time-boxes shutdown by wrapping `flush_uploads` in
+            // `tokio::time::timeout`, so shutdown is safe; but `run_cycle` /
+            // `run_once` and the backend probe have no outer bound. This is
+            // unreachable in P1 — the manager is installed-but-unconfigured in
+            // setup(), there is no supervisor, and the tests drive cycles
+            // under their own harness bounds — so it is not a live defect for
+            // this unit. It becomes relevant at the P2 command layer, where a
+            // `sync_run_once` command against an unreachable endpoint could
+            // hang indefinitely; close it there with a sensible default
+            // `request_timeout` (and/or an outer bound on `run_once`) rather
+            // than leaving the per-call network unbounded (P1-U7 round-3
+            // minor).
             let s3 = S3Client::new(S3Config {
                 endpoint: settings.endpoint.clone(),
                 region: settings.region.clone(),
