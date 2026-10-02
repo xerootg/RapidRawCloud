@@ -38,7 +38,7 @@ use std::path::Path;
 
 use bytes::Bytes;
 
-use crate::clock::{compare, DeviceId, VvOrder};
+use crate::clock::{compare, pick_winner, Candidate, DeviceId, VersionVector, VvOrder};
 use crate::journal::{decode_segment, JournalEntry, Kind, Op, Tombstone, SEGMENT_MAX_BYTES};
 use crate::keys::{
     classify_key, device_retired_key, journal_segment_key, library_key, local_path, manifest_key,
@@ -504,19 +504,40 @@ pub async fn compact_own_segments(
 
     // Rule 1: the owner's own manifest must durably cover the segments, and
     // its presence is re-confirmed by a read-back HEAD before any DELETE.
+    // The deletable ceiling never exceeds the **published** cursor — the
+    // db-folded extent build_manifest can prove (its own-cursor attestation
+    // + rows/deleted-set fold every published entry's effect), so a segment
+    // the db has not folded (`published < max_seq`) is always skipped, never
+    // retroactively covered.
+    let published = db.published_cursor()?;
     let (ceiling, manifest_written_ts) = match get_manifest(s3, bucket, &owner).await {
         Ok(manifest) => {
-            // A manifest is already present: use its coverage as-is. We never
-            // force coverage up to the published cursor here — a segment whose
-            // entries are not provably folded (cursors[owner] < max_seq) must
-            // be *skipped*, never retroactively covered then deleted (§2.10
-            // safety). The read-back HEAD still runs, so a transient anomaly
-            // aborts the whole pass.
-            verify_manifest_present(s3, bucket, &owner, None, db).await?;
-            (
-                manifest.header.cursors.get(&owner).copied().unwrap_or(0),
-                manifest.header.written_server_ts,
-            )
+            let stored = manifest.header.cursors.get(&owner).copied().unwrap_or(0);
+            if stored < published {
+                // The on-wire manifest predates segments published since it
+                // was written (review round 0 major: without this the frozen
+                // cursor wedged every later segment at ManifestCoverageBelow
+                // forever — unbounded journal growth, defeating §2.10's ~2
+                // week bound). Rebuild to cover the published cursor, PUT, and
+                // read-back verify the ETag. Freshly written, so rule 2 holds
+                // every segment back this pass (age 0); the reconfirm clock
+                // resets on a coverage advance exactly as this function's
+                // docstring promises, and deletion resumes ≥ 24 h later.
+                let manifest = build_manifest(db, now)?;
+                let etag = put_manifest(s3, bucket, &owner, &manifest).await?;
+                verify_manifest_present(s3, bucket, &owner, Some(&etag), db).await?;
+                (
+                    manifest.header.cursors.get(&owner).copied().unwrap_or(0),
+                    now,
+                )
+            } else {
+                // Coverage already current: use it as-is, re-confirmed by a
+                // read-back HEAD (a transient anomaly aborts the whole pass).
+                // The unchanged manifest keeps aging in place, so rule 2 can
+                // fire on this pass.
+                verify_manifest_present(s3, bucket, &owner, None, db).await?;
+                (stored, manifest.header.written_server_ts)
+            }
         }
         Err(ManifestError::S3(e)) if e.is_no_such_key() => {
             // Absent: build + PUT a fresh covering manifest and read-back
@@ -657,11 +678,11 @@ pub async fn tombstone_gc(
     // content_id — needed for the content-id liveness check).
     let prefix = format!("{CONTROL_PREFIX}tombstones/");
     let keys = list_keys_under(s3, bucket, &prefix).await?;
-    struct Candidate {
+    struct TombCandidate {
         tomb: Tombstone,
         content_id: Option<ContentId>,
     }
-    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut candidates: Vec<TombCandidate> = Vec::new();
     for key in &keys {
         if !matches!(classify_key(key), KeyClass::Tombstone { .. }) {
             continue;
@@ -679,10 +700,22 @@ pub async fn tombstone_gc(
             continue;
         };
         let content_id = db.get_item(&tomb.relkey)?.and_then(|r| r.content_id);
-        candidates.push(Candidate { tomb, content_id });
+        candidates.push(TombCandidate { tomb, content_id });
     }
 
     let active = active_devices(s3, bucket, clock, cfg).await?;
+
+    // §2.10 (d) "a final journal re-read (all devices' prefixes)": the
+    // on-wire truth, consulted in UNION with the runner's local converged
+    // state for both the supersession and the content-id liveness checks.
+    // This closes the catch-up→GC race — a resurrecting put (or a live
+    // sibling sharing a content_id) that is durably published but not yet
+    // folded into the runner's local state would otherwise be invisible to
+    // a possibly-stale local snapshot, and GC would destroy data a live
+    // dominating version still references (review round 0 blocker + major,
+    // Garage-probe-verified). The local state still covers a put whose
+    // segment was already compacted away, so neither source alone is enough.
+    let fleet = read_fleet_entries(s3, bucket).await?;
 
     // Classify each tombstone against the 4-condition gate.
     enum Class {
@@ -697,18 +730,28 @@ pub async fn tombstone_gc(
             classes.push(Class::Retained(GcSkipReason::WithinGrace { age_secs: age }));
             continue;
         }
-        // (d) not superseded by a resurrecting put (edits beat deletes).
-        if is_superseded(db, &c.tomb)? {
+        // (d) not superseded by a resurrecting put (edits beat deletes) —
+        // local converged state OR the final journal re-read.
+        if is_superseded(db, &c.tomb)? || fleet_supersedes(&fleet, &c.tomb) {
             classes.push(Class::Retained(GcSkipReason::Superseded));
             continue;
         }
         // (a) every active device applied past it, or the 14-day cap elapsed.
-        // (Past the 30-day grace the cap trivially holds, so a laggard never
-        // blocks a grace-passed tombstone — but we evaluate it faithfully.)
-        let horizon = horizon_applied(&active, &c.tomb.device);
-        let del_seq = u64::from(c.tomb.vv.get(&c.tomb.device));
+        // The "applied past it" fast path compares the del entry's own
+        // journal **seq** (from the re-read — seq space) against each active
+        // device's applied cursor (also seq space); a tombstone carries no
+        // seq of its own, so when its del has been compacted off the wire
+        // the 14-day cap is the sole (a) gate (review round 0 minor: the old
+        // code compared a seq-space horizon against a vv-space component —
+        // different counters — which passed prematurely under any
+        // grace<cap config; past the default 30-day grace the cap holds
+        // anyway, so defaults are unchanged).
         let cap_elapsed = age > cfg.laggard_cap_secs;
-        if horizon >= del_seq || cap_elapsed {
+        let applied_past = match fleet_del_seq(&fleet, &c.tomb) {
+            Some(del_seq) => horizon_applied(&active, &c.tomb.device) >= del_seq,
+            None => false,
+        };
+        if applied_past || cap_elapsed {
             classes.push(Class::Eligible);
         } else {
             classes.push(Class::Retained(GcSkipReason::HorizonBlocked));
@@ -776,13 +819,18 @@ pub async fn tombstone_gc(
 
             // Content-id liveness: destroy the content-addressed
             // preview/thumb objects ONLY when no live relkey and no in-grace
-            // tombstone still references the content_id.
+            // tombstone still references the content_id. Liveness is sourced
+            // from the runner's local state OR the final journal re-read — a
+            // live sibling (byte-identical original) on another device not
+            // yet folded locally still protects the shared content (review
+            // round 0 major, Garage-probe-verified).
             let mut content_destroyed = Vec::new();
             if let Some(content) = &c.content_id {
                 let live_ref = db
                     .iter_items()?
                     .into_iter()
-                    .any(|(_, r)| !r.deleted && r.content_id.as_ref() == Some(content));
+                    .any(|(_, r)| !r.deleted && r.content_id.as_ref() == Some(content))
+                    || fleet_content_live(&fleet, content);
                 let grace_ref = grace_content.contains(content);
                 if !live_ref && !grace_ref {
                     s3.delete_object(bucket, &preview_key(content)).await?;
@@ -899,10 +947,24 @@ pub async fn auto_retire_sweep(
 }
 
 /// §2.10 orphaned-prefix GC: the journal segments of **retired** devices,
-/// folded into the GC **runner's** manifest and then deleted under the same
-/// rules as the runner's own prefix (coverage + 24 h re-confirm + horizon or
-/// 14-day cap). Returns one [`CompactionSummary`] per retired device whose
-/// prefix was touched, keyed by that device id. Idempotent.
+/// folded into the GC **runner's** manifest (through the §2.6/§2.7 ordered
+/// apply, [`fold_entry`]) and then deleted. Returns one [`CompactionSummary`]
+/// per retired device whose prefix was touched, keyed by that device id.
+/// Idempotent.
+///
+/// Deletion rules (the orphan form of the own-prefix rules): **coverage** —
+/// the runner's freshly rebuilt manifest must cover the orphaned segment
+/// (`cursors[device] >= max_seq`), and that manifest is PUT and **read-back
+/// HEAD verified present before any DELETE** (§2.1 principle 3); **horizon**
+/// — every other active device must have applied past the segment. The
+/// own-prefix 24 h re-confirm does not translate: that insurance watches a
+/// manifest that ages in place across passes, whereas the runner rewrites
+/// and read-back-verifies its manifest *this* pass, which is a stronger
+/// presence proof than waiting to re-HEAD it. The own-prefix 14-day cap does
+/// not apply either — the runner holds no per-(device,seq) publish stamp for
+/// a foreign prefix (see the loop) — so a laggard that has not caught up to a
+/// retired device's prefix simply defers the reclaim to a later pass; the
+/// fold is lossless and already durable, so nothing is lost by waiting.
 ///
 /// This is how a dead device's journal growth is reclaimed without the dead
 /// device ever running again: the live runner owns the fold (its manifest's
@@ -1018,14 +1080,17 @@ pub async fn gc_retired_prefixes(
                 });
                 continue;
             }
-            // The runner holds no publish stamp for a foreign prefix, so the
-            // 14-day cap is conservative (never fires without a stamp); the
-            // fast path is the normal route for a cleared horizon.
-            let capped = match db.segment_published_server_ts(seg.first_seq)? {
-                Some(ts) => now.saturating_sub(ts) > cfg.laggard_cap_secs,
-                None => false,
-            };
-            if horizon >= seg.max_seq || capped {
+            // The 14-day cap does NOT apply to a foreign (orphaned) prefix:
+            // the runner's per-segment publish stamps are keyed by seq with
+            // no device component (state.rs `segment_pub_ts_key`), so a
+            // retired device's segment at first_seq=1 would read the
+            // runner's OWN stamp for its own first_seq=1 — a cross-device
+            // collision feeding the cap a wrong publish time (review round 0
+            // minor). The fast path (every active peer applied past the
+            // orphaned prefix) is the correct and sufficient route; the fold
+            // is already read-back verified above, so an un-cleared horizon
+            // simply retries next pass.
+            if horizon >= seg.max_seq {
                 s3.delete_object(bucket, &journal_segment_key(&orphan.device, seg.first_seq))
                     .await?;
                 summary.deleted_seqs.push(seg.first_seq);
@@ -1212,15 +1277,19 @@ pub async fn resolve_quarantine(
     }
 }
 
-/// Crate-internal: does `put` (vv `pv`) dominate a tombstone/del at vv `dv`?
-/// A resurrecting put is one that strictly dominates the deletion's vv
-/// (§2.6/§2.7). Exposed to the GC superseded-check; a thin wrapper over
-/// [`crate::clock::compare`] so the one spelling of "resurrects" lives here.
+/// Crate-internal: does a `put` at vv `pv` keep an item alive against a
+/// deletion at vv `dv` (§2.7 "edits beat deletes")? A put that **strictly
+/// dominates** the deletion is a restore/resurrection; a put **concurrent**
+/// with it is a genuine concurrent edit that also survives (the same
+/// un-hide predicate the engine's `apply_put` deleted-record arm uses).
+/// Only a put the deletion dominates-or-equals (`Less`/`Equal`) is
+/// superseded by it. Used by **both** the local-state and the on-wire
+/// journal supersession checks so one spelling of "resurrects" lives here.
 pub(crate) fn put_supersedes_del(
     pv: &crate::clock::VersionVector,
     dv: &crate::clock::VersionVector,
 ) -> bool {
-    matches!(compare(pv, dv), VvOrder::Greater)
+    matches!(compare(pv, dv), VvOrder::Greater | VvOrder::Concurrent)
 }
 
 // ---------------------------------------------------------------------------
@@ -1452,10 +1521,15 @@ async fn verify_deleted_set_folded(
     }
 }
 
-/// The §2.10 (d) superseded check: the runner's converged state is the
-/// result of applying every journal (and merge) through the one unified apply
-/// rule, so a resurrecting `put` shows up as a **live** item record whose vv
-/// dominates the tombstone's. Edits beat deletes survive GC (§2.7/§2.6).
+/// The §2.10 (d) superseded check against the runner's **local converged
+/// state**: a resurrecting `put` the runner has already applied shows up as
+/// a **live** item record whose vv supersedes the tombstone's (edits beat
+/// deletes, §2.7/§2.6). This is only one half of (d): a put durably
+/// published but **not yet folded locally** would not appear here, so
+/// [`tombstone_gc`] takes the UNION of this with [`fleet_supersedes`] (the
+/// §2.10-mandated final journal re-read) before destroying anything — the
+/// local check alone consulted a possibly-stale snapshot and destroyed a
+/// restore's data keys in the catch-up→GC race (review round 0 blocker).
 fn is_superseded(db: &SyncDb, tomb: &Tombstone) -> Result<bool, CompactError> {
     match db.get_item(&tomb.relkey)? {
         Some(item) if !item.deleted => Ok(put_supersedes_del(&item.vv, &tomb.vv)),
@@ -1463,12 +1537,121 @@ fn is_superseded(db: &SyncDb, tomb: &Tombstone) -> Result<bool, CompactError> {
     }
 }
 
-/// Folds one orphaned-prefix journal entry into the runner's state inside a
-/// caller-held transaction — the lossless reclamation apply (§2.3 "merge is
-/// the idempotent apply"): a `put` materializes a live row, a `del` a deleted
-/// row, so the rebuilt runner manifest carries the retired device's effects
-/// for every later bootstrapper. Content-level unclassifiable keys are
-/// skipped (the [`crate::reader::JournalConsumer`] error contract).
+/// The item relkey an entry's bucket key addresses (originals/sidecars/xmp),
+/// or `None` for a key outside the per-item namespace.
+fn entry_item_relkey(entry: &JournalEntry) -> Option<RelKey> {
+    match classify_key(&entry.key) {
+        KeyClass::Original { relkey }
+        | KeyClass::Sidecar { relkey, .. }
+        | KeyClass::Xmp { relkey } => Some(relkey),
+        _ => None,
+    }
+}
+
+/// The §2.10 (d) "final journal re-read (all devices' prefixes)": LISTs the
+/// whole journal namespace, GETs + decodes every segment, and returns all
+/// entries. Consulted in union with the runner's local converged state so a
+/// resurrecting put (or a live content sibling) durably on the wire but not
+/// yet folded locally cannot be destroyed. A segment that vanished between
+/// the LIST and the GET (a racing compaction) is skipped — a stale LIST
+/// never forces an action (§2.1 principle 3).
+async fn read_fleet_entries(
+    s3: &impl S3TransferApi,
+    bucket: &str,
+) -> Result<Vec<JournalEntry>, CompactError> {
+    let prefix = format!("{CONTROL_PREFIX}journal/");
+    let keys = list_keys_under(s3, bucket, &prefix).await?;
+    let mut entries = Vec::new();
+    for key in &keys {
+        if !matches!(classify_key(key), KeyClass::Journal { .. }) {
+            continue;
+        }
+        let body = match s3.get_object(bucket, key, None).await {
+            Ok(output) => output.body.collect_capped(SEGMENT_MAX_BYTES).await?,
+            Err(e) if e.is_no_such_key() => continue,
+            Err(e) => return Err(e.into()),
+        };
+        entries.extend(decode_segment(&body)?);
+    }
+    Ok(entries)
+}
+
+/// On-wire supersession: a `put` on the tombstone's relkey that the
+/// deletion does not dominate ([`put_supersedes_del`] — §2.7 edits beat
+/// deletes). The resurrecting-put half of §2.10 (d).
+fn fleet_supersedes(entries: &[JournalEntry], tomb: &Tombstone) -> bool {
+    entries.iter().any(|e| {
+        e.op == Op::Put
+            && entry_item_relkey(e).as_ref() == Some(&tomb.relkey)
+            && put_supersedes_del(&e.vv, &tomb.vv)
+    })
+}
+
+/// The seq of the tombstone's own `del` entry on the wire (its deleting
+/// device's prefix, matching relkey + vv) — the seq-space value §2.10 (a)'s
+/// "every active device applied past it" fast path compares against each
+/// active device's applied cursor (both seqs). `None` when the del's
+/// segment has been compacted away, in which case the 14-day cap is the
+/// sole (a) gate.
+fn fleet_del_seq(entries: &[JournalEntry], tomb: &Tombstone) -> Option<u64> {
+    entries
+        .iter()
+        .filter(|e| {
+            e.op == Op::Del
+                && e.device == tomb.device
+                && entry_item_relkey(e).as_ref() == Some(&tomb.relkey)
+                && compare(&e.vv, &tomb.vv) == VvOrder::Equal
+        })
+        .map(|e| e.seq)
+        .min()
+}
+
+/// On-wire content-id liveness: some relkey carries a live `put` referencing
+/// `content` — a put that no `del` on the same relkey dominates-or-equals.
+/// The fleet half of the content-destruction guard: a shared preview/thumb
+/// stays while any live reference to its byte-identical original exists.
+fn fleet_content_live(entries: &[JournalEntry], content: &ContentId) -> bool {
+    entries.iter().any(|put| {
+        if put.op != Op::Put || put.content_id.as_ref() != Some(content) {
+            return false;
+        }
+        let Some(rel) = entry_item_relkey(put) else {
+            return false;
+        };
+        // Live iff no del on this relkey dominates-or-equals the put's vv.
+        !entries.iter().any(|d| {
+            d.op == Op::Del
+                && entry_item_relkey(d).as_ref() == Some(&rel)
+                && matches!(compare(&put.vv, &d.vv), VvOrder::Less | VvOrder::Equal)
+        })
+    })
+}
+
+/// Folds one orphaned-prefix journal entry into the runner's **converged**
+/// state inside a caller-held transaction — the §2.6/§2.7 *ordered* apply,
+/// **not** a blind replay. Every entry is ordered (by version vector)
+/// against the runner's current converged head for its relkey, so an entry
+/// the head already supersedes is a no-op — never a resurrection, never a
+/// deletion-loss. This is the same vv-aware rule `merge()` and the engine
+/// [`crate::reader::JournalConsumer`] run; the download/loser side effects a
+/// live device would take are deliberately **not** taken here (the fold's
+/// only output is the runner's manifest rows + deleted set).
+///
+/// Review round 0 blocker (two directions, Garage-probe-verified): the prior
+/// implementation applied a `put` through an unconditional
+/// [`StateTxn::replay_put_item`] and a `del` through
+/// [`StateTxn::delete_item`] + [`StateTxn::record_deleted`] with **no vv
+/// comparison at all**. Folding a stale orphan `put` over a dominating
+/// deletion the runner had already converged flipped the item live *and*
+/// left the deleted-set row standing — the rebuilt manifest then carried
+/// both a live row and a deleted row for one relkey (the §2.3 live/deleted
+/// contradiction `build_manifest`'s docs forbid), the A3 mass-resurrection.
+/// Folding a stale orphan `del` over a live dominating edit destroyed the
+/// live version and advertised the deletion — a real deletion-loss in the
+/// runner's authoritative manifest. The ordered apply below closes both.
+///
+/// Content-level unclassifiable keys are skipped (the [`JournalConsumer`]
+/// error contract); `Move`/`Attest` ride later units.
 fn fold_entry(txn: &StateTxn<'_>, entry: &JournalEntry) -> Result<(), CompactError> {
     let relkey = match classify_key(&entry.key) {
         KeyClass::Original { relkey }
@@ -1477,22 +1660,171 @@ fn fold_entry(txn: &StateTxn<'_>, entry: &JournalEntry) -> Result<(), CompactErr
         _ => return Ok(()),
     };
     match entry.op {
-        Op::Put => {
-            txn.replay_put_item(&relkey, &fold_item_record(entry))?;
-        }
-        Op::Del => {
-            txn.delete_item(&relkey)?;
-            txn.record_deleted(
-                &relkey,
-                &DeletedRecord {
-                    vv: entry.vv.clone(),
-                    server_ts: entry.ts,
-                },
-            )?;
-        }
-        Op::Move | Op::Attest => {}
+        Op::Put => fold_put(txn, entry, &relkey),
+        Op::Del => fold_del(txn, entry, &relkey),
+        Op::Move | Op::Attest => Ok(()),
     }
+}
+
+/// The §2.6/§2.7 ordered apply of an orphaned `put` against the runner's
+/// converged head (its live/soft-deleted item record and any deleted-set
+/// row). Adopts the put only when the head does not already dominate it;
+/// edits beat deletes (a put a deletion does not dominate un-hides).
+fn fold_put(txn: &StateTxn<'_>, entry: &JournalEntry, relkey: &RelKey) -> Result<(), CompactError> {
+    let Some(local) = txn.get_item(relkey)? else {
+        // Unknown item: order against any recorded deletion (§2.7). A put
+        // the deletion dominates (or equals) stays hidden behind the row;
+        // otherwise it is live and clears the row.
+        let row = txn.get_deleted(relkey)?;
+        let hidden = row
+            .as_ref()
+            .is_some_and(|r| matches!(compare(&entry.vv, &r.vv), VvOrder::Less | VvOrder::Equal));
+        let mut record = fold_item_record(entry);
+        if let Some(row) = &row {
+            record.vv.merge(&row.vv);
+        }
+        record.deleted = hidden;
+        txn.replay_put_item(relkey, &record)?;
+        if !hidden && row.is_some() {
+            txn.remove_deleted(relkey)?;
+        }
+        return Ok(());
+    };
+    match compare(&entry.vv, &local.vv) {
+        // The runner's converged head already dominates (or equals) the
+        // folded put: it is already reflected, so applying it would
+        // resurrect a deletion the head folds (the round-0 resurrection
+        // blocker). No-op.
+        VvOrder::Less | VvOrder::Equal => Ok(()),
+        // A strictly newer version the runner had not folded: adopt it live.
+        VvOrder::Greater => fold_adopt_put(txn, entry, relkey, &local),
+        // §2.6 case 4 over the converged head. A soft-deleted head has no
+        // live content to keep, so a concurrent put un-hides and adopts
+        // outright (edits beat deletes); a live head keeps its primary when
+        // it wins the deterministic (ts, device) pick, folding both vvs.
+        VvOrder::Concurrent => {
+            if local.deleted || fold_put_wins(entry, &local) {
+                fold_adopt_put(txn, entry, relkey, &local)
+            } else {
+                let mut record = local.clone();
+                record.vv.merge(&entry.vv);
+                record.deleted = false;
+                txn.replay_put_item(relkey, &record)?;
+                txn.remove_deleted(relkey)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Adopt the folded `put` as the item's live head, folding the prior head's
+/// lineage (including any deletion the head carried) into the vv and
+/// clearing any deleted-set row — so the manifest advertises one truth.
+fn fold_adopt_put(
+    txn: &StateTxn<'_>,
+    entry: &JournalEntry,
+    relkey: &RelKey,
+    local: &ItemRecord,
+) -> Result<(), CompactError> {
+    let mut record = fold_item_record(entry);
+    record.vv.merge(&local.vv);
+    record.pinned = local.pinned;
+    record.last_access_unix = local.last_access_unix;
+    record.deleted = false;
+    txn.replay_put_item(relkey, &record)?;
+    txn.remove_deleted(relkey)?;
     Ok(())
+}
+
+/// The §2.7 ordered apply of an orphaned `del` against the runner's
+/// converged head. A `del` a live head strictly dominates (or that is
+/// concurrent with a live edit) is dropped — edits beat deletes; only a
+/// `del` that dominates (or equals a hidden head) hides the item and records
+/// the deleted-set row.
+fn fold_del(txn: &StateTxn<'_>, entry: &JournalEntry, relkey: &RelKey) -> Result<(), CompactError> {
+    let Some(local) = txn.get_item(relkey)? else {
+        // Unknown item: record the deletion anchor so a slower put cannot
+        // resurrect it out of order (§2.7), merging prior knowledge.
+        return fold_record_deletion(txn, relkey, &entry.vv, entry.ts);
+    };
+    if local.deleted {
+        // Already hidden: two deletes of one item both stand — fold the vv
+        // into the record and the row.
+        let mut record = local.clone();
+        record.vv.merge(&entry.vv);
+        txn.replay_put_item(relkey, &record)?;
+        return fold_record_deletion(txn, relkey, &entry.vv, entry.ts);
+    }
+    match compare(&entry.vv, &local.vv) {
+        // The live head supersedes (Less) the del, or re-delivers an
+        // already-applied one (Equal): nothing to delete — a stale orphan
+        // del must not destroy a live dominating edit (the round-0
+        // deletion-loss blocker).
+        VvOrder::Less | VvOrder::Equal => Ok(()),
+        // Dominating del: hide the item and record the deleted-set row.
+        VvOrder::Greater => {
+            let mut record = local.clone();
+            record.vv.merge(&entry.vv);
+            record.deleted = true;
+            txn.replay_put_item(relkey, &record)?;
+            fold_record_deletion(txn, relkey, &entry.vv, entry.ts)
+        }
+        // Concurrent del vs a live edit: EDITS BEAT DELETES (§2.7) — the
+        // item stays live and absorbs the del's vv (no row; the deletion
+        // lost). The fold needs only the runner's converged metadata to be
+        // right for its manifest, so no side-effecting resurrection fires.
+        VvOrder::Concurrent => {
+            let mut record = local.clone();
+            record.vv.merge(&entry.vv);
+            txn.replay_put_item(relkey, &record)?;
+            Ok(())
+        }
+    }
+}
+
+/// Records (or merges into) the per-item deleted-set row — vv max-merge,
+/// `server_ts` max — matching the engine's `record_deletion_row` so the
+/// fold's deleted set is identical to the one journal replay would produce.
+fn fold_record_deletion(
+    txn: &StateTxn<'_>,
+    relkey: &RelKey,
+    vv: &VersionVector,
+    server_ts: i64,
+) -> Result<(), CompactError> {
+    let merged = match txn.get_deleted(relkey)? {
+        Some(mut row) => {
+            row.vv.merge(vv);
+            DeletedRecord {
+                vv: row.vv,
+                server_ts: row.server_ts.max(server_ts),
+            }
+        }
+        None => DeletedRecord {
+            vv: vv.clone(),
+            server_ts,
+        },
+    };
+    txn.record_deleted(relkey, &merged)?;
+    Ok(())
+}
+
+/// The §2.6 case-4 (ts, device) pick between a folded `put` and the local
+/// head (same rule as the engine's `remote_wins_identity`): an
+/// identity-less head always loses to the arriving entry.
+fn fold_put_wins(entry: &JournalEntry, local: &ItemRecord) -> bool {
+    match (local.head_ts, &local.device) {
+        (Some(ts), Some(device)) => {
+            let winner = pick_winner(
+                Candidate {
+                    ts: entry.ts,
+                    device: &entry.device,
+                },
+                Candidate { ts, device },
+            );
+            winner.ts == entry.ts && *winner.device == entry.device
+        }
+        _ => true,
+    }
 }
 
 /// Builds the runner's item record for a folded `put` entry (a `Synced`

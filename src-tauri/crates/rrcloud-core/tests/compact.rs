@@ -606,22 +606,38 @@ async fn compaction_14_day_cap_deletes_despite_a_laggard() {
 
 #[tokio::test]
 async fn compaction_skips_segment_not_covered_by_manifest() {
-    // §2.10 safety: cursors[A] < a segment's max_seq -> that segment is
-    // NEVER deleted.
+    // §2.10 safety: a segment whose entries the db has NOT folded
+    // (published_cursor < max_seq, so build_manifest cannot prove coverage)
+    // is NEVER deleted. The covering manifest's own cursor rides the
+    // published cursor (review round 0: the present-branch rebuilds the
+    // manifest to track the published cursor, so the genuine under-coverage
+    // case is published < max_seq — not a manifest artificially frozen below
+    // what the db has already folded).
     let Some(g) = garage::shared() else { return };
     let bucket = g.create_unique_bucket("cmp-safety");
     let client = g.client();
     let (a, b, c) = (dev(DEV_A), dev(DEV_B), dev(DEV_C));
     let (_dir, _path, db) = open_db(&a);
 
-    let segs = publish_segments(&db, &client, &bucket, 3, NOW - 3600).await;
-    assert_eq!(segs, vec![1, 2, 3]);
+    // Two segments are genuinely published+folded (published_cursor = 2);
+    // a third segment OBJECT exists on the wire but its entries were never
+    // folded (published_cursor stays 2), so the manifest cannot cover it.
+    let segs = publish_segments(&db, &client, &bucket, 2, NOW - 3600).await;
+    assert_eq!(segs, vec![1, 2]);
+    let orphan_seg3 = {
+        let mut e =
+            common::sync::entry(&a, Op::Put, Kind::Sidecar, sidecar_key(&rel("img/s3.NEF")));
+        e.seq = 3;
+        e
+    };
+    common::sync::put_raw_segment(&client, &bucket, &a, 3, &[orphan_seg3]).await;
 
-    // Manifest covers only up to seq 2 (written with cursors[A] = 2), so
-    // segment 3 is not provably folded. Build a manifest then shrink its
-    // own cursor before planting it.
-    let mut manifest = build_manifest(&db, NOW - 25 * 3600).expect("manifest");
-    manifest.header.cursors.insert(a.clone(), 2);
+    let manifest = build_manifest(&db, NOW - 25 * 3600).expect("manifest");
+    assert_eq!(
+        manifest.header.cursors.get(&a),
+        Some(&2),
+        "manifest covers only the published cursor (2)"
+    );
     put_manifest(&client, &bucket, &a, &manifest)
         .await
         .expect("plant");
@@ -635,7 +651,7 @@ async fn compaction_skips_segment_not_covered_by_manifest() {
 
     assert!(
         !summary.deleted_seqs.contains(&3),
-        "segment 3 (not covered by the manifest) must survive"
+        "segment 3 (entries not folded into the manifest) must survive"
     );
     assert!(
         exists(&client, &bucket, &journal_segment_key(&a, 3)).await,
@@ -653,6 +669,77 @@ async fn compaction_skips_segment_not_covered_by_manifest() {
         ),
         "exact skip reason, got {:?}",
         skipped3.reason
+    );
+    // The covered+folded segments still compact normally.
+    let mut deleted = summary.deleted_seqs.clone();
+    deleted.sort_unstable();
+    assert_eq!(deleted, vec![1, 2], "the folded segments compact");
+}
+
+#[tokio::test]
+async fn compaction_advances_manifest_coverage_for_later_segments() {
+    // Review round 0 major: once a manifest exists, segments published AFTER
+    // it used to be wedged at ManifestCoverageBelow forever (the frozen
+    // cursor was never refreshed) -> unbounded journal growth. The present
+    // branch must rebuild the manifest to cover the published cursor.
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("cmp-advance");
+    let client = g.client();
+    let (a, b, c) = (dev(DEV_A), dev(DEV_B), dev(DEV_C));
+    let (_dir, _path, db) = open_db(&a);
+
+    // First manifest covers cursor 2 (aged 25h).
+    publish_segments(&db, &client, &bucket, 2, NOW - 3600).await;
+    let first = build_manifest(&db, NOW - 25 * 3600).expect("manifest");
+    assert_eq!(first.header.cursors.get(&a), Some(&2));
+    put_manifest(&client, &bucket, &a, &first)
+        .await
+        .expect("plant first manifest");
+
+    // Two more segments (3,4) published and folded; the on-wire manifest
+    // still says cursor 2.
+    publish_segments(&db, &client, &bucket, 2, NOW - 3600).await;
+    assert_eq!(db.published_cursor().unwrap(), 4);
+
+    // Both active peers applied past 4 (fast path clears once covered).
+    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 4)])).await;
+    put_device(&client, &bucket, &c, &device_entry(0, NOW - 60, &[(&a, 4)])).await;
+
+    // Pass 1: coverage advances. The rebuilt manifest is fresh, so rule 2
+    // holds every segment back this pass; no segment is stuck below coverage.
+    let clock = ServerClock::pinned(NOW);
+    let pass1 = compact_own_segments(&db, &client, &bucket, &clock, &CompactConfig::default())
+        .await
+        .expect("compact pass 1");
+    assert!(
+        !pass1
+            .skipped
+            .iter()
+            .any(|s| matches!(s.reason, SkipReason::ManifestCoverageBelow { .. })),
+        "no segment is wedged below coverage after the rebuild, got {:?}",
+        pass1.skipped
+    );
+    let on_wire = get_manifest(&client, &bucket, &a)
+        .await
+        .expect("manifest after advance");
+    assert_eq!(
+        on_wire.header.cursors.get(&a),
+        Some(&4),
+        "on-wire manifest coverage advanced to the published cursor"
+    );
+
+    // Pass 2, ≥24h later: the now-aged manifest lets the newly-covered
+    // segments compact (the growth bound is honored, not stalled).
+    let later = ServerClock::pinned(NOW + 25 * 3600);
+    let pass2 = compact_own_segments(&db, &client, &bucket, &later, &CompactConfig::default())
+        .await
+        .expect("compact pass 2");
+    let mut deleted = pass2.deleted_seqs.clone();
+    deleted.sort_unstable();
+    assert_eq!(
+        deleted,
+        vec![1, 2, 3, 4],
+        "every covered+aged segment compacts once coverage advanced"
     );
 }
 
@@ -1174,6 +1261,216 @@ async fn tombstone_gc_crash_between_fold_and_delete_is_recoverable() {
     );
 }
 
+#[tokio::test]
+async fn tombstone_gc_resurrection_guard_from_on_wire_journal_only() {
+    // Review round 0 blocker: a resurrecting put durably PUBLISHED to a
+    // device's journal segment but NOT yet folded into the runner's local
+    // state must still block GC — the §2.10(d) "final journal re-read (all
+    // devices' prefixes)" closes the catch-up->GC race. The old local-only
+    // superseded-check consulted a stale snapshot and destroyed the restore's
+    // data keys (Garage-probe-verified). The runner's local item here is
+    // STILL deleted; the put lives only on the wire.
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("gc-resurrect-wire");
+    let client = g.client();
+    let (a, b) = (dev(DEV_A), dev(DEV_B));
+    let (_dir, _path, db) = open_db(&a);
+
+    let image = rel("img/wire-edited.NEF");
+    let content = rrcloud_core::semhash::ContentId::from_bytes(b"wire-edited");
+    // del {a:5}, 31 days old; runner's LOCAL state shows it deleted (NOT
+    // caught up to B's resurrecting put).
+    plant_deleted_image(
+        &db,
+        &client,
+        &bucket,
+        &image,
+        &content,
+        vv(&[(&a, 5)]),
+        NOW - 31 * 86_400,
+    )
+    .await;
+
+    // Resurrecting put {a:5,b:1} published ONLY to B's journal segment.
+    let put = {
+        let mut e = common::sync::entry(&b, Op::Put, Kind::Sidecar, sidecar_key(&image));
+        e.seq = 1;
+        e.vv = vv(&[(&a, 5), (&b, 1)]);
+        e
+    };
+    common::sync::put_raw_segment(&client, &bucket, &b, 1, &[put]).await;
+    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 9)])).await;
+
+    let clock = ServerClock::pinned(NOW);
+    let summary = tombstone_gc(&db, &client, &bucket, &clock, &CompactConfig::default())
+        .await
+        .expect("gc");
+
+    assert!(
+        summary.destroyed.iter().all(|d| d.relkey != image),
+        "an on-wire resurrecting put (not yet applied locally) blocks GC"
+    );
+    assert!(
+        summary
+            .retained
+            .iter()
+            .any(|r| r.relkey == image && matches!(r.reason, GcSkipReason::Superseded)),
+        "retained with the Superseded reason from the journal re-read"
+    );
+    assert!(
+        exists(&client, &bucket, &library_key(&image)).await,
+        "original preserved"
+    );
+    assert!(
+        exists(&client, &bucket, &sidecar_key(&image)).await,
+        "sidecar preserved"
+    );
+    assert!(
+        exists(&client, &bucket, &tombstone_key(&image)).await,
+        "tombstone preserved"
+    );
+}
+
+#[tokio::test]
+async fn tombstone_gc_content_liveness_from_on_wire_sibling() {
+    // Review round 0 major: a live sibling sharing a content_id, present on
+    // the wire (another device's journal) but NOT folded into the runner's
+    // local state, must keep the shared preview/thumb from being destroyed.
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("gc-dedupe-wire");
+    let client = g.client();
+    let (a, b) = (dev(DEV_A), dev(DEV_B));
+    let (_dir, _path, db) = open_db(&a);
+
+    let content = rrcloud_core::semhash::ContentId::from_bytes(b"shared-on-wire");
+    let dead = rel("img/dup-dead.NEF");
+    let live = rel("img/dup-live.NEF");
+
+    // Dead image, GC-eligible (31d); its local record references the content.
+    plant_deleted_image(
+        &db,
+        &client,
+        &bucket,
+        &dead,
+        &content,
+        vv(&[(&a, 5)]),
+        NOW - 31 * 86_400,
+    )
+    .await;
+
+    // Live sibling referencing the SAME content_id, present ONLY on B's
+    // journal (never folded into the runner's local state).
+    let put = {
+        let mut e = common::sync::entry(&b, Op::Put, Kind::Original, library_key(&live));
+        e.seq = 1;
+        e.vv = vv(&[(&b, 1)]);
+        e.content_id = Some(content.clone());
+        e
+    };
+    common::sync::put_raw_segment(&client, &bucket, &b, 1, &[put]).await;
+    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 9)])).await;
+
+    let clock = ServerClock::pinned(NOW);
+    let summary = tombstone_gc(&db, &client, &bucket, &clock, &CompactConfig::default())
+        .await
+        .expect("gc");
+
+    // The dead image's own data keys go, but the shared content survives.
+    assert!(
+        !exists(&client, &bucket, &library_key(&dead)).await,
+        "dead original gone"
+    );
+    assert!(
+        exists(&client, &bucket, &preview_key(&content)).await,
+        "shared preview kept while an on-wire sibling references the content_id"
+    );
+    let dead_destroyed = summary
+        .destroyed
+        .iter()
+        .find(|d| d.relkey == dead)
+        .expect("dead destroyed");
+    assert!(
+        dead_destroyed.content_destroyed.is_empty(),
+        "content NOT destroyed while an on-wire live sibling references it"
+    );
+}
+
+#[tokio::test]
+async fn tombstone_gc_horizon_fast_path_uses_seq_not_vv_component() {
+    // Review round 0 minor: §2.10(a)'s "every active device applied past it"
+    // fast path must compare the del's journal SEQ (seq space) against each
+    // active device's applied cursor (seq space), NOT the del's vv component
+    // (vv space) — the two counters diverge (attestations/moves/re-puts
+    // advance seq without bumping vv). Under a grace<cap config the fast path
+    // is live, and the old vv-component compare passed prematurely. Here the
+    // del sits at seq 10 with vv {A:1}; the only active peer applied only to
+    // seq 5, and the tombstone is past grace but under the cap -> it must be
+    // RETAINED (HorizonBlocked), where the vv-component compare (1) would
+    // have wrongly declared it eligible.
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("gc-seq-horizon");
+    let client = g.client();
+    let (a, b) = (dev(DEV_A), dev(DEV_B));
+    let (_dir, _path, db) = open_db(&a);
+
+    // grace 5d < cap 14d, so the fast path (not the cap) gates (a).
+    let cfg = CompactConfig {
+        grace_secs: 5 * 86_400,
+        laggard_cap_secs: 14 * 86_400,
+        ..CompactConfig::default()
+    };
+
+    let image = rel("img/seq-horizon.NEF");
+    let content = rrcloud_core::semhash::ContentId::from_bytes(b"seq-horizon");
+    // Tombstone 8 days old: past the 5-day grace, under the 14-day cap. The
+    // runner (A) is the deleting device; del vv {A:1}.
+    plant_deleted_image(
+        &db,
+        &client,
+        &bucket,
+        &image,
+        &content,
+        vv(&[(&a, 1)]),
+        NOW - 8 * 86_400,
+    )
+    .await;
+
+    // The del entry on the wire sits at seq 10 (seq != vv component).
+    let del = {
+        let mut e = common::sync::entry(&a, Op::Del, Kind::Sidecar, sidecar_key(&image));
+        e.seq = 10;
+        e.vv = vv(&[(&a, 1)]);
+        e
+    };
+    common::sync::put_raw_segment(&client, &bucket, &a, 10, &[del]).await;
+
+    // The only active peer applied A's prefix only to seq 5 (< the del's
+    // seq 10): it has NOT learned the deletion.
+    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 5)])).await;
+
+    let clock = ServerClock::pinned(NOW);
+    let summary = tombstone_gc(&db, &client, &bucket, &clock, &cfg)
+        .await
+        .expect("gc");
+
+    assert!(
+        summary.destroyed.iter().all(|d| d.relkey != image),
+        "a laggard behind the del's real seq blocks GC (seq-space horizon)"
+    );
+    assert!(
+        summary
+            .retained
+            .iter()
+            .any(|r| r.relkey == image && matches!(r.reason, GcSkipReason::HorizonBlocked)),
+        "retained HorizonBlocked, got {:?}",
+        summary.retained
+    );
+    assert!(
+        exists(&client, &bucket, &library_key(&image)).await,
+        "data keys preserved while the horizon is blocked"
+    );
+}
+
 // ===========================================================================
 // Device lifecycle (§2.10)
 // ===========================================================================
@@ -1331,6 +1628,127 @@ async fn gc_retired_prefix_folds_and_deletes_orphaned_segments() {
         runner.rows.iter().any(|r| r.key == rel("x/i0.NEF"))
             || runner.rows.iter().any(|r| r.key == rel("x/i1.NEF")),
         "X's live effects folded into the runner manifest before deletion"
+    );
+}
+
+#[tokio::test]
+async fn gc_retired_prefix_fold_does_not_resurrect_a_dominated_deletion() {
+    // Review round 0 blocker (PROBE2): the runner converged X DELETED at a
+    // dominating vv {X:1,A:1}; retired device X's orphaned journal still
+    // holds the stale put {X:1}. The vv-aware fold must leave X deleted, and
+    // the rebuilt manifest must NOT carry both a live row and a deleted row
+    // for the same relkey (the §2.3 A3 mass-resurrection contradiction).
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("cmp-orphan-resurrect");
+    let client = g.client();
+    let (a, x, b) = (dev(DEV_A), dev(DEV_X), dev(DEV_B));
+    let (_dir, _path, db) = open_db(&a);
+
+    let img = rel("img/orphan-x.NEF");
+    // Runner's converged head: deleted at {X:1,A:1} + the deleted-set row.
+    let mut head = synced_sidecar(vv(&[(&x, 1), (&a, 1)]));
+    head.deleted = true;
+    db.replay_put_item(&img, &head).expect("deleted head");
+    db.record_deleted(
+        &img,
+        &DeletedRecord {
+            vv: vv(&[(&x, 1), (&a, 1)]),
+            server_ts: NOW - 40 * 86_400,
+        },
+    )
+    .expect("deleted row");
+
+    // X's orphaned journal: the stale put {X:1} the deletion dominates.
+    let stale_put = {
+        let mut e = common::sync::entry(&x, Op::Put, Kind::Sidecar, sidecar_key(&img));
+        e.seq = 1;
+        e.vv = vv(&[(&x, 1)]);
+        e
+    };
+    common::sync::put_raw_segment(&client, &bucket, &x, 1, &[stale_put]).await;
+    put_retired(&client, &bucket, &x).await;
+    put_device(&client, &bucket, &a, &device_entry(0, NOW - 60, &[(&x, 1)])).await;
+    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&x, 1)])).await;
+
+    let clock = ServerClock::pinned(NOW);
+    gc_retired_prefixes(&db, &client, &bucket, &clock, &CompactConfig::default())
+        .await
+        .expect("orphan gc");
+
+    // X stays deleted locally (not resurrected by the stale orphan put).
+    let item = db.get_item(&img).expect("item").expect("present");
+    assert!(
+        item.deleted,
+        "the fold must not resurrect a dominated deletion"
+    );
+
+    // The rebuilt runner manifest advertises one truth: a deleted row, no
+    // live row for the same key.
+    let manifest = get_manifest(&client, &bucket, &a)
+        .await
+        .expect("runner manifest");
+    assert!(
+        !manifest.rows.iter().any(|r| r.key == img),
+        "no live row for a key the runner knows is deleted"
+    );
+    assert!(
+        manifest.deleted.iter().any(|d| d.del == img),
+        "deleted-set row retained"
+    );
+}
+
+#[tokio::test]
+async fn gc_retired_prefix_fold_does_not_destroy_a_live_dominating_edit() {
+    // Review round 0 blocker (PROBE3, the converse): the runner converged X
+    // LIVE at a dominating vv {X:1,A:1}; retired device X's orphaned journal
+    // holds the stale del {X:1}. The fold must leave X live and NOT advertise
+    // a deletion (deletion-loss of a live version).
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("cmp-orphan-delloss");
+    let client = g.client();
+    let (a, x, b) = (dev(DEV_A), dev(DEV_X), dev(DEV_B));
+    let (_dir, _path, db) = open_db(&a);
+
+    let img = rel("img/orphan-live.NEF");
+    // Runner's converged head: LIVE at {X:1,A:1}.
+    db.replay_put_item(&img, &synced_sidecar(vv(&[(&x, 1), (&a, 1)])))
+        .expect("live head");
+
+    // X's orphaned journal: the stale del {X:1} the live edit dominates.
+    let stale_del = {
+        let mut e = common::sync::entry(&x, Op::Del, Kind::Sidecar, sidecar_key(&img));
+        e.seq = 1;
+        e.vv = vv(&[(&x, 1)]);
+        e
+    };
+    common::sync::put_raw_segment(&client, &bucket, &x, 1, &[stale_del]).await;
+    put_retired(&client, &bucket, &x).await;
+    put_device(&client, &bucket, &a, &device_entry(0, NOW - 60, &[(&x, 1)])).await;
+    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&x, 1)])).await;
+
+    let clock = ServerClock::pinned(NOW);
+    gc_retired_prefixes(&db, &client, &bucket, &clock, &CompactConfig::default())
+        .await
+        .expect("orphan gc");
+
+    // X stays live locally (the stale orphan del did not destroy it).
+    let item = db.get_item(&img).expect("item").expect("present");
+    assert!(
+        !item.deleted,
+        "the fold must not destroy a live dominating edit"
+    );
+
+    // The rebuilt runner manifest carries the live row and NO deleted row.
+    let manifest = get_manifest(&client, &bucket, &a)
+        .await
+        .expect("runner manifest");
+    assert!(
+        manifest.rows.iter().any(|r| r.key == img),
+        "live row retained"
+    );
+    assert!(
+        !manifest.deleted.iter().any(|d| d.del == img),
+        "no spurious deleted row for a live key"
     );
 }
 
