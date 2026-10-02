@@ -527,6 +527,53 @@ fn sync_xmp_for_rrdata(
     }
 }
 
+/// Removes tags from a single `.rrdata` sidecar **under the per-path lock**,
+/// retaining exactly the tags for which `retain` returns `true`
+/// (ARCHITECTURE.md §3.4 step 1). The whole load+mutate+write runs inside
+/// [`crate::exif_processing::update_sidecar`], so a field a concurrent writer
+/// (an editor rating/label edit, the background AI-tagging pass, sync's apply)
+/// committed between this clear's read and its write can never be clobbered —
+/// the AI-tagging-vs-user-edit lost-update race. The earlier
+/// `fs::read_to_string` + `serde_json::from_str` (outside any lock) +
+/// `save_sidecar` pattern loaded the document outside the lock and so lost
+/// such a concurrent field; these two tag-clearing commands are themselves
+/// AI-tag read-modify-write writers and must go through `update_sidecar` for
+/// the same reason as `modify_tags_for_path`.
+///
+/// Returns the written metadata when a tag was actually removed, or `None`
+/// when the sidecar had no tags or none matched for removal — the write (and
+/// the engine churn notification) is skipped, so an item whose tags are
+/// unchanged is left exactly as it was.
+fn clear_tags_in_sidecar(
+    path: &Path,
+    retain: impl Fn(&str) -> bool,
+) -> Result<Option<ImageMetadata>, String> {
+    let mut removed = false;
+    let metadata = crate::exif_processing::update_sidecar(
+        None,
+        path,
+        crate::sync::WriteOrigin::AiTagging,
+        |metadata| {
+            let Some(tags) = metadata.tags.as_mut() else {
+                return false;
+            };
+            let original_len = tags.len();
+            tags.retain(|tag| retain(tag));
+            if tags.len() == original_len {
+                // Nothing matched for removal — skip the write (no churn,
+                // and nothing to clobber).
+                return false;
+            }
+            if tags.is_empty() {
+                metadata.tags = None;
+            }
+            removed = true;
+            true
+        },
+    )?;
+    Ok(removed.then_some(metadata))
+}
+
 #[tauri::command]
 pub fn clear_ai_tags(root_path: String, app_handle: AppHandle) -> Result<usize, String> {
     if !Path::new(&root_path).exists() {
@@ -542,33 +589,17 @@ pub fn clear_ai_tags(root_path: String, app_handle: AppHandle) -> Result<usize, 
 
     for entry in walker.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.is_file()
-            && path.extension().and_then(|s| s.to_str()) == Some("rrdata")
-            && let Ok(content) = fs::read_to_string(path)
-            && let Ok(mut metadata) = serde_json::from_str::<ImageMetadata>(&content)
-            && let Some(tags) = &mut metadata.tags
-        {
-            let original_len = tags.len();
-            // Keep color tags and user tags, remove others (AI tags)
-            tags.retain(|tag| {
+        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rrdata") {
+            // Keep color tags and user tags, remove others (AI tags).
+            match clear_tags_in_sidecar(path, |tag| {
                 tag.starts_with(COLOR_TAG_PREFIX) || tag.starts_with(USER_TAG_PREFIX)
-            });
-
-            if tags.len() < original_len {
-                if tags.is_empty() {
-                    metadata.tags = None;
-                }
-                if crate::exif_processing::save_sidecar(
-                    None,
-                    path,
-                    &metadata,
-                    crate::sync::WriteOrigin::AiTagging,
-                )
-                .is_ok()
-                {
+            }) {
+                Ok(Some(metadata)) => {
                     updated_count += 1;
                     sync_xmp_for_rrdata(path, &metadata, enable_xmp_sync, create_xmp_if_missing);
                 }
+                Ok(None) => {}
+                Err(e) => eprintln!("Failed to clear AI tags for {}: {}", path.display(), e),
             }
         }
     }
@@ -590,33 +621,155 @@ pub fn clear_all_tags(root_path: String, app_handle: AppHandle) -> Result<usize,
 
     for entry in walker.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.is_file()
-            && path.extension().and_then(|s| s.to_str()) == Some("rrdata")
-            && let Ok(content) = fs::read_to_string(path)
-            && let Ok(mut metadata) = serde_json::from_str::<ImageMetadata>(&content)
-            && let Some(tags) = &mut metadata.tags
-        {
-            let original_len = tags.len();
-            // Keep only color tags, remove AI and user tags
-            tags.retain(|tag| tag.starts_with(COLOR_TAG_PREFIX));
-
-            if tags.len() < original_len {
-                if tags.is_empty() {
-                    metadata.tags = None;
-                }
-                if crate::exif_processing::save_sidecar(
-                    None,
-                    path,
-                    &metadata,
-                    crate::sync::WriteOrigin::AiTagging,
-                )
-                .is_ok()
-                {
+        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rrdata") {
+            // Keep only color tags, remove AI and user tags.
+            match clear_tags_in_sidecar(path, |tag| tag.starts_with(COLOR_TAG_PREFIX)) {
+                Ok(Some(metadata)) => {
                     updated_count += 1;
                     sync_xmp_for_rrdata(path, &metadata, enable_xmp_sync, create_xmp_if_missing);
                 }
+                Ok(None) => {}
+                Err(e) => eprintln!("Failed to clear tags for {}: {}", path.display(), e),
             }
         }
     }
     Ok(updated_count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::image_processing::ImageMetadata;
+
+    fn seed(path: &Path, meta: &ImageMetadata) {
+        std::fs::write(path, serde_json::to_vec_pretty(meta).unwrap()).unwrap();
+    }
+
+    fn read(path: &Path) -> ImageMetadata {
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn keep_non_ai(tag: &str) -> bool {
+        tag.starts_with(COLOR_TAG_PREFIX) || tag.starts_with(USER_TAG_PREFIX)
+    }
+
+    /// Regression for the P1-U7 round-2 review (major): `clear_ai_tags` /
+    /// `clear_all_tags` must read-modify-write their sidecar **under the
+    /// per-path lock** (via `update_sidecar`), not load the document outside
+    /// the lock and then `save_sidecar`. The old pattern clobbered any field a
+    /// concurrent writer committed between the clear's read and its write — the
+    /// §3.4 step 1 AI-tagging-vs-user-edit lost-update race.
+    ///
+    /// Deterministic (no sleep-race for the pass/fail signal): we hold the
+    /// path's lock, start the clear (which must block before it reads), commit
+    /// a concurrent `rating = 5` edit to disk, then release the lock. With the
+    /// RMW under the lock the clear re-reads `rating = 5` and preserves it;
+    /// with the load outside the lock it had already read the stale `rating =
+    /// 0` and writes it back, losing the committed edit.
+    #[test]
+    fn clear_tags_does_not_clobber_a_concurrently_committed_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("img.NEF.rrdata");
+        seed(
+            &sidecar,
+            &ImageMetadata {
+                rating: 0,
+                tags: Some(vec!["ai:cat".to_string(), "user:keep".to_string()]),
+                ..ImageMetadata::default()
+            },
+        );
+
+        // Hold the per-path lock: the clear's RMW cannot start until we have
+        // committed the concurrent edit to disk and released it.
+        let lock = crate::sync::sidecar_lock_for(&sidecar);
+        let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
+
+        let clear_path = sidecar.clone();
+        let handle =
+            std::thread::spawn(move || clear_tags_in_sidecar(&clear_path, keep_non_ai));
+
+        // Let the clear thread reach its lock-wait (and, for the old
+        // load-outside-the-lock pattern, perform its external read of the
+        // stale rating=0 document). This sleep only sequences the race it is
+        // meant to expose; the assertion itself is deterministic once the
+        // committed edit lands below.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+
+        // A concurrent writer commits rating=5 while the clear is blocked.
+        seed(
+            &sidecar,
+            &ImageMetadata {
+                rating: 5,
+                tags: Some(vec!["ai:cat".to_string(), "user:keep".to_string()]),
+                ..ImageMetadata::default()
+            },
+        );
+
+        drop(guard);
+        let written = handle.join().unwrap().expect("clear must not error");
+        assert!(
+            written.is_some(),
+            "the ai: tag should have been removed, producing a write"
+        );
+
+        let final_meta = read(&sidecar);
+        assert_eq!(
+            final_meta.rating, 5,
+            "clear clobbered a concurrently-committed rating edit — its read-modify-write \
+             did not run under the per-path lock"
+        );
+        let tags = final_meta.tags.unwrap_or_default();
+        assert!(
+            tags.contains(&"user:keep".to_string()),
+            "the retained user tag must survive, got {tags:?}"
+        );
+        assert!(
+            !tags.iter().any(|t| t.starts_with("ai:")),
+            "the ai: tag must be removed, got {tags:?}"
+        );
+    }
+
+    /// `clear_tags_in_sidecar` must not write (no churn, nothing to clobber)
+    /// when no tag matches for removal: a sidecar with only retained tags, and
+    /// one with no tags at all, both return `None` and leave the bytes
+    /// untouched. This is the "skip the item when the loaded tags are
+    /// unchanged" guarantee the review asked for.
+    #[test]
+    fn clear_tags_skips_write_when_nothing_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let retained = dir.path().join("retained.NEF.rrdata");
+        seed(
+            &retained,
+            &ImageMetadata {
+                rating: 2,
+                tags: Some(vec!["user:keep".to_string()]),
+                ..ImageMetadata::default()
+            },
+        );
+        let before = std::fs::read(&retained).unwrap();
+        assert!(
+            clear_tags_in_sidecar(&retained, keep_non_ai).unwrap().is_none(),
+            "a sidecar whose tags all survive must report no change"
+        );
+        assert_eq!(
+            std::fs::read(&retained).unwrap(),
+            before,
+            "the untouched sidecar's bytes must be left exactly as they were"
+        );
+
+        let untagged = dir.path().join("untagged.NEF.rrdata");
+        seed(
+            &untagged,
+            &ImageMetadata {
+                rating: 1,
+                tags: None,
+                ..ImageMetadata::default()
+            },
+        );
+        assert!(
+            clear_tags_in_sidecar(&untagged, keep_non_ai).unwrap().is_none(),
+            "a sidecar with no tags must report no change"
+        );
+    }
 }

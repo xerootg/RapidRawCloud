@@ -346,8 +346,10 @@ impl SyncManager {
 
 /// Wires the manager into `setup()` next to `start_thumbnail_workers`
 /// (§3.3): installs it as the process-global manager the hooks route
-/// through. The supervisor task and credential/settings load land in the
-/// GREEN pass.
+/// through. This unit installs the manager only — it is left unconfigured,
+/// so sync is inert until the P2 command layer lands. The §3.3 supervisor
+/// task and the credential/settings load are part of that P2 work (command
+/// registration / `configure`, per UPSTREAM_TOUCHES.md), not this unit.
 pub fn start_in_setup(app: &tauri::AppHandle, manager: &Arc<SyncManager>) {
     let _ = app;
     crate::sync::install_global_manager(manager.clone());
