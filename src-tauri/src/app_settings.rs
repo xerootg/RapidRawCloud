@@ -444,6 +444,82 @@ pub fn default_open_tree_sections() -> Vec<String> {
     vec!["current".to_string()]
 }
 
+/// Cloud sync settings (ARCHITECTURE.md §3.6). Nested in [`AppSettings`]
+/// behind `#[serde(default)]` so it round-trips through the frontend's
+/// whole-object save without being dropped. **Credentials are NOT here** —
+/// they live only in `sync::credentials` (never `settings.json` / webview).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSettings {
+    /// Master switch; default off (desktop gets the same engine, gated here).
+    #[serde(default)]
+    pub enabled: bool,
+    /// S3 endpoint, e.g. `https://garage.themissing.xyz`.
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub bucket: String,
+    /// `"garage"` for Garage.
+    #[serde(default)]
+    pub region: String,
+    /// Path-style addressing; default true.
+    #[serde(default = "default_true")]
+    pub force_path_style: bool,
+    #[serde(default)]
+    pub upload_requires_unmetered: bool,
+    #[serde(default)]
+    pub upload_requires_charging: bool,
+    /// Hydrated-originals LRU budget, default 8 GB.
+    #[serde(default = "default_cache_size_gb")]
+    pub cache_size_gb: u32,
+    /// Proxies + medium thumbs LRU budget, default 10 GB.
+    #[serde(default = "default_preview_budget_gb")]
+    pub preview_budget_gb: u32,
+    /// Proxy/medium prefetch recency window, default 12 months.
+    #[serde(default = "default_preview_prefetch_months")]
+    pub preview_prefetch_months: u32,
+    #[serde(default)]
+    pub auto_watch_dcim: bool,
+    #[serde(default)]
+    pub watched_media_buckets: Vec<String>,
+    /// Desktop app performs worker (backfill) duties.
+    #[serde(default)]
+    pub worker_backfill: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_cache_size_gb() -> u32 {
+    8
+}
+fn default_preview_budget_gb() -> u32 {
+    10
+}
+fn default_preview_prefetch_months() -> u32 {
+    12
+}
+
+impl Default for SyncSettings {
+    fn default() -> Self {
+        SyncSettings {
+            enabled: false,
+            endpoint: String::new(),
+            bucket: String::new(),
+            region: String::new(),
+            force_path_style: true,
+            upload_requires_unmetered: false,
+            upload_requires_charging: false,
+            cache_size_gb: 8,
+            preview_budget_gb: 10,
+            preview_prefetch_months: 12,
+            auto_watch_dcim: false,
+            watched_media_buckets: Vec::new(),
+            worker_backfill: false,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
@@ -586,6 +662,10 @@ pub struct AppSettings {
     pub adjustment_layout: AdjustmentLayout,
     #[serde(default)]
     pub workspace: WorkspaceState,
+    /// Cloud sync settings (§3.6). `#[serde(default)]` so it survives the
+    /// frontend whole-object round-trip.
+    #[serde(default)]
+    pub sync: SyncSettings,
 }
 
 impl Default for AppSettings {
@@ -684,6 +764,7 @@ impl Default for AppSettings {
             custom_aspect_ratios: Vec::new(),
             adjustment_layout: AdjustmentLayout::default(),
             workspace: WorkspaceState::default(),
+            sync: SyncSettings::default(),
         }
     }
 }

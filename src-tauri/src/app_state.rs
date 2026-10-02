@@ -249,4 +249,10 @@ pub struct AppState {
     pub disks_cache: Mutex<Option<Disks>>,
     pub disks_cache_refreshing: AtomicBool,
     pub camera_session: Mutex<CameraSession>,
+    /// Cloud sync lifecycle object (ARCHITECTURE.md §3.3). Inert until
+    /// `SyncManager::configure`.
+    pub sync_manager: Arc<crate::sync::SyncManager>,
+    /// Per-path sidecar lock map (§3.4 step 1): serializes the three
+    /// writers to one sidecar (user edit, AI tagging, sync apply).
+    pub sidecar_locks: crate::sync::SidecarLockMap,
 }

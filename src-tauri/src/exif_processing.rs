@@ -221,7 +221,16 @@ pub fn load_sidecar(sidecar_path: &Path) -> ImageMetadata {
         return ImageMetadata::default();
     };
 
-    let mut meta = serde_json::from_str::<ImageMetadata>(&content).unwrap_or_default();
+    let mut meta = match serde_json::from_str::<ImageMetadata>(&content) {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!(
+                "Failed to parse sidecar {}: {e}; using defaults",
+                sidecar_path.display()
+            );
+            ImageMetadata::default()
+        }
+    };
     let mut healed = false;
 
     if let Some(ref mut exif_map) = meta.exif {
@@ -233,8 +242,13 @@ pub fn load_sidecar(sidecar_path: &Path) -> ImageMetadata {
         }
     }
 
-    if healed && let Ok(json) = serde_json::to_string_pretty(&meta) {
-        let _ = fs::write(sidecar_path, json);
+    if healed {
+        let _ = save_sidecar(
+            None,
+            sidecar_path,
+            &meta,
+            crate::sync::WriteOrigin::AutoHeal,
+        );
         log::info!(
             "Auto-healed bloated sidecar for: {}",
             sidecar_path.display()
@@ -242,6 +256,40 @@ pub fn load_sidecar(sidecar_path: &Path) -> ImageMetadata {
     }
 
     meta
+}
+
+/// The single sidecar-write chokepoint (ARCHITECTURE.md §3.4). Every
+/// `.rrdata` write in the app routes through here:
+///
+/// 1. Acquire the per-path async-aware lock (`AppState` / global
+///    `sync::sidecar_locks`) — closes the AI-tagging-vs-user-edit race and
+///    serializes sync's third writer.
+/// 2. Corruption guard (incl. 0-byte): if the on-disk sidecar fails to
+///    parse — or disagrees with a non-default synced head — quarantine it
+///    to `<name>.rrdata.corrupt-<ts>`, trigger a priority re-download, and
+///    **abort** (feature-gated). With sync off, upstream behavior is kept
+///    (proceed), but the atomic write and the `load_sidecar` parse warning
+///    are always present.
+/// 3. Remote-head guard: when a known remote head is still `pending_down`,
+///    download first; offline, flag `base=unknown` (§2.6 case 4).
+/// 4. Atomic write via `tempfile::NamedTempFile` + `persist` (rename) in
+///    the same directory.
+/// 5. Compute the rrcloud-core semantic hash; if changed, notify the sync
+///    engine (`sync::hooks::notify_sidecar_saved`) — the §2.5 churn gate.
+///
+/// `app` carries the `AppHandle` for `sync-*` event emission where a call
+/// site has one; `None` at the batch write sites.
+pub fn save_sidecar(
+    app: Option<&tauri::AppHandle>,
+    sidecar_path: &Path,
+    meta: &ImageMetadata,
+    origin: crate::sync::WriteOrigin,
+) -> Result<(), String> {
+    let _ = (app, sidecar_path, meta, origin);
+    todo!(
+        "P1-U7: save_sidecar chokepoint — per-path lock, corruption/remote-head guards, \
+         atomic temp+rename, churn-gated notify (§3.4)"
+    )
 }
 
 pub fn load_sidecar_with_exif(sidecar_path: &Path, source_path: &Path) -> ImageMetadata {
@@ -1575,8 +1623,8 @@ fn load_primary_metadata(image_path: &Path) -> ImageMetadata {
 
 fn save_primary_metadata(image_path: &Path, metadata: &ImageMetadata) -> std::io::Result<()> {
     let primary = get_primary_sidecar_path(image_path);
-    let json = serde_json::to_string_pretty(metadata).map_err(std::io::Error::other)?;
-    fs::write(&primary, json)
+    save_sidecar(None, &primary, metadata, crate::sync::WriteOrigin::Primary)
+        .map_err(std::io::Error::other)
 }
 
 pub fn read_rrexif_sidecar(image_path: &Path) -> Option<HashMap<String, String>> {

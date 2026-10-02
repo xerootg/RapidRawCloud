@@ -39,7 +39,15 @@ mod panorama_stitching;
 mod panorama_utils;
 mod preset_converter;
 mod raw_processing;
+pub mod sync;
 mod tagging;
+
+// Re-export the pure-core sync crate so the integration tests reach its S3
+// client / engine types through `rapidraw_lib::rrcloud_core` without a
+// separate dev-dependency. Only present when the `sync` feature is on, so
+// a `--no-default-features` build links no rrcloud-core (ARCHITECTURE.md §7).
+#[cfg(feature = "sync")]
+pub use ::rrcloud_core;
 mod tagging_utils;
 mod window_customizer;
 
@@ -1939,6 +1947,11 @@ pub fn run() {
             start_analytics_worker(app_handle.clone());
             file_management::start_thumbnail_workers(app_handle.clone());
             file_management::start_metadata_workers(app_handle.clone());
+            {
+                use tauri::Manager;
+                let state = app.state::<AppState>();
+                crate::sync::manager::start_in_setup(&app_handle, &state.sync_manager);
+            }
             jxl_oxide::integration::register_image_decoding_hook();
 
             let window_cfg = app.config().app.windows.first().unwrap().clone();
@@ -2140,6 +2153,8 @@ pub fn run() {
             disks_cache: Mutex::new(None),
             disks_cache_refreshing: AtomicBool::new(false),
             camera_session: Mutex::new(camera_tethering::CameraSession::new()),
+            sync_manager: crate::sync::SyncManager::new_inert(),
+            sidecar_locks: crate::sync::sidecar_locks(),
         })
         .invoke_handler(tauri::generate_handler![
             apply_adjustments,
@@ -2302,6 +2317,10 @@ pub fn run() {
 				}
                 tauri::RunEvent::ExitRequested { api, .. } => {
                     api.prevent_exit();
+
+                    // Bounded (<=2s) opportunistic flush of queued small
+                    // sidecar uploads before the process exits (§3.3).
+                    crate::sync::hooks::sync_exit_flush(app_handle);
 
                     #[cfg(target_os = "macos")]
                     unsafe { libc::_exit(0); }

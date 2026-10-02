@@ -10,8 +10,12 @@ name = "rapidraw_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [features]
-default = []
+# Sync is on by default in the fork (ARCHITECTURE.md §7). A
+# `--no-default-features` build links no rrcloud-core and the sync shims
+# are inert no-ops, so it is functionally identical to upstream.
+default = ["sync"]
 tethering = ["dep:gphoto2"]
+sync = ["dep:rrcloud-core"]
 
 [dependencies]
 tauri = { version = "2.11", features = [ "macos-private-api", "rustls-tls", "protocol-asset" ] }
@@ -68,6 +72,13 @@ libc = "0.2.189"
 rgb = "0.8.53"
 imgref = "1.12.2"
 sysinfo = "0.39.6"
+# Pure-core sync engine (ARCHITECTURE.md §3). Optional path dependency
+# gated by the `sync` feature; rrcloud-core keeps its own standalone
+# [workspace] + Cargo.lock, so cargo resolves this as an external path
+# dependency.
+rrcloud-core = { path = "crates/rrcloud-core", optional = true }
+# Per-path sidecar lock map (§3.4 step 1).
+dashmap = "6"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 trash = "5.2.6"

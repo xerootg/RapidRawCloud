@@ -96,11 +96,13 @@ fn resolve_image_metadata(
 ) -> ImageFileMetadata {
     let mut metadata = crate::exif_processing::load_sidecar(sidecar_path);
 
-    if enable_xmp_sync
-        && sync_metadata_from_xmp(image_path, &mut metadata)
-        && let Ok(json) = serde_json::to_string_pretty(&metadata)
-    {
-        let _ = fs::write(sidecar_path, json);
+    if enable_xmp_sync && sync_metadata_from_xmp(image_path, &mut metadata) {
+        let _ = crate::exif_processing::save_sidecar(
+            None,
+            sidecar_path,
+            &metadata,
+            crate::sync::WriteOrigin::XmpImport,
+        );
     }
 
     let is_raw = crate::formats::is_raw_file(image_path);
@@ -499,9 +501,12 @@ pub async fn update_exif_fields(
             let mut final_metadata = crate::exif_processing::load_sidecar(&primary_path);
 
             final_metadata.exif = Some(exif_data);
-            if let Ok(json) = serde_json::to_string_pretty(&final_metadata) {
-                let _ = std::fs::write(&primary_path, json);
-            }
+            let _ = crate::exif_processing::save_sidecar(
+                None,
+                &primary_path,
+                &final_metadata,
+                crate::sync::WriteOrigin::ExifCache,
+            );
         });
         Ok(())
     })
@@ -2541,8 +2546,12 @@ pub fn save_metadata_and_update_thumbnail(
 
     metadata.adjustments = final_adjustments;
 
-    let json_string = serde_json::to_string_pretty(&metadata).map_err(|e| e.to_string())?;
-    std::fs::write(&sidecar_path, json_string).map_err(|e| e.to_string())?;
+    crate::exif_processing::save_sidecar(
+        Some(&app_handle),
+        &sidecar_path,
+        &metadata,
+        crate::sync::WriteOrigin::User,
+    )?;
 
     if let Ok(settings) = load_settings(app_handle.clone())
         && settings.enable_xmp_sync.unwrap_or(false)
@@ -2662,9 +2671,12 @@ pub async fn apply_adjustments_to_paths(
 
             existing_metadata.adjustments = new_adjustments;
 
-            if let Ok(json_string) = serde_json::to_string_pretty(&existing_metadata) {
-                let _ = std::fs::write(&sidecar_path, json_string);
-            }
+            let _ = crate::exif_processing::save_sidecar(
+                None,
+                &sidecar_path,
+                &existing_metadata,
+                crate::sync::WriteOrigin::Batch,
+            );
 
             if enable_xmp_sync {
                 let source_path = parse_virtual_path(path).0;
@@ -2738,9 +2750,12 @@ pub async fn reset_adjustments_for_paths(
 
             existing_metadata.adjustments = serde_json::json!({});
 
-            if let Ok(json_string) = serde_json::to_string_pretty(&existing_metadata) {
-                let _ = std::fs::write(&sidecar_path, json_string);
-            }
+            let _ = crate::exif_processing::save_sidecar(
+                None,
+                &sidecar_path,
+                &existing_metadata,
+                crate::sync::WriteOrigin::Batch,
+            );
 
             if enable_xmp_sync {
                 let source_path = parse_virtual_path(path).0;
@@ -2844,9 +2859,12 @@ pub async fn apply_auto_lens_correction_to_paths(
                 lens_db.as_deref(),
             );
 
-            if let Ok(json_string) = serde_json::to_string_pretty(&existing_metadata) {
-                let _ = std::fs::write(&sidecar_path, json_string);
-            }
+            let _ = crate::exif_processing::save_sidecar(
+                None,
+                &sidecar_path,
+                &existing_metadata,
+                crate::sync::WriteOrigin::Batch,
+            );
 
             if enable_xmp_sync {
                 sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
@@ -2957,9 +2975,12 @@ pub async fn apply_auto_adjustments_to_paths(
                     }
                 }
 
-                if let Ok(json_string) = serde_json::to_string_pretty(&existing_metadata) {
-                    let _ = std::fs::write(&sidecar_path, json_string);
-                }
+                let _ = crate::exif_processing::save_sidecar(
+                    None,
+                    &sidecar_path,
+                    &existing_metadata,
+                    crate::sync::WriteOrigin::Batch,
+                );
 
                 if enable_xmp_sync {
                     sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
@@ -3027,9 +3048,12 @@ pub fn set_color_label_for_paths(
             metadata.tags = Some(tags);
         }
 
-        if let Ok(json_string) = serde_json::to_string_pretty(&metadata) {
-            let _ = std::fs::write(&sidecar_path, json_string);
-        }
+        let _ = crate::exif_processing::save_sidecar(
+            None,
+            &sidecar_path,
+            &metadata,
+            crate::sync::WriteOrigin::Batch,
+        );
 
         if enable_xmp_sync {
             let source_path = parse_virtual_path(path).0;
@@ -3057,9 +3081,12 @@ pub fn set_rating_for_paths(
 
         metadata.rating = rating;
 
-        if let Ok(json_string) = serde_json::to_string_pretty(&metadata) {
-            let _ = std::fs::write(&sidecar_path, json_string);
-        }
+        let _ = crate::exif_processing::save_sidecar(
+            None,
+            &sidecar_path,
+            &metadata,
+            crate::sync::WriteOrigin::Batch,
+        );
 
         if enable_xmp_sync {
             let source_path = parse_virtual_path(path).0;
@@ -3078,11 +3105,13 @@ pub fn load_metadata(path: String, app_handle: AppHandle) -> Result<ImageMetadat
     let (source_path, sidecar_path) = parse_virtual_path(&path);
     let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
 
-    if enable_xmp_sync
-        && sync_metadata_from_xmp(&source_path, &mut metadata)
-        && let Ok(json) = serde_json::to_string_pretty(&metadata)
-    {
-        let _ = fs::write(&sidecar_path, json);
+    if enable_xmp_sync && sync_metadata_from_xmp(&source_path, &mut metadata) {
+        let _ = crate::exif_processing::save_sidecar(
+            None,
+            &sidecar_path,
+            &metadata,
+            crate::sync::WriteOrigin::XmpImport,
+        );
     }
 
     Ok(metadata)
@@ -4077,9 +4106,12 @@ pub fn create_virtual_copy(
             .map_err(|e| format!("Failed to copy sidecar file: {}", e))?;
     } else {
         let default_metadata = ImageMetadata::default();
-        let json_string =
-            serde_json::to_string_pretty(&default_metadata).map_err(|e| e.to_string())?;
-        fs::write(new_sidecar_path, json_string).map_err(|e| e.to_string())?;
+        crate::exif_processing::save_sidecar(
+            None,
+            &new_sidecar_path,
+            &default_metadata,
+            crate::sync::WriteOrigin::VirtualCopy,
+        )?;
     }
 
     if let Some(album_id) = target_album_id {
