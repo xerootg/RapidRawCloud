@@ -655,9 +655,11 @@ pub struct GcSummary {
 ///
 /// Destruction = DELETE the original + sidecar(s) + xmp data keys **and**
 /// the content-addressed `preview`/`thumb` objects — the latter **only when
-/// no live relkey and no in-grace tombstone references that `content_id`**
+/// no live relkey and no retained tombstone references that `content_id`**
 /// (content-id liveness: two images sharing byte-identical originals keep
-/// the shared preview/thumb until *both* are gone). The order is strict and
+/// the shared preview/thumb until *both* are gone; a tombstone retained this
+/// pass for *any* reason — in-grace or horizon-blocked — still keeps its
+/// data keys, so it protects the shared content too). The order is strict and
 /// pinned by the crash-safety test: fold-and-verify (c) → DELETE data/content
 /// keys → DELETE the tombstone object. A crash between fold and DELETE leaves
 /// a recoverable state — the deleted-set record is already durable, so a
@@ -758,23 +760,53 @@ pub async fn tombstone_gc(
         }
     }
 
-    // Content ids still referenced by an in-grace tombstone (its data keys
-    // survive, so its content must too — content-id liveness).
-    let mut grace_content: Vec<ContentId> = Vec::new();
-    for (i, c) in candidates.iter().enumerate() {
-        if matches!(
-            classes[i],
-            Class::Retained(GcSkipReason::WithinGrace { .. })
-        ) {
-            if let Some(cid) = &c.content_id {
-                grace_content.push(cid.clone());
-            }
-        }
-    }
-
     let mut summary = GcSummary::default();
     let any_eligible = classes.iter().any(|c| matches!(c, Class::Eligible));
     if any_eligible {
+        // Content ids a *retained* tombstone still references: its data keys
+        // survive this pass, so the shared content must too (content-id
+        // liveness). This is EVERY `Retained(_)` tombstone, not only
+        // `WithinGrace` ones — a `HorizonBlocked` tombstone keeps its
+        // original/sidecar this pass just the same, so destroying a shared
+        // content-addressed preview/thumb it still points at would strand it
+        // (review round 1 minor: previously only `WithinGrace` siblings were
+        // counted, so an eligible sibling could destroy content a
+        // HorizonBlocked one still referenced under an aggressive grace<cap
+        // policy).
+        let mut retained_content: BTreeSet<ContentId> = BTreeSet::new();
+        for (i, c) in candidates.iter().enumerate() {
+            if matches!(classes[i], Class::Retained(_)) {
+                if let Some(cid) = &c.content_id {
+                    retained_content.insert(cid.clone());
+                }
+            }
+        }
+
+        // Content ids referenced by a live relkey, computed ONCE for the whole
+        // pass (review round 1 minor efficiency): a single `iter_items` scan
+        // for local live references, unioned with one `fleet_content_live`
+        // sweep over the distinct candidate content ids for on-wire live
+        // siblings not yet folded locally. Previously both were recomputed
+        // inside the destroy loop for every eligible tombstone — N full
+        // item-table scans plus N quadratic fleet scans on the hot path.
+        let mut live_content: BTreeSet<ContentId> = BTreeSet::new();
+        for (_, r) in db.iter_items()? {
+            if !r.deleted {
+                if let Some(cid) = r.content_id {
+                    live_content.insert(cid);
+                }
+            }
+        }
+        let candidate_cids: BTreeSet<ContentId> = candidates
+            .iter()
+            .filter_map(|c| c.content_id.clone())
+            .collect();
+        for cid in &candidate_cids {
+            if !live_content.contains(cid) && fleet_content_live(&fleet, cid) {
+                live_content.insert(cid.clone());
+            }
+        }
+
         // (c) deleted-set fold, FIRST. Ensure each eligible tombstone's
         // {del, vv, server_ts} row is durable in the runner's deleted set,
         // then PUT the runner's manifest and read-back verify it present
@@ -818,20 +850,17 @@ pub async fn tombstone_gc(
             }
 
             // Content-id liveness: destroy the content-addressed
-            // preview/thumb objects ONLY when no live relkey and no in-grace
-            // tombstone still references the content_id. Liveness is sourced
-            // from the runner's local state OR the final journal re-read — a
-            // live sibling (byte-identical original) on another device not
-            // yet folded locally still protects the shared content (review
-            // round 0 major, Garage-probe-verified).
+            // preview/thumb objects ONLY when no live relkey and no retained
+            // tombstone still references the content_id. Both sets are
+            // precomputed above: `live_content` from local state unioned with
+            // the final journal re-read (a byte-identical sibling on another
+            // device not yet folded locally still protects the shared
+            // content — review round 0 major, Garage-probe-verified), and
+            // `retained_content` from every tombstone kept this pass.
             let mut content_destroyed = Vec::new();
             if let Some(content) = &c.content_id {
-                let live_ref = db
-                    .iter_items()?
-                    .into_iter()
-                    .any(|(_, r)| !r.deleted && r.content_id.as_ref() == Some(content))
-                    || fleet_content_live(&fleet, content);
-                let grace_ref = grace_content.contains(content);
+                let live_ref = live_content.contains(content);
+                let grace_ref = retained_content.contains(content);
                 if !live_ref && !grace_ref {
                     s3.delete_object(bucket, &preview_key(content)).await?;
                     s3.delete_object(bucket, &thumb_key(content, ThumbSize::Small))

@@ -1396,6 +1396,105 @@ async fn tombstone_gc_content_liveness_from_on_wire_sibling() {
 }
 
 #[tokio::test]
+async fn tombstone_gc_content_kept_by_horizon_blocked_sibling() {
+    // Review round 1 minor: a HorizonBlocked tombstone keeps its data keys
+    // this pass exactly like a WithinGrace one, so its content_id must be
+    // protected from the content-destruction guard too. Two tombstones share
+    // one content_id (byte-identical originals): X is Eligible (past the
+    // 14-day cap) and Y is HorizonBlocked (past grace, inside the cap, no del
+    // on the wire). GC destroys X's own data keys but must NOT destroy the
+    // shared preview/thumb — Y's original still references the content.
+    //
+    // Reachable only under an aggressive homelab policy (grace < cap); under
+    // the default config a past-grace tombstone is always past the cap too,
+    // so HorizonBlocked never co-occurs with an Eligible sibling.
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("gc-dedupe-horizon");
+    let client = g.client();
+    let (a, b) = (dev(DEV_A), dev(DEV_B));
+    let (_dir, _path, db) = open_db(&a);
+
+    // Aggressive policy: grace (5d) below the cap (14d).
+    let cfg = CompactConfig {
+        grace_secs: 5 * 86_400,
+        laggard_cap_secs: 14 * 86_400,
+        ..CompactConfig::default()
+    };
+
+    let content = rrcloud_core::semhash::ContentId::from_bytes(b"shared-horizon");
+    let x = rel("img/dup-x.NEF");
+    let y = rel("img/dup-y.NEF");
+
+    // X: 20 days old -> past the 14-day cap -> Eligible.
+    plant_deleted_image(
+        &db,
+        &client,
+        &bucket,
+        &x,
+        &content,
+        vv(&[(&a, 5)]),
+        NOW - 20 * 86_400,
+    )
+    .await;
+    // Y: 8 days old -> past the 5-day grace, inside the 14-day cap, and with
+    // no del on the wire the fast path cannot fire -> HorizonBlocked.
+    plant_deleted_image(
+        &db,
+        &client,
+        &bucket,
+        &y,
+        &content,
+        vv(&[(&a, 7)]),
+        NOW - 8 * 86_400,
+    )
+    .await;
+    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 9)])).await;
+
+    let clock = ServerClock::pinned(NOW);
+    let summary = tombstone_gc(&db, &client, &bucket, &clock, &cfg)
+        .await
+        .expect("gc");
+
+    // X destroyed, Y retained HorizonBlocked.
+    let x_destroyed = summary
+        .destroyed
+        .iter()
+        .find(|d| d.relkey == x)
+        .expect("X destroyed");
+    assert!(
+        summary
+            .retained
+            .iter()
+            .any(|r| r.relkey == y && matches!(r.reason, GcSkipReason::HorizonBlocked)),
+        "Y retained HorizonBlocked, got {:?}",
+        summary.retained
+    );
+
+    // Y's own data keys and tombstone are untouched.
+    assert!(
+        exists(&client, &bucket, &library_key(&y)).await,
+        "HorizonBlocked sibling's original preserved"
+    );
+    assert!(
+        exists(&client, &bucket, &tombstone_key(&y)).await,
+        "HorizonBlocked sibling's tombstone preserved"
+    );
+    // The shared content survives because Y still references it.
+    assert!(
+        exists(&client, &bucket, &preview_key(&content)).await,
+        "shared preview kept while a HorizonBlocked sibling references the content_id"
+    );
+    assert!(
+        exists(&client, &bucket, &thumb_key(&content, ThumbSize::Small)).await,
+        "shared thumb kept while a HorizonBlocked sibling references the content_id"
+    );
+    assert!(
+        x_destroyed.content_destroyed.is_empty(),
+        "content NOT destroyed while a HorizonBlocked sibling references it"
+    );
+}
+
+#[tokio::test]
 async fn tombstone_gc_horizon_fast_path_uses_seq_not_vv_component() {
     // Review round 0 minor: §2.10(a)'s "every active device applied past it"
     // fast path must compare the del's journal SEQ (seq space) against each
