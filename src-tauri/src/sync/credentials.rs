@@ -60,16 +60,51 @@ impl FileCredentialStore {
 
 impl CredentialStore for FileCredentialStore {
     fn load(&self) -> std::io::Result<Option<Credentials>> {
-        let _ = &self.path;
-        todo!("P1-U7: read + parse credentials.json (0600), returning None when absent (§3.6)")
+        match std::fs::read(&self.path) {
+            Ok(bytes) => {
+                let creds: Credentials = serde_json::from_slice(&bytes)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                Ok(Some(creds))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn store(&self, creds: &Credentials) -> std::io::Result<()> {
-        let _ = creds;
-        todo!("P1-U7: atomically write credentials.json and chmod 0600 on unix (§3.6)")
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_vec_pretty(creds)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        // Atomic temp+rename in the same directory so a crash mid-write can
+        // never leave a half-written credential file.
+        let dir = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+        {
+            use std::io::Write;
+            tmp.write_all(&json)?;
+            tmp.flush()?;
+        }
+        // Tighten to 0600 before the file carries a secret under its final
+        // name (§3.6: read only in Rust, never world-readable).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tmp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        tmp.persist(&self.path)
+            .map_err(|e| std::io::Error::other(e.error))?;
+        Ok(())
     }
 
     fn clear(&self) -> std::io::Result<()> {
-        todo!("P1-U7: remove credentials.json if present (§3.6)")
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }

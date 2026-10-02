@@ -126,49 +126,104 @@ pub fn sync_exit_flush(app: &tauri::AppHandle) {
 #[cfg(feature = "sync")]
 mod imp {
     use std::path::{Path, PathBuf};
+    use std::time::Duration;
 
     use crate::image_processing::ImageMetadata;
-    use crate::sync::WriteOrigin;
+    use crate::sync::{WriteOrigin, global_manager};
 
-    pub fn notify_sidecar_saved(sidecar_path: &Path, meta: &ImageMetadata, origin: WriteOrigin) {
-        let _ = (sidecar_path, meta, origin);
-        todo!(
-            "P1-U7: route sidecar-saved into the global SyncManager (§3.4 step 5 / §3.7 admission)"
-        )
+    /// The §3.3 exit-flush budget: bounded so the process never stalls on
+    /// shutdown (ARCHITECTURE.md §3.3).
+    const EXIT_FLUSH_BUDGET: Duration = Duration::from_secs(2);
+
+    pub fn notify_sidecar_saved(sidecar_path: &Path, _meta: &ImageMetadata, origin: WriteOrigin) {
+        // Route into the process-global manager (installed in `setup()` and
+        // by the integration tests). When none is installed, or sync is
+        // unconfigured, this is a cheap no-op (§3.3). The manager re-reads
+        // the just-persisted bytes so the engine hashes exactly what landed
+        // on disk.
+        if let Some(mgr) = global_manager() {
+            mgr.note_local_sidecar(sidecar_path, origin);
+        }
     }
 
     pub fn notify_new_original(path: &Path) {
-        let _ = path;
-        todo!("P1-U7: enqueue a new original for upload (§3.4 new-original hooks)")
+        // A new original (import / derived output / duplicate / copy) is
+        // enqueued for upload through the same §2.5 intake, keyed by its own
+        // relkey (§3.4 new-original hooks). Best-effort: any failure is
+        // logged, never propagated to the upstream call site.
+        if let Some(mgr) = global_manager() {
+            mgr.note_new_original(path);
+        }
     }
 
     pub fn notify_deleted(path: &Path) {
-        let _ = path;
-        todo!("P1-U7: soft delete + tombstone (§2.7)")
+        // §2.7 soft delete + tombstone. The full remote tombstone is an
+        // async S3 effect driven by the supervisor; the hook records the
+        // local intent for the next cycle. Best-effort, never panics.
+        if let Some(mgr) = global_manager() {
+            mgr.note_deleted(path);
+        }
     }
 
     pub fn notify_moved(from: &Path, to: &Path) {
-        let _ = (from, to);
-        todo!("P1-U7: remote move (§2.7)")
+        // §2.7 remote move. Same deferral as `notify_deleted`: the hook
+        // records intent; the async move effect rides the supervisor.
+        if let Some(mgr) = global_manager() {
+            mgr.note_moved(from, to);
+        }
     }
 
     pub fn is_stub(path: &Path) -> bool {
+        // Stubs are created only once the §3.5 hydration/eviction unit (P2)
+        // lands; until then no path is a cloud stub, so the honest answer is
+        // always `false` (every original is present on disk).
         let _ = path;
-        todo!("P2: in-memory stub mirror of redb (§3.5)")
+        false
     }
 
-    pub fn ensure_local(path: &Path, reason: &str) -> std::io::Result<PathBuf> {
-        let _ = (path, reason);
-        todo!("P2: hydrate stub with ranged resume (§3.5)")
+    pub fn ensure_local(path: &Path, _reason: &str) -> std::io::Result<PathBuf> {
+        // No stubs exist yet (see `is_stub`), so hydration is an identity
+        // pass: the real original is already present at `path` (P2 adds the
+        // ranged-resume download).
+        Ok(path.to_path_buf())
     }
 
     pub fn sync_flush_path(path: &Path) {
-        let _ = path;
-        todo!("P1-U7: release the §3.7 editor hold for this path")
+        // §3.7 editor-hold release hint. The P1 admission policy quiesces
+        // every dirty item (`admit_pending(|_, _| true)`), so there is no
+        // per-path hold to release yet; record the hint for the manager.
+        if let Some(mgr) = global_manager() {
+            mgr.note_flush_hint(path);
+        }
     }
 
     pub fn sync_exit_flush(app: &tauri::AppHandle) {
+        // Bounded (<=2s) opportunistic drain of queued small sidecar
+        // uploads on `RunEvent::ExitRequested` (§3.3). Runs the async flush
+        // to completion on a transient current-thread runtime so the
+        // synchronous Tauri run-event callback can call it directly, and is
+        // itself hard-bounded so shutdown never hangs.
         let _ = app;
-        todo!("P1-U7: bounded (<=2s) exit flush of queued small sidecar uploads (§3.3)")
+        let Some(mgr) = global_manager() else {
+            return;
+        };
+        if !mgr.is_configured() {
+            return;
+        }
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                log::warn!("exit flush: could not build runtime: {e}");
+                return;
+            }
+        };
+        runtime.block_on(async {
+            if let Err(e) = mgr.exit_flush(EXIT_FLUSH_BUDGET).await {
+                log::warn!("exit flush: {e}");
+            }
+        });
     }
 }

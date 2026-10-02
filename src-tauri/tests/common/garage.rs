@@ -354,11 +354,11 @@ admin_token = "{admin_token}"
 
 impl Drop for Garage {
     fn drop(&mut self) {
-        if let Ok(mut guard) = self.child.lock() {
-            if let Some(mut child) = guard.take() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+        if let Ok(mut guard) = self.child.lock()
+            && let Some(mut child) = guard.take()
+        {
+            let _ = child.kill();
+            let _ = child.wait();
         }
     }
 }

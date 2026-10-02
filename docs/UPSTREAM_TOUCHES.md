@@ -10,13 +10,13 @@ Status legend: [ ] planned (phase) · [x] landed
 
 | File | Change | Status |
 |---|---|---|
-| `src-tauri/Cargo.toml` | workspace member `crates/rrcloud-core`, deps, `sync` feature | [ ] P1 |
-| `src-tauri/src/lib.rs` | `mod sync;` + command registration + SyncManager start + exit flush + `ensure_local` guards in merge commands | [ ] P1/P2 |
-| `src-tauri/src/app_state.rs` | `sync_manager` field + sidecar lock map | [ ] P1 |
-| `src-tauri/src/app_settings.rs` | `sync: SyncSettings` field | [ ] P1 |
-| `src-tauri/src/exif_processing.rs` | `save_sidecar` chokepoint (corruption + remote-head guards); `load_sidecar` warn on parse failure | [ ] P1 |
-| `src-tauri/src/file_management.rs` | ~12 write sites → chokepoint; `is_cloud_placeholder` `\|\| sync::is_stub`; `ensure_local` guards; import/derived/delete hooks; XMP-import hash gate; `ImageFile.sync_state` | [ ] P1/P2 |
-| `src-tauri/src/tagging.rs` | 4 write sites → chokepoint | [ ] P1 |
+| `src-tauri/Cargo.toml` | optional path dep `crates/rrcloud-core` + `sync` feature (default on) + `dashmap` | [x] P1 |
+| `src-tauri/src/lib.rs` | `pub mod sync;` + `#[cfg(sync)] pub use ::rrcloud_core;` + SyncManager start in `setup()` + `RunEvent::ExitRequested` exit flush. (command registration + `ensure_local` guards in merge commands remain P2) | [x] P1 (partial) |
+| `src-tauri/src/app_state.rs` | `sync_manager` field + sidecar lock map | [x] P1 |
+| `src-tauri/src/app_settings.rs` | `sync: SyncSettings` field (`#[serde(default)]`; credentials excluded) | [x] P1 |
+| `src-tauri/src/exif_processing.rs` | `save_sidecar` chokepoint (per-path lock, 0-byte/corrupt quarantine + abort, atomic temp+rename, churn-gated notify); `load_sidecar` warn on parse failure + auto-heal routes through chokepoint | [x] P1 |
+| `src-tauri/src/file_management.rs` | ~11 sidecar write sites → chokepoint (`is_cloud_placeholder` `\|\| sync::is_stub`; `ensure_local` guards; import/derived/delete hooks; XMP-import hash gate; `ImageFile.sync_state` remain P1/P2) | [x] P1 (sidecar sites) |
+| `src-tauri/src/tagging.rs` | 4 sidecar write sites → chokepoint | [x] P1 |
 | `src-tauri/src/image_loader.rs` | proxy branch + `ensure_local` at the iCloud error branch; pin `(apply_ungamma, apply_calibration)` for tagged proxies; `proxy_scale`-scaled enhance amounts | [ ] P2/P3 |
 | `src-tauri/src/raw_processing.rs` | `clamp_limit`: `fast_demosaic && !is_linear_format` (ARCHITECTURE.md §4.1/E3) | [ ] P3 |
 | `src-tauri/src/export_processing.rs` | `ensure_local` before per-image load | [ ] P2 |

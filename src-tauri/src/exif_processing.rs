@@ -285,11 +285,124 @@ pub fn save_sidecar(
     meta: &ImageMetadata,
     origin: crate::sync::WriteOrigin,
 ) -> Result<(), String> {
-    let _ = (app, sidecar_path, meta, origin);
-    todo!(
-        "P1-U7: save_sidecar chokepoint — per-path lock, corruption/remote-head guards, \
-         atomic temp+rename, churn-gated notify (§3.4)"
-    )
+    // (1) Per-path lock — serializes the three writers to one sidecar (user
+    // edit, AI tagging, sync's inbound apply). Always held, feature or not;
+    // a poisoned lock is recovered (the data it guards is on disk, not in
+    // the mutex). The guard lives for the whole write.
+    let lock = crate::sync::sidecar_lock_for(sidecar_path);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    // The exact byte image upstream wrote: pretty JSON, no trailing newline.
+    let new_bytes = serde_json::to_vec_pretty(meta).map_err(|e| e.to_string())?;
+
+    // (2) corruption guard + (5) churn-gate decision — sync feature only.
+    // With sync off, the chokepoint is purely the atomic write below, so it
+    // is byte-identical to upstream's old `fs::write` (§7 parity).
+    #[cfg(feature = "sync")]
+    let changed = {
+        let mut changed = true;
+        if let Ok(prior_bytes) = std::fs::read(sidecar_path) {
+            let parsed_ok = !prior_bytes.is_empty()
+                && serde_json::from_slice::<ImageMetadata>(&prior_bytes).is_ok();
+            if !parsed_ok {
+                // A locally corrupt / 0-byte sidecar must never be silently
+                // replaced by a defaults-based document that then out-versions
+                // the real edit everywhere (the §3.4 / A4 trap). When sync is
+                // configured, quarantine it and abort; the next cycle's apply
+                // pulls the real remote head back down. With sync off/
+                // unconfigured, keep upstream behavior and proceed.
+                let configured = crate::sync::global_manager()
+                    .map(|m| m.is_configured())
+                    .unwrap_or(false);
+                if configured {
+                    quarantine_corrupt_sidecar(sidecar_path)?;
+                    if let Some(app) = app {
+                        crate::sync::events::emit_error(
+                            app,
+                            Some(sidecar_path.to_string_lossy().as_ref()),
+                            "sidecar restored — please retry",
+                        );
+                    }
+                    return Err(format!(
+                        "corrupt sidecar quarantined, write aborted: {}",
+                        sidecar_path.display()
+                    ));
+                }
+            } else if let (Ok(prior_sem), Ok(new_sem)) = (
+                rrcloud_core::semhash::sem_hash(&prior_bytes),
+                rrcloud_core::semhash::sem_hash(&new_bytes),
+            ) {
+                // §2.5 churn gate: an EXIF-cache / auto-heal rewrite with the
+                // same semantic hash must not notify the engine.
+                changed = prior_sem != new_sem;
+            }
+        }
+        changed
+    };
+
+    // (4) Atomic write: temp file in the same directory, then rename. A
+    // failure (e.g. a missing parent dir) leaves nothing behind — no partial
+    // file, no leftover temp sibling.
+    atomic_write_sidecar(sidecar_path, &new_bytes)?;
+
+    // (5) Churn-gated engine notification (§3.4 step 5). No-op when no
+    // manager is installed / sync is unconfigured.
+    #[cfg(feature = "sync")]
+    {
+        if changed {
+            crate::sync::hooks::notify_sidecar_saved(sidecar_path, meta, origin);
+        }
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = (app, origin);
+    }
+
+    Ok(())
+}
+
+/// Atomically writes `bytes` to `sidecar_path` via a same-directory temp
+/// file plus rename (ARCHITECTURE.md §3.4 step 4). Any failure leaves the
+/// destination and directory exactly as they were.
+fn atomic_write_sidecar(sidecar_path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let dir = sidecar_path.parent().ok_or_else(|| {
+        format!(
+            "sidecar has no parent directory: {}",
+            sidecar_path.display()
+        )
+    })?;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(|e| e.to_string())?;
+    {
+        use std::io::Write;
+        tmp.write_all(bytes).map_err(|e| e.to_string())?;
+        tmp.flush().map_err(|e| e.to_string())?;
+    }
+    tmp.persist(sidecar_path).map_err(|e| e.error.to_string())?;
+    Ok(())
+}
+
+/// Quarantines a corrupt on-disk sidecar to `<name>.corrupt-<ts>` so the
+/// real edit is preserved for inspection and never clobbered by defaults
+/// (ARCHITECTURE.md §3.4 step 2).
+#[cfg(feature = "sync")]
+fn quarantine_corrupt_sidecar(sidecar_path: &Path) -> Result<(), String> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut name = sidecar_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".corrupt-{ts}"));
+    let dest = sidecar_path.with_file_name(name);
+    std::fs::rename(sidecar_path, &dest).map_err(|e| e.to_string())?;
+    log::warn!(
+        "Quarantined corrupt sidecar {} -> {}",
+        sidecar_path.display(),
+        dest.display()
+    );
+    Ok(())
 }
 
 pub fn load_sidecar_with_exif(sidecar_path: &Path, source_path: &Path) -> ImageMetadata {
