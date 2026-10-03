@@ -27,17 +27,22 @@ use std::sync::Arc;
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 
+#[cfg(feature = "sync")]
+pub mod commands;
 pub mod credentials;
 pub mod events;
 pub mod hooks;
 pub mod manager;
 
 pub use credentials::{CredentialStore, Credentials, FileCredentialStore};
-pub use manager::{EvictionReport, SyncError, SyncManager, SyncState, SyncStatus, ThumbVariant};
+pub use manager::{
+    ConflictKeep, EvictionReport, PeerDevice, RecentlyDeleted, SyncError, SyncManager, SyncState,
+    SyncStatus, ThumbVariant, VerifyReport,
+};
 
 // Re-exports so the integration tests (and future command layer) reach the
 // chokepoint and settings types through one module path.
-pub use crate::app_settings::SyncSettings;
+pub use crate::app_settings::{AppSettings, SyncSettings};
 pub use crate::exif_processing::{save_sidecar, update_sidecar};
 pub use crate::image_processing::ImageMetadata;
 

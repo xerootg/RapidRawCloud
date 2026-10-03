@@ -117,6 +117,21 @@ export enum Invokes {
   TetherSetSetting = 'tether_set_setting',
   TetherCapture = 'tether_capture',
   TetherGetPreview = 'tether_get_preview',
+  // Cloud sync (ARCHITECTURE.md §3.3/§3.5/§3.6/§3.8, U8). Absent on an
+  // upstream `--no-default-features` build; callers guard via useSyncActions.
+  SyncStatus = 'sync_status',
+  SyncConfigure = 'sync_configure',
+  SyncSetCredentials = 'sync_set_credentials',
+  SyncPinPaths = 'sync_pin_paths',
+  SyncUnpinPaths = 'sync_unpin_paths',
+  SyncFreeSpace = 'sync_free_space',
+  SyncHydrate = 'sync_hydrate',
+  SyncRecentlyDeleted = 'sync_recently_deleted',
+  SyncRestore = 'sync_restore',
+  SyncResolveConflict = 'sync_resolve_conflict',
+  SyncFlushPath = 'sync_flush_path',
+  SyncRetireDevice = 'sync_retire_device',
+  SyncVerifyLibrary = 'sync_verify_library',
 }
 
 export enum ExifOverlay {
@@ -259,6 +274,8 @@ export interface AppSettings {
   groupPreferredType?: GroupPreference; // legacy
   alwaysDecodeRawThumbnails?: boolean;
   workspace?: WorkspaceState;
+  // Cloud sync settings (ARCHITECTURE.md §3.6). Credentials are never here.
+  sync?: SyncSettings;
 }
 
 export interface BrushSettings {
@@ -305,6 +322,71 @@ export interface ImageFile {
   is_cloud_placeholder: boolean;
   is_raw: boolean;
   group_id: string | null;
+  // Per-item cloud-sync lane state for the grid badge (ARCHITECTURE.md §3.8):
+  // e.g. 'stub' | 'hydrated' | 'synced' | 'pending_up' | 'pending_down' |
+  // 'corrupt_remote'. Undefined/null when sync is off or the item has no record.
+  sync_state?: string | null;
+}
+
+/// Cloud sync settings mirrored from the Rust `SyncSettings` (§3.6). Credentials
+/// are NEVER part of this — the webview only ever learns `credentialsConfigured`.
+export interface SyncSettings {
+  enabled: boolean;
+  endpoint: string;
+  bucket: string;
+  region: string;
+  forcePathStyle: boolean;
+  uploadRequiresUnmetered: boolean;
+  uploadRequiresCharging: boolean;
+  cacheSizeGb: number;
+  previewBudgetGb: number;
+  previewPrefetchMonths: number;
+  autoWatchDcim: boolean;
+  watchedMediaBuckets: string[];
+  workerBackfill: boolean;
+}
+
+/// A device in the shared registry for the settings device panel (§2.10/§3.8).
+export interface SyncPeerDevice {
+  deviceId: string;
+  isSelf: boolean;
+  lastSeenUnix: number;
+  retired: boolean;
+}
+
+/// The §3.8 status snapshot (`sync_status` command). Carries only
+/// `credentialsConfigured: boolean` — never secret material (§3.6).
+export interface SyncStatusDto {
+  state: 'idle' | 'syncing' | 'offline' | 'error';
+  pendingUp: number;
+  pendingDown: number;
+  bytesUp: number;
+  bytesDown: number;
+  dirtyUnbacked: number;
+  configured: boolean;
+  credentialsConfigured: boolean;
+  deviceId: string | null;
+  peerDevices: SyncPeerDevice[];
+}
+
+/// A soft-deleted item in the "Recently Deleted" view (§3.8).
+export interface SyncRecentlyDeleted {
+  path: string;
+  relkey: string;
+  deletedUnix: number;
+}
+
+/// Per-path item-state update from the batched `sync-item-state` event (§3.8).
+export interface SyncItemStateUpdate {
+  path: string;
+  state: string;
+}
+
+/// A `sync-conflict` event payload (§3.8).
+export interface SyncConflict {
+  path: string;
+  copyPath: string;
+  winnerDevice: string;
 }
 
 export interface Option {

@@ -42,6 +42,7 @@ import {
   normalizeCombo,
 } from '../../utils/keyboardUtils';
 import Text from '../ui/Text';
+import SyncSettingsSection from './sync/SyncSettingsSection';
 import { TextColors, TextVariants, TextWeights } from '../../types/typography';
 import { useOsPlatform } from '../../hooks/useOsPlatform';
 import { useCloudUsage } from '../../hooks/useCloudUsage';
@@ -543,6 +544,7 @@ export default function SettingsPanel({
       { id: 'general', label: t('settings.categories.general'), icon: SlidersHorizontal },
       { id: 'processing', label: t('settings.categories.processing'), icon: Cpu },
       { id: 'shortcuts', label: t('settings.categories.shortcuts'), icon: Keyboard },
+      { id: 'sync', label: 'Sync', icon: Cloud },
     ],
     [t],
   );
@@ -2493,6 +2495,20 @@ export default function SettingsPanel({
                         </Button>
                       </div>
                     </div>
+                  </div>
+                </motion.div>
+              )}
+              {activeCategory === 'sync' && (
+                <motion.div
+                  key="sync"
+                  initial={{ opacity: 0, x: 10 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -10 }}
+                  transition={{ duration: 0.2 }}
+                  className="space-y-10"
+                >
+                  <div className="p-6 bg-surface rounded-xl shadow-md">
+                    <SyncSettingsSection />
                   </div>
                 </motion.div>
               )}

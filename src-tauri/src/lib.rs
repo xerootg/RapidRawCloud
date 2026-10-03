@@ -190,7 +190,10 @@ pub fn effective_geometry_scale(base_to_output: f32, proxy_scale: f32) -> f32 {
 /// correct region of the downscaled proxy base. A no-op clone when there is no
 /// crop. Returns the modified adjustments; the caller restores the reported
 /// crop offset back to original space by dividing by `proxy_scale`.
-fn scale_crop_into_proxy_space(adjustments: &serde_json::Value, proxy_scale: f32) -> serde_json::Value {
+fn scale_crop_into_proxy_space(
+    adjustments: &serde_json::Value,
+    proxy_scale: f32,
+) -> serde_json::Value {
     let mut adj = adjustments.clone();
     if let Some(crop_val) = adj.get("crop").cloned()
         && let Ok(c) = serde_json::from_value::<Crop>(crop_val)
@@ -2382,6 +2385,36 @@ pub fn run() {
             camera_tethering::tether_get_preview,
             camera_tethering::tether_autofocus,
             guided_perspective::calculate_guided_perspective,
+            // Cloud-sync control surface (ARCHITECTURE.md §3.3/§3.5/§3.6/§3.8,
+            // U8). cfg-gated on `sync`: a `--no-default-features` build
+            // registers none of these and stays functionally upstream (§7);
+            // the webview call-guards on their absence.
+            #[cfg(feature = "sync")]
+            sync::commands::sync_status,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_configure,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_set_credentials,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_pin_paths,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_unpin_paths,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_free_space,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_hydrate,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_recently_deleted,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_restore,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_resolve_conflict,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_flush_path,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_retire_device,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_verify_library,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
@@ -2530,8 +2563,7 @@ mod proxy_render_scale_tests {
         // A radial mask centered at ORIGINAL pixel (3000, 2000) must land at the
         // corresponding proxy-space point (1280, 853) on the 2560x1707 canvas.
         let def = radial_def(3000.0, 2000.0, 300.0);
-        let bmp = generate_mask_bitmap(&def, pw, ph, eff, (0.0, 0.0), None)
-            .expect("mask bitmap");
+        let bmp = generate_mask_bitmap(&def, pw, ph, eff, (0.0, 0.0), None).expect("mask bitmap");
         let (cx, cy) = centroid(&bmp).expect(
             "mask must be visible on the proxy canvas; a missing proxy_scale displaces it \
              off-canvas (to original coord 3000,2000 on a 2560x1707 base)",

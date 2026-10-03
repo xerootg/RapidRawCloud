@@ -16,6 +16,8 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::app_settings::SyncSettings;
 use crate::sync::WriteOrigin;
 use crate::sync::credentials::Credentials;
@@ -85,6 +87,65 @@ pub struct EvictionReport {
     pub corrupt: Vec<PathBuf>,
     /// Total bytes still resident in hydrated originals after the pass.
     pub resident_bytes: u64,
+}
+
+/// A device in the shared registry (§2.10 / §3.8 device-management panel),
+/// surfaced to the settings UI's "list/retire devices" view by
+/// [`SyncManager::peer_devices`]. Serialized straight to the webview, so it
+/// carries no secret material.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PeerDevice {
+    /// The registry device id.
+    pub device_id: String,
+    /// This device's own id matches `device_id` (so the UI can mark "this
+    /// device" and refuse to retire it out from under itself).
+    pub is_self: bool,
+    /// Last registry heartbeat, unix seconds (0 when unknown).
+    pub last_seen_unix: i64,
+    /// Whether the device has already been retired (§2.10 GC).
+    pub retired: bool,
+}
+
+/// A soft-deleted item surfaced in the settings "Recently Deleted" view
+/// (§3.8), returned by [`SyncManager::recently_deleted`] and restorable with
+/// [`SyncManager::restore`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentlyDeleted {
+    /// Absolute local path the item would be restored to.
+    pub path: String,
+    /// The library-relative key (stable across devices).
+    pub relkey: String,
+    /// Tombstone time, unix seconds (0 when unknown).
+    pub deleted_unix: i64,
+}
+
+/// Which side of a conflict to keep when resolving one from the UI (§3.8
+/// `sync-conflict`): the winning (version-vector) document, or the local
+/// loser preserved as a copy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ConflictKeep {
+    /// Keep the version-vector winner; discard the local loser.
+    Winner,
+    /// Keep the local loser as a `-conflict` copy alongside the winner.
+    Copy,
+}
+
+/// What one [`SyncManager::verify_library`] reconcile pass found (§3.5
+/// wholeness reconcile), surfaced by the settings "Verify library" action.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VerifyReport {
+    /// Items whose local/remote facts were checked.
+    pub checked: usize,
+    /// Items whose missing originals/sidecars were re-queued for download.
+    pub repaired: usize,
+    /// Items the remote no longer holds (reported, not deleted locally).
+    pub missing: usize,
+    /// Items whose remote bytes failed a read-back hash (`corrupt_remote`).
+    pub corrupt: usize,
 }
 
 /// Errors from the manager's plain-Rust API.
@@ -629,6 +690,145 @@ impl SyncManager {
         #[cfg(not(feature = "sync"))]
         {
             let _ = (image_path, variant, jpeg_bytes, cache_thumbnails_dir);
+            Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    // ---- §3.8 control surface (U8 command layer) --------------------------
+    //
+    // These back the Tauri command handlers in `sync::commands`. They are
+    // genuine gaps over the existing engine primitives (which already ship in
+    // rrcloud-core: `device_id`, `active_devices`, `recently_deleted`,
+    // `restore_item`, the conflict relkey helpers, `retire_device`,
+    // `reconcile_wholeness`). The bodies land in U8 green; U8 red leaves them
+    // `todo!()` under the feature and inert (never-panicking) when sync is off,
+    // so both cargo configs compile and the command tests fail on the gap.
+
+    /// This device's registry id (§2.10), or `None` when sync is off or
+    /// unconfigured. Backs `sync_status().device_id`.
+    pub fn device_id(&self) -> Option<String> {
+        #[cfg(feature = "sync")]
+        {
+            if self.configured().is_err() {
+                return None;
+            }
+            todo!("U8 green: expose the engine's device_id")
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            None
+        }
+    }
+
+    /// The shared device registry (§2.10) for the settings device panel.
+    /// Empty when sync is off or unconfigured. Backs
+    /// `sync_status().peer_devices`.
+    pub fn peer_devices(&self) -> Vec<PeerDevice> {
+        #[cfg(feature = "sync")]
+        {
+            if self.configured().is_err() {
+                return Vec::new();
+            }
+            todo!("U8 green: list the device registry via active_devices")
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// Soft-deleted items (§2.7) for the "Recently Deleted" view (§3.8).
+    pub fn recently_deleted(&self) -> Result<Vec<RecentlyDeleted>, SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let _cfg = self.configured()?;
+            todo!("U8 green: project engine::recently_deleted into the DTO")
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    /// Restores a soft-deleted item (§2.7), re-queuing its download. Returns
+    /// the paths restored (an item plus any associated sidecar).
+    pub fn restore(&self, image_path: &Path) -> Result<Vec<PathBuf>, SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let _cfg = self.configured()?;
+            let _ = image_path;
+            todo!("U8 green: drive engine::restore_item for the relkey")
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = image_path;
+            Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    /// Resolves a §2.6 conflict on `image_path` from the UI (§3.8): keep the
+    /// version-vector winner, or preserve the local loser as a copy.
+    pub fn resolve_conflict(&self, image_path: &Path, keep: ConflictKeep) -> Result<(), SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let _cfg = self.configured()?;
+            let _ = (image_path, keep);
+            todo!("U8 green: resolve via the engine conflict helpers (§2.6)")
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = (image_path, keep);
+            Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    /// "Free up space" for specific paths (§3.5): evict the named hydrated
+    /// originals back to 0-byte stubs (honoring the same verified-remote gate
+    /// as [`Self::run_evictor`], never evicting unverified bytes), regardless
+    /// of the LRU budget. Returns the number actually demoted.
+    pub fn evict_paths(&self, image_paths: &[PathBuf]) -> Result<usize, SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let _cfg = self.configured()?;
+            let _ = image_paths;
+            // GREEN: evict each verified path and `self.mark_stub(p, true)` as
+            // each commits, mirroring `run_evictor`'s per-item mirror update.
+            todo!("U8 green: evict the named paths to stubs behind the §3.5 gate")
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = image_paths;
+            Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    /// Retires a device from the shared registry (§2.10) from the settings
+    /// device panel.
+    pub async fn retire_device(&self, device_id: &str) -> Result<(), SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let _cfg = self.configured()?;
+            let _ = device_id;
+            todo!("U8 green: drive compact::retire_device")
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = device_id;
+            Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    /// Kicks a wholeness reconcile (§3.5): re-checks local vs. remote facts
+    /// and re-queues anything missing, backing the settings "Verify library"
+    /// action.
+    pub async fn verify_library(&self) -> Result<VerifyReport, SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let _cfg = self.configured()?;
+            todo!("U8 green: drive engine::reconcile_wholeness and tally")
+        }
+        #[cfg(not(feature = "sync"))]
+        {
             Err(SyncError::FeatureDisabled)
         }
     }

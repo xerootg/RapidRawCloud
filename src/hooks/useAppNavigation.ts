@@ -138,6 +138,8 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
     });
 
     debouncedSave.flush();
+    // §3.7: hint the sync engine to admit the editor-held sidecar now.
+    if (selectedImage?.path) invoke(Invokes.SyncFlushPath, { path: selectedImage.path }).catch(() => {});
     debouncedSetHistory.cancel();
 
     const lastActivePath = selectedImage?.path ?? null;
@@ -160,6 +162,8 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
       useEditorStore.getState().patchesSentToBackend.clear();
       debouncedSave.flush();
+      // §3.7: flush hint for the image we are switching away from.
+      if (selectedImage?.path) invoke(Invokes.SyncFlushPath, { path: selectedImage.path }).catch(() => {});
       debouncedSetHistory.cancel();
 
       if (selectedImage?.path && cachedEditStateRef.current) {
@@ -385,6 +389,8 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
         if (!preserveEditor && selectedImage) {
           debouncedSave.flush();
+          // §3.7: flush hint before tearing down the editor for this image.
+          if (selectedImage.path) invoke(Invokes.SyncFlushPath, { path: selectedImage.path }).catch(() => {});
           debouncedSetHistory.cancel();
           setEditor({ selectedImage: null, finalPreviewUrl: null, uncroppedAdjustedPreviewUrl: null, histogram: null });
           setEditor({ adjustments: INITIAL_ADJUSTMENTS });

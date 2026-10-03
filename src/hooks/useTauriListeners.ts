@@ -6,6 +6,8 @@ import { useProcessStore } from '../store/useProcessStore';
 import { useEditorStore } from '../store/useEditorStore';
 import { useUIStore } from '../store/useUIStore';
 import { useLibraryStore } from '../store/useLibraryStore';
+import { useSyncStore } from '../store/useSyncStore';
+import { SyncConflict, SyncStatusDto } from '../components/ui/AppProperties';
 
 interface TauriListenerProps {
   refreshAllFolderTrees: () => void;
@@ -389,6 +391,39 @@ export function useTauriListeners({
             cullingModalState: { ...state.cullingModalState, progress: null, error: String(event.payload) },
           }));
         }
+      }),
+      // ---- Cloud sync (ARCHITECTURE.md §3.8) ----
+      listen('sync-status', (event: any) => {
+        if (!isEffectActive) return;
+        const store = useSyncStore.getState();
+        store.setStatus(event.payload as SyncStatusDto);
+        if (store.available !== true) store.setAvailable(true);
+      }),
+      listen('sync-item-state', (event: any) => {
+        if (!isEffectActive) return;
+        // Batched payload: an array of {path, state}.
+        const updates = Array.isArray(event.payload) ? event.payload : [event.payload];
+        useSyncStore.getState().applyItemStates(updates);
+      }),
+      listen('sync-hydrate-progress', (event: any) => {
+        if (!isEffectActive) return;
+        const { path, bytes, total } = event.payload;
+        useSyncStore.getState().setHydrateProgress(path, { bytes, total });
+      }),
+      listen('sync-hydrated', (event: any) => {
+        if (!isEffectActive) return;
+        const { path } = event.payload;
+        useSyncStore.getState().clearHydrateProgress(path);
+        useSyncStore.getState().applyItemStates([{ path, state: 'hydrated' }]);
+      }),
+      listen('sync-conflict', (event: any) => {
+        if (!isEffectActive) return;
+        useSyncStore.getState().pushConflict(event.payload as SyncConflict);
+      }),
+      listen('sync-error', (event: any) => {
+        if (!isEffectActive) return;
+        const payload = event.payload ?? {};
+        useSyncStore.getState().setError({ path: payload.path ?? null, message: String(payload.message ?? payload) });
       }),
     ];
 
