@@ -561,3 +561,208 @@ async fn adopt_remote_preserves_this_devices_out_of_root_album_membership() {
         "B's new in-root image must be adopted, rebased onto A's root, got {imgs:?}"
     );
 }
+
+/// Round review blocker: the `remote_wins: true` arm of a §2.6 concurrent
+/// meta conflict must publish the elementwise-max vv to the SHARED key, not
+/// just believe it locally — otherwise the live object's vv never advances
+/// past the winner's own un-merged value, the same concurrent pair compares
+/// `Concurrent` again next cycle (never `Equal`/`Greater`), and the resolving
+/// device's dirty flag can never clear (architecture §2.6: "the key's vv ←
+/// elementwise max of both vvs, so the next edit on either device dominates
+/// both branches and the conflict cannot reopen").
+///
+/// Deterministic without timing luck: `ts` is captured at `note_local_meta`
+/// time (wall-clock seconds), and the §2.6 concurrent tiebreak is `ts` first,
+/// device id only on a tie (`clock::pick_winner`). B saves (and is dirty)
+/// first; after a full second has elapsed, A saves and publishes — so A's
+/// head strictly postdates B's, and when B resolves the conflict against A,
+/// A (remote) deterministically wins regardless of either device's random
+/// UUID, landing B in the very `remote_wins: true` arm under test.
+#[tokio::test]
+async fn concurrent_conflict_remote_wins_merges_the_live_vv_so_it_cannot_reopen() {
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run the conflict-vv-merge test");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("albums-conflict-vv-merge");
+    let a = device(garage, &bucket);
+    let b = device(garage, &bucket);
+
+    // B saves (and goes dirty) first, at the earlier ts.
+    let doc_b = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "fb", "name": "FromB", "icon": null,
+          "images": [b.sync_root.join("b.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    b.save_meta(MetaKind::Albums, &b.albums_path(), &doc_b);
+
+    // A full second later (ts is whole unix seconds), A saves and publishes
+    // first — A's head strictly postdates B's.
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+    let doc_a = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "fa", "name": "FromA", "icon": null,
+          "images": [a.sync_root.join("a.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    a.save_meta(MetaKind::Albums, &a.albums_path(), &doc_a);
+    a.mgr.run_once().await.expect("A publishes first");
+
+    // B's cycle now resolves a concurrent conflict against A's (later-ts,
+    // dominant) head: A/remote must win the deterministic tiebreak.
+    b.mgr
+        .run_once()
+        .await
+        .expect("B resolves the conflict (remote/A wins)");
+
+    let client = garage.client();
+    let a_id = a.mgr.device_id().expect("A has a device id");
+    let b_id = b.mgr.device_id().expect("B has a device id");
+
+    let head = client
+        .head_object(&bucket, ".rrcloud/v1/meta/albums.json")
+        .await
+        .expect("head the live albums document");
+    let vv_json = head
+        .metadata
+        .get("rr-vv")
+        .expect("the live object must carry the rr-vv metadata head");
+    let vv: std::collections::BTreeMap<String, u64> =
+        serde_json::from_str(vv_json).expect("rr-vv metadata parses as a vv map");
+    assert_eq!(
+        vv.get(&a_id).copied(),
+        Some(1),
+        "live vv must carry the winner's (A's) bump: {vv:?}"
+    );
+    assert_eq!(
+        vv.get(&b_id).copied(),
+        Some(1),
+        "live vv must ALSO carry the resolving device's (B's) bump — the \
+         elementwise max of both sides — or the exact same concurrent pair \
+         reopens the conflict on the next comparison: {vv:?}"
+    );
+
+    // The other half of the same bug: with the vv never advancing, B's
+    // resolve-and-verify loop can never observe its own intended head, so it
+    // falls through without ever clearing `meta_dirty` — re-resolving the
+    // identical (already-resolved) conflict forever. A clean no-op re-cycle
+    // must mint no additional conflict-loser copy.
+    b.mgr
+        .run_once()
+        .await
+        .expect("B's second cycle, with no further local edits, must be a clean no-op");
+    let meta_keys_after = keys_under(&client, &bucket, ".rrcloud/v1/meta/").await;
+    let conflict_keys: Vec<&String> = meta_keys_after
+        .iter()
+        .filter(|k| k.starts_with(".rrcloud/v1/meta/albums.conflict-") && k.ends_with(".json"))
+        .collect();
+    assert_eq!(
+        conflict_keys.len(),
+        1,
+        "a settled conflict must mint exactly one recoverable loser copy, not re-resolve on \
+         every subsequent cycle: {meta_keys_after:?}"
+    );
+}
+
+/// Round review blocker: the overwrite PUT of the shared meta key (both the
+/// `KeepLocal`-dirty republish and either side of a `Conflict` resolution) is
+/// unconditional — it is issued from a decision made against a `HeadObject`
+/// read that may by now be stale, with no recheck immediately before the
+/// write. A third device's concurrent publish landing in that gap is
+/// silently destroyed: not live, and — because the clobbering device never
+/// knew the third device existed — captured in no conflict-loser copy
+/// either, contradicting meta.rs's documented "no album/preset data is ever
+/// lost" and §2.6/§2.9's lossless-conflict guarantee.
+///
+/// Reproduced with two devices (B, C) that each independently resolve a
+/// concurrent conflict against the SAME already-published baseline (A's
+/// document) **without ever learning of each other**, racing their
+/// resolutions concurrently (`tokio::join!`) against the same real Garage
+/// backend. Whichever finishes last unconditionally overwrites the other's
+/// freshly-resolved document — real network interleaving decides the order,
+/// but either order loses data identically on the current unconditional-PUT
+/// code: both B and C compute a conflict-loser copy of A's content only
+/// (each is unaware of the other), so the loser's own edit is recorded
+/// nowhere once it is overwritten. A correct implementation must detect the
+/// gap (a fresh recheck immediately before the overwrite) and fall back to
+/// re-resolving against what is now actually live, so after a few settling
+/// cycles every one of the three devices' edits is recoverable — live or as
+/// a conflict-loser copy — never silently gone.
+#[tokio::test]
+async fn an_unaware_third_devices_concurrent_edit_is_never_silently_clobbered() {
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run the third-writer clobber test");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("albums-third-writer");
+    let a = device(garage, &bucket);
+    let b = device(garage, &bucket);
+    let c = device(garage, &bucket);
+
+    let doc_a = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "fa", "name": "FromA", "icon": null,
+          "images": [a.sync_root.join("a.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    a.save_meta(MetaKind::Albums, &a.albums_path(), &doc_a);
+    a.mgr.run_once().await.expect("A publishes the baseline");
+
+    // B and C each save a DISTINCT concurrent edit, neither having seen the
+    // other (nor re-fetched after A — both still only know A's baseline).
+    // `ts` is whole unix seconds (§2.6 tiebreak); a second between each save
+    // guarantees ts_A < ts_B < ts_C strictly, so BOTH B's and C's resolution
+    // against A deterministically has the local (dirty) side win regardless
+    // of either device's random UUID — isolating the test to the race
+    // between B and C's own unconditional overwrites (the bug under test),
+    // with no dependence on which side a concurrent-tiebreak happens to pick.
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+    let doc_b = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "fb", "name": "FromB", "icon": null,
+          "images": [b.sync_root.join("b.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    b.save_meta(MetaKind::Albums, &b.albums_path(), &doc_b);
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+    let doc_c = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "fc", "name": "FromC", "icon": null,
+          "images": [c.sync_root.join("c.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    c.save_meta(MetaKind::Albums, &c.albums_path(), &doc_c);
+
+    // Race B's and C's resolutions concurrently against the same live key —
+    // each believes it is only resolving against A, unaware the other is
+    // doing the very same thing at the same time.
+    let (r_b, r_c) = tokio::join!(b.mgr.run_once(), c.mgr.run_once());
+    r_b.expect("B's cycle must not error");
+    r_c.expect("C's cycle must not error");
+
+    // Let everything settle: further cycles adopt whatever ultimately won,
+    // with no more local edits pending anywhere.
+    for _ in 0..3 {
+        a.mgr.run_once().await.expect("A settles");
+        b.mgr.run_once().await.expect("B settles");
+        c.mgr.run_once().await.expect("C settles");
+    }
+
+    let client = garage.client();
+    let meta_keys = keys_under(&client, &bucket, ".rrcloud/v1/meta/").await;
+    let live = get_bytes(&client, &bucket, ".rrcloud/v1/meta/albums.json").await;
+    let mut recoverable_names: Vec<String> = album_names(&live);
+    let conflict_keys: Vec<&String> = meta_keys
+        .iter()
+        .filter(|k| k.starts_with(".rrcloud/v1/meta/albums.conflict-") && k.ends_with(".json"))
+        .collect();
+    for key in &conflict_keys {
+        let bytes = get_bytes(&client, &bucket, key).await;
+        recoverable_names.extend(album_names(&bytes));
+    }
+    recoverable_names.sort();
+    recoverable_names.dedup();
+    assert_eq!(
+        recoverable_names,
+        vec!["FromA".to_string(), "FromB".to_string(), "FromC".to_string()],
+        "every device's edit must be recoverable — live or as a conflict-loser copy — \
+         never silently destroyed by an unconditional overwrite; got live+losers \
+         {recoverable_names:?} from meta keys {meta_keys:?}"
+    );
+}

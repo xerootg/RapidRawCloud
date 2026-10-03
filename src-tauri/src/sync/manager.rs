@@ -1061,6 +1061,18 @@ mod imp {
         /// Nothing needed writing (§2.6 case 1): the live state already
         /// satisfies our local edit. Nothing to verify.
         Converged,
+        /// The decision was made against a remote read that a fresh
+        /// recheck, taken immediately before committing the shared key's
+        /// overwrite, found already stale — some other write landed in the
+        /// gap. Nothing was written (the stale decision is abandoned whole,
+        /// not partially acted on); the caller must re-fetch the now-actual
+        /// remote and re-resolve against it, in the same cycle — the same
+        /// resolve-and-verify shape the architecture already applies
+        /// *after* a write (the first-publish race), applied *before* this
+        /// one instead, since a post-write verify here could never tell
+        /// "we landed cleanly" apart from "we silently clobbered a
+        /// competitor" — both read back as our own just-written head.
+        Stale,
         /// A write (publish, conflict resolution) or an adopt happened; the
         /// carried head is what the caller believes is now live, to confirm
         /// with a follow-up `HeadObject`.
@@ -1484,6 +1496,43 @@ mod imp {
             Ok(())
         }
 
+        /// [`Self::put_meta_document`], guarded by a fresh `HeadObject`
+        /// recheck against `expected_remote` immediately before committing
+        /// the write.
+        ///
+        /// `new_head`/`bytes` were decided from a `HeadObject`+`GET` pair
+        /// read earlier (`expected_remote`) and can go stale while that
+        /// decision is acted on (relativizing, localizing, writing the
+        /// local file, materializing the conflict loser) — this key is
+        /// shared across every device, unlike every other key this engine
+        /// writes, so a competitor's publish landing in that gap is
+        /// reachable. Unlike the first-publish race (an accepted, documented
+        /// exception — no prior content exists there for a blind overwrite
+        /// to destroy), overwriting a key that already holds someone else's
+        /// un-accounted-for edit would silently destroy it: the usual
+        /// after-the-write resolve-and-verify ([`Configured::sync_one_meta_document`])
+        /// cannot tell "we landed cleanly" apart from "we just clobbered a
+        /// competitor" — both read back as exactly the head we ourselves
+        /// just wrote. Checking immediately before the write instead closes
+        /// that blind spot: a mismatch here means the decision is already
+        /// void, so nothing is written at all, and [`MetaActOutcome::Stale`]
+        /// tells the caller to re-fetch and re-resolve against what is now
+        /// actually live rather than act on stale information.
+        async fn put_meta_document_guarded(
+            &self,
+            kind: MetaKind,
+            bytes: Vec<u8>,
+            new_head: &MetaHead,
+            expected_remote: &MetaHead,
+        ) -> Result<MetaActOutcome, SyncError> {
+            let fresh = self.fetch_remote_meta_head(kind).await?;
+            if fresh.as_ref() != Some(expected_remote) {
+                return Ok(MetaActOutcome::Stale);
+            }
+            self.put_meta_document(kind, bytes, new_head).await?;
+            Ok(MetaActOutcome::Acted(new_head.clone()))
+        }
+
         /// The "first publisher" PUT for `kind`: like [`Self::put_meta_document`]
         /// but with `fail_if_exists` (`If-None-Match: *`), so a second device
         /// racing the same empty key cannot silently last-write-wins over us
@@ -1646,12 +1695,32 @@ mod imp {
 
             for attempt in 0..Self::MAX_META_RESOLVE_ATTEMPTS {
                 let outcome = self.act_meta_once(kind, dirty, &local, remote.clone()).await?;
-                let MetaActOutcome::Acted(intended) = outcome else {
-                    // Converged: the live state (whatever it is) already
-                    // satisfies our local edit — nothing was written, so
-                    // there is nothing to verify.
-                    self.clear_meta_dirty(kind);
-                    return Ok(());
+                let intended = match outcome {
+                    MetaActOutcome::Converged => {
+                        // The live state (whatever it is) already satisfies
+                        // our local edit — nothing was written, so there is
+                        // nothing to verify.
+                        self.clear_meta_dirty(kind);
+                        return Ok(());
+                    }
+                    MetaActOutcome::Stale => {
+                        // A pre-write recheck caught a competitor's write
+                        // already live before we committed anything —
+                        // nothing was written this attempt. Re-fetch (our
+                        // `remote` is now known-stale) and re-resolve
+                        // against the now-actual remote.
+                        remote = self.fetch_remote_meta_head(kind).await?;
+                        if attempt + 1 == Self::MAX_META_RESOLVE_ATTEMPTS {
+                            log::warn!(
+                                "sync: meta {kind:?} did not converge after {} attempts this \
+                                 cycle (persistent racing writer?); leaving dirty for the next \
+                                 cycle",
+                                Self::MAX_META_RESOLVE_ATTEMPTS
+                            );
+                        }
+                        continue;
+                    }
+                    MetaActOutcome::Acted(intended) => intended,
                 };
                 let observed = self.fetch_remote_meta_head(kind).await?;
                 if observed.as_ref() == Some(&intended) {
@@ -1748,8 +1817,7 @@ mod imp {
                             .ok()
                             .and_then(|p| p.get(&kind).cloned())
                             .ok_or_else(|| se("meta: dirty kind has no staged bytes"))?;
-                        self.put_meta_document(kind, bytes, local).await?;
-                        Ok(MetaActOutcome::Acted(local.clone()))
+                        self.put_meta_document_guarded(kind, bytes, local, &remote).await
                     } else {
                         // Not dirty — our recorded head already dominates the
                         // (unchanged) remote; nothing to do or verify.
@@ -1777,17 +1845,36 @@ mod imp {
                     let mut merged_vv = local.vv.clone();
                     merged_vv.merge(&remote.vv);
 
-                    let new_head = if remote_wins {
+                    // Both arms below write the SHARED key through the
+                    // guarded helper (§2.6/§2.9): a mismatch there means a
+                    // competitor's write landed since `remote` was read, so
+                    // this resolution is abandoned (`Stale`) rather than
+                    // overwriting whatever that competitor just published.
+                    // The local-file write and the conflict-loser PUT ahead
+                    // of it are unaffected either way — the loser is a
+                    // content-addressed, idempotent fact about THIS
+                    // historical pair that stays true even if the shared key
+                    // has since moved on, and the local file is superseded
+                    // by whatever the next retry resolves to if this attempt
+                    // turns out stale.
+                    if remote_wins {
                         let localized = meta::localize(kind, &remote_bytes, &self.sync_root).map_err(se)?;
                         let merged = self.merge_local_out_of_root(kind, &localized)?;
                         self.write_local_meta(kind, &merged)?;
                         self.put_meta_conflict_loser(kind, &local_relativized).await?;
-                        MetaHead {
+                        let new_head = MetaHead {
                             vv: merged_vv,
                             blake3: remote.blake3.clone(),
                             ts: remote.ts,
                             device: remote.device.clone(),
-                        }
+                        };
+                        // Re-publishes the remote's own (unchanged) bytes —
+                        // only the vv advances, to the elementwise max, so
+                        // this exact concurrent pair can never reopen the
+                        // conflict (§2.6: "the next edit on either device
+                        // dominates both branches").
+                        self.put_meta_document_guarded(kind, remote_bytes, &new_head, &remote)
+                            .await
                     } else {
                         let new_head = MetaHead {
                             vv: merged_vv,
@@ -1795,12 +1882,14 @@ mod imp {
                             ts: local.ts,
                             device: local.device.clone(),
                         };
-                        self.put_meta_document(kind, local_relativized, &new_head)
+                        let outcome = self
+                            .put_meta_document_guarded(kind, local_relativized, &new_head, &remote)
                             .await?;
-                        self.put_meta_conflict_loser(kind, &remote_bytes).await?;
-                        new_head
-                    };
-                    Ok(MetaActOutcome::Acted(new_head))
+                        if matches!(outcome, MetaActOutcome::Acted(_)) {
+                            self.put_meta_conflict_loser(kind, &remote_bytes).await?;
+                        }
+                        Ok(outcome)
+                    }
                 }
             }
         }
