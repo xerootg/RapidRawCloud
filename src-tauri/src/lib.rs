@@ -1877,6 +1877,18 @@ pub fn run() {
         }
     }
 
+    #[cfg(feature = "sync")]
+    {
+        // The P5 Android platform plugin (ARCHITECTURE.md §5): registers
+        // the Kotlin `RrcloudPlugin` class on Android (a no-op `Rrcloud`
+        // handle on desktop), which is what wires the `RrcloudBridge` JNI
+        // entry points' native-library load into the app's lifecycle.
+        // Feature-gated to mirror `SyncManager`'s own `sync`-only wiring
+        // (`crate::sync::manager::start_in_setup`, below) — a
+        // `--no-default-features` build links neither.
+        builder = builder.plugin(tauri_plugin_rrcloud::init());
+    }
+
     builder
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_fs::init())

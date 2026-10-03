@@ -15,7 +15,12 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # are inert no-ops, so it is functionally identical to upstream.
 default = ["sync"]
 tethering = ["dep:gphoto2"]
-sync = ["dep:rrcloud-core"]
+# `tauri-plugin-rrcloud` carries the §5 Android platform work (WorkManager
+# jobs, Keystore CredentialStore, DCIM ContentObserver, JNI bridge
+# registration); it is a plain dependency of every platform's build (like
+# any other Tauri plugin crate) but is only ever *used* — `init()` called,
+# its android/ Kotlin project linked — under `sync`, mirroring rrcloud-core.
+sync = ["dep:rrcloud-core", "dep:tauri-plugin-rrcloud"]
 
 [dependencies]
 tauri = { version = "2.11", features = [ "macos-private-api", "rustls-tls", "protocol-asset" ] }
@@ -77,6 +82,11 @@ sysinfo = "0.39.6"
 # [workspace] + Cargo.lock, so cargo resolves this as an external path
 # dependency.
 rrcloud-core = { path = "crates/rrcloud-core", optional = true }
+# The P5 Android plugin (ARCHITECTURE.md §5). Scaffolded via `npx tauri
+# plugin new`; lives at the repo root (sibling of `src-tauri`, like
+# `worker/`) rather than under `crates/`, matching where `tauri plugin new`
+# puts a plugin by convention. Optional + gated by `sync` above.
+tauri-plugin-rrcloud = { path = "../tauri-plugin-rrcloud", optional = true }
 # Per-path sidecar lock map (§3.4 step 1).
 dashmap = "6"
 

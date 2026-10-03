@@ -155,6 +155,16 @@ tokio = { version = "1", features = [
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 
+# P5 Android bridge (ARCHITECTURE.md §5.1): the `Java_…_RrcloudBridge_*`
+# JNI entry points in `src/android/bridge.rs`. Target-gated exactly like
+# `src-tauri`'s own `android_integration.rs` (same `jni` major as that
+# crate's `jni = "0.21"`, so a workspace-unified build never resolves two
+# incompatible `jni` majors) — a host `cargo test` never compiles this
+# dependency or the `bridge` module content behind it, which is how the
+# §5 pure-logic modules stay testable with no JNI/Android toolchain.
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
 # Crash-injection + lock-exclusivity suite for the redb state store (§2.1.5,
 # §5.1). harness = false: the binary re-execs itself as a writer/locker child
 # (dispatched on an env var), and the parent SIGKILLs it mid-commit-loop —

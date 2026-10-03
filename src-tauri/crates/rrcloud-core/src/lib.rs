@@ -40,7 +40,13 @@
 //!   `rrcloud-worker` bin (`src/bin/rrcloud-worker.rs`), which depends on
 //!   this crate **only** (a documented refinement of §6 — no
 //!   `rapidraw_lib`/tauri linkage; color parity comes from [`proxy`]).
+//! - [`android`]: the §5 Android platform integration — the
+//!   `tauri-plugin-rrcloud` JNI bridge entry points (target-gated, needs a
+//!   JVM) plus the host-testable pure decision logic those entry points
+//!   call into (bounded-cycle deadline, JNI result-code mapping, DCIM
+//!   dedupe, scan-window arithmetic).
 
+pub mod android;
 pub mod clock;
 pub mod compact;
 pub mod engine;
