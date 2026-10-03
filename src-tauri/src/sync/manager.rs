@@ -1203,6 +1203,26 @@ mod imp {
                 }
             }
 
+            // Reseed the pending-publish lane from redb (§2.9): a local edit
+            // admitted by `note_local_meta` durably stages its relativized
+            // bytes (`pending_meta_bytes`) in the same call that bumps the
+            // head above, and only clears them once a cycle confirms
+            // delivery. Without this, a device that restarts between
+            // admitting an edit and that confirmation would reseed
+            // `meta_heads` already-bumped (so `decide_meta` sees its own
+            // state as dominant) but `meta_dirty` empty — and silently never
+            // republish, since nothing here marks the edit as still owed.
+            // See `SyncDb::pending_meta_bytes`'s doc for the full failure
+            // mode this closes.
+            let mut meta_dirty = std::collections::HashSet::new();
+            let mut meta_pending = std::collections::HashMap::new();
+            for kind in [MetaKind::Albums, MetaKind::Presets] {
+                if let Some(bytes) = db.pending_meta_bytes(kind.meta_key()).map_err(se)? {
+                    meta_dirty.insert(kind);
+                    meta_pending.insert(kind, bytes);
+                }
+            }
+
             Ok(Configured {
                 bucket: settings.bucket.clone(),
                 settings,
@@ -1211,10 +1231,10 @@ mod imp {
                 s3: Arc::new(s3),
                 backend: std::sync::Mutex::new(None),
                 notify_count: AtomicUsize::new(0),
-                meta_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
+                meta_dirty: std::sync::Mutex::new(meta_dirty),
                 meta_local_paths: std::sync::Mutex::new(std::collections::HashMap::new()),
                 meta_heads: std::sync::Mutex::new(meta_heads),
-                meta_pending: std::sync::Mutex::new(std::collections::HashMap::new()),
+                meta_pending: std::sync::Mutex::new(meta_pending),
             })
         }
 
@@ -1337,12 +1357,21 @@ mod imp {
             drop(heads);
             // Persisted immediately, not only once a cycle later confirms
             // delivery (§2.9): a crash between this save-site intake and the
-            // next cycle must not lose the version bump itself, even though
-            // the pending relativized bytes (reconstructable from the local
-            // file, which the save site already wrote durably) are not
-            // separately persisted here.
+            // next cycle must not lose the version bump itself. The
+            // relativized pending bytes are persisted right alongside it
+            // (`set_pending_meta_bytes`) — not reconstructed from the head
+            // alone — because the head by itself cannot later be told apart
+            // from "this version already reached the bucket" (see
+            // `SyncDb::pending_meta_bytes`'s doc): without the separate
+            // record, a restart before the next cycle confirms delivery
+            // would reseed `meta_heads` already-bumped and never know to
+            // republish, silently losing the edit from every other device's
+            // point of view.
             if let Err(e) = self.db.set_synced_meta_head(kind.meta_key(), &new_head) {
                 log::warn!("sync intake (meta): persist head: {e}");
+            }
+            if let Err(e) = self.db.set_pending_meta_bytes(kind.meta_key(), &relativized) {
+                log::warn!("sync intake (meta): persist pending bytes: {e}");
             }
             if let Ok(mut pending) = self.meta_pending.lock() {
                 pending.insert(kind, relativized);
@@ -1796,8 +1825,17 @@ mod imp {
                     .ok()
                     .and_then(|p| p.get(&kind).cloned())
                     .ok_or_else(|| se("meta: dirty kind has no staged bytes"))?;
-                self.put_meta_document_if_absent(kind, bytes, local).await?;
-                return Ok(MetaActOutcome::Acted(local.clone()));
+                // `Ok(false)` means our conditional PUT did NOT land (a
+                // competitor published first) — gate the outcome on that
+                // directly rather than optimistically claiming `Acted` and
+                // relying on the caller's separate post-write re-verify to
+                // catch the mismatch on an extra, otherwise-unnecessary round
+                // trip.
+                return Ok(if self.put_meta_document_if_absent(kind, bytes, local).await? {
+                    MetaActOutcome::Acted(local.clone())
+                } else {
+                    MetaActOutcome::Stale
+                });
             };
 
             match meta::decide_meta(local, &remote) {
@@ -1850,18 +1888,34 @@ mod imp {
                     // competitor's write landed since `remote` was read, so
                     // this resolution is abandoned (`Stale`) rather than
                     // overwriting whatever that competitor just published.
-                    // The local-file write and the conflict-loser PUT ahead
-                    // of it are unaffected either way — the loser is a
+                    //
+                    // In BOTH arms the conflict-loser is durably staged
+                    // FIRST, unconditionally, before the write that could
+                    // destroy its only remaining copy (`write_local_meta`
+                    // overwrites this device's only on-disk copy of its own
+                    // edit in the `remote_wins` arm; the guarded PUT
+                    // overwrites the shared key — the only remaining copy of
+                    // the peer's edit — in the other). A crash, or simply a
+                    // network/IO failure, between the two can then never
+                    // destroy data: either the destructive write never ran
+                    // (the loser is already safe, the original is untouched
+                    // where it was), or it ran successfully (the losing side
+                    // was always going to be superseded, and is already
+                    // preserved). Staging unconditionally — not only when
+                    // the destructive write goes on to succeed — matches
+                    // this codebase's own established pattern for the
+                    // identical hazard: `engine.rs::resolve_concurrent`
+                    // materializes a sidecar's loser before `adopt_remote`
+                    // overwrites the primary file. The loser PUT is a
                     // content-addressed, idempotent fact about THIS
-                    // historical pair that stays true even if the shared key
-                    // has since moved on, and the local file is superseded
-                    // by whatever the next retry resolves to if this attempt
-                    // turns out stale.
+                    // historical pair, so re-staging it on a stale retry (or
+                    // redundantly from a second device) is a harmless no-op
+                    // overwrite with identical bytes.
                     if remote_wins {
+                        self.put_meta_conflict_loser(kind, &local_relativized).await?;
                         let localized = meta::localize(kind, &remote_bytes, &self.sync_root).map_err(se)?;
                         let merged = self.merge_local_out_of_root(kind, &localized)?;
                         self.write_local_meta(kind, &merged)?;
-                        self.put_meta_conflict_loser(kind, &local_relativized).await?;
                         let new_head = MetaHead {
                             vv: merged_vv,
                             blake3: remote.blake3.clone(),
@@ -1876,19 +1930,15 @@ mod imp {
                         self.put_meta_document_guarded(kind, remote_bytes, &new_head, &remote)
                             .await
                     } else {
+                        self.put_meta_conflict_loser(kind, &remote_bytes).await?;
                         let new_head = MetaHead {
                             vv: merged_vv,
                             blake3: Blake3Hex::from_bytes(&local_relativized),
                             ts: local.ts,
                             device: local.device.clone(),
                         };
-                        let outcome = self
-                            .put_meta_document_guarded(kind, local_relativized, &new_head, &remote)
-                            .await?;
-                        if matches!(outcome, MetaActOutcome::Acted(_)) {
-                            self.put_meta_conflict_loser(kind, &remote_bytes).await?;
-                        }
-                        Ok(outcome)
+                        self.put_meta_document_guarded(kind, local_relativized, &new_head, &remote)
+                            .await
                     }
                 }
             }
@@ -1900,6 +1950,13 @@ mod imp {
             }
             if let Ok(mut pending) = self.meta_pending.lock() {
                 pending.remove(&kind);
+            }
+            // Clears the durable half too (`SyncDb::pending_meta_bytes`) —
+            // the edit is now confirmed delivered (or there was nothing left
+            // to deliver), so a restart from here on must NOT reseed this
+            // kind as still outstanding.
+            if let Err(e) = self.db.clear_pending_meta_bytes(kind.meta_key()) {
+                log::warn!("sync: meta {kind:?} clear pending bytes: {e}");
             }
         }
 

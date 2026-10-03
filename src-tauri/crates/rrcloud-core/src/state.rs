@@ -441,6 +441,9 @@ const K_SEGMENT_PUB_TS_PREFIX: &str = "seg_pub_ts:";
 /// §2.9 per-kind authored/adopted meta-document head key prefix (see
 /// [`SyncDb::synced_meta_head`]).
 const K_META_HEAD_PREFIX: &str = "meta_head:";
+/// §2.9 per-kind durably-staged pending-publish bytes key prefix (see
+/// [`SyncDb::pending_meta_bytes`]).
+const K_META_PENDING_PREFIX: &str = "meta_pending:";
 
 /// The meta key holding the server-time publish stamp of the own-prefix
 /// segment starting at `first_seq` (zero-padded hex, so keys sort in seq
@@ -453,6 +456,13 @@ fn segment_pub_ts_key(first_seq: u64) -> String {
 /// bucket key is `meta_key` (e.g. `.rrcloud/v1/meta/albums.json`).
 fn meta_head_key(meta_key: &str) -> String {
     format!("{K_META_HEAD_PREFIX}{meta_key}")
+}
+
+/// The meta key holding the durably-staged pending-publish bytes for the
+/// document whose bucket key is `meta_key` (see
+/// [`SyncDb::pending_meta_bytes`]).
+fn meta_pending_key(meta_key: &str) -> String {
+    format!("{K_META_PENDING_PREFIX}{meta_key}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2210,6 +2220,57 @@ impl SyncDb {
         self.with_txn(|t| {
             let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
             meta.insert(meta_head_key(meta_key).as_str(), to_json(head)?.as_slice())
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// The §2.9 relativized document bytes this device has staged to
+    /// publish for `meta_key` but has not yet confirmed delivered, or `None`
+    /// if there is nothing outstanding. This is the durable half of the
+    /// in-memory `meta_pending`/`meta_dirty` pair the sync manager keeps per
+    /// process: [`Self::synced_meta_head`] alone is not enough to recover a
+    /// pending publish on restart, because it is overwritten with the
+    /// *bumped* head the moment the local edit is admitted (so the version
+    /// itself is never lost even across a crash) — which makes the head
+    /// alone indistinguishable from "this version already reached the
+    /// bucket". Without this record, a device that restarts after admitting
+    /// a local album/preset edit but before a sync cycle confirms it
+    /// delivered would reseed `meta_heads` with the already-bumped head,
+    /// see its own local state as already dominant on the very next cycle,
+    /// and never republish — silently and permanently losing the edit from
+    /// every other device's point of view. Reseeding `meta_pending` /
+    /// `meta_dirty` from this record on reconfigure closes that gap.
+    pub fn pending_meta_bytes(&self, meta_key: &str) -> Result<Option<Vec<u8>>, StateError> {
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(T_META).map_err(db_err)?;
+        Ok(meta
+            .get(meta_pending_key(meta_key).as_str())
+            .map_err(db_err)?
+            .map(|guard| guard.value().to_vec()))
+    }
+
+    /// Durably stages `bytes` as the outstanding pending publish for
+    /// `meta_key` (see [`Self::pending_meta_bytes`]). Overwrites any
+    /// previous value — a newer local edit supersedes whatever was still
+    /// outstanding from an earlier one.
+    pub fn set_pending_meta_bytes(&self, meta_key: &str, bytes: &[u8]) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(meta_pending_key(meta_key).as_str(), bytes)
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// Clears the outstanding pending publish for `meta_key` (see
+    /// [`Self::pending_meta_bytes`]) once a cycle confirms the document
+    /// delivered (or finds there is nothing left to publish). A no-op if
+    /// nothing was staged.
+    pub fn clear_pending_meta_bytes(&self, meta_key: &str) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.remove(meta_pending_key(meta_key).as_str())
                 .map_err(db_err)?;
             Ok(())
         })

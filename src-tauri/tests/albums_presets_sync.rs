@@ -502,6 +502,70 @@ async fn concurrent_first_publishers_recover_on_next_appearance_after_restart() 
     );
 }
 
+/// Round review blocker: `note_local_meta` bumps and durably persists the
+/// [`MetaHead`] (`SyncDb::set_synced_meta_head`) immediately on save, but
+/// previously left the dirty/pending-publish state in-memory only. A
+/// restart between that save and the next sync cycle reseeds `meta_heads`
+/// from redb with the ALREADY-BUMPED head but `meta_dirty` empty — so
+/// `decide_meta` sees the local head as already dominant (`KeepLocal`) and,
+/// seeing it as not-dirty, treats that as a clean no-op forever: the edit is
+/// never published, silently and permanently, from every OTHER device's
+/// point of view (the bytes are still on this device's own disk, so nothing
+/// looks wrong locally — only a second device, or this device after a
+/// factory-reset, would ever reveal it never arrived).
+///
+/// Exactly the repro the finding calls for: save, restart with NO cycle in
+/// between, then run a single cycle and confirm the document landed.
+#[tokio::test]
+async fn a_local_meta_edit_survives_a_restart_before_the_first_sync_cycle() {
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run the restart-durability test");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("albums-restart-durability");
+    let a = device(garage, &bucket);
+
+    let doc_a = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "fa", "name": "FromA", "icon": null,
+          "images": [a.sync_root.join("a.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    a.save_meta(MetaKind::Albums, &a.albums_path(), &doc_a);
+
+    // Restart BEFORE any cycle ever ran — the save-site intake is the only
+    // thing that has happened to this device so far.
+    let a = a.restart(garage, &bucket);
+    a.mgr
+        .run_once()
+        .await
+        .expect("the first post-restart cycle");
+
+    let client = garage.client();
+    let meta_keys = keys_under(&client, &bucket, ".rrcloud/v1/meta/").await;
+    assert!(
+        meta_keys.iter().any(|k| k == ".rrcloud/v1/meta/albums.json"),
+        "the edit admitted before the restart must still publish on the first \
+         post-restart cycle, got {meta_keys:?}"
+    );
+    let live = get_bytes(&client, &bucket, ".rrcloud/v1/meta/albums.json").await;
+    assert_eq!(
+        album_names(&live),
+        vec!["FromA".to_string()],
+        "the published document must carry the pre-restart edit"
+    );
+
+    // A second cycle with nothing new to say must be a clean no-op: no
+    // duplicate publish, no conflict manufactured against itself.
+    a.mgr.run_once().await.expect("a clean no-op cycle");
+    let meta_keys_after = keys_under(&client, &bucket, ".rrcloud/v1/meta/").await;
+    assert_eq!(
+        meta_keys_after,
+        vec![".rrcloud/v1/meta/albums.json".to_string()],
+        "a settled, unchanged document must not be re-published or conflict \
+         with itself: {meta_keys_after:?}"
+    );
+}
+
 #[tokio::test]
 async fn adopt_remote_preserves_this_devices_out_of_root_album_membership() {
     let Some(garage) = garage::shared() else {
@@ -764,5 +828,102 @@ async fn an_unaware_third_devices_concurrent_edit_is_never_silently_clobbered() 
         "every device's edit must be recoverable — live or as a conflict-loser copy — \
          never silently destroyed by an unconditional overwrite; got live+losers \
          {recoverable_names:?} from meta keys {meta_keys:?}"
+    );
+}
+
+/// Round review blocker: in the `remote_wins: true` arm of a §2.6 concurrent
+/// meta conflict, the losing device's ONLY on-disk copy of its own edit is
+/// overwritten by `write_local_meta` (adopting the winner) BEFORE that edit's
+/// bytes are durably preserved as the conflict loser. A crash — or here, an
+/// ordinary I/O failure — landing between those two writes permanently
+/// destroys the loser with no copy left anywhere: not on disk (overwritten
+/// mid-way... except the write itself is what's under test and must be made
+/// to fail), not in the bucket (the loser PUT never ran). This contradicts
+/// meta.rs's and ARCHITECTURE §2.6/§2.9's "no album/preset data is ever
+/// lost" guarantee, and inverts the already-established ordering this same
+/// codebase uses correctly for sidecar conflicts (`engine.rs::resolve_concurrent`
+/// materializes the loser before `adopt_remote` overwrites the primary file).
+///
+/// Deterministic, no timing luck: B saves (and is dirty) first; a full
+/// second later A saves and publishes, so A's head strictly postdates B's
+/// and B's resolution against it deterministically lands in the
+/// `remote_wins: true` arm under test (same technique as
+/// `concurrent_conflict_remote_wins_merges_the_live_vv_so_it_cannot_reopen`).
+/// Just before B's resolving cycle, B's local `albums/` directory is
+/// replaced with a plain file, so `write_local_meta`'s `create_dir_all`
+/// deterministically fails — a real, reproducible I/O failure standing in
+/// for "the process is interrupted right there" — exercising exactly the
+/// ordering the finding is about without relying on process-kill timing.
+///
+/// Under the pre-fix ordering (overwrite, THEN stage the loser) this
+/// deterministically fails: `write_local_meta`'s error returns before the
+/// loser PUT ever runs, so B's edit is recoverable nowhere. Under the fix
+/// (stage the loser durably, THEN attempt the overwrite) the loser is
+/// already safely in the bucket by the time the injected failure surfaces.
+#[tokio::test]
+async fn conflict_loser_is_staged_before_the_destructive_local_overwrite_can_run() {
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run the loser-ordering test");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("albums-loser-ordering");
+    let a = device(garage, &bucket);
+    let b = device(garage, &bucket);
+
+    // B saves (and goes dirty) first, at the earlier ts.
+    let doc_b = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "fb", "name": "FromB", "icon": null,
+          "images": [b.sync_root.join("b.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    b.save_meta(MetaKind::Albums, &b.albums_path(), &doc_b);
+
+    // A full second later, A saves and publishes first — A's head strictly
+    // postdates B's, so B's resolution against it is deterministically
+    // `remote_wins: true`.
+    std::thread::sleep(std::time::Duration::from_millis(1_200));
+    let doc_a = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "fa", "name": "FromA", "icon": null,
+          "images": [a.sync_root.join("a.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    a.save_meta(MetaKind::Albums, &a.albums_path(), &doc_a);
+    a.mgr.run_once().await.expect("A publishes first");
+
+    // Sabotage B's local meta directory so `write_local_meta` (adopting A's
+    // winning document) deterministically fails: `create_dir_all` on a path
+    // whose component already exists as a plain file errors out, instead of
+    // silently succeeding the way it would against an already-correct
+    // directory.
+    let albums_dir = b.albums_path().parent().unwrap().to_path_buf();
+    std::fs::remove_dir_all(&albums_dir).expect("remove B's albums dir");
+    std::fs::write(&albums_dir, b"not a directory").expect("replace it with a plain file");
+
+    // B's cycle resolves the conflict (A/remote wins) and must fail trying
+    // to adopt A's document locally — but the failure must happen AFTER B's
+    // own losing edit is already durably staged as the recoverable loser.
+    let result = b.mgr.run_once().await;
+    assert!(
+        result.is_err(),
+        "the injected I/O failure must surface as a cycle error, not be silently swallowed"
+    );
+
+    let client = garage.client();
+    let meta_keys = keys_under(&client, &bucket, ".rrcloud/v1/meta/").await;
+    let conflict_keys: Vec<&String> = meta_keys
+        .iter()
+        .filter(|k| k.starts_with(".rrcloud/v1/meta/albums.conflict-") && k.ends_with(".json"))
+        .collect();
+    assert_eq!(
+        conflict_keys.len(),
+        1,
+        "B's losing edit must already be durably staged as a recoverable conflict-loser \
+         object by the time the local-overwrite failure surfaces, got meta keys {meta_keys:?}"
+    );
+    let loser_bytes = get_bytes(&client, &bucket, conflict_keys[0]).await;
+    assert_eq!(
+        album_names(&loser_bytes),
+        vec!["FromB".to_string()],
+        "the staged loser must hold B's own (about to be overwritten) content"
     );
 }
