@@ -37,11 +37,14 @@
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
-use crate::clock::{DeviceId, VersionVector};
+use crate::clock::{compare, pick_winner, Candidate, DeviceId, VersionVector, VvOrder};
 use crate::journal::Kind;
-use crate::keys::{KeyError, ALBUMS_META_KEY, CONTROL_PREFIX, PRESETS_META_KEY};
-use crate::semhash::Blake3Hex;
+use crate::keys::{
+    local_path, relkey, KeyError, RelKey, ALBUMS_META_KEY, CONTROL_PREFIX, PRESETS_META_KEY,
+};
+use crate::semhash::{canonical_json, Blake3Hex};
 
 /// URI scheme marking a relativized, library-relative image/LUT path inside
 /// a synced meta document (`rr://<relkey>`). Chosen so a relativized path is
@@ -168,8 +171,25 @@ pub enum MetaDecision {
 /// same [`MetaDecision`], and the concurrent winner is stable regardless of
 /// arrival order (`pick_winner` is symmetric).
 pub fn decide_meta(local: &MetaHead, remote: &MetaHead) -> MetaDecision {
-    let _ = (local, remote);
-    todo!("P6 green: reuse clock::compare + pick_winner to order the two meta heads")
+    match compare(&remote.vv, &local.vv) {
+        VvOrder::Equal => MetaDecision::Converged,
+        VvOrder::Greater => MetaDecision::AdoptRemote,
+        VvOrder::Less => MetaDecision::KeepLocal,
+        VvOrder::Concurrent => {
+            let winner = pick_winner(
+                Candidate {
+                    ts: remote.ts,
+                    device: &remote.device,
+                },
+                Candidate {
+                    ts: local.ts,
+                    device: &local.device,
+                },
+            );
+            let remote_wins = winner.ts == remote.ts && *winner.device == remote.device;
+            MetaDecision::Conflict { remote_wins }
+        }
+    }
 }
 
 /// Rewrites a meta document for **upload** (§2.9): every absolute image path
@@ -180,8 +200,12 @@ pub fn decide_meta(local: &MetaHead, remote: &MetaHead) -> MetaDecision {
 /// semantically unchanged document relativizes to byte-identical output
 /// (feeds [`MetaKind::conflict_key`] determinism).
 pub fn relativize(kind: MetaKind, doc: &[u8], sync_root: &Path) -> Result<Vec<u8>, MetaError> {
-    let _ = (kind, doc, sync_root);
-    todo!("P6 green: relativize in-root paths to rr://, drop out-of-root entries")
+    let mut value: Value = serde_json::from_slice(doc)?;
+    match kind {
+        MetaKind::Albums => relativize_albums(&mut value, sync_root),
+        MetaKind::Presets => relativize_presets(&mut value, sync_root),
+    }
+    Ok(serde_json::to_vec_pretty(&value)?)
 }
 
 /// Rewrites a downloaded meta document for **this device** (§2.9): every
@@ -190,8 +214,12 @@ pub fn relativize(kind: MetaKind, doc: &[u8], sync_root: &Path) -> Result<Vec<u8
 /// copy — out-of-root paths were dropped at upload) pass through unchanged.
 /// A malformed `rr://` relkey is a typed [`MetaError::Key`] (fail closed).
 pub fn localize(kind: MetaKind, doc: &[u8], sync_root: &Path) -> Result<Vec<u8>, MetaError> {
-    let _ = (kind, doc, sync_root);
-    todo!("P6 green: map rr://<relkey> back to this device's absolute paths")
+    let mut value: Value = serde_json::from_slice(doc)?;
+    match kind {
+        MetaKind::Albums => localize_albums(&mut value, sync_root)?,
+        MetaKind::Presets => localize_presets(&mut value, sync_root)?,
+    }
+    Ok(serde_json::to_vec_pretty(&value)?)
 }
 
 /// The canonical byte form of a meta document used for loser hashing
@@ -200,6 +228,142 @@ pub fn localize(kind: MetaKind, doc: &[u8], sync_root: &Path) -> Result<Vec<u8>,
 /// same bytes — and therefore the same [`MetaKind::conflict_key`] suffix —
 /// regardless of how either serialized it locally.
 pub fn canonical(doc: &[u8]) -> Result<Vec<u8>, MetaError> {
-    let _ = doc;
-    todo!("P6 green: parse + re-serialize with sorted keys for a stable loser hash")
+    let value: Value = serde_json::from_slice(doc)?;
+    Ok(canonical_json(&value).into_bytes())
+}
+
+/// Maps one path string through [`relkey`] into its `rr://<relkey>` wire
+/// form; `None` when `s` is not a path under `sync_root` (or not a mappable
+/// path at all — see [`relativize`]'s doc for the drop rule this feeds).
+fn relativize_path_str(s: &str, sync_root: &Path) -> Option<String> {
+    relkey(Path::new(s), sync_root)
+        .ok()
+        .map(|rk| format!("{RR_SCHEME}{}", rk.as_str()))
+}
+
+/// The reverse of [`relativize_path_str`]: an `rr://<relkey>` form maps back
+/// to an absolute path under `sync_root`; anything else (there is no
+/// `rr://` form in a well-formed uploaded copy) passes through unchanged.
+fn localize_path_str(s: &str, sync_root: &Path) -> Result<String, MetaError> {
+    match s.strip_prefix(RR_SCHEME) {
+        Some(rest) => {
+            let rk = RelKey::parse_wire(rest.to_string())?;
+            Ok(local_path(&rk, sync_root).to_string_lossy().into_owned())
+        }
+        None => Ok(s.to_string()),
+    }
+}
+
+/// Relativizes every `images` array (recursing through `children`, §2.9):
+/// in-root entries become `rr://<relkey>`, out-of-root entries are dropped.
+fn relativize_albums(value: &mut Value, sync_root: &Path) {
+    match value {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                relativize_albums(item, sync_root);
+            }
+        }
+        Value::Object(map) => {
+            if let Some(Value::Array(images)) = map.get_mut("images") {
+                let mapped: Vec<Value> = images
+                    .iter()
+                    .filter_map(|img| {
+                        img.as_str()
+                            .and_then(|s| relativize_path_str(s, sync_root))
+                            .map(Value::String)
+                    })
+                    .collect();
+                *images = mapped;
+            }
+            if let Some(children) = map.get_mut("children") {
+                relativize_albums(children, sync_root);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The reverse of [`relativize_albums`]: every `rr://` image entry maps
+/// back onto `sync_root`. A malformed relkey fails closed.
+fn localize_albums(value: &mut Value, sync_root: &Path) -> Result<(), MetaError> {
+    match value {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                localize_albums(item, sync_root)?;
+            }
+        }
+        Value::Object(map) => {
+            if let Some(Value::Array(images)) = map.get_mut("images") {
+                for img in images.iter_mut() {
+                    if let Value::String(s) = img {
+                        *s = localize_path_str(s, sync_root)?;
+                    }
+                }
+            }
+            if let Some(children) = map.get_mut("children") {
+                localize_albums(children, sync_root)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Relativizes every `lutPath` field anywhere in the document (§2.9): an
+/// in-root value becomes `rr://<relkey>`; an out-of-root value drops the
+/// field entirely (LUTs are not synced in v1, the same rule as a sidecar's
+/// `lutPath`).
+fn relativize_presets(value: &mut Value, sync_root: &Path) {
+    if let Value::Object(map) = value {
+        let replacement = map
+            .get("lutPath")
+            .and_then(Value::as_str)
+            .map(|s| relativize_path_str(s, sync_root));
+        match replacement {
+            Some(Some(rr)) => {
+                map.insert("lutPath".to_string(), Value::String(rr));
+            }
+            Some(None) => {
+                map.remove("lutPath");
+            }
+            None => {}
+        }
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                relativize_presets(item, sync_root);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                relativize_presets(v, sync_root);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The reverse of [`relativize_presets`]: every `rr://` `lutPath` maps back
+/// onto `sync_root`. A malformed relkey fails closed.
+fn localize_presets(value: &mut Value, sync_root: &Path) -> Result<(), MetaError> {
+    if let Value::Object(map) = value {
+        if let Some(Value::String(s)) = map.get_mut("lutPath") {
+            *s = localize_path_str(s, sync_root)?;
+        }
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                localize_presets(item, sync_root)?;
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                localize_presets(v, sync_root)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }

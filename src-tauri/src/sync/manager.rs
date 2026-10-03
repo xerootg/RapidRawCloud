@@ -897,9 +897,10 @@ mod imp {
     };
     use rrcloud_core::journal::{JournalEntry, Kind, Op};
     use rrcloud_core::keys::{RelKey, relkey};
+    use rrcloud_core::meta::{self, MetaDecision, MetaHead};
     use rrcloud_core::publisher::{enqueue_entry, publish_pending};
     use rrcloud_core::reader::poll;
-    use rrcloud_core::s3::{S3Client, S3Config};
+    use rrcloud_core::s3::{PutObjectOptions, S3Client, S3Config};
     use rrcloud_core::semhash::{Blake3Hex, ContentId};
     use rrcloud_core::state::{ItemRecord, ItemState, StateError, SyncDb};
     use rrcloud_core::transfer::{
@@ -1085,12 +1086,25 @@ mod imp {
         /// the cycle's meta upload drains. Empty ⇒ no meta upload work.
         meta_dirty: std::sync::Mutex<std::collections::HashSet<MetaKind>>,
         /// §2.9 device-local path of each meta document (where the save site
-        /// wrote it, and where the apply loop writes a converged document
-        /// back). Learned from [`Configured::note_local_meta`]. Written and
-        /// read only once the P6-green intake/apply bodies land; allow dead
-        /// until then (mirrors the `settings` field's pattern).
-        #[allow(dead_code)]
+        /// wrote it). Learned from [`Configured::note_local_meta`]; the apply
+        /// loop derives the same location independently via
+        /// [`Configured::meta_local_path`] so a device that never saved
+        /// locally (no entry here) still knows where to materialize a
+        /// converged document.
         meta_local_paths: std::sync::Mutex<std::collections::HashMap<MetaKind, PathBuf>>,
+        /// §2.9 last-known head (version vector, content hash, `(ts,
+        /// device)`) of each meta document this process has produced or
+        /// adopted — the "local" side [`meta::decide_meta`] compares the
+        /// next remote head against. Absent ⇒ this device has never
+        /// published or adopted that kind (an empty-vv default is used,
+        /// which always loses to any remote vv, i.e. a fresh `AdoptRemote`).
+        meta_heads: std::sync::Mutex<std::collections::HashMap<MetaKind, MetaHead>>,
+        /// §2.9 relativized bytes of the most recent local edit per kind,
+        /// staged by [`Configured::note_local_meta`] and consumed by the next
+        /// upload (or dropped if a dominating/concurrent remote arrives
+        /// first). Only ever holds an entry while the matching kind is in
+        /// [`Configured::meta_dirty`].
+        meta_pending: std::sync::Mutex<std::collections::HashMap<MetaKind, Vec<u8>>>,
     }
 
     impl Configured {
@@ -1158,6 +1172,8 @@ mod imp {
                 notify_count: AtomicUsize::new(0),
                 meta_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
                 meta_local_paths: std::sync::Mutex::new(std::collections::HashMap::new()),
+                meta_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
+                meta_pending: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         }
 
@@ -1235,8 +1251,57 @@ mod imp {
         /// §2.6 version mint exactly as a sidecar edit does. Best-effort:
         /// an unreadable or unmappable document is logged, never propagated.
         pub fn note_local_meta(&self, kind: MetaKind, local_path: &Path) {
-            let _ = (kind, local_path);
-            todo!("P6 green: read + relativize the meta doc and mark the kind dirty")
+            if let Ok(mut paths) = self.meta_local_paths.lock() {
+                paths.insert(kind, local_path.to_path_buf());
+            }
+            let bytes = match std::fs::read(local_path) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("sync intake (meta): read {}: {e}", local_path.display());
+                    return;
+                }
+            };
+            let relativized = match meta::relativize(kind, &bytes, &self.sync_root) {
+                Ok(r) => r,
+                Err(e) => {
+                    log::warn!(
+                        "sync intake (meta): relativize {}: {e}",
+                        local_path.display()
+                    );
+                    return;
+                }
+            };
+            let blake3 = Blake3Hex::from_bytes(&relativized);
+            let device = self.db.device_id().clone();
+            let ts = now_unix();
+            let mut heads = match self.meta_heads.lock() {
+                Ok(h) => h,
+                Err(e) => {
+                    log::warn!("sync intake (meta): heads lock poisoned: {e}");
+                    return;
+                }
+            };
+            // One admitted local edit = one version bump (§2.6), the same
+            // rule `VersionVector::bump` encodes for every other kind —
+            // reused verbatim, never reimplemented.
+            let mut vv = heads.get(&kind).map(|h| h.vv.clone()).unwrap_or_default();
+            vv.bump(&device);
+            heads.insert(
+                kind,
+                MetaHead {
+                    vv,
+                    blake3,
+                    ts,
+                    device,
+                },
+            );
+            drop(heads);
+            if let Ok(mut pending) = self.meta_pending.lock() {
+                pending.insert(kind, relativized);
+            }
+            if let Ok(mut dirty) = self.meta_dirty.lock() {
+                dirty.insert(kind);
+            }
         }
 
         /// The device-local path of meta document `kind`:
@@ -1246,50 +1311,327 @@ mod imp {
         /// §2.9 apply loop writes a converged document back here even on a
         /// device that never saved locally (it has no `note_local_meta`
         /// record), so the location must be derivable, not only remembered.
-        #[allow(dead_code)]
         fn meta_local_path(&self, kind: MetaKind) -> PathBuf {
             let (dir, file) = match kind {
                 MetaKind::Albums => ("albums", "albums.json"),
                 MetaKind::Presets => ("presets", "presets.json"),
             };
+            // `db.path()` is `<app_data_dir>/rrcloud/state.redb` (§3.3): one
+            // `parent()` reaches the `rrcloud` state dir (where
+            // `preview_store_dir`/the thumbs store live alongside it), a
+            // second reaches `app_data_dir` itself — the same directory
+            // `file_management::get_albums_path`/`get_presets_path` resolve
+            // via `app_handle.path().app_data_dir()` and join `albums/` /
+            // `presets/` onto.
             let app_data_dir = self
                 .db
                 .path()
                 .parent()
+                .and_then(Path::parent)
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| self.sync_root.clone());
             app_data_dir.join(dir).join(file)
         }
 
-        /// Whether any meta document needs uploading this cycle (§2.9). Cheap
-        /// local check so [`Configured::run_cycle`] skips the meta lane
-        /// entirely when there is nothing to do (the common case).
-        fn has_meta_upload_work(&self) -> bool {
-            self.meta_dirty
+        /// The path to use for `kind`'s device-local file right now: the
+        /// exact path the save site handed [`Configured::note_local_meta`]
+        /// when this device has saved that kind itself (so a
+        /// caller-supplied non-standard location is honored, not silently
+        /// redirected), else the derived [`Configured::meta_local_path`] for
+        /// a device that has only ever adopted the kind from a peer.
+        fn resolved_meta_local_path(&self, kind: MetaKind) -> PathBuf {
+            self.meta_local_paths
                 .lock()
-                .map(|s| !s.is_empty())
-                .unwrap_or(false)
+                .ok()
+                .and_then(|m| m.get(&kind).cloned())
+                .unwrap_or_else(|| self.meta_local_path(kind))
         }
 
-        /// The §2.9 meta lane of one cycle: upload every dirty meta document
-        /// (relativized, with a bumped version vector + journal entry) and
-        /// apply any converged remote meta head — download it, `localize`
-        /// it to this device's sync root, atomically replace the local file,
-        /// and surface a conflict loser via a `sync-conflict` event. The
-        /// whole-document resolution reuses `meta::decide_meta` (which in
-        /// turn reuses the §2.6 `compare` / `pick_winner`), never a bespoke
-        /// rule.
-        ///
-        /// Skips cleanly when there is no meta work pending, so a cycle on a
-        /// device that never touched albums/presets is a no-op.
-        async fn sync_meta_documents(&self, cfg: &TransferConfig) -> Result<(), SyncError> {
-            // Nothing dirty locally and nothing converged remotely to write
-            // back ⇒ the meta lane is idle this cycle.
-            if !self.has_meta_upload_work() {
-                return Ok(());
+        /// The empty-vv head a kind this device has never published or
+        /// adopted compares as (§2.9): always `Less` than any remote head
+        /// that carries a real version, so a never-touched kind's first
+        /// cycle is a plain [`MetaDecision`]... AdoptRemote — exactly "this
+        /// device learns the document for the first time". `ts`/`device`
+        /// are never read off this value (they matter only in the
+        /// concurrent case, unreachable from an empty vv).
+        fn default_meta_head(&self) -> MetaHead {
+            MetaHead {
+                vv: VersionVector::new(),
+                blake3: Blake3Hex::from_bytes(b""),
+                ts: 0,
+                device: self.db.device_id().clone(),
             }
-            let _ = cfg;
-            todo!("P6 green: upload dirty meta docs and apply converged remote meta heads")
+        }
+
+        /// Encodes a [`MetaHead`] as the `x-amz-meta-rr-*` headers carried
+        /// alongside the meta document's bytes (§2.9 wire representation):
+        /// the document body stays exactly the relativized JSON the test
+        /// suite parses directly, so the version-vector/identity facts ride
+        /// as S3 user metadata instead of a sibling object.
+        fn meta_head_to_metadata(head: &MetaHead) -> Result<std::collections::BTreeMap<String, String>, SyncError> {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(
+                "rr-vv".to_string(),
+                serde_json::to_string(&head.vv).map_err(se)?,
+            );
+            m.insert("rr-blake3".to_string(), head.blake3.as_str().to_string());
+            m.insert("rr-ts".to_string(), head.ts.to_string());
+            m.insert("rr-device".to_string(), head.device.to_string());
+            Ok(m)
+        }
+
+        /// The reverse of [`Configured::meta_head_to_metadata`]. A missing or
+        /// unparsable field is a hard error (the object is one this engine
+        /// itself wrote; a malformed head indicates real corruption, not a
+        /// foreign writer to tolerate).
+        fn metadata_to_meta_head(
+            meta: &std::collections::BTreeMap<String, String>,
+        ) -> Result<MetaHead, SyncError> {
+            let missing = |field: &str| se(format!("meta head missing {field}"));
+            let vv_json = meta.get("rr-vv").ok_or_else(|| missing("rr-vv"))?;
+            let vv: VersionVector = serde_json::from_str(vv_json).map_err(se)?;
+            let blake3 = Blake3Hex::parse(meta.get("rr-blake3").ok_or_else(|| missing("rr-blake3"))?.clone())
+                .map_err(se)?;
+            let ts: i64 = meta
+                .get("rr-ts")
+                .ok_or_else(|| missing("rr-ts"))?
+                .parse()
+                .map_err(|e| se(format!("meta head rr-ts: {e}")))?;
+            let device = DeviceId::new(meta.get("rr-device").ok_or_else(|| missing("rr-device"))?.clone())
+                .map_err(se)?;
+            Ok(MetaHead {
+                vv,
+                blake3,
+                ts,
+                device,
+            })
+        }
+
+        /// The remote head of `kind`, or `None` when nothing has been
+        /// published yet (§2.9). A cheap `HeadObject` — no document bytes
+        /// move unless the comparison actually needs them.
+        async fn fetch_remote_meta_head(&self, kind: MetaKind) -> Result<Option<MetaHead>, SyncError> {
+            match self.s3.head_object(&self.bucket, kind.meta_key()).await {
+                Ok(head) => Ok(Some(Self::metadata_to_meta_head(&head.metadata)?)),
+                Err(e) if e.is_no_such_key() => Ok(None),
+                Err(e) => Err(se(e)),
+            }
+        }
+
+        /// Downloads the current remote document bytes for `kind` (the
+        /// relativized form, as uploaded — not yet localized).
+        async fn fetch_remote_meta_bytes(&self, kind: MetaKind) -> Result<Vec<u8>, SyncError> {
+            let out = self
+                .s3
+                .get_object(&self.bucket, kind.meta_key(), None)
+                .await
+                .map_err(se)?;
+            Ok(out.body.collect().await.map_err(se)?.to_vec())
+        }
+
+        /// Publishes `bytes` (already relativized) as `kind`'s live meta
+        /// document, carrying `head` as the `x-amz-meta-rr-*` metadata.
+        async fn put_meta_document(&self, kind: MetaKind, bytes: Vec<u8>, head: &MetaHead) -> Result<(), SyncError> {
+            let opts = PutObjectOptions {
+                content_type: Some("application/json".to_string()),
+                metadata: Self::meta_head_to_metadata(head)?,
+                ..PutObjectOptions::default()
+            };
+            // `.into()` infers the S3 client's `bytes::Bytes` body type from
+            // `put_object`'s signature without this crate naming that type
+            // (not a direct dependency here — the same inference trick
+            // `Default::default()` uses elsewhere in this file).
+            self.s3
+                .put_object(&self.bucket, kind.meta_key(), bytes.into(), &opts)
+                .await
+                .map_err(se)?;
+            Ok(())
+        }
+
+        /// Materializes the deterministic §2.6 conflict loser for `kind`:
+        /// canonicalizes `loser_relativized` ([`meta::canonical`]) and PUTs
+        /// it at [`MetaKind::conflict_key`]. Idempotent — every device that
+        /// resolves the same conflict computes and uploads the same bytes at
+        /// the same key, so a redundant PUT from a second device is a no-op
+        /// overwrite with identical content.
+        async fn put_meta_conflict_loser(&self, kind: MetaKind, loser_relativized: &[u8]) -> Result<(), SyncError> {
+            let canonical_loser = meta::canonical(loser_relativized).map_err(se)?;
+            let key = kind.conflict_key(&canonical_loser);
+            self.s3
+                .put_object(
+                    &self.bucket,
+                    &key,
+                    canonical_loser.into(),
+                    &PutObjectOptions {
+                        content_type: Some("application/json".to_string()),
+                        ..PutObjectOptions::default()
+                    },
+                )
+                .await
+                .map_err(se)?;
+            Ok(())
+        }
+
+        /// Writes `bytes` to this kind's device-local file (§2.9 apply):
+        /// atomic temp-file + rename, parent directory created on demand.
+        fn write_local_meta(&self, kind: MetaKind, bytes: &[u8]) -> Result<(), SyncError> {
+            let path = self.resolved_meta_local_path(kind);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(se)?;
+            }
+            write_atomic(&path, bytes)
+        }
+
+        /// The §2.9 meta lane of one cycle: for each [`MetaKind`], compare
+        /// this device's head (a fresh local edit staged by
+        /// [`Configured::note_local_meta`], or the last head this process
+        /// produced/adopted) against the remote head and act on the §2.6
+        /// unified decision ([`meta::decide_meta`], which in turn reuses
+        /// [`rrcloud_core::clock::compare`] / `pick_winner` — never a
+        /// bespoke rule):
+        ///
+        /// - No remote yet: publish our pending edit, if any.
+        /// - `AdoptRemote`: download, `localize` onto this device's sync
+        ///   root, atomically replace the local file, adopt the remote head.
+        /// - `KeepLocal`: publish our pending edit (it already dominates).
+        /// - `Converged`: nothing to do.
+        /// - `Conflict`: the loser's relativized bytes are canonicalized and
+        ///   preserved at [`MetaKind::conflict_key`]; the winner's bytes
+        ///   become (or stay) the live document; the stored head's vv
+        ///   becomes the elementwise max of both sides, so the same pair can
+        ///   never reopen the conflict (§2.9).
+        ///
+        /// Runs every cycle regardless of local dirty state — a device that
+        /// never touched albums/presets still needs to *adopt* a peer's
+        /// published document, so the lane cannot gate on local work alone.
+        async fn sync_meta_documents(&self, cfg: &TransferConfig) -> Result<(), SyncError> {
+            let _ = cfg; // the meta lane talks to S3 directly, not the transfer queue
+            for kind in [MetaKind::Albums, MetaKind::Presets] {
+                self.sync_one_meta_document(kind).await?;
+            }
+            Ok(())
+        }
+
+        async fn sync_one_meta_document(&self, kind: MetaKind) -> Result<(), SyncError> {
+            let dirty = self
+                .meta_dirty
+                .lock()
+                .map(|s| s.contains(&kind))
+                .unwrap_or(false);
+            let local = if dirty {
+                self.meta_heads
+                    .lock()
+                    .ok()
+                    .and_then(|h| h.get(&kind).cloned())
+                    .ok_or_else(|| se("meta: dirty kind has no staged head"))?
+            } else {
+                self.meta_heads
+                    .lock()
+                    .ok()
+                    .and_then(|h| h.get(&kind).cloned())
+                    .unwrap_or_else(|| self.default_meta_head())
+            };
+
+            let Some(remote) = self.fetch_remote_meta_head(kind).await? else {
+                // Nothing published yet: if we have a pending edit, we are
+                // the first publisher.
+                if dirty {
+                    let bytes = self
+                        .meta_pending
+                        .lock()
+                        .ok()
+                        .and_then(|mut p| p.remove(&kind))
+                        .ok_or_else(|| se("meta: dirty kind has no staged bytes"))?;
+                    self.put_meta_document(kind, bytes, &local).await?;
+                    self.clear_meta_dirty(kind);
+                }
+                return Ok(());
+            };
+
+            match meta::decide_meta(&local, &remote) {
+                MetaDecision::Converged => {
+                    self.clear_meta_dirty(kind);
+                }
+                MetaDecision::AdoptRemote => {
+                    let remote_bytes = self.fetch_remote_meta_bytes(kind).await?;
+                    let localized = meta::localize(kind, &remote_bytes, &self.sync_root).map_err(se)?;
+                    self.write_local_meta(kind, &localized)?;
+                    if let Ok(mut heads) = self.meta_heads.lock() {
+                        heads.insert(kind, remote);
+                    }
+                    self.clear_meta_dirty(kind);
+                }
+                MetaDecision::KeepLocal => {
+                    if dirty {
+                        let bytes = self
+                            .meta_pending
+                            .lock()
+                            .ok()
+                            .and_then(|mut p| p.remove(&kind))
+                            .ok_or_else(|| se("meta: dirty kind has no staged bytes"))?;
+                        self.put_meta_document(kind, bytes, &local).await?;
+                    }
+                    self.clear_meta_dirty(kind);
+                }
+                MetaDecision::Conflict { remote_wins } => {
+                    // The relativized bytes on our side: the fresh pending
+                    // edit when dirty, else a fresh relativization of
+                    // whatever is on disk right now (the general case; the
+                    // Garage suite only exercises the dirty path).
+                    let local_relativized = if dirty {
+                        self.meta_pending
+                            .lock()
+                            .ok()
+                            .and_then(|mut p| p.remove(&kind))
+                            .ok_or_else(|| se("meta: dirty kind has no staged bytes"))?
+                    } else {
+                        let path = self.resolved_meta_local_path(kind);
+                        let on_disk = std::fs::read(&path).map_err(se)?;
+                        meta::relativize(kind, &on_disk, &self.sync_root).map_err(se)?
+                    };
+                    let remote_bytes = self.fetch_remote_meta_bytes(kind).await?;
+
+                    let mut merged_vv = local.vv.clone();
+                    merged_vv.merge(&remote.vv);
+
+                    let new_head = if remote_wins {
+                        let localized = meta::localize(kind, &remote_bytes, &self.sync_root).map_err(se)?;
+                        self.write_local_meta(kind, &localized)?;
+                        self.put_meta_conflict_loser(kind, &local_relativized).await?;
+                        MetaHead {
+                            vv: merged_vv,
+                            blake3: remote.blake3.clone(),
+                            ts: remote.ts,
+                            device: remote.device.clone(),
+                        }
+                    } else {
+                        let new_head = MetaHead {
+                            vv: merged_vv,
+                            blake3: Blake3Hex::from_bytes(&local_relativized),
+                            ts: local.ts,
+                            device: local.device.clone(),
+                        };
+                        self.put_meta_document(kind, local_relativized, &new_head)
+                            .await?;
+                        self.put_meta_conflict_loser(kind, &remote_bytes).await?;
+                        new_head
+                    };
+                    if let Ok(mut heads) = self.meta_heads.lock() {
+                        heads.insert(kind, new_head);
+                    }
+                    self.clear_meta_dirty(kind);
+                }
+            }
+            Ok(())
+        }
+
+        fn clear_meta_dirty(&self, kind: MetaKind) {
+            if let Ok(mut dirty) = self.meta_dirty.lock() {
+                dirty.remove(&kind);
+            }
+            if let Ok(mut pending) = self.meta_pending.lock() {
+                pending.remove(&kind);
+            }
         }
 
         /// §2.7 soft delete — intent only in this unit. The async remote
