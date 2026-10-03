@@ -298,17 +298,22 @@ fn relativize_albums(value: &mut Value, sync_root: &Path) {
 ///
 /// A meta document's shared/remote form never carries an out-of-root path
 /// at all — it is dropped at whichever device's upload first relativized
-/// it ([`relativize_albums`]'s drop rule, "kept locally"). So a plain
-/// atomic replace of the local file with every adopted/won remote
-/// document — not just the first one — would silently destroy that
-/// out-of-root membership on every subsequent apply, since the remote the
-/// device is adopting was never in a position to carry it forward. This
-/// restores it: albums are matched by `"id"`, and an out-of-root image
-/// present on the old local album but absent from the new one is appended
-/// (skipped if already present, so a repeated apply is idempotent).
+/// it ([`relativize_albums`] / [`relativize_presets`]'s drop rule, "kept
+/// locally"). So a plain atomic replace of the local file with every
+/// adopted/won remote document — not just the first one — would silently
+/// destroy that out-of-root data on every subsequent apply, since the
+/// remote the device is adopting was never in a position to carry it
+/// forward. This restores it for **both** kinds: albums are matched by
+/// `"id"`, and an out-of-root image present on the old local album but
+/// absent from the new one is appended; presets are matched by `"id"`, and
+/// an out-of-root `lutPath` present on the old local preset but absent from
+/// the new one is restored at the same nested location it was stripped
+/// from (normally `adjustments.lutPath`, but the path is recorded rather
+/// than assumed so an unexpected shape still round-trips). Both are
+/// skipped if already present, so a repeated apply is idempotent.
 ///
 /// `old_local` absent (this device has never held a local copy before) is
-/// a no-op — there is no prior local-only membership to preserve. Malformed
+/// a no-op — there is no prior local-only data to preserve. Malformed
 /// `old_local` bytes are likewise treated as "nothing to merge" rather than
 /// failing the whole adopt (the remote is still a valid document on its
 /// own); `new_localized` is assumed well-formed (it just round-tripped
@@ -326,10 +331,18 @@ pub fn merge_out_of_root(
         return Ok(new_localized.to_vec());
     };
     let mut new_value: Value = serde_json::from_slice(new_localized)?;
-    if kind == MetaKind::Albums {
-        let out_of_root = collect_album_out_of_root(&old, sync_root);
-        if !out_of_root.is_empty() {
-            merge_album_out_of_root(&mut new_value, &out_of_root);
+    match kind {
+        MetaKind::Albums => {
+            let out_of_root = collect_album_out_of_root(&old, sync_root);
+            if !out_of_root.is_empty() {
+                merge_album_out_of_root(&mut new_value, &out_of_root);
+            }
+        }
+        MetaKind::Presets => {
+            let out_of_root = collect_preset_out_of_root(&old, sync_root);
+            if !out_of_root.is_empty() {
+                merge_preset_out_of_root(&mut new_value, &out_of_root);
+            }
         }
     }
     Ok(serde_json::to_vec_pretty(&new_value)?)
@@ -473,6 +486,113 @@ fn relativize_presets(value: &mut Value, sync_root: &Path) {
         Value::Object(map) => {
             for v in map.values_mut() {
                 relativize_presets(v, sync_root);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walks a presets document (local, absolute-path form) and collects, per
+/// preset `id`, the out-of-root `lutPath` values [`relativize_presets`]
+/// would drop from an uploaded copy — together with the key path from the
+/// preset object down to the field (normally `["adjustments"]`, since
+/// `lutPath` lives inside `adjustments`), so [`merge_preset_out_of_root`]
+/// can restore it at the exact nested location it was taken from rather
+/// than assuming a fixed shape.
+///
+/// An `id` found on an object applies to that object's whole subtree (its
+/// nested `lutPath`, wherever it lives) until a *nested* object introduces
+/// its own `id` (e.g. a folder's preset children), at which point the path
+/// tracked for matches resets to be relative to that nearer id — the same
+/// "closest enclosing id" rule a folder/preset tree needs regardless of
+/// nesting depth.
+fn collect_preset_out_of_root(
+    value: &Value,
+    sync_root: &Path,
+) -> std::collections::HashMap<String, Vec<(Vec<String>, String)>> {
+    fn walk(
+        value: &Value,
+        sync_root: &Path,
+        id_ctx: Option<&str>,
+        rel_path: &[String],
+        out: &mut std::collections::HashMap<String, Vec<(Vec<String>, String)>>,
+    ) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, sync_root, id_ctx, rel_path, out);
+                }
+            }
+            Value::Object(map) => {
+                let own_id = map.get("id").and_then(Value::as_str);
+                let (effective_id, base_path): (Option<&str>, &[String]) = match own_id {
+                    Some(id) => (Some(id), &[][..]),
+                    None => (id_ctx, rel_path),
+                };
+                for (k, v) in map {
+                    if k == "lutPath" {
+                        if let (Some(id), Value::String(s)) = (effective_id, v) {
+                            if relativize_path_str(s, sync_root).is_none() {
+                                out.entry(id.to_string())
+                                    .or_default()
+                                    .push((base_path.to_vec(), s.clone()));
+                            }
+                        }
+                        continue;
+                    }
+                    let mut child_path = base_path.to_vec();
+                    child_path.push(k.clone());
+                    walk(v, sync_root, effective_id, &child_path, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    walk(value, sync_root, None, &[], &mut out);
+    out
+}
+
+/// The reverse direction of [`collect_preset_out_of_root`]: for every
+/// preset in `value` whose `id` has a recorded out-of-root `lutPath`,
+/// restores it at the recorded key path — unless a `lutPath` is already
+/// present there (an in-root value just localized, or a previous idempotent
+/// restore), so a repeated apply never clobbers real data or duplicates.
+fn merge_preset_out_of_root(
+    value: &mut Value,
+    out_of_root: &std::collections::HashMap<String, Vec<(Vec<String>, String)>>,
+) {
+    fn set_at_path(map: &mut serde_json::Map<String, Value>, path: &[String], lut: &str) {
+        match path.split_first() {
+            None => {
+                map.entry("lutPath".to_string())
+                    .or_insert_with(|| Value::String(lut.to_string()));
+            }
+            Some((head, rest)) => {
+                let entry = map
+                    .entry(head.clone())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+                if let Value::Object(inner) = entry {
+                    set_at_path(inner, rest, lut);
+                }
+            }
+        }
+    }
+    match value {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                merge_preset_out_of_root(item, out_of_root);
+            }
+        }
+        Value::Object(map) => {
+            let id = map.get("id").and_then(Value::as_str).map(str::to_string);
+            if let Some(entries) = id.as_deref().and_then(|id| out_of_root.get(id)) {
+                for (path, lut) in entries {
+                    set_at_path(map, path, lut);
+                }
+            }
+            for v in map.values_mut() {
+                merge_preset_out_of_root(v, out_of_root);
             }
         }
         _ => {}

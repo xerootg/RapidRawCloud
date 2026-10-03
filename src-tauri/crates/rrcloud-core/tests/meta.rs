@@ -285,6 +285,65 @@ fn merge_out_of_root_restores_local_only_album_membership_after_adopt() {
 }
 
 #[test]
+fn merge_out_of_root_restores_local_only_preset_lutpath_after_adopt() {
+    // The device's own prior local file: a preset's lutPath points outside
+    // the sync root (never crossed the wire — relativize dropped it).
+    let old_local = serde_json::to_vec(&serde_json::json!([
+        {
+            "preset": {
+                "id": "p1",
+                "name": "Warm",
+                "adjustments": { "exposure": 0.2, "lutPath": "/outside/luts/warm.cube" }
+            }
+        }
+    ]))
+    .unwrap();
+    // A peer's adopted-and-localized remote: same preset id, a descendant
+    // edit that never touched lutPath (exposure changed) — but the
+    // uploaded copy this device is adopting never carried the out-of-root
+    // lutPath at all (it was dropped at THIS device's own earlier upload).
+    let new_localized = serde_json::to_vec(&serde_json::json!([
+        {
+            "preset": {
+                "id": "p1",
+                "name": "Warm",
+                "adjustments": { "exposure": 0.5 }
+            }
+        }
+    ]))
+    .unwrap();
+    let merged = merge_out_of_root(
+        MetaKind::Presets,
+        Some(&old_local),
+        &new_localized,
+        Path::new("/rootA"),
+    )
+    .expect("merge");
+    let v: serde_json::Value = serde_json::from_slice(&merged).expect("merged parses");
+    assert_eq!(
+        v[0]["preset"]["adjustments"]["lutPath"], "/outside/luts/warm.cube",
+        "the device's own out-of-root lutPath must survive an unrelated remote adopt \
+         (round-trip data loss otherwise — the exact hazard §2.9's merge-back exists \
+         to prevent, here left unhandled for presets)"
+    );
+    assert_eq!(
+        v[0]["preset"]["adjustments"]["exposure"], 0.5,
+        "the peer's descendant edit is still applied"
+    );
+
+    // Idempotent: merging again (e.g. a second consecutive AdoptRemote)
+    // does not change the result.
+    let merged_again = merge_out_of_root(
+        MetaKind::Presets,
+        Some(&old_local),
+        &merged,
+        Path::new("/rootA"),
+    )
+    .expect("merge again");
+    assert_eq!(merged_again, merged);
+}
+
+#[test]
 fn merge_out_of_root_is_noop_with_no_prior_local_copy() {
     let new_localized = relativize(MetaKind::Albums, &albums_doc(), Path::new("/rootA"))
         .and_then(|rel| localize(MetaKind::Albums, &rel, Path::new("/dev2")))

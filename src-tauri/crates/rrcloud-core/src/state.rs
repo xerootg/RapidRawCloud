@@ -2263,6 +2263,34 @@ impl SyncDb {
         })
     }
 
+    /// Atomically persists both the bumped head ([`Self::set_synced_meta_head`])
+    /// and its matching staged pending bytes ([`Self::set_pending_meta_bytes`])
+    /// for `meta_key` in a **single commit**. This is the save-site intake's
+    /// path (`Configured::note_local_meta`): admitting a local edit always
+    /// needs both facts durable together — a crash between two separate
+    /// commits would persist the bumped head without the bytes needed to
+    /// republish it, which (per [`Self::pending_meta_bytes`]'s doc) makes
+    /// `meta_dirty` reseed `false` for an edit whose head is already locally
+    /// dominant, silently and permanently dropping it from the sync wire.
+    /// Doing both inserts inside one [`Self::with_txn`] closes that window:
+    /// either both land, or (on an early error / a panic unwinding the
+    /// closure) neither does.
+    pub fn set_meta_head_and_pending_bytes(
+        &self,
+        meta_key: &str,
+        head: &MetaHead,
+        bytes: &[u8],
+    ) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(meta_head_key(meta_key).as_str(), to_json(head)?.as_slice())
+                .map_err(db_err)?;
+            meta.insert(meta_pending_key(meta_key).as_str(), bytes)
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
     /// Clears the outstanding pending publish for `meta_key` (see
     /// [`Self::pending_meta_bytes`]) once a cycle confirms the document
     /// delivered (or finds there is nothing left to publish). A no-op if

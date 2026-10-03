@@ -1358,20 +1358,24 @@ mod imp {
             // Persisted immediately, not only once a cycle later confirms
             // delivery (§2.9): a crash between this save-site intake and the
             // next cycle must not lose the version bump itself. The
-            // relativized pending bytes are persisted right alongside it
-            // (`set_pending_meta_bytes`) — not reconstructed from the head
-            // alone — because the head by itself cannot later be told apart
-            // from "this version already reached the bucket" (see
-            // `SyncDb::pending_meta_bytes`'s doc): without the separate
-            // record, a restart before the next cycle confirms delivery
-            // would reseed `meta_heads` already-bumped and never know to
-            // republish, silently losing the edit from every other device's
-            // point of view.
-            if let Err(e) = self.db.set_synced_meta_head(kind.meta_key(), &new_head) {
-                log::warn!("sync intake (meta): persist head: {e}");
-            }
-            if let Err(e) = self.db.set_pending_meta_bytes(kind.meta_key(), &relativized) {
-                log::warn!("sync intake (meta): persist pending bytes: {e}");
+            // relativized pending bytes are persisted atomically alongside
+            // it (`set_meta_head_and_pending_bytes`, ONE commit) — not
+            // reconstructed from the head alone, and not as two separate
+            // commits — because the head by itself cannot later be told
+            // apart from "this version already reached the bucket" (see
+            // `SyncDb::pending_meta_bytes`'s doc): a crash between two
+            // separate commits would persist the bumped head without its
+            // bytes, which a restart before the next cycle confirms
+            // delivery would reseed `meta_heads` already-bumped (dominant)
+            // and `meta_dirty` false (no staged bytes), never republishing —
+            // silently and permanently losing the edit from every other
+            // device's point of view. One atomic commit makes that
+            // intermediate state unreachable.
+            if let Err(e) =
+                self.db
+                    .set_meta_head_and_pending_bytes(kind.meta_key(), &new_head, &relativized)
+            {
+                log::warn!("sync intake (meta): persist head + pending bytes: {e}");
             }
             if let Ok(mut pending) = self.meta_pending.lock() {
                 pending.insert(kind, relativized);

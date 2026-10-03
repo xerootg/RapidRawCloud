@@ -42,8 +42,10 @@ mod linux {
     use std::process::{Child, Command, Stdio};
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-    use rrcloud_core::clock::DeviceId;
-    use rrcloud_core::keys::RelKey;
+    use rrcloud_core::clock::{DeviceId, VersionVector};
+    use rrcloud_core::keys::{RelKey, ALBUMS_META_KEY};
+    use rrcloud_core::meta::MetaHead;
+    use rrcloud_core::semhash::Blake3Hex;
     use rrcloud_core::state::{legal, ItemRecord, ItemState, StateError, SyncDb};
 
     const CHILD_ENV: &str = "RRCLOUD_STATE_CRASH_CHILD";
@@ -89,6 +91,14 @@ mod linux {
         let mut v = format!("segment {seq} x{} \u{0000}", count_for(seq)).into_bytes();
         v.extend((0..(seq % 64 + 16)).map(|i| ((seq.wrapping_mul(31) + i) % 251) as u8));
         v
+    }
+
+    /// Deterministic §2.9 meta-document bytes for iteration `seq`: both
+    /// parent and child compute these independently, same role as
+    /// [`seg_bytes`] but for the `set_meta_head_and_pending_bytes` atomicity
+    /// probe below.
+    fn meta_bytes(seq: u64) -> Vec<u8> {
+        format!("{{\"seq\":{seq}}}").into_bytes()
     }
 
     /// The writer child's transition cycle (all §2.4-legal edges).
@@ -238,6 +248,25 @@ mod linux {
             ack(format!("APPLIED {seq}"));
             db.set_cursor(&peer, seq).expect("set_cursor");
             ack(format!("CURSOR {seq}"));
+            // §2.9 atomicity probe (round-3 review finding): the bumped
+            // head and its matching pending bytes must land in ONE commit.
+            // `meta_bytes(seq)`'s blake3 is the only valid head blake3 for
+            // this seq — if a crash ever split this into two separate
+            // commits, a kill between them would leave the head referring
+            // to THIS seq's bytes while the pending-bytes key still held
+            // the PREVIOUS iteration's bytes (never cleared in this flow),
+            // a blake3 mismatch the parent's post-crash check below would
+            // catch.
+            let bytes = meta_bytes(seq);
+            let head = MetaHead {
+                vv: VersionVector::new(),
+                blake3: Blake3Hex::from_bytes(&bytes),
+                ts: seq as i64,
+                device: dev(DEV_SELF),
+            };
+            db.set_meta_head_and_pending_bytes(ALBUMS_META_KEY, &head, &bytes)
+                .expect("set_meta_head_and_pending_bytes");
+            ack(format!("META {seq}"));
         }
     }
 
@@ -320,6 +349,7 @@ mod linux {
         let mut acked_item_state: BTreeMap<u64, ItemState> = BTreeMap::new();
         let mut acked_applied: Vec<u64> = Vec::new();
         let mut max_acked_cursor: u64 = 0;
+        let mut max_acked_meta_seq: u64 = 0;
         let peer = dev(DEV_PEER);
 
         for iteration in 0..KILL_ITERATIONS {
@@ -411,6 +441,10 @@ mod linux {
                     "CURSOR" => {
                         let seq: u64 = parts.next().expect("seq").parse().expect("seq");
                         max_acked_cursor = max_acked_cursor.max(seq);
+                    }
+                    "META" => {
+                        let seq: u64 = parts.next().expect("seq").parse().expect("seq");
+                        max_acked_meta_seq = max_acked_meta_seq.max(seq);
                     }
                     other => panic!("unknown ACK tag {other:?} in line {line:?}"),
                 }
@@ -545,6 +579,40 @@ mod linux {
                 cursor >= max_acked_cursor,
                 "iteration {iteration}: cursor {cursor} regressed below ACKed {max_acked_cursor}"
             );
+
+            // (5) §2.9 `set_meta_head_and_pending_bytes` atomicity: the head
+            // and its pending bytes are written in ONE commit, so after any
+            // crash they must either both be absent (no META iteration ever
+            // completed) or both present AND mutually consistent — the
+            // head's blake3 matching the blake3 of whatever bytes are
+            // actually on disk. A head referring to one seq's bytes while
+            // the pending-bytes key still holds a DIFFERENT seq's bytes
+            // (the torn state two separate commits can leave) is exactly
+            // the round-3 review hazard this probe exists to catch.
+            let meta_head = db.synced_meta_head(ALBUMS_META_KEY).expect("synced_meta_head");
+            let meta_bytes_on_disk = db.pending_meta_bytes(ALBUMS_META_KEY).expect("pending_meta_bytes");
+            assert_eq!(
+                meta_head.is_some(),
+                meta_bytes_on_disk.is_some(),
+                "iteration {iteration}: meta head ({meta_head:?}) and pending bytes \
+                 ({meta_bytes_on_disk:?}) must be written together — a crash must never \
+                 leave one without the other"
+            );
+            if let (Some(head), Some(bytes)) = (&meta_head, &meta_bytes_on_disk) {
+                assert_eq!(
+                    head.blake3,
+                    Blake3Hex::from_bytes(bytes),
+                    "iteration {iteration}: meta head's blake3 does not match the \
+                     committed pending bytes {bytes:?} — the head bump and the bytes \
+                     write landed in different commits"
+                );
+                assert!(
+                    head.ts as u64 >= max_acked_meta_seq,
+                    "iteration {iteration}: meta head ts {} regressed below ACKed META {}",
+                    head.ts,
+                    max_acked_meta_seq
+                );
+            }
 
             drop(db); // release the lock for the next iteration's child
         }
