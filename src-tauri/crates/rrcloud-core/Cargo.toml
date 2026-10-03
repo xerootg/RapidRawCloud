@@ -57,6 +57,12 @@ rawler = { git = "https://github.com/CyberTimon/RapidRAW-DngLab.git", rev = "934
 # Lanczos3 linear-space resample + q75 JPEG thumb encode (§4.2 steps 5/8),
 # matching the host app's `image` major so the proxy path and the app agree.
 image = "0.25"
+# Parallel rows for the §4.2 step-5 linear-space Lanczos3 resample in
+# `proxy.rs`. Pure Rust and already in the tree transitively via rawler, so
+# this adds no new toolchain surface; it keeps the full-resolution proxy
+# downscale (and the fidelity suite's matched resample) from dominating the
+# generation cost.
+rayon = "1"
 # 0.13 matches the reqwest/rustls stack the host app (src-tauri) already
 # ships, so joining the workspace does not pull in a second HTTP stack
 # (§3.9 rationale). The rustls-platform-verifier hookup lands with the

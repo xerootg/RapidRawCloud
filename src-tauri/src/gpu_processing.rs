@@ -184,7 +184,46 @@ pub fn gpu_adapter_probe() -> Option<String> {
 /// test skips when [`gpu_adapter_probe`] returns `None`, so this is only
 /// reached when an adapter is present).
 pub fn init_gpu_context_headless() -> Result<GpuContext, String> {
-    todo!("P3 green: headless compute-only GpuContext bring-up (no surface / no AppState)")
+    let instance_desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    let instance = wgpu::Instance::new(instance_desc);
+
+    let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .map_err(|e| format!("headless: failed to find a wgpu adapter: {e}"))?;
+
+    let mut required_features = wgpu::Features::empty();
+    if adapter
+        .features()
+        .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+    {
+        required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+    }
+
+    let limits = adapter.limits();
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        label: Some("Headless Processing Device"),
+        required_features,
+        required_limits: limits.clone(),
+        experimental_features: wgpu::ExperimentalFeatures::default(),
+        memory_hints: wgpu::MemoryHints::Performance,
+        trace: wgpu::Trace::Off,
+    }))
+    .map_err(|e| e.to_string())?;
+
+    device.on_uncaptured_error(Arc::new(|err: wgpu::Error| {
+        log::error!("[wgpu-error][headless] {}", err);
+    }));
+
+    Ok(GpuContext {
+        device: Arc::new(device),
+        queue: Arc::new(queue),
+        limits,
+        display: Arc::new(std::sync::Mutex::new(None)),
+    })
 }
 
 /// Render `base_image` through the real adjustment pipeline at its native
@@ -198,8 +237,82 @@ pub fn render_adjustments_headless(
     base_image: &DynamicImage,
     adjustments: &serde_json::Value,
 ) -> Result<DynamicImage, String> {
-    let _ = (context, base_image, adjustments);
-    todo!("P3 green: headless full-pipeline render for the GPU ΔE confirmation test")
+    let (width, height) = base_image.dimensions();
+    if width == 0 || height == 0 {
+        return Err("headless render: empty base image".to_string());
+    }
+
+    let max_dim = context.limits.max_texture_dimension_2d;
+    if width > max_dim || height > max_dim {
+        return Err(format!(
+            "headless render: image {width}x{height} exceeds GPU limit {max_dim}"
+        ));
+    }
+
+    let device = &context.device;
+    let queue = &context.queue;
+
+    // A GPU processor sized for this image (rounded up to 256 like the editor).
+    let proc_w = (width + 255) & !255;
+    let proc_h = (height + 255) & !255;
+    let processor = GpuProcessor::new(context.clone(), proc_w, proc_h)?;
+
+    // Upload the linear base as an Rgba16Float texture, identical to the
+    // editor's input-texture path.
+    let img_rgba_f16 = to_rgba_f16(base_image);
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("Headless Input Texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        },
+        TextureDataOrder::MipMajor,
+        bytemuck::cast_slice(&img_rgba_f16),
+    );
+    let texture_view = texture.create_view(&Default::default());
+
+    // Raw-mode adjustments (the proxy and original develop bases are both raw
+    // develop output); no masks, no LUT, full frame.
+    let all_adjustments =
+        crate::image_processing::get_all_adjustments_from_json(adjustments, true, None);
+    let request = RenderRequest {
+        adjustments: all_adjustments,
+        mask_bitmaps: &[],
+        lut: None,
+        roi: None,
+    };
+
+    let (processed_pixels, out_w, out_h, _x, _y) = processor.run(
+        &texture_view,
+        width,
+        height,
+        request,
+        false,
+        RenderOutputPrecision::EightBit,
+    )?;
+
+    match processed_pixels {
+        RenderedPixels::U8(pixels) => {
+            let img_buf = ImageBuffer::<Rgba<u8>, Vec<u8>>::from_raw(out_w, out_h, pixels)
+                .ok_or("headless render: failed to build 8-bit image buffer")?;
+            Ok(DynamicImage::ImageRgba8(img_buf))
+        }
+        RenderedPixels::U16(pixels) => {
+            let img_buf = ImageBuffer::<Rgba<u16>, Vec<u16>>::from_raw(out_w, out_h, pixels)
+                .ok_or("headless render: failed to build 16-bit image buffer")?;
+            Ok(DynamicImage::ImageRgba16(img_buf))
+        }
+    }
 }
 
 pub fn get_or_init_gpu_context(

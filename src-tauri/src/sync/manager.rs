@@ -398,12 +398,9 @@ impl SyncManager {
     /// `None` when sync is off, `path` is not a stub, or no proxy DNG has been
     /// downloaded. Backs [`crate::sync::hooks::proxy_handle`]; the proxy-mode
     /// loader branch uses it to decode the preview while reporting the
-    /// original (journal) dimensions.
-    ///
-    /// RED scaffold: returns `None` (so the loader always falls through to the
-    /// §3.5 hydrate path and the P2 suite is unaffected). The P3 green pass
-    /// consults the durable preview store (`previews/<content_id>.pxy.dng`)
-    /// and the item's journaled `(w, h)`.
+    /// original (journal) dimensions. Consults the durable preview store
+    /// (`previews/<content_id>.pxy.dng`) and the item's journaled `(w, h)`
+    /// (§4.4).
     pub fn proxy_handle(&self, path: &Path) -> Option<super::hooks::ProxyHandle> {
         #[cfg(feature = "sync")]
         {
@@ -415,6 +412,25 @@ impl SyncManager {
         {
             let _ = path;
             None
+        }
+    }
+
+    /// §4.3 importing-client generation entry point: build and durably store
+    /// the smart preview + thumbs for the local original at `path` (callable by
+    /// the P4 headless-worker backfill as well). A no-op when sync is off; a
+    /// best-effort no-op when `path` is not a decodable, fully-synced original.
+    pub fn generate_proxy_for(&self, path: &Path) -> Result<(), SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            match self.configured() {
+                Ok(cfg) => cfg.generate_and_store_proxy(path),
+                Err(_) => Ok(()),
+            }
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = path;
+            Ok(())
         }
     }
 
@@ -673,7 +689,7 @@ mod imp {
     use rrcloud_core::publisher::{enqueue_entry, publish_pending};
     use rrcloud_core::reader::poll;
     use rrcloud_core::s3::{S3Client, S3Config};
-    use rrcloud_core::semhash::Blake3Hex;
+    use rrcloud_core::semhash::{Blake3Hex, ContentId};
     use rrcloud_core::state::{ItemRecord, ItemState, StateError, SyncDb};
     use rrcloud_core::transfer::{
         BackendProfile, CancelFlag, ExpectedDownload, TransferConfig, TransferError,
@@ -689,6 +705,20 @@ mod imp {
     /// Transfer concurrency per lane (§2.4 / §3.3). Small and fixed: the
     /// desktop app is not the bulk worker.
     const TRANSFER_CONCURRENCY: usize = 2;
+
+    /// Smart previews generated per `run_cycle` (§4.3). Small: generation is a
+    /// full raw decode + demosaic, scheduled on the thumbnail worker priority
+    /// tier in the architecture; the desktop cycle only nibbles the backlog.
+    const PROXY_BACKFILL_PER_CYCLE: usize = 2;
+
+    /// Write `bytes` to `path` via a sibling temp file + rename, so a crash
+    /// mid-write never leaves a torn smart preview in the durable store.
+    fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), SyncError> {
+        let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
+        std::fs::write(&tmp, bytes).map_err(se)?;
+        std::fs::rename(&tmp, path).map_err(se)?;
+        Ok(())
+    }
 
     /// How long a hydration that loses the single-driver race will wait for
     /// the in-flight transfer owning the item to finish before giving up and
@@ -990,22 +1020,160 @@ mod imp {
             );
         }
 
+        /// The durable smart-preview store directory
+        /// (`app_data_dir/rrcloud/previews`, alongside the redb and the
+        /// `thumbs` store — §3.5/§4.3). Proxies are content-keyed:
+        /// `previews/<content_id>.pxy.dng`.
+        fn preview_store_dir(&self) -> PathBuf {
+            self.db
+                .path()
+                .parent()
+                .unwrap_or(self.sync_root.as_path())
+                .join("previews")
+        }
+
+        /// §4.4 proxy edit-mode lookup: `Some(ProxyHandle)` when `path` is a
+        /// `Stub` original whose content id is known, whose durable
+        /// `previews/<content_id>.pxy.dng` is present locally, and which
+        /// carries journaled `(w, h)`; otherwise `None`, so the loader falls
+        /// through to the §3.5 hydrate path.
+        pub fn proxy_handle(&self, path: &Path) -> Option<super::super::hooks::ProxyHandle> {
+            let rk = relkey(path, &self.sync_root).ok()?;
+            let record = self.db.get_item(&rk).ok().flatten()?;
+            if record.deleted || record.state != ItemState::Stub {
+                return None;
+            }
+            let content_id = record.content_id?;
+            let (w, h) = (record.w?, record.h?);
+            if w == 0 || h == 0 {
+                return None;
+            }
+            let dng_path = self.preview_store_dir().join(format!(
+                "{}{}",
+                content_id.as_str(),
+                rrcloud_core::proxy::PROXY_FILE_SUFFIX
+            ));
+            if !dng_path.is_file() {
+                return None;
+            }
+            let orig_long = w.max(h);
+            let proxy_long_edge = orig_long.min(rrcloud_core::proxy::PROXY_LONG_EDGE);
+            Some(super::super::hooks::ProxyHandle {
+                dng_path,
+                orig_width: w,
+                orig_height: h,
+                proxy_long_edge,
+            })
+        }
+
+        /// §4.3 importing-client generation: decode the local original at
+        /// `image_path`, build the linear-DNG smart preview + JPEG thumbs
+        /// (`rrcloud_core::proxy`), write them content-keyed into the durable
+        /// preview store, and record the measured original `(w, h)` + content
+        /// id on the item so [`Self::proxy_handle`] fires once the original is
+        /// later evicted to a stub. Best-effort and side-effect-free on
+        /// failure: a non-original, a stub (no local bytes), an undecodable
+        /// file, or a missing content identity all return `Ok(())` without
+        /// touching the store or the record. The P4 worker reuses the same
+        /// `proxy` module for backfill + the S3/journal upload of previews.
+        pub fn generate_and_store_proxy(&self, image_path: &Path) -> Result<(), SyncError> {
+            let rk = relkey(image_path, &self.sync_root).map_err(se)?;
+            let Some(record) = self.db.get_item(&rk).map_err(se)? else {
+                return Ok(());
+            };
+            if record.deleted || record.kind != Kind::Original || record.state == ItemState::Stub {
+                return Ok(());
+            }
+            let content_id = match record
+                .content_id
+                .clone()
+                .or_else(|| record.blake3.as_ref().map(ContentId::from_blake3))
+            {
+                Some(cid) => cid,
+                None => return Ok(()),
+            };
+            let dir = self.preview_store_dir();
+            let dng_path = dir.join(format!(
+                "{}{}",
+                content_id.as_str(),
+                rrcloud_core::proxy::PROXY_FILE_SUFFIX
+            ));
+            // Already generated — nothing to do.
+            if dng_path.is_file() {
+                return Ok(());
+            }
+            let bytes = match std::fs::read(image_path) {
+                Ok(b) if !b.is_empty() => b,
+                _ => return Ok(()),
+            };
+            let out = match rrcloud_core::proxy::generate_proxy(&bytes) {
+                Ok(o) => o,
+                Err(e) => {
+                    log::warn!("proxy generation skipped for {}: {e}", image_path.display());
+                    return Ok(());
+                }
+            };
+            std::fs::create_dir_all(&dir).map_err(se)?;
+            write_atomic(&dng_path, &out.dng)?;
+            write_atomic(
+                &dir.join(format!("{}_small.jpg", content_id.as_str())),
+                &out.small_jpeg,
+            )?;
+            write_atomic(
+                &dir.join(format!("{}_medium.jpg", content_id.as_str())),
+                &out.medium_jpeg,
+            )?;
+            // Record the measured (never-EXIF) original dims + content id so a
+            // later eviction-to-stub makes this proxy editable (§2.2/§4.4).
+            let _ = self.db.update_item(&rk, record.state, |r| {
+                r.w = Some(out.orig_width);
+                r.h = Some(out.orig_height);
+                if r.content_id.is_none() {
+                    r.content_id = Some(content_id.clone());
+                }
+            });
+            Ok(())
+        }
+
+        /// §4.3 opportunistic generation pass: build smart previews for up to
+        /// `budget` `Synced` originals that do not yet have one. Runs after the
+        /// upload lane drains (so only fully-backed-up originals are
+        /// considered) and is wholly best-effort — undecodable or
+        /// content-id-less items are silently skipped.
+        pub fn generate_pending_proxies(&self, budget: usize) {
+            if budget == 0 {
+                return;
+            }
+            let items = match self.db.iter_items() {
+                Ok(i) => i,
+                Err(e) => {
+                    log::warn!("proxy backfill: iter_items: {e}");
+                    return;
+                }
+            };
+            let mut made = 0usize;
+            for (rk, record) in items {
+                if made >= budget {
+                    break;
+                }
+                if record.deleted
+                    || record.kind != Kind::Original
+                    || record.state != ItemState::Synced
+                {
+                    continue;
+                }
+                let path = local_target_path(&self.sync_root, &rk, record.kind);
+                match self.generate_and_store_proxy(&path) {
+                    Ok(()) => made += 1,
+                    Err(e) => log::warn!("proxy backfill {}: {e}", path.display()),
+                }
+            }
+        }
+
         /// §3.5 stub creation — writes the 0-byte placeholder at
         /// `image_path`, sets its mtime to `remote_mtime_unix` via
         /// `filetime`, and records an `ItemState::Stub` item carrying the
-        /// remote `blake3_hex`/`size`/`verified_remote` facts. Scaffold:
-        /// unimplemented until the P2 green pass.
-        /// §4.4 proxy edit-mode lookup. RED scaffold: always `None` so the
-        /// loader falls through to the §3.5 hydrate path and the P2 suite is
-        /// unaffected. The green pass returns `Some(ProxyHandle)` when the
-        /// item is a stub, its `content_id` is known, the durable
-        /// `previews/<content_id>.pxy.dng` is present locally, and the item
-        /// carries journaled `(w, h)`.
-        pub fn proxy_handle(&self, path: &Path) -> Option<super::super::hooks::ProxyHandle> {
-            let _ = path;
-            None
-        }
-
+        /// remote `blake3_hex`/`size`/`verified_remote` facts.
         pub fn create_stub(
             &self,
             image_path: &Path,
@@ -1675,6 +1843,12 @@ mod imp {
             let cfg = self.transfer_cfg(backend);
 
             let uploaded = self.drain_uploads(&cfg).await?;
+
+            // §4.3 importing-client generation: once the upload lane has
+            // drained (so the considered originals are fully backed up), build
+            // smart previews for a bounded number of `Synced` originals that do
+            // not have one yet. Best-effort: never fails the cycle.
+            self.generate_pending_proxies(PROXY_BACKFILL_PER_CYCLE);
 
             // Inbound journal: poll through a fresh EngineConsumer applying
             // under the §2.6 unified rule (no byte transfers — the pump

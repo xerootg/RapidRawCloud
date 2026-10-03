@@ -5624,6 +5624,7 @@ dependencies = [
  "percent-encoding",
  "quick-xml 0.38.4",
  "rawler 0.7.1 (git+https://github.com/CyberTimon/RapidRAW-DngLab.git?rev=934af4b213a12b95f77d69529627067056066294)",
+ "rayon",
  "redb",
  "reqwest",
  "serde",

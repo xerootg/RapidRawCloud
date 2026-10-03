@@ -249,6 +249,7 @@ pub fn proxy_decode_settings(base: &AppSettings) -> AppSettings {
 /// RED scaffold: unimplemented until the P3 green pass. Unreachable in RED
 /// because `SyncManager::proxy_handle` returns `None`, so the loader always
 /// falls through to the §3.5 hydrate path.
+#[cfg(feature = "sync")]
 #[allow(clippy::needless_pass_by_value)]
 async fn load_image_from_proxy(
     path: String,
@@ -258,8 +259,99 @@ async fn load_image_from_proxy(
     state: tauri::State<'_, AppState>,
     my_generation: usize,
 ) -> Result<LoadImageResult, String> {
-    let _ = (path, handle, metadata, settings, state, my_generation);
-    todo!("P3 green: decode the smart preview, store proxy_scale, report journal dims")
+    let generation_tracker = state.load_image_generation.clone();
+    let cancel_token = Some((generation_tracker.clone(), my_generation));
+
+    // §4.4: proxy_scale = proxy_long_edge / orig_long_edge. Both share the
+    // §4.2-step-3 develop provenance, so this cannot misplace masks.
+    let orig_long = handle.orig_width.max(handle.orig_height);
+    let proxy_scale = rrcloud_core::proxy::proxy_scale(orig_long, handle.proxy_long_edge);
+
+    // §4.1/§4.4: pin the proxy decode past the user's `linear_raw_mode`
+    // (apply_ungamma=false, apply_calibration=true). Disable the loader's own
+    // color-NR / sharpening so we can re-apply them scaled by `proxy_scale`
+    // (E2) rather than at full-resolution amounts.
+    let orig_color_nr = settings.raw_preprocessing_color_nr.unwrap_or(0.5);
+    let orig_sharpening = settings.raw_preprocessing_sharpening.unwrap_or(0.35);
+    let mut decode_settings = proxy_decode_settings(&settings);
+    decode_settings.raw_preprocessing_color_nr = Some(0.0);
+    decode_settings.raw_preprocessing_sharpening = Some(0.0);
+
+    // E2: the full-resolution enhance amounts, scaled to the proxy resolution.
+    let color_nr_amount = if orig_color_nr <= 0.0 {
+        0.0
+    } else {
+        let x = orig_color_nr.clamp(0.01, 1.0);
+        (12.0 / x - 10.0).max(0.1)
+    } * proxy_scale;
+    let sharpening_amount = orig_sharpening * proxy_scale;
+
+    let dng_path = handle.dng_path.clone();
+    let dng_path_str = dng_path.to_string_lossy().to_string();
+
+    let decoded = tokio::task::spawn_blocking(
+        move || -> Result<(DynamicImage, HashMap<String, String>), String> {
+            if generation_tracker.load(Ordering::SeqCst) != my_generation {
+                return Err("Load cancelled".to_string());
+            }
+            let bytes = match read_file_mapped(dng_path.as_path()) {
+                Ok(mmap) => mmap.to_vec(),
+                Err(_) => fs::read(&dng_path).map_err(|e| {
+                    format!("Failed to read smart preview {}: {}", dng_path.display(), e)
+                })?,
+            };
+            if generation_tracker.load(Ordering::SeqCst) != my_generation {
+                return Err("Load cancelled".to_string());
+            }
+            let mut img = load_base_image_from_bytes(
+                &bytes,
+                &dng_path_str,
+                false,
+                &decode_settings,
+                cancel_token.clone(),
+            )
+            .map_err(|e| e.to_string())?;
+            if color_nr_amount > 0.0 || sharpening_amount > 0.0 {
+                remove_raw_artifacts_and_enhance(&mut img, color_nr_amount, sharpening_amount);
+            }
+            let exif = crate::exif_processing::read_exif_data(&dng_path_str, &bytes);
+            Ok((img, exif))
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())??;
+
+    let (proxy_img, exif_data) = decoded;
+
+    if state.load_image_generation.load(Ordering::SeqCst) != my_generation {
+        return Err("Load cancelled".to_string());
+    }
+
+    // §4.4 (w,h) provenance: report the ORIGINAL (journal) dimensions, never
+    // the decoded proxy's reduced size — the latter only feeds `proxy_scale`.
+    let (reported_width, reported_height) = proxy_reported_dimensions(
+        (handle.orig_width, handle.orig_height),
+        proxy_img.dimensions(),
+    );
+
+    *state.proxy_scale.lock().unwrap_or_else(|e| e.into_inner()) = Some(proxy_scale);
+
+    *state
+        .original_image
+        .lock()
+        .unwrap_or_else(|e| e.into_inner()) = Some(crate::app_state::LoadedImage {
+        path,
+        image: Arc::new(proxy_img),
+        is_raw: true,
+    });
+
+    Ok(LoadImageResult {
+        width: reported_width,
+        height: reported_height,
+        metadata,
+        exif: exif_data,
+        is_raw: true,
+    })
 }
 
 fn classify_raw_develop_error(path: &str, err: anyhow::Error) -> anyhow::Error {
@@ -917,6 +1009,8 @@ pub async fn load_image(
             .original_image
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
+        // §4.4: clear any prior proxy scale; set again only on the proxy path.
+        *state.proxy_scale.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *state
             .cached_preview
             .lock()
@@ -994,6 +1088,7 @@ pub async fn load_image(
                 // the ORIGINAL (journal) dimensions. `proxy_handle` is `None`
                 // when sync is off or no proxy is present, so this is inert on
                 // the upstream/hydrate path.
+                #[cfg(feature = "sync")]
                 if let Some(handle) = crate::sync::hooks::proxy_handle(&source_path) {
                     return load_image_from_proxy(
                         path,

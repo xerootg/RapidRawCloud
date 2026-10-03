@@ -214,6 +214,13 @@ pub struct AppState {
     pub window_setup_complete: AtomicBool,
     pub gpu_crash_flag_path: Mutex<Option<PathBuf>>,
     pub original_image: Mutex<Option<LoadedImage>>,
+    /// P3 proxy edit mode (ARCHITECTURE.md §4.4): when the current
+    /// `original_image` was decoded from a smart preview, this holds
+    /// `proxy_long_edge / orig_long_edge` so the render/preview path can
+    /// multiply original-pixel-space geometry (crop/masks/AI patches) by it,
+    /// exactly as `generate_thumbnail_data` does with `total_scale`. `None`
+    /// whenever the loaded image is a full-resolution original.
+    pub proxy_scale: Mutex<Option<f32>>,
     pub cached_preview: Mutex<Option<CachedPreview>>,
     pub gpu_context: Mutex<Option<GpuContext>>,
     pub gpu_image_cache: Mutex<Option<GpuImageCache>>,
