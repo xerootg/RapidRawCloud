@@ -35,19 +35,19 @@ use std::path::PathBuf;
 use bytes::Bytes;
 use common::engine as eh;
 use common::garage;
-use common::sync::{dev, open_db, rel, DEV_A};
+use common::sync::{dev, entry as journal_entry, open_db, rel, DEV_A, DEV_B};
 use common::transfer as th;
 use common::transfer::CountingS3;
 
 use rrcloud_core::clock::{DeviceId, VersionVector};
 use rrcloud_core::compact::{CompactConfig, ServerClock};
-use rrcloud_core::engine::item_local_path;
+use rrcloud_core::engine::{item_local_path, sidecar_item_relkey};
 use rrcloud_core::journal::{Kind, Op, Tombstone};
 use rrcloud_core::keys::{
     journal_segment_key, library_key, preview_key, sidecar_key, thumb_key, tombstone_key, RelKey,
     ThumbSize,
 };
-use rrcloud_core::manifest::get_manifest;
+use rrcloud_core::manifest::{build_manifest, get_manifest, put_manifest};
 use rrcloud_core::publisher::{enqueue_entry, publish_pending};
 use rrcloud_core::s3::{PutObjectOptions, S3Client};
 use rrcloud_core::semhash::{Blake3Hex, ContentId};
@@ -714,6 +714,334 @@ async fn worker_cycle_compacts_covered_aged_own_segments() {
             "segment object compacted away"
         );
     }
+}
+
+// ===========================================================================
+// §2.3 MANIFEST MERGE (review blocker: re-adopts / resurrects compacted peers)
+// ===========================================================================
+
+/// A live-original item record a peer holds and advertises in its manifest.
+fn peer_original_record(dev_: &DeviceId, raw: &[u8]) -> ItemRecord {
+    ItemRecord {
+        kind: Kind::Original,
+        state: ItemState::Synced,
+        size: raw.len() as u64,
+        mtime_unix_ns: 0,
+        blake3: Some(Blake3Hex::from_bytes(raw)),
+        sem_hash: None,
+        vv: vv(&[(dev_, 1)]),
+        content_id: Some(ContentId::from_bytes(raw)),
+        w: Some(640),
+        h: Some(480),
+        pinned: false,
+        last_access_unix: 0,
+        verified_remote: true,
+        attested: true,
+        base_unknown: false,
+        rating: None,
+        color_label: None,
+        device: Some(dev_.clone()),
+        head_ts: Some(NOW),
+        admitted_vv: None,
+        admitted_ts: None,
+        deleted: false,
+    }
+}
+
+/// §2.3: an original advertised **only** in a peer's manifest — its journal
+/// segment was §2.10-compacted, so a fresh worker's poll hits a bootstrap
+/// gap on that peer — must NOT be re-adopted. `run_cycle` must route the gap
+/// to a manifest merge, learn the peer's version, and skip adoption (no
+/// spurious `{worker:1}` version concurrent with the peer's, no duplicate
+/// proxy). Corpus-gated so adoption (the pre-fix behavior) would otherwise
+/// succeed on a real RAW — making the "not re-adopted" assertion the clean
+/// regression signal.
+#[tokio::test]
+async fn gap_routes_to_manifest_merge_so_a_compacted_peer_original_is_not_readopted() {
+    let (filename, raw) = skip_without_corpus!("gap_routes_to_manifest_merge");
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-merge");
+    let client = g.client();
+
+    let item = ingest_relkey(&filename);
+    // The original bytes sit in the bucket (no journal entry of our own).
+    put_raw(&client, &bucket, &library_key(&item), &raw).await;
+
+    // Peer D holds the original as a live record, journals it as seq 1 and a
+    // filler as seq 2, publishes a manifest advertising it, then its seq-1
+    // segment is COMPACTED (deleted) — leaving the manifest as the only
+    // carrier of the original and a bootstrap gap at seq 2.
+    let d = dev(DEV_B);
+    let (_ddir, _dpath, d_db) = open_db(&d);
+    let cid = ContentId::from_bytes(&raw);
+    let b3 = Blake3Hex::from_bytes(&raw);
+    d_db.replay_put_item(&item, &peer_original_record(&d, &raw))
+        .expect("peer record");
+
+    let mut orig_put = journal_entry(&d, Op::Put, Kind::Original, library_key(&item));
+    orig_put.vv = vv(&[(&d, 1)]);
+    orig_put.content_id = Some(cid.clone());
+    orig_put.blake3 = Some(b3.clone());
+    orig_put.size = Some(raw.len() as u64);
+    orig_put.w = Some(640);
+    orig_put.h = Some(480);
+    enqueue_entry(&d_db, &orig_put).expect("enqueue orig");
+    publish_pending(&d_db, &client, &bucket)
+        .await
+        .expect("publish seg1");
+    let filler = journal_entry(
+        &d,
+        Op::Put,
+        Kind::Sidecar,
+        sidecar_key(&rel("ingest/filler.NEF")),
+    );
+    enqueue_entry(&d_db, &filler).expect("enqueue filler");
+    publish_pending(&d_db, &client, &bucket)
+        .await
+        .expect("publish seg2");
+
+    let manifest = build_manifest(&d_db, NOW).expect("build manifest");
+    assert!(
+        manifest.rows.iter().any(|r| r.key == item),
+        "peer manifest advertises the original as a live row"
+    );
+    put_manifest(&client, &bucket, &d, &manifest)
+        .await
+        .expect("put manifest");
+
+    // §2.10 compaction removes the seq-1 segment (the original's journal).
+    client
+        .delete_object(&bucket, &journal_segment_key(&d, 1))
+        .await
+        .expect("compact seg1");
+
+    // The worker runs a cycle.
+    let state = tempfile::tempdir().expect("state dir");
+    let cfg = worker_cfg(g, &bucket, Some(state.path().to_path_buf()));
+    let worker = Worker::open(&cfg).expect("open worker");
+    let report = worker::run_cycle(
+        &worker,
+        &CycleOptions {
+            clock: Some(ServerClock::pinned(NOW)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("cycle");
+
+    assert!(
+        !report.adopted.contains(&item),
+        "a manifest-only peer original must NOT be re-adopted (adopted={:?})",
+        report.adopted
+    );
+    let w_entries = eh::journal_entries_of(&client, &bucket, worker.device_id()).await;
+    assert!(
+        !w_entries
+            .iter()
+            .any(|e| e.op == Op::Put && e.kind == Kind::Original && e.key == library_key(&item)),
+        "no spurious worker put-original for a manifest-advertised peer original"
+    );
+    let learned = worker
+        .db()
+        .get_item(&item)
+        .expect("get_item")
+        .expect("the worker learned the peer's original via the §2.3 manifest merge");
+    assert_eq!(
+        learned.content_id.as_ref(),
+        Some(&cid),
+        "the worker converged on the peer's content_id, not a re-adopted duplicate"
+    );
+}
+
+// ===========================================================================
+// §2.7/§6 WHOLE-ITEM BACKSTOP (review blocker: reconcile_wholeness uncalled)
+// ===========================================================================
+
+/// §2.7/§6: the GC worker must run `engine::reconcile_wholeness` as its
+/// unconditional whole-item backstop. In a worker-only homelab (phones
+/// offline) a delete-vs-edit race can leave the worker holding a tombstoned
+/// original beside a LIVE sidecar with no peer resurrection published; the
+/// author-only inline lanes never fire for the worker. `run_cycle` must
+/// re-advertise the original so §2.10 GC can never destroy a RAW a live
+/// sidecar still references.
+#[tokio::test]
+async fn run_cycle_reconciles_wholeness_resurrecting_a_live_sidecars_tombstoned_original() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-whole");
+    let client = g.client();
+    let state = tempfile::tempdir().expect("state dir");
+    let cfg = worker_cfg(g, &bucket, Some(state.path().to_path_buf()));
+    let worker = Worker::open(&cfg).expect("open worker");
+
+    let image = rel("race/IMG_0007.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+    let raw = b"the-raw-original-bytes-still-in-grace";
+    let cid = ContentId::from_bytes(raw);
+    let b3 = Blake3Hex::from_bytes(raw);
+    // Bytes still in the bucket (grace window).
+    put_raw(&client, &bucket, &library_key(&image), raw).await;
+
+    // Worker's converged local view: original TOMBSTONED, base sidecar LIVE
+    // — the forbidden half-deleted shape. The worker HOLDS the original
+    // (blake3), so reconcile_wholeness can re-advertise it.
+    let del_vv = vv(&[(worker.device_id(), 3)]);
+    let mut orig = deleted_original_record(&cid, del_vv.clone());
+    orig.blake3 = Some(b3.clone());
+    worker
+        .db()
+        .replay_put_item(&image, &orig)
+        .expect("tombstoned original");
+    worker
+        .db()
+        .record_deleted(
+            &image,
+            &DeletedRecord {
+                vv: del_vv.clone(),
+                server_ts: NOW - DAY,
+            },
+        )
+        .expect("deleted row");
+    let sidecar = ItemRecord {
+        kind: Kind::Sidecar,
+        state: ItemState::Synced,
+        size: 128,
+        mtime_unix_ns: 0,
+        blake3: Some(Blake3Hex::from_bytes(b"sidecar-edits")),
+        sem_hash: None,
+        vv: vv(&[(worker.device_id(), 2)]),
+        content_id: None,
+        w: None,
+        h: None,
+        pinned: false,
+        last_access_unix: 0,
+        verified_remote: true,
+        attested: false,
+        base_unknown: false,
+        rating: Some(4),
+        color_label: Some("green".to_string()),
+        device: Some(worker.device_id().clone()),
+        head_ts: Some(NOW - DAY),
+        admitted_vv: None,
+        admitted_ts: None,
+        deleted: false,
+    };
+    worker
+        .db()
+        .replay_put_item(&sidecar_rel, &sidecar)
+        .expect("live sidecar");
+
+    let report = worker::run_cycle(
+        &worker,
+        &CycleOptions {
+            clock: Some(ServerClock::pinned(NOW)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("cycle");
+
+    assert!(
+        report.resurrected.contains(&image),
+        "run_cycle re-advertised the tombstoned original (resurrected={:?})",
+        report.resurrected
+    );
+    assert!(
+        !worker
+            .db()
+            .get_item(&image)
+            .expect("get")
+            .expect("rec")
+            .deleted,
+        "the original is live again after the cycle — no orphan for §2.10 GC"
+    );
+    assert_eq!(
+        worker.db().get_deleted(&image).expect("row"),
+        None,
+        "the original's deleted-set row is superseded by the resurrection"
+    );
+    let w_entries = eh::journal_entries_of(&client, &bucket, worker.device_id()).await;
+    assert!(
+        w_entries
+            .iter()
+            .any(|e| e.op == Op::Put && e.kind == Kind::Original && e.key == library_key(&image)),
+        "the resurrection put is published under the worker's prefix so phones learn the whole item"
+    );
+    assert!(
+        exists(&client, &bucket, &library_key(&image)).await,
+        "the held RAW is still in the bucket (destruction is §2.10 GC's)"
+    );
+}
+
+// ===========================================================================
+// PER-ITEM ISOLATION (review major: one poison original aborts the cycle)
+// ===========================================================================
+
+/// §6 forward progress: a non-RAW/undecodable foreign original (a valid §1.2
+/// original the proxy pipeline cannot represent) must NOT abort the cycle. A
+/// bogus non-RAW object dropped beside a real RAW: the RAW is adopted with a
+/// proxy + thumbs, the non-RAW is adopted WITHOUT a proxy (its decode failure
+/// isolated), the cycle completes (so hygiene + §2.10 GC run), and a second
+/// cycle re-attempts neither (no re-poison).
+#[tokio::test]
+async fn one_undecodable_foreign_original_does_not_abort_the_cycle() {
+    let (filename, raw) = skip_without_corpus!("per_item_isolation");
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-isolate");
+    let client = g.client();
+    let state = tempfile::tempdir().expect("state dir");
+    let cfg = worker_cfg(g, &bucket, Some(state.path().to_path_buf()));
+    let worker = Worker::open(&cfg).expect("open worker");
+
+    // A real RAW (decodable → proxy) and a non-RAW original (undecodable by
+    // proxy.rs), both dropped externally under library/. The uppercase-ext
+    // non-RAW sorts BEFORE the RAW, so a non-isolated cycle hits it first and
+    // aborts before adopting the RAW.
+    let raw_item = ingest_relkey(&filename);
+    put_raw(&client, &bucket, &library_key(&raw_item), &raw).await;
+    let poison = rel("ingest/photo.JPG");
+    put_raw(
+        &client,
+        &bucket,
+        &library_key(&poison),
+        b"not a decodable raw or jpeg body - proxy.rs will fail to decode this",
+    )
+    .await;
+
+    let report = worker::run_cycle(&worker, &CycleOptions::default())
+        .await
+        .expect("a poison item must not abort the cycle");
+
+    assert!(
+        report.adopted.contains(&raw_item),
+        "the decodable RAW is adopted (adopted={:?})",
+        report.adopted
+    );
+    assert!(
+        report.proxies_generated >= 1,
+        "a proxy was generated for the RAW"
+    );
+    assert!(
+        report.adopted_without_proxy.contains(&poison),
+        "the undecodable original is adopted WITHOUT a proxy, not crashed on \
+         (adopted_without_proxy={:?})",
+        report.adopted_without_proxy
+    );
+    assert!(
+        worker.db().get_item(&raw_item).unwrap().is_some()
+            && worker.db().get_item(&poison).unwrap().is_some(),
+        "both originals are journal-known after the cycle"
+    );
+
+    // Forward progress: the second cycle re-adopts nothing and re-attempts
+    // the poison item not at all (it is journal-known now).
+    let second = worker::run_cycle(&worker, &CycleOptions::default())
+        .await
+        .expect("second cycle");
+    assert!(second.adopted.is_empty(), "nothing re-adopted on cycle 2");
+    assert!(
+        second.adopted_without_proxy.is_empty(),
+        "the poison item is not re-attempted on cycle 2"
+    );
 }
 
 // A `CompactConfig` field is referenced so the import is load-bearing even

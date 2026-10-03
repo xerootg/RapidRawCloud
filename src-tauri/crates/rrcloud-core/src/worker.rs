@@ -53,6 +53,7 @@
 //! (§6) — just wasteful, never unsafe; the worker never assumes
 //! exclusivity.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -64,13 +65,13 @@ use crate::compact::{
     auto_retire_sweep, compact_own_segments, gc_retired_prefixes, tombstone_gc, CompactConfig,
     CompactError, CompactionSummary, GcSummary, ServerClock,
 };
-use crate::engine::{EngineConsumer, EngineError};
+use crate::engine::{reconcile_wholeness, EngineConsumer, EngineError};
 use crate::journal::{JournalEntry, JournalError, Kind, Op, JOURNAL_VERSION};
 use crate::keys::{
     classify_key, library_key, preview_key, thumb_key, KeyClass, KeyError, RelKey, ThumbSize,
     LIBRARY_PREFIX,
 };
-use crate::manifest::ManifestError;
+use crate::manifest::{get_manifest, merge as merge_manifests, Manifest, ManifestError};
 use crate::proxy::{generate_proxy_with, ProxyError, ProxyParams};
 use crate::publisher::{
     enqueue_entry, get_device_entry, publish_pending, put_device_entry, DeviceProfile,
@@ -313,8 +314,20 @@ pub struct CycleOptions {
 #[derive(Debug, Default)]
 pub struct CycleReport {
     /// Foreign originals adopted this cycle (journaled `attest` + `put`),
-    /// by item relkey.
+    /// by item relkey. Includes [`CycleReport::adopted_without_proxy`].
     pub adopted: Vec<RelKey>,
+    /// Foreign originals adopted this cycle whose smart preview could **not**
+    /// be generated (a non-RAW/undecodable `library/` object — still a valid
+    /// §1.2 original, so it is journaled `attest` + `put` so phones learn it,
+    /// but with no preview/thumbs). Per-item isolation: one such object never
+    /// aborts the cycle (§6 forward progress). A subset of
+    /// [`CycleReport::adopted`].
+    pub adopted_without_proxy: Vec<RelKey>,
+    /// §2.7/§6 whole-item resurrections re-advertised this cycle by
+    /// [`crate::engine::reconcile_wholeness`] (a live sidecar's tombstoned
+    /// original, or the converse), by item relkey — the GC worker's
+    /// unconditional whole-item backstop.
+    pub resurrected: Vec<RelKey>,
     /// Smart previews generated via [`crate::proxy::generate_proxy_with`].
     pub proxies_generated: usize,
     /// Preview objects PUT under `previews/<content_id>`.
@@ -332,6 +345,10 @@ pub struct CycleReport {
     pub gc: GcSummary,
     /// Devices retired (explicit or auto) this cycle.
     pub retired: Vec<DeviceId>,
+    /// Read-only reporting only ([`Worker::open_readonly`]): the count of
+    /// `library/` original objects observed, written nowhere. Always `0` for
+    /// the journaling role.
+    pub foreign_originals_seen: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +362,11 @@ pub struct Worker {
     db: SyncDb,
     s3: S3Client,
     bucket: String,
+    /// `true` for a [`Worker::open_readonly`] handle: [`run_cycle`] does
+    /// **read-only reporting only** — it never heartbeats, journals,
+    /// publishes, or GCs, so the ephemeral identity never pollutes the
+    /// device registry / §2.10 horizons with a phantom device (§6).
+    readonly: bool,
 }
 
 impl Worker {
@@ -388,6 +410,7 @@ impl Worker {
             db,
             s3,
             bucket: cfg.bucket.clone(),
+            readonly: false,
         })
     }
 
@@ -409,6 +432,7 @@ impl Worker {
             db,
             s3,
             bucket: cfg.bucket.clone(),
+            readonly: true,
         })
     }
 
@@ -477,6 +501,19 @@ pub async fn run_cycle(worker: &Worker, opts: &CycleOptions) -> Result<CycleRepo
     let db = &worker.db;
     let mut report = CycleReport::default();
 
+    // A read-only handle ([`Worker::open_readonly`]) does reporting only: it
+    // never heartbeats, journals, publishes, or GCs, so its ephemeral
+    // identity never pollutes the device registry / §2.10 horizons (§6). Only
+    // the library listing (a pure read) runs.
+    if worker.readonly {
+        report.foreign_originals_seen = list_library_keys(s3, bucket)
+            .await?
+            .into_iter()
+            .filter(|(key, _)| matches!(classify_key(key), KeyClass::Original { .. }))
+            .count();
+        return Ok(report);
+    }
+
     // (0) Heartbeat: register/refresh this worker's registry entry so peers'
     // §2.10 horizons account for it and the server-time offset is recorded.
     heartbeat(worker).await?;
@@ -488,23 +525,43 @@ pub async fn run_cycle(worker: &Worker, opts: &CycleOptions) -> Result<CycleRepo
         None => ServerClock::from_db(db)?,
     };
 
-    // (1a) Catch up: poll every FOREIGN prefix into our state db, so the
-    // reconcile below sees journal-known state (own prefix is skipped by
-    // `poll`). A no-op event sink — the worker takes no UI action on the
-    // §2.6 events, and plain adoptions never conflict.
+    // (1a) Catch up (§2.2 poll + §2.3 gap-routed manifest merge): poll every
+    // FOREIGN prefix into our state db, and for any peer the poll reports a
+    // gap on (its early segments §2.10-compacted), merge that peer's manifest
+    // so we learn its advertised items instead of mistaking them for foreign
+    // drops. Own prefix is skipped by `poll`.
+    catch_up(worker).await?;
+
+    // (1b) §2.7/§6 whole-item backstop at quiescence: re-advertise any
+    // original a live sidecar still references that a delete-vs-edit race
+    // left tombstoned (and the converse). This is the GC worker's
+    // *unconditional* whole-item backstop — the catch-all the author-only
+    // inline `apply_del` lanes miss when the surviving editor went offline
+    // before applying the delete, so §2.10 GC below can never destroy a RAW a
+    // live sidecar still references. Runs at quiescence (post-poll/merge), so
+    // its decision is a pure function of converged local state (§2.11). Its
+    // staged resurrection puts are published by (1d).
     {
         let mut events = ();
-        let mut consumer = EngineConsumer::new(db, worker.work_root(), &mut events)?;
-        poll(db, s3, bucket, &mut consumer).await?;
+        report.resurrected = reconcile_wholeness(db, &mut events)?;
     }
 
-    // (1b) Reconcile: adopt every foreign original that has no journal-known
-    // state, then publish this cycle's staged entries under our own prefix.
+    // (1c) Reconcile: adopt every foreign original that has no journal-known
+    // state (staging only — per-item isolated, so one undecodable object
+    // never aborts the cycle).
     adopt_foreign_originals(worker, opts, &clock, &mut report).await?;
+
+    // (1d) Publish everything staged this cycle (adoptions + resurrections)
+    // under our own prefix in one drain — a single publish point, so a poison
+    // item earlier in (1c) can never strand already-staged entries unpublished.
+    let published = publish_pending(db, s3, bucket).await?;
+    report.journal_entries_published = published.entries;
 
     // (2) Hygiene: abort stale multipart uploads (the portable mechanism —
     // ListMultipartUploads + AbortMultipartUpload, no lifecycle-rule
-    // dependency, §2.4).
+    // dependency, §2.4). The age gate uses §2.10 **server** time (the
+    // multipart Initiated timestamps are server-provided), not the local
+    // wall clock.
     {
         let backend = match stored_backend_profile(db)? {
             Some(b) => b,
@@ -512,7 +569,8 @@ pub async fn run_cycle(worker: &Worker, opts: &CycleOptions) -> Result<CycleRepo
         };
         let tcfg = TransferConfig::new(bucket.to_string(), worker.work_root(), backend);
         let stale =
-            abort_stale_uploads(db, s3, &tcfg, STALE_UPLOAD_MAX_AGE_SECS, now_unix_local()).await?;
+            abort_stale_uploads(db, s3, &tcfg, STALE_UPLOAD_MAX_AGE_SECS, clock.now_server())
+                .await?;
         for (rel, _id) in stale.aborted_own {
             report.aborted_multipart_uploads.push(library_key(&rel));
         }
@@ -527,7 +585,9 @@ pub async fn run_cycle(worker: &Worker, opts: &CycleOptions) -> Result<CycleRepo
     // (3) §2.10: retire dead devices first (so horizons stop counting them),
     // GC tombstones, fold retired devices' orphaned prefixes, then compact
     // our own segments LAST — each builds from the same durable state, and
-    // compaction's own-manifest coverage check reflects everything above.
+    // compaction's own-manifest coverage check reflects everything above
+    // (including this cycle's resurrections, so a resurrected original is in
+    // the manifest before any peer's horizon could GC it).
     report.retired = auto_retire_sweep(s3, bucket, &clock, &opts.compact).await?;
     report.gc = tombstone_gc(db, s3, bucket, &clock, &opts.compact).await?;
     // Orphaned-prefix reclaim: folded into our manifest losslessly; the
@@ -536,6 +596,75 @@ pub async fn run_cycle(worker: &Worker, opts: &CycleOptions) -> Result<CycleRepo
     report.compaction = compact_own_segments(db, s3, bucket, &clock, &opts.compact).await?;
 
     Ok(report)
+}
+
+/// §2.2 steady-state poll + §2.3 gap-routed catch-up.
+///
+/// Poll every foreign prefix; then for every device the poll reports a
+/// **bootstrap or mid-stream gap** on — its journal starts past where we can
+/// apply, because its early segments were §2.10-compacted — GET that peer's
+/// **manifest** and merge it. The §2.3 catch-up attestation seeds the cursor
+/// past the gap and folds the compacted entries' effects (live rows + the
+/// deleted set); a re-poll then applies anything past the now-seeded cursors.
+///
+/// Without this a peer original advertised **only** in a manifest (its
+/// journal segment compacted) would be mistaken for a foreign drop and
+/// re-adopted — a spurious `{worker:1}` version concurrent with the peer's,
+/// plus a duplicate proxy — and a peer's compacted soft-`del` whose bytes are
+/// still in the grace window would be resurrected (reopening A3). The merge
+/// routes the gap to the manifest so neither happens.
+async fn catch_up(worker: &Worker) -> Result<(), WorkerError> {
+    let db = &worker.db;
+    let s3 = &worker.s3;
+    let bucket = worker.bucket.as_str();
+
+    let report = {
+        let mut events = ();
+        let mut consumer = EngineConsumer::new(db, worker.work_root(), &mut events)?;
+        poll(db, s3, bucket, &mut consumer).await?
+    };
+
+    // The peers whose journals are gapped (bootstrap or mid-stream).
+    let mut gapped: BTreeSet<DeviceId> = BTreeSet::new();
+    for gap in &report.gaps {
+        gapped.insert(gap.device.clone());
+    }
+    for gap in &report.mid_stream_gaps {
+        gapped.insert(gap.device.clone());
+    }
+    if gapped.is_empty() {
+        return Ok(());
+    }
+
+    // GET each gapped peer's manifest (the §2.3 catch-up attestation).
+    let mut manifests: Vec<(DeviceId, Manifest)> = Vec::new();
+    for device in gapped {
+        match get_manifest(s3, bucket, &device).await {
+            Ok(m) => manifests.push((device, m)),
+            // A gapped peer with no manifest yet: nothing to merge this pass;
+            // the gap re-reports next cycle until the peer (or its retiring GC
+            // worker) writes/folds one. Never a cycle-aborting error.
+            Err(ManifestError::S3(e)) if e.is_no_such_key() => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if manifests.is_empty() {
+        return Ok(());
+    }
+
+    // Merge through the same engine consumer as journal replay (§2.3), then
+    // re-poll to apply entries past the now-seeded cursors.
+    {
+        let mut events = ();
+        let mut consumer = EngineConsumer::new(db, worker.work_root(), &mut events)?;
+        merge_manifests(&manifests, db, &mut consumer)?;
+    }
+    {
+        let mut events = ();
+        let mut consumer = EngineConsumer::new(db, worker.work_root(), &mut events)?;
+        poll(db, s3, bucket, &mut consumer).await?;
+    }
+    Ok(())
 }
 
 /// The §2.2/§2.10 heartbeat: PUT this worker's device-registry entry with
@@ -563,10 +692,18 @@ async fn heartbeat(worker: &Worker) -> Result<(), WorkerError> {
 
 /// §2.3 reconcile + §2.1 foreign adoption: list `library/`, and for each
 /// original with no journal-known state (no local item record after the
-/// catch-up poll) GET → blake3 → proxy → PUT preview/thumbs → journal
-/// `attest` + `put` (original/preview/thumb), recording the adopted original
-/// in our own state so a re-run is a no-op and the manifest advertises it.
-/// All staged entries are published under our own prefix at the end.
+/// catch-up poll + merge) GET → blake3 → proxy → PUT preview/thumbs →
+/// **stage** `attest` + `put` (original/preview/thumb), recording the
+/// adopted original in our own state so a re-run is a no-op and the manifest
+/// advertises it. Staging only — [`run_cycle`] publishes once, afterward.
+///
+/// Per-item isolation (§6 forward progress): a non-RAW/undecodable
+/// `library/` object is still a valid §1.2 original, so its proxy failure
+/// does **not** abort the cycle — the original is adopted `attest` + `put`
+/// (so phones learn it), with no preview/thumbs, and recorded in
+/// [`CycleReport::adopted_without_proxy`]. Because it is still recorded in
+/// local state, a later cycle skips it (no re-poison), and hygiene + §2.10
+/// GC always run.
 async fn adopt_foreign_originals(
     worker: &Worker,
     opts: &CycleOptions,
@@ -579,14 +716,18 @@ async fn adopt_foreign_originals(
     let device = db.device_id().clone();
     let now_ts = clock.now_server();
 
-    for key in list_library_keys(s3, bucket).await? {
+    for (key, last_modified) in list_library_keys(s3, bucket).await? {
         let relkey = match classify_key(&key) {
             KeyClass::Original { relkey } => relkey,
             // Sidecars/xmp/foreign keys are not adopted as originals here.
             _ => continue,
         };
-        // Journal-known state → already adopted (by us or a peer). Skip.
-        if db.get_item(&relkey)?.is_some() {
+        // Journal-known state (an item record OR a deleted-set row, learned
+        // from the journal or a §2.3 manifest merge) → already adopted/known
+        // by us or a peer, or soft-deleted with bytes still in grace. Skip:
+        // re-adopting would spuriously conflict, and re-adopting a deleted
+        // key would resurrect it (A3).
+        if db.get_item(&relkey)?.is_some() || db.get_deleted(&relkey)?.is_some() {
             continue;
         }
 
@@ -598,46 +739,33 @@ async fn adopt_foreign_originals(
             .collect_capped(MAX_ADOPT_ORIGINAL_BYTES)
             .await?;
         let blake3 = Blake3Hex::from_bytes(&bytes);
-        let content_id = ContentId::from_bytes(&bytes);
         let size = bytes.len() as u64;
+        // §2.2/§3.5: carry the object's server mtime so phones materialize
+        // the stub at the real mtime, not epoch-0. The listing's
+        // `LastModified` is the server-provided timestamp.
+        let mtime_unix = last_modified
+            .as_deref()
+            .and_then(crate::publisher::parse_http_date)
+            .filter(|s| *s > 0)
+            .unwrap_or(0);
+        let mtime_unix_ns = mtime_unix.saturating_mul(1_000_000_000);
 
         // Smart preview + thumbs (§4.2), via the same pinned rawler the app
-        // resolves — color parity by construction.
-        let proxy = generate_proxy_with(&bytes, &opts.proxy)?;
-        report.proxies_generated += 1;
-        let orig_w = proxy.orig_width;
-        let orig_h = proxy.orig_height;
-        let preview_hash = Blake3Hex::from_bytes(&proxy.dng);
-        let preview_len = proxy.dng.len() as u64;
-        let small_hash = Blake3Hex::from_bytes(&proxy.small_jpeg);
-        let small_len = proxy.small_jpeg.len() as u64;
-        let medium_hash = Blake3Hex::from_bytes(&proxy.medium_jpeg);
-        let medium_len = proxy.medium_jpeg.len() as u64;
-
-        // PUT the content-addressed preview + thumb objects.
-        s3.put_object(
-            bucket,
-            &preview_key(&content_id),
-            Bytes::from(proxy.dng),
-            &PutObjectOptions::default(),
-        )
-        .await?;
-        report.previews_put += 1;
-        s3.put_object(
-            bucket,
-            &thumb_key(&content_id, ThumbSize::Small),
-            Bytes::from(proxy.small_jpeg),
-            &PutObjectOptions::default(),
-        )
-        .await?;
-        s3.put_object(
-            bucket,
-            &thumb_key(&content_id, ThumbSize::Medium),
-            Bytes::from(proxy.medium_jpeg),
-            &PutObjectOptions::default(),
-        )
-        .await?;
-        report.thumbs_put += 2;
+        // resolves — color parity by construction. Per-item isolated: a
+        // non-RAW/undecodable original (a valid §1.2 original the proxy
+        // pipeline cannot represent) is adopted WITHOUT a proxy rather than
+        // aborting the cycle.
+        let content_id = ContentId::from_bytes(&bytes);
+        let proxy = match generate_proxy_with(&bytes, &opts.proxy) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!(
+                    "rrcloud-worker: adopting {} without a proxy (preview generation failed: {e})",
+                    key
+                );
+                None
+            }
+        };
 
         // The worker is the first to version this foreign original, so the
         // §2.6 version vector is {worker: 1}.
@@ -681,37 +809,86 @@ async fn adopt_foreign_originals(
         put_original.key = library_key(&relkey);
         put_original.blake3 = Some(blake3.clone());
         put_original.size = Some(size);
-        put_original.content_id = Some(content_id.clone());
-        put_original.w = Some(orig_w);
-        put_original.h = Some(orig_h);
+        put_original.mtime = (mtime_unix > 0).then_some(mtime_unix);
+
+        // The preview/thumb lane only when the proxy was generated; a
+        // no-proxy original carries no `content_id` (there is no preview to
+        // address) and no dimensions.
+        let (record_content_id, record_w, record_h) = if let Some(proxy) = proxy {
+            report.proxies_generated += 1;
+            let orig_w = proxy.orig_width;
+            let orig_h = proxy.orig_height;
+            let preview_hash = Blake3Hex::from_bytes(&proxy.dng);
+            let preview_len = proxy.dng.len() as u64;
+            let small_hash = Blake3Hex::from_bytes(&proxy.small_jpeg);
+            let small_len = proxy.small_jpeg.len() as u64;
+            let medium_hash = Blake3Hex::from_bytes(&proxy.medium_jpeg);
+            let medium_len = proxy.medium_jpeg.len() as u64;
+
+            // PUT the content-addressed preview + thumb objects.
+            s3.put_object(
+                bucket,
+                &preview_key(&content_id),
+                Bytes::from(proxy.dng),
+                &PutObjectOptions::default(),
+            )
+            .await?;
+            report.previews_put += 1;
+            s3.put_object(
+                bucket,
+                &thumb_key(&content_id, ThumbSize::Small),
+                Bytes::from(proxy.small_jpeg),
+                &PutObjectOptions::default(),
+            )
+            .await?;
+            s3.put_object(
+                bucket,
+                &thumb_key(&content_id, ThumbSize::Medium),
+                Bytes::from(proxy.medium_jpeg),
+                &PutObjectOptions::default(),
+            )
+            .await?;
+            report.thumbs_put += 2;
+
+            put_original.content_id = Some(content_id.clone());
+            put_original.w = Some(orig_w);
+            put_original.h = Some(orig_h);
+
+            let mut put_preview = tmpl.clone();
+            put_preview.op = Op::Put;
+            put_preview.kind = Kind::Preview;
+            put_preview.key = preview_key(&content_id);
+            put_preview.blake3 = Some(preview_hash);
+            put_preview.size = Some(preview_len);
+            put_preview.content_id = Some(content_id.clone());
+            enqueue_entry(db, &put_preview)?;
+
+            let mut put_thumb_small = tmpl.clone();
+            put_thumb_small.op = Op::Put;
+            put_thumb_small.kind = Kind::Thumb;
+            put_thumb_small.key = thumb_key(&content_id, ThumbSize::Small);
+            put_thumb_small.blake3 = Some(small_hash);
+            put_thumb_small.size = Some(small_len);
+            put_thumb_small.content_id = Some(content_id.clone());
+            enqueue_entry(db, &put_thumb_small)?;
+
+            let mut put_thumb_medium = tmpl.clone();
+            put_thumb_medium.op = Op::Put;
+            put_thumb_medium.kind = Kind::Thumb;
+            put_thumb_medium.key = thumb_key(&content_id, ThumbSize::Medium);
+            put_thumb_medium.blake3 = Some(medium_hash);
+            put_thumb_medium.size = Some(medium_len);
+            put_thumb_medium.content_id = Some(content_id.clone());
+            enqueue_entry(db, &put_thumb_medium)?;
+
+            (Some(content_id.clone()), Some(orig_w), Some(orig_h))
+        } else {
+            report.adopted_without_proxy.push(relkey.clone());
+            (None, None, None)
+        };
+
+        // Stage the original put last (its fields above are now final).
         enqueue_entry(db, &put_original)?;
-
-        let mut put_preview = tmpl.clone();
-        put_preview.op = Op::Put;
-        put_preview.kind = Kind::Preview;
-        put_preview.key = preview_key(&content_id);
-        put_preview.blake3 = Some(preview_hash);
-        put_preview.size = Some(preview_len);
-        put_preview.content_id = Some(content_id.clone());
-        enqueue_entry(db, &put_preview)?;
-
-        let mut put_thumb_small = tmpl.clone();
-        put_thumb_small.op = Op::Put;
-        put_thumb_small.kind = Kind::Thumb;
-        put_thumb_small.key = thumb_key(&content_id, ThumbSize::Small);
-        put_thumb_small.blake3 = Some(small_hash);
-        put_thumb_small.size = Some(small_len);
-        put_thumb_small.content_id = Some(content_id.clone());
-        enqueue_entry(db, &put_thumb_small)?;
-
-        let mut put_thumb_medium = tmpl;
-        put_thumb_medium.op = Op::Put;
-        put_thumb_medium.kind = Kind::Thumb;
-        put_thumb_medium.key = thumb_key(&content_id, ThumbSize::Medium);
-        put_thumb_medium.blake3 = Some(medium_hash);
-        put_thumb_medium.size = Some(medium_len);
-        put_thumb_medium.content_id = Some(content_id.clone());
-        enqueue_entry(db, &put_thumb_medium)?;
 
         // Record the adopted original in our own state: a re-run sees it as
         // journal-known (idempotence), and the manifest advertises it as a
@@ -721,13 +898,13 @@ async fn adopt_foreign_originals(
             kind: Kind::Original,
             state: ItemState::Synced,
             size,
-            mtime_unix_ns: 0,
+            mtime_unix_ns,
             blake3: Some(blake3),
             sem_hash: None,
             vv,
-            content_id: Some(content_id),
-            w: Some(orig_w),
-            h: Some(orig_h),
+            content_id: record_content_id,
+            w: record_w,
+            h: record_h,
             pinned: false,
             last_access_unix: 0,
             verified_remote: true,
@@ -745,15 +922,16 @@ async fn adopt_foreign_originals(
         report.adopted.push(relkey);
     }
 
-    // Publish everything staged this cycle under our own prefix (one segment
-    // drain; crash-safe, byte-identical re-PUT on replay).
-    let published = publish_pending(db, s3, bucket).await?;
-    report.journal_entries_published = published.entries;
     Ok(())
 }
 
 /// One paged `ListObjectsV2` over `library/`, following continuation tokens.
-async fn list_library_keys(s3: &S3Client, bucket: &str) -> Result<Vec<String>, WorkerError> {
+/// Each entry pairs the object key with its `LastModified` (the §2.2 mtime
+/// source for adopted originals).
+async fn list_library_keys(
+    s3: &S3Client,
+    bucket: &str,
+) -> Result<Vec<(String, Option<String>)>, WorkerError> {
     let mut keys = Vec::new();
     let mut continuation_token: Option<String> = None;
     loop {
@@ -767,7 +945,7 @@ async fn list_library_keys(s3: &S3Client, bucket: &str) -> Result<Vec<String>, W
                 },
             )
             .await?;
-        keys.extend(page.objects.into_iter().map(|o| o.key));
+        keys.extend(page.objects.into_iter().map(|o| (o.key, o.last_modified)));
         if !page.is_truncated {
             return Ok(keys);
         }
@@ -804,10 +982,12 @@ pub async fn run(worker: &Worker, mode: RunMode, opts: &CycleOptions) -> Result<
 /// Structured per-cycle log line to stdout (§6 point 3).
 fn log_cycle(report: &CycleReport) {
     println!(
-        "rrcloud-worker cycle: adopted={} proxies={} previews_put={} thumbs_put={} \
-         journaled={} aborted_uploads={} gc_destroyed={} gc_retained={} compacted_segments={} \
-         retired={}",
+        "rrcloud-worker cycle: adopted={} adopted_no_proxy={} resurrected={} proxies={} \
+         previews_put={} thumbs_put={} journaled={} aborted_uploads={} gc_destroyed={} \
+         gc_retained={} compacted_segments={} retired={}",
         report.adopted.len(),
+        report.adopted_without_proxy.len(),
+        report.resurrected.len(),
         report.proxies_generated,
         report.previews_put,
         report.thumbs_put,
@@ -821,18 +1001,11 @@ fn log_cycle(report: &CycleReport) {
     for relkey in &report.adopted {
         println!("  adopted {}", relkey.as_str());
     }
+    for relkey in &report.resurrected {
+        println!("  resurrected {}", relkey.as_str());
+    }
     for device in &report.retired {
         println!("  retired {device}");
-    }
-}
-
-/// The local wall clock as unix seconds (negative clocks clamp to 0 rather
-/// than panic — library paths do not unwrap). Used for the §2.4 stale-upload
-/// age gate, whose timestamps are in local time.
-fn now_unix_local() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(d) => i64::try_from(d.as_secs()).unwrap_or(i64::MAX),
-        Err(_) => 0,
     }
 }
 

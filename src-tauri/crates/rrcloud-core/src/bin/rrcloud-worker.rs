@@ -18,9 +18,17 @@ use rrcloud_core::worker::{
     self, CycleOptions, RunMode, Worker, WorkerConfig, DEFAULT_DAEMON_INTERVAL,
 };
 
+const USAGE: &str = "usage: rrcloud-worker [--once | --daemon --interval <dur>]";
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    match real_main().await {
+    // A CLI usage error is a clean usage message + nonzero exit (code 2),
+    // never a Rust panic/backtrace — it is operator input, not a bug.
+    let Some(mode) = parse_mode() else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    match real_main(mode).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("rrcloud-worker: fatal: {e}");
@@ -29,8 +37,7 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn real_main() -> Result<(), worker::WorkerError> {
-    let mode = parse_mode().expect("usage: rrcloud-worker [--once | --daemon --interval <dur>]");
+async fn real_main(mode: RunMode) -> Result<(), worker::WorkerError> {
     let cfg = WorkerConfig::from_env()?;
     let worker = Worker::open(&cfg)?;
     worker::run(&worker, mode, &CycleOptions::default()).await

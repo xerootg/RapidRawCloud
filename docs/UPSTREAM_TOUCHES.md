@@ -41,7 +41,12 @@ Notes:
   additive and *inside* `crates/rrcloud-core/Cargo.toml` (the `[[bin]]` plus the `tokio`
   `rt-multi-thread`/`macros`/`time` runtime features the bin's `#[tokio::main]` needs, already in the
   test build); no upstream manifest is touched. See `rrcloud_core::worker` module docs and
-  ARCHITECTURE.md §6.
+  ARCHITECTURE.md §6. The worker is **pure orchestration** over existing `rrcloud-core` modules and
+  reimplements no protocol logic: P4 review round 0 wired `worker::run_cycle` to the two engine
+  entry points the GC worker must be the backstop for — `engine::reconcile_wholeness` (the §2.7/§6
+  whole-item backstop, previously with no production caller) and the §2.3 gap-routed
+  `manifest::merge` (`worker::catch_up`, so a manifest-only peer original is not re-adopted) — plus
+  per-item proxy isolation and server-time stale-upload hygiene. Still additive to `rrcloud-core`.
 - `tauri.conf.json` is deliberately untouched — thumbnail seeding hard-links into the existing
   `$APPCACHE/thumbnails` asset-protocol scope (ARCHITECTURE.md §3.5).
 - P0 keeps `crates/rrcloud-core` standalone (own lockfile, no workspace membership) so the
