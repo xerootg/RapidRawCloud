@@ -9,10 +9,13 @@
 FROM rust:1.97-bookworm AS builder
 WORKDIR /build
 # rrcloud-core declares rust-version 1.97, edition 2021. rawler is a git dep
-# fetched during the build (needs network in CI). tests/ is not copied: a
-# --bin build compiles neither tests nor dev-dependencies.
+# fetched during the build (needs network in CI). tests/ MUST be copied even
+# though a --bin build compiles no tests/dev-deps: the crate declares explicit
+# [[test]] targets (state_crash, transfer_crash), and cargo requires their
+# source files to exist to PARSE the manifest, before target selection.
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+COPY tests ./tests
 # Build only the worker bin in release.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
