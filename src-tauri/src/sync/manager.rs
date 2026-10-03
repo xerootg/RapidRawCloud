@@ -501,11 +501,11 @@ impl SyncManager {
         #[cfg(feature = "sync")]
         {
             let cfg = self.configured()?;
-            let report = cfg.run_evictor().await?;
-            for p in &report.evicted {
-                self.mark_stub(p, true);
-            }
-            Ok(report)
+            // The mirror is updated per item as the pass commits each stub
+            // (see `Configured::evict_to_stub`), not only on a clean `Ok`, so a
+            // mid-pass error cannot desync it from redb/disk.
+            let mut on_evicted = |p: &Path| self.mark_stub(p, true);
+            cfg.run_evictor(&mut on_evicted).await
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -524,11 +524,12 @@ impl SyncManager {
         #[cfg(feature = "sync")]
         {
             let cfg = self.configured()?;
-            let report = cfg.run_evictor_with_budget(max_resident_bytes).await?;
-            for p in &report.evicted {
-                self.mark_stub(p, true);
-            }
-            Ok(report)
+            // The mirror is updated per item as the pass commits each stub
+            // (see `Configured::evict_to_stub`), not only on a clean `Ok`, so a
+            // mid-pass error cannot desync it from redb/disk.
+            let mut on_evicted = |p: &Path| self.mark_stub(p, true);
+            cfg.run_evictor_with_budget(max_resident_bytes, &mut on_evicted)
+                .await
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -1285,9 +1286,12 @@ mod imp {
         /// §3.5 LRU eviction pass using `settings.sync.cache_size_gb` as the
         /// resident-bytes budget. Scaffold: unimplemented until the P2 green
         /// pass.
-        pub async fn run_evictor(&self) -> Result<EvictionReport, SyncError> {
+        pub async fn run_evictor(
+            &self,
+            on_evicted: &mut dyn FnMut(&Path),
+        ) -> Result<EvictionReport, SyncError> {
             let budget = (self.settings.cache_size_gb as u64) << 30;
-            self.run_evictor_with_budget(budget).await
+            self.run_evictor_with_budget(budget, on_evicted).await
         }
 
         /// §3.5 LRU eviction pass with an explicit `max_resident_bytes`
@@ -1297,6 +1301,7 @@ mod imp {
         pub async fn run_evictor_with_budget(
             &self,
             max_resident_bytes: u64,
+            on_evicted: &mut dyn FnMut(&Path),
         ) -> Result<EvictionReport, SyncError> {
             // Resident originals: items holding local bytes (`Hydrated`, or a
             // `Synced` original this device uploaded) — never stubs. Sidecars
@@ -1364,7 +1369,7 @@ mod imp {
                 // Demote to a 0-byte stub: terminal transition, truncate the
                 // file, restore the remote mtime so the thumbnail cache key
                 // survives (§3.5).
-                self.evict_to_stub(&rk, &record, &path)?;
+                self.evict_to_stub(&rk, &record, &path, on_evicted)?;
                 resident = resident.saturating_sub(record.size);
                 report.evicted.push(path);
             }
@@ -1407,10 +1412,19 @@ mod imp {
             rk: &RelKey,
             record: &ItemRecord,
             path: &Path,
+            on_evicted: &mut dyn FnMut(&Path),
         ) -> Result<(), SyncError> {
             self.db
                 .transition(rk, record.state, ItemState::Stub, |_| {})
                 .map_err(se)?;
+            // The redb transition is the authoritative commit: the item is now
+            // durably a `Stub`. Notify the caller's in-memory stub mirror here,
+            // BEFORE the fallible truncate/mtime steps below, so a later failure
+            // in this pass (e.g. a vanished local file) cannot leave redb/disk
+            // ahead of the mirror. Otherwise already-demoted 0-byte stubs would
+            // answer `is_stub()`/`is_cloud_placeholder()` false until restart and
+            // every §3.5 guard site would read the placeholder as content.
+            on_evicted(path);
             // Truncate in place (never a remove+recreate: the directory entry
             // and inode stay put under any concurrent reader).
             std::fs::OpenOptions::new()

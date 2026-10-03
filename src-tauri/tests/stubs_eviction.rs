@@ -329,3 +329,108 @@ async fn evictor_never_evicts_unverified_or_corrupt_remote_bytes() {
         "corrupt_remote keeps the good local bytes, never a 0-byte stub"
     );
 }
+
+/// Regression (blocker): a mid-pass eviction error must not desync the
+/// in-memory stub mirror from redb/disk. The evictor commits each
+/// `Hydrated/Synced → Stub` transition + truncation per item; if a LATER
+/// candidate makes the pass return `Err` (here: a vanished local file makes
+/// `evict_to_stub`'s truncate `open()` fail), the items already demoted are
+/// 0-byte stubs on disk + redb, yet `is_stub`/`is_cloud_placeholder` would
+/// answer `false` for them until the next process restart — so every §3.5
+/// guard site bypasses hydration and reads the 0-byte placeholder as content.
+/// The mirror must learn of every committed stub even on the error path.
+#[tokio::test]
+async fn evictor_error_keeps_the_stub_mirror_consistent_with_redb() {
+    let _g = global_guard().await;
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("p2-evict-desync");
+    let settings = settings_for(garage, &bucket, 8);
+    let creds = creds_for(garage);
+
+    // Device A publishes two originals.
+    let root_a = tempfile::tempdir().expect("root a");
+    let state_a = tempfile::tempdir().expect("state a");
+    let mgr_a = SyncManager::new_inert();
+    mgr_a
+        .configure(
+            settings.clone(),
+            creds.clone(),
+            root_a.path().to_path_buf(),
+            state_a.path().to_path_buf(),
+        )
+        .expect("configure a");
+    sync::install_global_manager(mgr_a.clone());
+
+    let rel_old = "lib/OLD_01.NEF";
+    let rel_new = "lib/NEW_01.NEF";
+    let r_old =
+        upload_original(&mgr_a, root_a.path(), rel_old, &original_bytes(1, 80 * 1024)).await;
+    let r_new =
+        upload_original(&mgr_a, root_a.path(), rel_new, &original_bytes(2, 80 * 1024)).await;
+
+    // Device B stubs both, hydrates OLD first (LRU victim) then NEW.
+    let root_b = tempfile::tempdir().expect("root b");
+    let state_b = tempfile::tempdir().expect("state b");
+    let mgr_b = SyncManager::new_inert();
+    mgr_b
+        .configure(
+            settings,
+            creds,
+            root_b.path().to_path_buf(),
+            state_b.path().to_path_buf(),
+        )
+        .expect("configure b");
+    sync::install_global_manager(mgr_b.clone());
+
+    let stub_old = root_b.path().join(rel_old);
+    let stub_new = root_b.path().join(rel_new);
+    std::fs::create_dir_all(stub_old.parent().unwrap()).expect("mkdir");
+    mgr_b
+        .create_stub(&stub_old, &r_old.blake3_hex, r_old.size, r_old.mtime_unix)
+        .expect("stub old");
+    mgr_b
+        .create_stub(&stub_new, &r_new.blake3_hex, r_new.size, r_new.mtime_unix)
+        .expect("stub new");
+    mgr_b.ensure_local(&stub_old, "test").expect("hydrate old");
+    mgr_b.ensure_local(&stub_new, "test").expect("hydrate new");
+
+    // Delete NEW's local file so that when the pass reaches it (after OLD has
+    // already been committed to a stub), `evict_to_stub`'s truncate `open()`
+    // fails and the whole pass returns `Err`.
+    std::fs::remove_file(&stub_new).expect("delete NEW local file");
+
+    // A zero budget evicts OLD first (committed: redb Stub + 0-byte file),
+    // then errors on the vanished NEW.
+    let result = mgr_b.run_evictor_with_budget(0).await;
+    assert!(
+        result.is_err(),
+        "a vanished local file must make the pass return Err"
+    );
+
+    // OLD was committed to a stub on disk + redb before the error.
+    assert_eq!(
+        mgr_b.item_sync_state(&stub_old).as_deref(),
+        Some("stub"),
+        "OLD is durably a stub in redb despite the mid-pass error"
+    );
+    assert_eq!(
+        std::fs::metadata(&stub_old).unwrap().len(),
+        0,
+        "OLD is a 0-byte stub on disk"
+    );
+
+    // The invariant under test: the in-memory mirror agrees with redb for
+    // every committed stub, so the §3.5 guard sites re-hydrate instead of
+    // reading the 0-byte placeholder as content.
+    assert!(
+        mgr_b.is_stub(&stub_old),
+        "the mirror must recognize OLD as a stub even though the pass errored"
+    );
+    assert!(
+        sync::hooks::is_stub(&stub_old),
+        "is_cloud_placeholder's backing query must also recognize the stub"
+    );
+}
