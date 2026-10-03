@@ -31,9 +31,12 @@
 //! - [`compact`]: §2.10 compaction, horizons, GC, device lifecycle, and
 //!   the §2.3 pre-upload quarantine decision — the pure server-time
 //!   decisions and their S3 effects, driven by explicit entry points.
-//!
-//! The remaining modules from architecture §3.1 (`proxy`, `thumbs`) land in
-//! later units.
+//! - [`worker`]: the headless worker (§6) — the idempotent, crash-safe
+//!   reconcile / foreign-adoption / proxy-backfill / §2.10-GC cycle, as
+//!   pure orchestration over the modules above. Backs the
+//!   `rrcloud-worker` bin (`src/bin/rrcloud-worker.rs`), which depends on
+//!   this crate **only** (a documented refinement of §6 — no
+//!   `rapidraw_lib`/tauri linkage; color parity comes from [`proxy`]).
 
 pub mod clock;
 pub mod compact;
@@ -48,6 +51,7 @@ pub mod s3;
 pub mod semhash;
 pub mod state;
 pub mod transfer;
+pub mod worker;
 
 /// Crate-private helpers shared across modules.
 pub(crate) mod hexutil {

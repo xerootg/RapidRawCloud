@@ -93,15 +93,24 @@ thiserror = "2"
 # streamed per-part/source reads use `tokio::fs`/`io-util`. No new
 # transitive surface: reqwest 0.13 (above) already drives tokio on every
 # async path, so this only makes the existing runtime dependency explicit.
-# No runtime features (`rt`/`macros`) and no `sync` — the engine never
-# spawns; the §2.4 transfer-concurrency cap is structural (the pump's
-# `FuturesUnordered` length never exceeds the cap, polled on the caller's
-# runtime), so no semaphore is needed. `tokio_util` (CancellationToken) is
-# deliberately NOT added: the pump's cancel flag is a plain atomic (see
-# `transfer::CancelFlag`).
+# The library async paths never spawn; the §2.4 transfer-concurrency cap is
+# structural (the pump's `FuturesUnordered` length never exceeds the cap,
+# polled on the caller's runtime), so no semaphore is needed. `tokio_util`
+# (CancellationToken) is deliberately NOT added: the pump's cancel flag is a
+# plain atomic (see `transfer::CancelFlag`).
+#
+# P4 headless-worker addition: `rt-multi-thread`/`macros`/`time` are the
+# **top-level runtime** the `rrcloud-worker` bin needs (`#[tokio::main]`,
+# the `--daemon` interval sleep). They are additive — the library's async
+# entry points still never spawn and the P4 worker module is pure
+# orchestration — and were already enabled in this crate's test build
+# (dev-dependencies), so they add no new transitive surface.
 tokio = { version = "1", default-features = false, features = [
     "fs",
     "io-util",
+    "rt-multi-thread",
+    "macros",
+    "time",
 ] }
 # `parsing` added by the P1-U4 review round: the stale-upload orphan sweep
 # age-gates backend-listed uploads on their `Initiated` timestamp (RFC 3339),
@@ -109,6 +118,15 @@ tokio = { version = "1", default-features = false, features = [
 # one more feature — no new dependency.
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 unicode-normalization = "0.1"
+
+# The headless worker (ARCHITECTURE.md §6), as a bin in THIS crate depending
+# on `rrcloud-core` ONLY — a documented refinement of §6 (which said "link
+# `rapidraw_lib`"): color parity with the app is already a property of
+# `rrcloud-core::proxy` (same pinned rawler rev), so no tauri/gtk/webkit
+# linkage is needed. `main()` is a thin shell over `worker::run_cycle`.
+[[bin]]
+name = "rrcloud-worker"
+path = "src/bin/rrcloud-worker.rs"
 
 [features]
 # Test-support surface: the `force_*` tamper/corruption helpers in
