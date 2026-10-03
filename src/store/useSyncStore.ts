@@ -28,7 +28,11 @@ interface SyncState {
   lastError: { path: string | null; message: string } | null;
 
   setAvailable: (available: boolean) => void;
-  setStatus: (status: SyncStatusDto) => void;
+  // Accepts a partial snapshot and MERGES it over the last status, so a live
+  // `sync-status` event (the 6-field §3.8 subset) never clobbers the
+  // command-only facts (configured/credentialsConfigured/deviceId/peerDevices)
+  // learned from the full `sync_status` probe.
+  setStatus: (status: Partial<SyncStatusDto>) => void;
   applyItemStates: (updates: Array<{ path: string; state: string }>) => void;
   setHydrateProgress: (path: string, progress: HydrateProgress) => void;
   clearHydrateProgress: (path: string) => void;
@@ -47,7 +51,12 @@ export const useSyncStore = create<SyncState>((set) => ({
 
   setAvailable: (available) => set({ available }),
 
-  setStatus: (status) => set({ status }),
+  setStatus: (status) =>
+    set((state) => ({
+      status: state.status
+        ? { ...state.status, ...status }
+        : (status as SyncStatusDto),
+    })),
 
   applyItemStates: (updates) =>
     set((state) => {

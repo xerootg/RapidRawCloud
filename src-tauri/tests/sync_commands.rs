@@ -28,6 +28,8 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use common::garage;
+use rapidraw_lib::rrcloud_core::keys::LIBRARY_PREFIX;
+use rapidraw_lib::rrcloud_core::s3::PutObjectOptions;
 use rapidraw_lib::sync::commands::{
     self, SyncStatusDto, configure_core, credentials_configured_core, hydrate_core,
     set_credentials_core, status_core,
@@ -425,5 +427,73 @@ async fn conflict_retire_verify_surface() {
     assert_eq!(
         report.corrupt, 0,
         "a clean library verifies with no corruption"
+    );
+}
+
+/// `verify_library` re-checks local vs. remote facts (§3.5): a synced
+/// original whose remote blob has gone missing is reported `missing`, and one
+/// whose remote bytes no longer match the verified size is reported `corrupt`
+/// — the DTO fields the "Verify library" action surfaces. Regression for the
+/// U8 review finding that both counts were hardcoded to 0 (a silent clean
+/// bill over a local-only reconcile).
+#[tokio::test]
+async fn verify_library_detects_missing_and_corrupt_remote() {
+    let _g = global_guard().await;
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("u8-verify");
+    let settings = settings_for(garage, &bucket);
+    let creds = creds_for(garage);
+    let root = tempfile::tempdir().expect("root");
+    let state = tempfile::tempdir().expect("state");
+    let mgr = SyncManager::new_inert();
+    mgr.configure(
+        settings,
+        creds,
+        root.path().to_path_buf(),
+        state.path().to_path_buf(),
+    )
+    .expect("configure");
+    sync::install_global_manager(mgr.clone());
+
+    // Two synced originals land in the bucket.
+    let rel_a = "verify/a.NEF";
+    let rel_b = "verify/b.NEF";
+    upload_original(&mgr, root.path(), rel_a, &original_bytes(7, 4096)).await;
+    upload_original(&mgr, root.path(), rel_b, &original_bytes(9, 4096)).await;
+
+    // A clean library: nothing missing, nothing corrupt; both were checked.
+    let clean = mgr.verify_library().await.expect("verify clean");
+    assert_eq!(clean.missing, 0, "clean library has no missing originals");
+    assert_eq!(clean.corrupt, 0, "clean library has no corrupt originals");
+    assert!(clean.checked >= 2, "both originals were checked");
+
+    // Remote facts drift under the engine: A's blob is deleted, B's is
+    // replaced with a wrong-length body.
+    let client = garage.client();
+    client
+        .delete_object(&bucket, &format!("{LIBRARY_PREFIX}{rel_a}"))
+        .await
+        .expect("delete remote a");
+    client
+        .put_object(
+            &bucket,
+            &format!("{LIBRARY_PREFIX}{rel_b}"),
+            bytes::Bytes::from_static(b"short"),
+            &PutObjectOptions::default(),
+        )
+        .await
+        .expect("corrupt remote b");
+
+    let report = mgr.verify_library().await.expect("verify drifted");
+    assert_eq!(
+        report.missing, 1,
+        "A's deleted remote blob is reported missing"
+    );
+    assert_eq!(
+        report.corrupt, 1,
+        "B's wrong-length remote blob is reported corrupt"
     );
 }

@@ -240,9 +240,16 @@ pub fn sync_free_space(paths: Vec<String>, state: State<'_, AppState>) -> Result
 }
 
 /// "Make available offline" (§3.5): hydrate the stub at `path`.
+///
+/// The ranged GET inside [`hydrate_core`] is blocking, so it runs on a
+/// dedicated `spawn_blocking` thread rather than parking a tokio worker for the
+/// full multi-MB download.
 #[tauri::command]
 pub async fn sync_hydrate(path: String, state: State<'_, AppState>) -> Result<(), String> {
-    hydrate_core(&state.sync_manager, PathBuf::from(path))
+    let manager = state.sync_manager.clone();
+    tokio::task::spawn_blocking(move || hydrate_core(&manager, PathBuf::from(path)))
+        .await
+        .map_err(|e| format!("hydrate task join error: {e}"))?
 }
 
 /// The "Recently Deleted" view (§3.8).

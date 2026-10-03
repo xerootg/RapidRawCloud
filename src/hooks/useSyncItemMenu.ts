@@ -20,8 +20,11 @@ export function useSyncItemMenu() {
     (paths: string[]): Option[] => {
       if (available !== true || paths.length === 0) return [];
       const anyStub = paths.some((p) => itemStates[p] === 'stub');
-      const anyPinned = paths.some((p) => itemStates[p] === 'pinned');
 
+      // Pin is an orthogonal record flag, not a `sync-item-state` lane, so the
+      // menu has no reliable local source of truth for the current pin state.
+      // Both Pin and Unpin are therefore always offered (both commands are
+      // idempotent — a no-op flips 0 items), so Unpin stays reachable.
       return [
         {
           icon: createElement(CloudDownload, { size: 16 }),
@@ -34,17 +37,16 @@ export function useSyncItemMenu() {
           label: 'Free up space',
           onClick: () => void freeSpace(paths),
         },
-        anyPinned
-          ? {
-              icon: createElement(PinOff, { size: 16 }),
-              label: 'Unpin',
-              onClick: () => void unpinPaths(paths),
-            }
-          : {
-              icon: createElement(Pin, { size: 16 }),
-              label: 'Pin (keep offline)',
-              onClick: () => void pinPaths(paths),
-            },
+        {
+          icon: createElement(Pin, { size: 16 }),
+          label: 'Pin (keep offline)',
+          onClick: () => void pinPaths(paths),
+        },
+        {
+          icon: createElement(PinOff, { size: 16 }),
+          label: 'Unpin',
+          onClick: () => void unpinPaths(paths),
+        },
       ];
     },
     [available, itemStates, hydrate, freeSpace, pinPaths, unpinPaths],

@@ -811,13 +811,15 @@ impl SyncManager {
         }
     }
 
-    /// Kicks a wholeness reconcile (§3.5): re-checks local vs. remote facts
-    /// and re-queues anything missing, backing the settings "Verify library"
-    /// action.
+    /// Kicks the §3.5 "Verify library" reconcile: re-advertises any
+    /// wholeness-violating tombstoned items and `HEAD`s every backed original
+    /// against the remote, so the report's `missing` / `corrupt` reflect real
+    /// local-vs-remote facts (not a hardcoded clean bill). Backs the settings
+    /// "Verify library" action.
     pub async fn verify_library(&self) -> Result<VerifyReport, SyncError> {
         #[cfg(feature = "sync")]
         {
-            self.configured()?.verify_library()
+            self.configured()?.verify_library().await
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -2220,24 +2222,72 @@ mod imp {
             }
         }
 
-        /// §3.5 wholeness reconcile for the settings "Verify library" action:
-        /// re-advertises any wholeness-violating tombstoned items and tallies
-        /// the pass. Local only (reads redb, re-queues locally); the
-        /// re-advertised versions upload on the next cycle.
-        pub fn verify_library(&self) -> Result<VerifyReport, SyncError> {
-            let checked = self
-                .db
-                .iter_items()
-                .map_err(se)?
-                .iter()
-                .filter(|(_, r)| !r.deleted)
-                .count();
+        /// §3.5 "Verify library" reconcile: re-advertises any
+        /// wholeness-violating tombstoned items (the `repaired` tally) **and**
+        /// re-checks local-vs-remote facts for every live original the engine
+        /// believes is backed, so the report is not a fabricated clean bill.
+        ///
+        /// For each such original it `HEAD`s the remote blob:
+        /// - a `NoSuchKey` (the remote no longer holds it) counts as `missing`;
+        /// - a present blob whose byte length disagrees with the verified size
+        ///   counts as `corrupt` (a read-back discrepancy the §2.4 verify gate
+        ///   would flag);
+        /// - an original already parked in the `corrupt_remote` lane counts as
+        ///   `corrupt` without a round-trip.
+        ///
+        /// The reconcile re-queues locally and re-advertised versions upload on
+        /// the next cycle; the HEAD pass is read-only (it reports, it does not
+        /// mutate state here).
+        pub async fn verify_library(&self) -> Result<VerifyReport, SyncError> {
+            // Local wholeness reconcile first (re-advertise half-deleted shapes).
             let repaired = reconcile_wholeness(&self.db, &mut ()).map_err(se)?.len();
+
+            let mut checked = 0usize;
+            let mut missing = 0usize;
+            let mut corrupt = 0usize;
+            for (rel, rec) in self.db.iter_items().map_err(se)? {
+                if rec.kind != Kind::Original || rec.deleted {
+                    continue;
+                }
+                checked += 1;
+                // An original already flagged corrupt_remote (§2.4) is corrupt
+                // without a round-trip.
+                if rec.state == ItemState::CorruptRemote {
+                    corrupt += 1;
+                    continue;
+                }
+                // Only originals the engine treats as remotely backed are
+                // checkable; a purely-local Dirty/Queued original has no remote
+                // fact to verify yet.
+                let backed = rec.verified_remote
+                    || matches!(
+                        rec.state,
+                        ItemState::Synced
+                            | ItemState::Hydrated
+                            | ItemState::Stub
+                            | ItemState::PendingDown
+                    );
+                if !backed {
+                    continue;
+                }
+                let key = bucket_key_for(&rel, Kind::Original).map_err(se)?;
+                match self.s3.head_object(&self.bucket, &key).await {
+                    Ok(head) => {
+                        // A present blob whose length no longer matches the
+                        // verified size is a read-back discrepancy.
+                        if rec.size > 0 && head.content_length != rec.size {
+                            corrupt += 1;
+                        }
+                    }
+                    Err(e) if e.is_no_such_key() => missing += 1,
+                    Err(e) => return Err(se(e)),
+                }
+            }
             Ok(VerifyReport {
                 checked,
                 repaired,
-                missing: 0,
-                corrupt: 0,
+                missing,
+                corrupt,
             })
         }
 
