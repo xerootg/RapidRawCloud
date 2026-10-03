@@ -134,3 +134,61 @@ fn stub_set_is_rehydrated_from_redb_after_restart() {
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&state);
 }
+
+/// §3.5 verify-before-truncate: `create_stub` must never clobber a local
+/// original that is actually present with real bytes. The apply/reconcile
+/// caller is contracted to prove the original is remote-only first, but a
+/// reconcile race or mis-decision could still target such a relkey — and the
+/// underlying `File::create` would truncate it to a 0-byte stub with no
+/// recovery. The defensive guard refuses that, writing nothing.
+#[test]
+fn create_stub_refuses_to_truncate_an_existing_non_stub_file() {
+    let _g = serial();
+
+    let root = tempfile::tempdir().expect("root").keep();
+    let state = tempfile::tempdir().expect("state").keep();
+
+    let rel = "trip/REAL_0001.NEF";
+    let real_path = root.join(rel);
+    std::fs::create_dir_all(real_path.parent().unwrap()).expect("mkdir real dir");
+
+    // A local original actually present with real bytes — the exact case a
+    // reconcile mis-decision could wrongly drive create_stub against.
+    let real_bytes = (0..8192u32).map(|i| (i % 253) as u8).collect::<Vec<u8>>();
+    std::fs::write(&real_path, &real_bytes).expect("write real original");
+
+    let blake3_hex = blake3::hash(&real_bytes).to_hex().to_string();
+    let remote_size = real_bytes.len() as u64;
+    let remote_mtime = 1_700_000_000i64;
+
+    let mgr = SyncManager::new_inert();
+    mgr.configure(settings(), creds(), root.clone(), state.clone())
+        .expect("configure");
+    sync::install_global_manager(mgr.clone());
+
+    // The guard: refuse rather than truncate content never proven discardable.
+    mgr.create_stub(&real_path, &blake3_hex, remote_size, remote_mtime)
+        .expect_err("create_stub must refuse to truncate an existing non-stub file");
+
+    // The bytes survive untouched, and no Stub record was recorded.
+    assert_eq!(
+        std::fs::read(&real_path).expect("read preserved original"),
+        real_bytes,
+        "create_stub must not truncate the existing local original"
+    );
+    assert_ne!(
+        mgr.item_sync_state(&real_path).as_deref(),
+        Some("stub"),
+        "no Stub record may be recorded when the guard bails"
+    );
+    assert!(
+        !mgr.is_stub(&real_path),
+        "the mirror must not mark a refused target as a stub"
+    );
+
+    drop(mgr);
+    sync::install_global_manager(SyncManager::new_inert());
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&state);
+}

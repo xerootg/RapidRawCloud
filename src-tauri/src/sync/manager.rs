@@ -421,6 +421,12 @@ impl SyncManager {
     /// This is the API the engine apply / reconcile path drives when it
     /// learns of an original it does not hold locally (§3.5); the P2 tests
     /// drive it directly to stand in for that apply step.
+    ///
+    /// Contract: the caller MUST prove the original is absent / remote-only
+    /// before invoking this. As a defensive backstop against a reconcile race
+    /// or mis-decision, `create_stub` refuses (returns an error, writing
+    /// nothing) when `image_path` already exists with real bytes and is not
+    /// already a known stub, rather than truncating content it cannot recover.
     pub fn create_stub(
         &self,
         image_path: &Path,
@@ -975,6 +981,34 @@ mod imp {
             let rk = relkey(image_path, &self.sync_root).map_err(se)?;
             let blake3 = Blake3Hex::parse(blake3_hex)
                 .map_err(|e| se(format!("create_stub: bad remote blake3: {e}")))?;
+
+            // Verify-before-truncate (§3.5): the apply/reconcile caller must
+            // prove the original is absent / remote-only before driving this,
+            // but a reconcile race or mis-decision could still target a relkey
+            // whose local file actually holds real bytes — and the
+            // `File::create` below would truncate it to a 0-byte stub,
+            // destroying the content with no recovery. Refuse that: bail when
+            // the target exists with `size > 0` and redb does not already
+            // track it as a `Stub`. Re-adopting an existing stub (its file is
+            // 0 bytes) still passes, so idempotent re-stubbing is unaffected.
+            if let Ok(meta) = std::fs::metadata(image_path)
+                && meta.len() > 0
+            {
+                let known_stub = self
+                    .db
+                    .get_item(&rk)
+                    .map_err(se)?
+                    .is_some_and(|r| matches!(r.state, ItemState::Stub));
+                if !known_stub {
+                    return Err(se(format!(
+                        "create_stub: refusing to truncate existing {}-byte file at {} \
+                         that is not a known stub (caller must prove the original is \
+                         remote-only before stubbing, §3.5)",
+                        meta.len(),
+                        image_path.display()
+                    )));
+                }
+            }
 
             // The 0-byte placeholder at the real path, with the remote
             // original's mtime replayed so `compute_thumbnail_cache_hash`
