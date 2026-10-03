@@ -297,7 +297,9 @@ async fn pin_and_free_space_flip_pinned_and_evict() {
     mgr_b.ensure_local(&free, "test").expect("hydrate free");
 
     // Pin `keep` (existing API), then "free up space" over both paths.
-    let pinned = mgr_b.pin_paths(&[keep.clone()], true).expect("pin");
+    let pinned = mgr_b
+        .pin_paths(std::slice::from_ref(&keep), true)
+        .expect("pin");
     assert_eq!(pinned, 1, "one path newly pinned");
 
     // RED: `evict_paths` is todo!(). Pinned `keep` must survive; `free` demotes.
@@ -316,13 +318,15 @@ async fn pin_and_free_space_flip_pinned_and_evict() {
 #[tokio::test]
 async fn credentials_never_leak() {
     // (1) Structural guard that must ALWAYS hold — runs before any gap.
-    let mut app = AppSettings::default();
-    app.sync = SyncSettings {
-        enabled: true,
-        endpoint: "https://garage.example".to_string(),
-        bucket: "b".to_string(),
-        region: "garage".to_string(),
-        ..SyncSettings::default()
+    let app = AppSettings {
+        sync: SyncSettings {
+            enabled: true,
+            endpoint: "https://garage.example".to_string(),
+            bucket: "b".to_string(),
+            region: "garage".to_string(),
+            ..SyncSettings::default()
+        },
+        ..AppSettings::default()
     };
     let settings_json = serde_json::to_string(&app).expect("serialize AppSettings");
     for needle in ["accessKey", "access_key", "secretKey", "secret_key"] {

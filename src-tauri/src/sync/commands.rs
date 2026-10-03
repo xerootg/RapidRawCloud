@@ -25,8 +25,10 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::app_settings::SyncSettings;
 use crate::app_state::AppState;
-use crate::sync::credentials::{CredentialStore, FileCredentialStore};
-use crate::sync::manager::{ConflictKeep, PeerDevice, RecentlyDeleted, SyncManager, VerifyReport};
+use crate::sync::credentials::{CredentialStore, Credentials, FileCredentialStore};
+use crate::sync::manager::{
+    ConflictKeep, PeerDevice, RecentlyDeleted, SyncManager, SyncState, VerifyReport,
+};
 
 /// The §3.8 `sync-status` snapshot surfaced to the webview. Credentials NEVER
 /// appear here — only [`credentials_configured`](Self::credentials_configured)
@@ -58,8 +60,28 @@ pub struct SyncStatusDto {
 /// stamping `credentials_configured` from the (separately-read) store. The
 /// projection that must never carry secret material (§3.6).
 pub fn status_core(manager: &SyncManager, credentials_configured: bool) -> SyncStatusDto {
-    let _ = (manager, credentials_configured);
-    todo!("U8 green: project status + device_id + peer_devices into SyncStatusDto")
+    let status = manager.status();
+    let state = match status.state {
+        SyncState::Idle => "idle",
+        SyncState::Syncing => "syncing",
+        SyncState::Offline => "offline",
+        SyncState::Error => "error",
+    };
+    SyncStatusDto {
+        state: state.to_string(),
+        pending_up: status.pending_up,
+        pending_down: status.pending_down,
+        // Byte-level transfer accounting is not tracked in `SyncStatus` yet
+        // (the per-cycle counters are object counts); report 0 rather than a
+        // fabricated figure. Never carries credential material (§3.6).
+        bytes_up: 0,
+        bytes_down: 0,
+        dirty_unbacked: status.dirty_unbacked,
+        configured: status.configured,
+        credentials_configured,
+        device_id: manager.device_id(),
+        peer_devices: manager.peer_devices(),
+    }
 }
 
 /// Persists `access_key`/`secret_key` to the Rust-only credential store and
@@ -69,15 +91,17 @@ pub fn set_credentials_core(
     access_key: String,
     secret_key: String,
 ) -> Result<(), String> {
-    let _ = (store, access_key, secret_key);
-    todo!("U8 green: write Credentials to the 0600 store, return ()")
+    let creds = Credentials {
+        access_key,
+        secret_key,
+    };
+    store.store(&creds).map_err(|e| e.to_string())
 }
 
 /// Whether both credential halves are present in the store (§3.6) — the only
 /// credential fact the webview ever learns.
 pub fn credentials_configured_core(store: &dyn CredentialStore) -> bool {
-    let _ = store;
-    todo!("U8 green: report Credentials::is_complete from the store")
+    matches!(store.load(), Ok(Some(creds)) if creds.is_complete())
 }
 
 /// Reads credentials from `store` and (re)points the manager at `settings` +
@@ -91,18 +115,31 @@ pub fn configure_core(
     sync_root: PathBuf,
     state_dir: PathBuf,
 ) -> Result<(), String> {
-    let _ = (manager, store, settings, sync_root, state_dir);
-    todo!(
-        "U8 green: read creds from store + SyncManager::configure (stopping any running cycle first)"
-    )
+    // Credentials come only from the Rust-only store (§3.6) — never from the
+    // settings the webview round-trips. An unconfigured store binds the engine
+    // with empty credentials (the first cycle then surfaces the auth gap),
+    // rather than refusing to (re)point the manager at the new settings.
+    let creds = store.load().map_err(|e| e.to_string())?.unwrap_or_default();
+    // `SyncManager::configure` tears down any prior `Configured` (dropping its
+    // handle) as it installs the fresh engine, so a re-configure rebinds the
+    // manager cleanly.
+    manager
+        .configure(settings, creds, sync_root, state_dir)
+        .map_err(|e| e.to_string())
 }
 
 /// "Make available offline" (§3.5): hydrate the stub at `path` to its original
 /// bytes, returning when done. Wraps [`SyncManager::ensure_local`] on a
 /// blocking worker so the async command never stalls the runtime.
 pub fn hydrate_core(manager: &SyncManager, path: PathBuf) -> Result<(), String> {
-    let _ = (manager, path);
-    todo!("U8 green: SyncManager::ensure_local on spawn_blocking, map to ()")
+    // `ensure_local` is idempotent (a no-op on a non-stub) and runs the ranged
+    // download on its own dedicated-thread runtime, so it is safe to call from
+    // the async command without stalling the app's runtime on a nested
+    // `block_on`.
+    manager
+        .ensure_local(&path, "make-available-offline")
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 // ===== credential store location ==========================================
@@ -134,11 +171,30 @@ pub async fn sync_configure(
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    // GREEN: load AppSettings, set `.sync = settings`, save_settings(app),
-    // resolve sync_root (library root) + state_dir (app_data/rrcloud), then
-    // configure_core(&state.sync_manager, &store, settings, root, state_dir).
-    let _ = (settings, &state, &app);
-    todo!("U8 green: persist settings + configure_core")
+    // Persist the sync block through the existing settings path (credentials
+    // are NOT part of `AppSettings`, so nothing secret is written — §3.6).
+    let mut app_settings = crate::app_settings::load_settings(app.clone())?;
+    app_settings.sync = settings.clone();
+    crate::app_settings::save_settings(app_settings.clone(), app.clone())?;
+
+    // The library root the engine keys relative to: the first configured root
+    // folder (falling back to the last opened one). Reconfiguring sync with no
+    // library open is a user error, not a panic.
+    let sync_root = app_settings
+        .root_folders
+        .first()
+        .cloned()
+        .or_else(|| app_settings.last_root_path.clone())
+        .map(PathBuf::from)
+        .ok_or_else(|| "cannot enable sync: no library folder is open".to_string())?;
+    let state_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("rrcloud");
+
+    let store = credential_store(&app)?;
+    configure_core(&state.sync_manager, &store, settings, sync_root, state_dir)
 }
 
 /// Writes credentials to the Rust-only store (§3.6). Returns `()`, never an

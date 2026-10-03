@@ -709,10 +709,7 @@ impl SyncManager {
     pub fn device_id(&self) -> Option<String> {
         #[cfg(feature = "sync")]
         {
-            if self.configured().is_err() {
-                return None;
-            }
-            todo!("U8 green: expose the engine's device_id")
+            self.configured().ok().map(|cfg| cfg.device_id())
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -726,10 +723,10 @@ impl SyncManager {
     pub fn peer_devices(&self) -> Vec<PeerDevice> {
         #[cfg(feature = "sync")]
         {
-            if self.configured().is_err() {
-                return Vec::new();
-            }
-            todo!("U8 green: list the device registry via active_devices")
+            self.configured()
+                .ok()
+                .map(|cfg| cfg.peer_devices())
+                .unwrap_or_default()
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -741,8 +738,7 @@ impl SyncManager {
     pub fn recently_deleted(&self) -> Result<Vec<RecentlyDeleted>, SyncError> {
         #[cfg(feature = "sync")]
         {
-            let _cfg = self.configured()?;
-            todo!("U8 green: project engine::recently_deleted into the DTO")
+            self.configured()?.recently_deleted()
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -755,9 +751,7 @@ impl SyncManager {
     pub fn restore(&self, image_path: &Path) -> Result<Vec<PathBuf>, SyncError> {
         #[cfg(feature = "sync")]
         {
-            let _cfg = self.configured()?;
-            let _ = image_path;
-            todo!("U8 green: drive engine::restore_item for the relkey")
+            self.configured()?.restore(image_path)
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -771,9 +765,7 @@ impl SyncManager {
     pub fn resolve_conflict(&self, image_path: &Path, keep: ConflictKeep) -> Result<(), SyncError> {
         #[cfg(feature = "sync")]
         {
-            let _cfg = self.configured()?;
-            let _ = (image_path, keep);
-            todo!("U8 green: resolve via the engine conflict helpers (§2.6)")
+            self.configured()?.resolve_conflict(image_path, keep)
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -789,11 +781,13 @@ impl SyncManager {
     pub fn evict_paths(&self, image_paths: &[PathBuf]) -> Result<usize, SyncError> {
         #[cfg(feature = "sync")]
         {
-            let _cfg = self.configured()?;
-            let _ = image_paths;
-            // GREEN: evict each verified path and `self.mark_stub(p, true)` as
-            // each commits, mirroring `run_evictor`'s per-item mirror update.
-            todo!("U8 green: evict the named paths to stubs behind the §3.5 gate")
+            let cfg = self.configured()?;
+            // Mark the in-memory stub mirror as each stub commits (before the
+            // fallible truncate inside `evict_to_stub`), mirroring
+            // `run_evictor`'s per-item update so a mid-pass failure can never
+            // leave redb/disk ahead of the mirror.
+            let mut on_evicted = |p: &Path| self.mark_stub(p, true);
+            cfg.evict_paths(image_paths, &mut on_evicted)
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -807,9 +801,8 @@ impl SyncManager {
     pub async fn retire_device(&self, device_id: &str) -> Result<(), SyncError> {
         #[cfg(feature = "sync")]
         {
-            let _cfg = self.configured()?;
-            let _ = device_id;
-            todo!("U8 green: drive compact::retire_device")
+            let cfg = self.configured()?;
+            cfg.retire_device(device_id).await
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -824,8 +817,7 @@ impl SyncManager {
     pub async fn verify_library(&self) -> Result<VerifyReport, SyncError> {
         #[cfg(feature = "sync")]
         {
-            let _cfg = self.configured()?;
-            todo!("U8 green: drive engine::reconcile_wholeness and tally")
+            self.configured()?.verify_library()
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -882,7 +874,9 @@ mod imp {
 
     use rrcloud_core::clock::{DeviceId, VersionVector};
     use rrcloud_core::engine::{
-        ChangeOutcome, EngineConsumer, LocalScan, admit_pending, notify_local_change,
+        ChangeOutcome, EngineConsumer, LocalScan, admit_pending, item_local_path,
+        notify_local_change, recently_deleted as engine_recently_deleted, reconcile_wholeness,
+        restore_item,
     };
     use rrcloud_core::journal::{JournalEntry, Kind, Op};
     use rrcloud_core::keys::{RelKey, relkey};
@@ -897,7 +891,10 @@ mod imp {
         pump_uploads, stored_backend_profile,
     };
 
-    use super::{EvictionReport, SyncError, SyncState, SyncStatus, ThumbVariant};
+    use super::{
+        ConflictKeep, EvictionReport, PeerDevice, RecentlyDeleted, SyncError, SyncState,
+        SyncStatus, ThumbVariant, VerifyReport,
+    };
     use crate::app_settings::SyncSettings;
     use crate::sync::WriteOrigin;
     use crate::sync::credentials::Credentials;
@@ -1982,6 +1979,266 @@ mod imp {
             serde_json::to_value(record.state)
                 .ok()
                 .and_then(|v| v.as_str().map(str::to_string))
+        }
+
+        // ---- §3.8 control-surface helpers (U8 command layer) ------------
+
+        /// This device's registry id (§2.10), as a string.
+        pub fn device_id(&self) -> String {
+            self.db.device_id().to_string()
+        }
+
+        /// A cheap, local view of the device fleet for the settings panel:
+        /// this device plus every peer this device has applied a journal
+        /// from (the redb cursor table, §2.3), ascending by id. No network —
+        /// the status path never blocks on a registry round-trip, so the
+        /// remote `last_seen` / `retired` facts are left at their defaults
+        /// (a richer view is a future async panel refresh, not the snapshot).
+        pub fn peer_devices(&self) -> Vec<PeerDevice> {
+            let own = self.db.device_id().to_string();
+            let mut ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+            ids.insert(own.clone());
+            if let Ok(cursors) = self.db.iter_cursors() {
+                for (device, _) in cursors {
+                    ids.insert(device.to_string());
+                }
+            }
+            ids.into_iter()
+                .map(|id| PeerDevice {
+                    is_self: id == own,
+                    device_id: id,
+                    last_seen_unix: 0,
+                    retired: false,
+                })
+                .collect()
+        }
+
+        /// §2.7 "Recently Deleted": the tombstoned item records, projected
+        /// to the webview DTO (ascending by relkey, as the engine lists them).
+        pub fn recently_deleted(&self) -> Result<Vec<RecentlyDeleted>, SyncError> {
+            let mut out = Vec::new();
+            for (rk, record) in engine_recently_deleted(&self.db).map_err(se)? {
+                out.push(RecentlyDeleted {
+                    path: item_local_path(&self.sync_root, &rk)
+                        .to_string_lossy()
+                        .into_owned(),
+                    relkey: rk.as_str().to_string(),
+                    deleted_unix: record.head_ts.unwrap_or(0),
+                });
+            }
+            Ok(out)
+        }
+
+        /// §2.7 restore: un-hides every tombstoned item of `image` and
+        /// re-queues it, returning the local paths restored.
+        pub fn restore(&self, image_path: &Path) -> Result<Vec<PathBuf>, SyncError> {
+            let image = relkey(image_path, &self.sync_root).map_err(se)?;
+            let restored = restore_item(&self.db, &image).map_err(se)?;
+            Ok(restored
+                .iter()
+                .map(|rk| item_local_path(&self.sync_root, rk))
+                .collect())
+        }
+
+        /// §2.6 conflict resolution from the UI. P1 `converge` resolves
+        /// concurrent versions automatically — the version-vector winner
+        /// stays live and the loser materializes as a `-conflict` copy — so
+        /// an item is normally never parked in `Conflict`. This drives the
+        /// local pick only when a record *is* in `Conflict` (keep the winner
+        /// → fetch it; keep the local loser → re-admit it as a fresh
+        /// version); a path with no parked conflict is a clean no-op.
+        pub fn resolve_conflict(
+            &self,
+            image_path: &Path,
+            keep: ConflictKeep,
+        ) -> Result<(), SyncError> {
+            let rk = relkey(image_path, &self.sync_root).map_err(se)?;
+            let Some(record) = self.db.get_item(&rk).map_err(se)? else {
+                return Ok(());
+            };
+            if record.state != ItemState::Conflict {
+                return Ok(());
+            }
+            let target = match keep {
+                ConflictKeep::Winner => ItemState::PendingDown,
+                ConflictKeep::Copy => ItemState::Dirty,
+            };
+            self.db
+                .transition(&rk, ItemState::Conflict, target, |_| {})
+                .map_err(se)?;
+            Ok(())
+        }
+
+        /// "Free up space" for the named paths (§3.5): evict each resolved,
+        /// verified, non-pinned resident original back to a 0-byte stub,
+        /// ignoring the LRU budget. Honors the same "never evict unverified
+        /// bytes" gate as [`Self::run_evictor_with_budget`] (`verified_remote`
+        /// plus an `attest` or a one-time read-back re-hash; a mismatch routes
+        /// to `CorruptRemote` and is never evicted). `on_evicted` fires as
+        /// each stub commits so the caller's mirror never trails redb/disk.
+        /// Returns the number demoted.
+        pub fn evict_paths(
+            &self,
+            image_paths: &[PathBuf],
+            on_evicted: &mut dyn FnMut(&Path),
+        ) -> Result<usize, SyncError> {
+            // Resolve args to target relkeys (file → own; directory → fan-out),
+            // exactly as `pin_paths` does.
+            let mut targets: std::collections::HashSet<RelKey> = std::collections::HashSet::new();
+            for arg in image_paths {
+                if arg.is_dir() {
+                    for (rk, record) in self.db.iter_items().map_err(se)? {
+                        if record.deleted {
+                            continue;
+                        }
+                        let local = local_target_path(&self.sync_root, &rk, record.kind);
+                        if local.starts_with(arg) {
+                            targets.insert(rk);
+                        }
+                    }
+                } else if let Ok(rk) = relkey(arg, &self.sync_root)
+                    && self.db.get_item(&rk).map_err(se)?.is_some()
+                {
+                    targets.insert(rk);
+                }
+            }
+
+            let mut demoted = 0usize;
+            for rk in targets {
+                let Some(record) = self.db.get_item(&rk).map_err(se)? else {
+                    continue;
+                };
+                // Only resident originals can be freed (sidecars are never
+                // stubbed, §3.5); a stub / in-flight item is skipped.
+                if record.deleted
+                    || record.kind != Kind::Original
+                    || !matches!(record.state, ItemState::Hydrated | ItemState::Synced)
+                {
+                    continue;
+                }
+                // Pinned originals are never evicted (§3.5).
+                if record.pinned {
+                    continue;
+                }
+                // Upload-side integrity must hold first (§2.4).
+                if !record.verified_remote {
+                    continue;
+                }
+                // Content-verified gate: an `attest` covers the version, else
+                // a one-time ranged read-back re-hash confirms the remote
+                // bytes. A mismatch is `corrupt_remote`; an unreadable remote
+                // keeps the local copy (the "never evict unverified bytes"
+                // invariant, §3.5).
+                if !record.attested {
+                    match self.readback_verify_blocking(&rk, &record)? {
+                        Readback::Confirmed => {}
+                        Readback::Unverifiable => continue,
+                        Readback::Mismatch => {
+                            let _ = self.db.transition(
+                                &rk,
+                                record.state,
+                                ItemState::CorruptRemote,
+                                |_| {},
+                            );
+                            continue;
+                        }
+                    }
+                }
+                let path = local_target_path(&self.sync_root, &rk, record.kind);
+                self.evict_to_stub(&rk, &record, &path, on_evicted)?;
+                demoted += 1;
+            }
+            Ok(demoted)
+        }
+
+        /// Synchronous wrapper over the async eviction read-back (§3.5): runs
+        /// the ranged GET + blake3 compare on a dedicated-thread runtime, so
+        /// the synchronous "free up space" path need not itself be `async`
+        /// (mirroring how [`Configured::hydrate`] drives its download).
+        fn readback_verify_blocking(
+            &self,
+            rk: &RelKey,
+            record: &ItemRecord,
+        ) -> Result<Readback, SyncError> {
+            let s3 = self.s3.clone();
+            let bucket = self.bucket.clone();
+            let rk = rk.clone();
+            let expected = record.blake3.clone();
+            run_blocking(async move {
+                let key = bucket_key_for(&rk, Kind::Original).map_err(se)?;
+                let output = match s3.get_object(&bucket, &key, None).await {
+                    Ok(o) => o,
+                    Err(_) => return Ok(Readback::Unverifiable),
+                };
+                let bytes = match output.body.collect().await {
+                    Ok(b) => b,
+                    Err(_) => return Ok(Readback::Unverifiable),
+                };
+                let actual = Blake3Hex::from_bytes(&bytes);
+                Ok(match expected {
+                    Some(e) if actual == e => Readback::Confirmed,
+                    Some(_) => Readback::Mismatch,
+                    None => Readback::Unverifiable,
+                })
+            })
+        }
+
+        /// §2.10 retire a device from the shared registry — the settings
+        /// device panel's action. The panel hands ids straight from the
+        /// registry, which are canonical UUIDv4s (the typed
+        /// [`compact::retire_device`](rrcloud_core::compact::retire_device)
+        /// path). Retirement is a single idempotent PUT of the device's
+        /// `.retired` marker, so an id that is not a canonical device id (a
+        /// stale or hand-entered value) still marks retirement via a direct
+        /// PUT at its marker key rather than hard-failing the action.
+        pub async fn retire_device(&self, device_id: &str) -> Result<(), SyncError> {
+            match DeviceId::new(device_id.to_string()) {
+                Ok(did) => {
+                    rrcloud_core::compact::retire_device(self.s3.as_ref(), &self.bucket, &did)
+                        .await
+                        .map_err(se)
+                }
+                Err(_) => {
+                    let key = format!(
+                        "{}devices/{device_id}.retired",
+                        rrcloud_core::keys::CONTROL_PREFIX
+                    );
+                    // Empty marker body. `Default::default()` yields an empty
+                    // `bytes::Bytes` (a dev-only dependency here, so it is not
+                    // named) inferred from `put_object`'s signature.
+                    self.s3
+                        .put_object(
+                            &self.bucket,
+                            &key,
+                            Default::default(),
+                            &rrcloud_core::s3::PutObjectOptions::default(),
+                        )
+                        .await
+                        .map(|_| ())
+                        .map_err(se)
+                }
+            }
+        }
+
+        /// §3.5 wholeness reconcile for the settings "Verify library" action:
+        /// re-advertises any wholeness-violating tombstoned items and tallies
+        /// the pass. Local only (reads redb, re-queues locally); the
+        /// re-advertised versions upload on the next cycle.
+        pub fn verify_library(&self) -> Result<VerifyReport, SyncError> {
+            let checked = self
+                .db
+                .iter_items()
+                .map_err(se)?
+                .iter()
+                .filter(|(_, r)| !r.deleted)
+                .count();
+            let repaired = reconcile_wholeness(&self.db, &mut ()).map_err(se)?.len();
+            Ok(VerifyReport {
+                checked,
+                repaired,
+                missing: 0,
+                corrupt: 0,
+            })
         }
 
         /// Lazily resolves the §2.4 backend profile: the persisted value if

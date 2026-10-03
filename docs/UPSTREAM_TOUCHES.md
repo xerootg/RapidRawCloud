@@ -11,7 +11,7 @@ Status legend: [ ] planned (phase) · [x] landed
 | File | Change | Status |
 |---|---|---|
 | `src-tauri/Cargo.toml` | optional path dep `crates/rrcloud-core` + `sync` feature (default on) + `dashmap` | [x] P1 |
-| `src-tauri/src/lib.rs` | `pub mod sync;` + `#[cfg(sync)] pub use ::rrcloud_core;` + SyncManager start in `setup()` + `RunEvent::ExitRequested` exit flush (P1); `ensure_local` guards in `get_image_dimensions`, `generate_preview_for_path`, and the `merge_hdr` merge command (P2); U8: the 13 `#[cfg(feature="sync")] sync::commands::sync_*` entries in `generate_handler!` (cfg-gated per entry — none register on `--no-default-features`) | [x] P1/P2 · [ ] U8 (red scaffold) |
+| `src-tauri/src/lib.rs` | `pub mod sync;` + `#[cfg(sync)] pub use ::rrcloud_core;` + SyncManager start in `setup()` + `RunEvent::ExitRequested` exit flush (P1); `ensure_local` guards in `get_image_dimensions`, `generate_preview_for_path`, and the `merge_hdr` merge command (P2); U8: the 13 `#[cfg(feature="sync")] sync::commands::sync_*` entries in `generate_handler!` (cfg-gated per entry — none register on `--no-default-features`) | [x] P1/P2 · [x] U8 |
 | `src-tauri/src/app_state.rs` | `sync_manager` field + sidecar lock map (P1); P3: `proxy_scale: Mutex<Option<f32>>` (set on the §4.4 proxy-edit-mode load, `None` for a full-resolution original) + its `Mutex::new(None)` init in `lib.rs` `.manage(AppState { .. })` | [x] P1/P3 |
 | `src-tauri/src/app_settings.rs` | `sync: SyncSettings` field (`#[serde(default)]`; credentials excluded) | [x] P1 |
 | `src-tauri/src/exif_processing.rs` | `save_sidecar` chokepoint (per-path lock + bounded lock-map prune, 0-byte/corrupt quarantine + abort, atomic temp+rename with `fs::write`-matching mode + fsync for §7 perm-parity, churn-gated notify) + `update_sidecar` read-modify-write variant (load+mutate+write under the one per-path lock — closes the AI-tagging-vs-user-edit lost-update race, P1-U7 review); `load_sidecar` warn on parse failure + auto-heal routes through chokepoint; `merge_exif_from_source` factored for the RMW sites and uses pure `read_exif_data_from_bytes` (no persist) so it cannot re-enter the held lock (P1-U7 round-3 blocker); the EXIF-population caches (`read_exif_data`/`persist_exif_if_missing`/`write_rrexif_sidecar`) write via `update_sidecar` (RMW under the lock) rather than `save_sidecar` on an out-of-lock load (P1-U7 round-3 lost-update) | [x] P1 |
@@ -25,10 +25,10 @@ Status legend: [ ] planned (phase) · [x] landed
 | `src-tauri/src/focus_stacking.rs` | `ensure_local` guard before each source load in `stitch_focus_stack` | [x] P2 |
 | `src-tauri/src/panorama_stitching.rs` | `ensure_local` guard before each source load in `stitch_panorama` | [x] P2 |
 | `src-tauri/gen/android/...` | manifest permissions, gradle deps, plugin registration | [ ] P5 |
-| `src/hooks/useTauriListeners.ts` | `sync-*` listeners (`sync-status`/`sync-item-state`/`sync-hydrate-progress`/`sync-hydrated`/`sync-conflict`/`sync-error`) → `useSyncStore` (U8 red scaffold) | [ ] U8 |
-| `src/hooks/useAppNavigation.ts` | `sync_flush_path` hint at the three debouncedSave flush points (U8 red scaffold) | [ ] U8 |
-| `src/components/ui/AppProperties.tsx` | `Invokes.Sync*` entries + `SyncSettings`/`SyncStatusDto`/`SyncPeerDevice`/`SyncRecentlyDeleted`/`SyncConflict` types + `ImageFile.sync_state` + `AppSettings.sync` (U8 red scaffold) | [ ] U8 |
-| UI components | MainLibrary status badge, SettingsPanel "Sync" category, App.tsx conflict toast (mount-point one-liners); new `components/panel/sync/*` + `useSyncStore`/`useSyncActions`/`useSyncItemMenu` are additive (U8 red scaffold) | [ ] U8 |
+| `src/hooks/useTauriListeners.ts` | `sync-*` listeners (`sync-status`/`sync-item-state`/`sync-hydrate-progress`/`sync-hydrated`/`sync-conflict`/`sync-error`) → `useSyncStore` | [x] U8 |
+| `src/hooks/useAppNavigation.ts` | `sync_flush_path` hint at the three debouncedSave flush points | [x] U8 |
+| `src/components/ui/AppProperties.tsx` | `Invokes.Sync*` entries + `SyncSettings`/`SyncStatusDto`/`SyncPeerDevice`/`SyncRecentlyDeleted`/`SyncConflict` types + `ImageFile.sync_state` + `AppSettings.sync` | [x] U8 |
+| UI components | MainLibrary status badge, SettingsPanel "Sync" category, App.tsx conflict toast (mount-point one-liners); new `components/panel/sync/*` + `useSyncStore`/`useSyncActions`/`useSyncItemMenu` are additive | [x] U8 |
 
 Notes:
 - **P4 headless worker touches NO upstream file (documented §6 refinement).** The worker is a
