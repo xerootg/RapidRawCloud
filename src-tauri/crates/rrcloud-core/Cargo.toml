@@ -47,6 +47,16 @@ md-5 = "0.10"
 hmac = "0.12"
 percent-encoding = "2"
 quick-xml = { version = "0.38", features = ["serialize"] }
+# Smart-preview proxy production (ARCHITECTURE.md §4.2, P3). `proxy.rs` is
+# feature-independent in this crate and built directly against the SAME
+# pinned rawler the host app resolves (`CyberTimon/RapidRAW-DngLab` @
+# 934af4b) so proxy color math is bit-for-bit the app's — no rawler fork or
+# port (§4.2 "NO rawler fork needed"). Pinned by `rev` because this crate is
+# standalone (its own lockfile); the host app pins the same rev via its lock.
+rawler = { git = "https://github.com/CyberTimon/RapidRAW-DngLab.git", rev = "934af4b213a12b95f77d69529627067056066294" }
+# Lanczos3 linear-space resample + q75 JPEG thumb encode (§4.2 steps 5/8),
+# matching the host app's `image` major so the proxy path and the app agree.
+image = "0.25"
 # 0.13 matches the reqwest/rustls stack the host app (src-tauri) already
 # ships, so joining the workspace does not pull in a second HTTP stack
 # (§3.9 rationale). The rustls-platform-verifier hookup lands with the
@@ -107,6 +117,9 @@ test-util = []
 # Self-dependency: enables `test-util` when building this crate's tests,
 # without any production build ever carrying the feature.
 rrcloud-core = { path = ".", features = ["test-util"] }
+# P3 proxy suite decodes the emitted JPEG thumbs to assert their long edge
+# (tests/proxy.rs). Same major as the [dependencies] entry.
+image = "0.25"
 tempfile = "3"
 tokio = { version = "1", features = [
     "rt-multi-thread",

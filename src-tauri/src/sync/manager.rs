@@ -394,6 +394,30 @@ impl SyncManager {
         }
     }
 
+    /// A locally present smart preview for the stub at `path` (§4.4), or
+    /// `None` when sync is off, `path` is not a stub, or no proxy DNG has been
+    /// downloaded. Backs [`crate::sync::hooks::proxy_handle`]; the proxy-mode
+    /// loader branch uses it to decode the preview while reporting the
+    /// original (journal) dimensions.
+    ///
+    /// RED scaffold: returns `None` (so the loader always falls through to the
+    /// §3.5 hydrate path and the P2 suite is unaffected). The P3 green pass
+    /// consults the durable preview store (`previews/<content_id>.pxy.dng`)
+    /// and the item's journaled `(w, h)`.
+    pub fn proxy_handle(&self, path: &Path) -> Option<super::hooks::ProxyHandle> {
+        #[cfg(feature = "sync")]
+        {
+            self.configured()
+                .ok()
+                .and_then(|cfg| cfg.proxy_handle(path))
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = path;
+            None
+        }
+    }
+
     /// Records `path` as a stub in the in-memory mirror. The durable
     /// `ItemState::Stub` record and the 0-byte file are written by
     /// [`Self::create_stub`]; this keeps the fast-path set in sync.
@@ -971,6 +995,17 @@ mod imp {
         /// `filetime`, and records an `ItemState::Stub` item carrying the
         /// remote `blake3_hex`/`size`/`verified_remote` facts. Scaffold:
         /// unimplemented until the P2 green pass.
+        /// §4.4 proxy edit-mode lookup. RED scaffold: always `None` so the
+        /// loader falls through to the §3.5 hydrate path and the P2 suite is
+        /// unaffected. The green pass returns `Some(ProxyHandle)` when the
+        /// item is a stub, its `content_id` is known, the durable
+        /// `previews/<content_id>.pxy.dng` is present locally, and the item
+        /// carries journaled `(w, h)`.
+        pub fn proxy_handle(&self, path: &Path) -> Option<super::super::hooks::ProxyHandle> {
+            let _ = path;
+            None
+        }
+
         pub fn create_stub(
             &self,
             image_path: &Path,

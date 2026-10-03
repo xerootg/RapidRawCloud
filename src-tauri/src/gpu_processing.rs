@@ -142,6 +142,66 @@ impl WgpuDisplay {
     }
 }
 
+/// Headless wgpu adapter probe (P3 §8 fidelity GPU confirmation).
+///
+/// Builds a compute-only `wgpu::Instance` (honoring `WGPU_BACKEND` /
+/// `VK_ICD_FILENAMES` so a software Vulkan adapter — Mesa lavapipe — is
+/// picked up in CI) and requests an adapter with **no** surface. Returns
+/// `Some(adapter description)` when one initializes, `None` otherwise.
+///
+/// The P3 GPU-rendered ΔE confirmation test calls this to decide whether to
+/// run or to skip-with-loud-eprintln (documented user-run confirmation);
+/// never fail a build on GPU unavailability (§8-P3 / task GPU note). Also
+/// used by the workflow harness to report `gpu_available`.
+pub fn gpu_adapter_probe() -> Option<String> {
+    let instance_desc = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    let instance = wgpu::Instance::new(instance_desc);
+    match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    })) {
+        Ok(adapter) => {
+            let info = adapter.get_info();
+            Some(format!(
+                "{} ({:?}, {:?})",
+                info.name, info.backend, info.device_type
+            ))
+        }
+        Err(e) => {
+            log::warn!("gpu_adapter_probe: no wgpu adapter: {e}");
+            None
+        }
+    }
+}
+
+/// Build a compute-only [`GpuContext`] with no window surface and no
+/// `AppState` (P3 fidelity GPU confirmation seam). Mirrors the adapter /
+/// device bring-up in [`get_or_init_gpu_context`] without the surface,
+/// crash-flag, or display plumbing.
+///
+/// RED scaffold: implemented in the P3 green pass (the GPU ΔE confirmation
+/// test skips when [`gpu_adapter_probe`] returns `None`, so this is only
+/// reached when an adapter is present).
+pub fn init_gpu_context_headless() -> Result<GpuContext, String> {
+    todo!("P3 green: headless compute-only GpuContext bring-up (no surface / no AppState)")
+}
+
+/// Render `base_image` through the real adjustment pipeline at its native
+/// size under `adjustments` (serde_json adjustments object), returning the
+/// 8-bit sRGB result — the §8-P3 GPU-rendered ΔE confirmation seam, driving
+/// the same GPU path the editor uses but without `AppState` caches.
+///
+/// RED scaffold: implemented in the P3 green pass.
+pub fn render_adjustments_headless(
+    context: &GpuContext,
+    base_image: &DynamicImage,
+    adjustments: &serde_json::Value,
+) -> Result<DynamicImage, String> {
+    let _ = (context, base_image, adjustments);
+    todo!("P3 green: headless full-pipeline render for the GPU ΔE confirmation test")
+}
+
 pub fn get_or_init_gpu_context(
     state: &tauri::State<AppState>,
     _app_handle: &tauri::AppHandle,

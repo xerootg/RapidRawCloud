@@ -53,7 +53,7 @@ dependencies = [
  "pollster",
  "quick-xml 0.41.0",
  "rand 0.10.2",
- "rawler",
+ "rawler 0.7.1 (git+https://github.com/CyberTimon/RapidRAW-DngLab.git)",
  "rayon",
  "regex",
  "reqwest",
@@ -5322,6 +5322,39 @@ dependencies = [
 [[package]]
 name = "rawler"
 version = "0.7.1"
+source = "git+https://github.com/CyberTimon/RapidRAW-DngLab.git?rev=934af4b213a12b95f77d69529627067056066294#934af4b213a12b95f77d69529627067056066294"
+dependencies = [
+ "backtrace",
+ "bitstream-io",
+ "byteorder",
+ "chrono",
+ "enumn",
+ "glob",
+ "hex",
+ "image",
+ "itertools 0.14.0",
+ "jxl-oxide",
+ "lazy_static",
+ "libflate",
+ "log",
+ "md5",
+ "memmap2",
+ "multiversion",
+ "num",
+ "num_enum",
+ "rayon",
+ "rustc_version",
+ "serde",
+ "thiserror 2.0.20",
+ "toml 0.8.2",
+ "uuid",
+ "weezl",
+ "zerocopy",
+]
+
+[[package]]
+name = "rawler"
+version = "0.7.1"
 source = "git+https://github.com/CyberTimon/RapidRAW-DngLab.git#934af4b213a12b95f77d69529627067056066294"
 dependencies = [
  "backtrace",
@@ -5586,9 +5619,11 @@ dependencies = [
  "futures",
  "hex",
  "hmac",
+ "image",
  "md-5",
  "percent-encoding",
  "quick-xml 0.38.4",
+ "rawler 0.7.1 (git+https://github.com/CyberTimon/RapidRAW-DngLab.git?rev=934af4b213a12b95f77d69529627067056066294)",
  "redb",
  "reqwest",
  "serde",

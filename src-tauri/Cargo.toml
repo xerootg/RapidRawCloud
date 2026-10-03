@@ -132,6 +132,9 @@ hex = "0.4"
 # corrupt remote object through the re-exported S3 client (`put_object` takes
 # a `Bytes` body). Test-only; it does not enter the shipping build.
 bytes = "1"
+# The P3 GPU ΔE confirmation test (`tests/proxy_fidelity.rs`) builds an
+# aggressive adjustments object with `serde_json::json!`. Test-only.
+serde_json = "1"
 
 [profile.dev]
 opt-level = 2

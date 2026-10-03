@@ -216,6 +216,52 @@ pub fn load_base_image_from_bytes(
     }
 }
 
+/// §4.4 (w,h) provenance invariant: proxy-mode load reports the **original**
+/// (journal) dimensions, never the decoded proxy's reduced size. The reduced
+/// size feeds only `proxy_scale`. A pure helper so the invariant is directly
+/// unit-testable — "journal dims == proxy-mode reported dims" — and so the
+/// loader branch cannot drift from it.
+pub fn proxy_reported_dimensions(
+    journal_dims: (u32, u32),
+    _proxy_decoded_dims: (u32, u32),
+) -> (u32, u32) {
+    journal_dims
+}
+
+/// Settings used to decode a smart preview (§4.1/§4.4): the proxy load path
+/// pins `linear_raw_mode` so user `linear_mode` settings never alter a
+/// tagged `RapidRawCloud/pxy1` proxy — `(apply_ungamma = false,
+/// apply_calibration = true)`, which is the `develop_internal` default arm
+/// (`linear_raw_mode = ""`). Returns a copy of `base` with that pin applied.
+pub fn proxy_decode_settings(base: &AppSettings) -> AppSettings {
+    let mut s = base.clone();
+    s.linear_raw_mode = String::new();
+    s
+}
+
+/// §4.4 proxy edit mode load. Decodes the smart preview DNG through
+/// [`load_base_image_from_bytes`] (hitting the LinearRaw branch with the
+/// §4.1 clamp fix and the pinned `(apply_ungamma=false, apply_calibration=true)`),
+/// stores `proxy_scale = proxy_long_edge / orig_long_edge` in `AppState`, sets
+/// `original_image`, and returns a [`LoadImageResult`] reporting the ORIGINAL
+/// (journal) dimensions via [`proxy_reported_dimensions`].
+///
+/// RED scaffold: unimplemented until the P3 green pass. Unreachable in RED
+/// because `SyncManager::proxy_handle` returns `None`, so the loader always
+/// falls through to the §3.5 hydrate path.
+#[allow(clippy::needless_pass_by_value)]
+async fn load_image_from_proxy(
+    path: String,
+    handle: crate::sync::hooks::ProxyHandle,
+    metadata: ImageMetadata,
+    settings: AppSettings,
+    state: tauri::State<'_, AppState>,
+    my_generation: usize,
+) -> Result<LoadImageResult, String> {
+    let _ = (path, handle, metadata, settings, state, my_generation);
+    todo!("P3 green: decode the smart preview, store proxy_scale, report journal dims")
+}
+
 fn classify_raw_develop_error(path: &str, err: anyhow::Error) -> anyhow::Error {
     let error_text = err.to_string();
     let lowered = error_text.to_ascii_lowercase();
@@ -943,6 +989,22 @@ pub async fn load_image(
             // macOS iCloud dataless file, or any placeholder with sync off,
             // where `is_stub` is a const `false`) keeps the upstream error.
             if crate::sync::hooks::is_stub(&source_path) {
+                // P3 proxy edit mode (§4.4): if a smart preview is present
+                // locally, decode the PROXY instead of hydrating, but report
+                // the ORIGINAL (journal) dimensions. `proxy_handle` is `None`
+                // when sync is off or no proxy is present, so this is inert on
+                // the upstream/hydrate path.
+                if let Some(handle) = crate::sync::hooks::proxy_handle(&source_path) {
+                    return load_image_from_proxy(
+                        path,
+                        handle,
+                        metadata,
+                        settings.clone(),
+                        state,
+                        my_generation,
+                    )
+                    .await;
+                }
                 crate::sync::hooks::ensure_local(&source_path, "load_image")
                     .map_err(|e| e.to_string())?;
             } else {

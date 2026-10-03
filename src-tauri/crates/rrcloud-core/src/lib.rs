@@ -41,6 +41,7 @@ pub mod engine;
 pub mod journal;
 pub mod keys;
 pub mod manifest;
+pub mod proxy;
 pub mod publisher;
 pub mod reader;
 pub mod s3;

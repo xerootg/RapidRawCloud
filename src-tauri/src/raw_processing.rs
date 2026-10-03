@@ -191,6 +191,17 @@ fn develop_internal(
 
     let safe_highlight_compression = 1000.0;
 
+    // P3 CLAMP FIX SITE (ARCHITECTURE.md §4.1/E3) — RED scaffold.
+    //
+    // Fast demosaic is meaningless for a LinearRaw decode (the `is_linear_format`
+    // branch above skips Demosaic entirely), yet a `fast_demosaic` thumbnail
+    // decode of a proxy would clamp to 1.0 and destroy exactly the >1.0
+    // above-nominal-white headroom the proxy exists to carry. The green pass
+    // flips this to `if fast_demosaic && !is_linear_format { 1.0 } else { .. }`.
+    // For non-linear formats this is behavior-preserving (upstream parity);
+    // the LinearRaw decode is only ever reached by proxies, which do not exist
+    // upstream — so `--no-default-features` parity holds. Left UNCHANGED here
+    // so the P3 clamp test is RED until the green pass.
     let clamp_limit = if fast_demosaic {
         1.0
     } else {

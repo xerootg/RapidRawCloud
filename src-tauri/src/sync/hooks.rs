@@ -84,6 +84,40 @@ pub fn is_stub(path: &Path) -> bool {
     }
 }
 
+/// A locally present smart preview for a sync stub (ARCHITECTURE.md §4.4).
+/// Carries the proxy DNG path and the **original** (journal) dimensions the
+/// proxy-mode load must report, plus the proxy's own long edge so the loader
+/// can compute `proxy_scale`. Always compiled so the loader branch is
+/// unconditional; `proxy_handle` returns `None` when sync is off or no proxy
+/// is present, leaving the upstream hydrate/decode path untouched.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProxyHandle {
+    /// Path to the local `.pxy.dng` smart preview.
+    pub dng_path: PathBuf,
+    /// Original displayed width from the journal/manifest (§2.2 provenance).
+    pub orig_width: u32,
+    /// Original displayed height from the journal/manifest.
+    pub orig_height: u32,
+    /// The proxy DNG's long edge (`<= 2560`), for `proxy_scale`.
+    pub proxy_long_edge: u32,
+}
+
+/// Returns a [`ProxyHandle`] when `path` is a sync stub whose smart preview
+/// is present locally (§4.4). `None` when sync is off, `path` is not a stub,
+/// or no proxy has been downloaded — in which case the loader falls through
+/// to the normal hydrate-then-decode path.
+pub fn proxy_handle(path: &Path) -> Option<ProxyHandle> {
+    #[cfg(feature = "sync")]
+    {
+        imp::proxy_handle(path)
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
 /// Ensures the original at `path` is present locally, hydrating a stub if
 /// needed (§3.5). When sync is off this is an identity pass: the real file
 /// is always present upstream, so it returns `path` unchanged.
@@ -188,6 +222,13 @@ mod imp {
         global_manager()
             .map(|mgr| mgr.is_stub(path))
             .unwrap_or(false)
+    }
+
+    pub fn proxy_handle(path: &Path) -> Option<super::ProxyHandle> {
+        // §4.4 proxy edit mode: a stub with a locally present smart preview
+        // routes the editor load through the proxy DNG. No configured manager
+        // or no proxy ⇒ `None`, so the loader falls through to hydrate.
+        global_manager().and_then(|mgr| mgr.proxy_handle(path))
     }
 
     pub fn ensure_local(path: &Path, reason: &str) -> std::io::Result<PathBuf> {

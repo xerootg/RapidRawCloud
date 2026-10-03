@@ -48,6 +48,25 @@ pub use crate::image_processing::ImageMetadata;
 // functions (not `#[tauri::command]`s), so a `pub use` is safe.
 pub use crate::file_management::{compute_thumbnail_cache_hash, is_cloud_placeholder};
 
+/// P3 smart-preview fidelity test seams (ARCHITECTURE.md §8-P3).
+///
+/// Thin `pub` re-exports of the otherwise module-private develop / resample /
+/// GPU entry points, plus the proxy-mode dimension-reporting helpers, so the
+/// `tests/proxy_fidelity.rs` integration suite can drive the real code paths
+/// (RawDevelop LinearRaw branch, the clamp fix, linear-space Lanczos3, the
+/// wgpu adapter probe) without widening those modules' own visibility. No
+/// behavior: re-exports and the `ProxyHandle` type only.
+#[doc(hidden)]
+pub mod proxy_support {
+    pub use crate::gpu_processing::{
+        gpu_adapter_probe, init_gpu_context_headless, render_adjustments_headless,
+    };
+    pub use crate::image_loader::{proxy_decode_settings, proxy_reported_dimensions};
+    pub use crate::image_processing::{GpuContext, apply_srgb_to_linear, downscale_f32_image};
+    pub use crate::raw_processing::develop_raw_image;
+    pub use crate::sync::hooks::ProxyHandle;
+}
+
 /// Test seam for the §3.5 `copy_files` guard: a plain-function wrapper over
 /// the private `file_management::copy_files` command so the integration suite
 /// can drive the real hydrate-then-copy guard. A direct `pub use` of the
