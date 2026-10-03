@@ -461,7 +461,9 @@ async fn concurrent_first_publishers_recover_on_next_appearance_after_restart() 
     let client = garage.client();
     let meta_keys = keys_under(&client, &bucket, ".rrcloud/v1/meta/").await;
     assert!(
-        meta_keys.iter().any(|k| k == ".rrcloud/v1/meta/albums.json"),
+        meta_keys
+            .iter()
+            .any(|k| k == ".rrcloud/v1/meta/albums.json"),
         "albums.json must exist after recovery, got {meta_keys:?}"
     );
     let live = get_bytes(&client, &bucket, ".rrcloud/v1/meta/albums.json").await;
@@ -543,7 +545,9 @@ async fn a_local_meta_edit_survives_a_restart_before_the_first_sync_cycle() {
     let client = garage.client();
     let meta_keys = keys_under(&client, &bucket, ".rrcloud/v1/meta/").await;
     assert!(
-        meta_keys.iter().any(|k| k == ".rrcloud/v1/meta/albums.json"),
+        meta_keys
+            .iter()
+            .any(|k| k == ".rrcloud/v1/meta/albums.json"),
         "the edit admitted before the restart must still publish on the first \
          post-restart cycle, got {meta_keys:?}"
     );
@@ -600,15 +604,23 @@ async fn adopt_remote_preserves_this_devices_out_of_root_album_membership() {
     v[0]["images"]
         .as_array_mut()
         .unwrap()
-        .push(serde_json::Value::String(in2_b.to_string_lossy().into_owned()));
+        .push(serde_json::Value::String(
+            in2_b.to_string_lossy().into_owned(),
+        ));
     let b_doc = serde_json::to_vec(&v).unwrap();
     b.save_meta(MetaKind::Albums, &b.albums_path(), &b_doc);
-    b.mgr.run_once().await.expect("B republishes its descendant edit");
+    b.mgr
+        .run_once()
+        .await
+        .expect("B republishes its descendant edit");
 
     // A's next cycle is a plain (non-dirty) AdoptRemote: it must gain B's
     // new image WITHOUT losing its own out-of-root membership, which the
     // shared document never carried and never can.
-    a.mgr.run_once().await.expect("A adopts B's descendant edit");
+    a.mgr
+        .run_once()
+        .await
+        .expect("A adopts B's descendant edit");
     let a_local = std::fs::read(a.albums_path()).expect("A local after second adopt");
     let imgs = album_images(&a_local);
     assert!(
@@ -824,7 +836,11 @@ async fn an_unaware_third_devices_concurrent_edit_is_never_silently_clobbered() 
     recoverable_names.dedup();
     assert_eq!(
         recoverable_names,
-        vec!["FromA".to_string(), "FromB".to_string(), "FromC".to_string()],
+        vec![
+            "FromA".to_string(),
+            "FromB".to_string(),
+            "FromC".to_string()
+        ],
         "every device's edit must be recoverable — live or as a conflict-loser copy — \
          never silently destroyed by an unconditional overwrite; got live+losers \
          {recoverable_names:?} from meta keys {meta_keys:?}"
@@ -925,5 +941,132 @@ async fn conflict_loser_is_staged_before_the_destructive_local_overwrite_can_run
         album_names(&loser_bytes),
         vec!["FromB".to_string()],
         "the staged loser must hold B's own (about to be overwritten) content"
+    );
+}
+
+/// Round 4 review blocker: `MetaDecision::Converged` fires not only for an
+/// equal vv but ALSO for a *concurrent* vv when the two sides' content
+/// happens to be byte-identical (§2.6 case 1, checked before the vv order
+/// at all — two devices independently producing the same bytes, e.g. the
+/// same album created on both before either ever saw the other). The §2.9
+/// doc comment for that case is "adopt metadata" — the vv must become the
+/// elementwise max of both sides, exactly as the `AdoptRemote`/`Conflict`
+/// arms already do — because the whole point of carrying a vv forward is
+/// so a LATER, genuinely divergent edit is compared against the device's
+/// full causal history, not just its own component.
+///
+/// This device (B) converges on content byte-identical to A's (same
+/// relative image path, so relativization produces the same `rr://`
+/// bytes) while each side's vv is still only its own component — a
+/// concurrent pair the blake3 check short-circuits to `Converged` before
+/// the vv order is even consulted. B then makes a REAL, different edit on
+/// top of that converged state. If the convergence correctly adopted the
+/// vv-max, B's new version strictly dominates A's untouched remote
+/// (`{A:1,B:2}` ⊇ `{A:1}`) and simply republishes — no conflict is
+/// possible because there is no concurrent remote edit anywhere in this
+/// scenario. If convergence left B's stale, A-less vv in place (the bug),
+/// B's new version (`{B:2}`) is incomparable with remote's `{A:1}` and
+/// §2.6 case 4 fires on a pair that was never actually concurrent,
+/// manufacturing a spurious conflict-loser object out of thin air.
+#[tokio::test]
+async fn converged_equal_content_under_concurrent_vv_adopts_the_vv_max() {
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run the converged-vv-max test");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("albums-converged-vv-max");
+    let a = device(garage, &bucket);
+    let b = device(garage, &bucket);
+
+    // A and B each independently create THE SAME album, referencing an
+    // image at the same relative path under their own (distinct) sync
+    // roots — relativization depends only on the relative path, so the
+    // uploaded/relativized bytes are byte-identical even though neither
+    // device has ever talked to the other yet.
+    let doc_a = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "seed", "name": "Seed", "icon": null,
+          "images": [a.sync_root.join("trip").join("a.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    let doc_b_seed = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "seed", "name": "Seed", "icon": null,
+          "images": [b.sync_root.join("trip").join("a.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+
+    // A publishes first (vv {A:1}).
+    a.save_meta(MetaKind::Albums, &a.albums_path(), &doc_a);
+    a.mgr.run_once().await.expect("A publishes the seed album");
+
+    // B independently saves the SAME content (vv {B:1} locally) and
+    // converges against A's published head: equal blake3 short-circuits
+    // the vv order (which is concurrent, {A:1} vs {B:1}) straight to
+    // `Converged`. Nothing is written to the shared key.
+    b.save_meta(MetaKind::Albums, &b.albums_path(), &doc_b_seed);
+    b.mgr
+        .run_once()
+        .await
+        .expect("B converges on identical content");
+
+    let client = garage.client();
+    let meta_keys_after_converge = keys_under(&client, &bucket, ".rrcloud/v1/meta/").await;
+    assert_eq!(
+        meta_keys_after_converge,
+        vec![".rrcloud/v1/meta/albums.json".to_string()],
+        "a pure content-convergence must not publish or conflict anything, \
+         got {meta_keys_after_converge:?}"
+    );
+
+    // B now makes a REAL, different edit on top of the converged state —
+    // there is no concurrent remote edit anywhere in this scenario (A has
+    // not touched albums.json since its first publish), so this can only
+    // ever be an ordinary descendant version.
+    let doc_b_v2 = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "fromb2", "name": "FromBv2", "icon": null,
+          "images": [b.sync_root.join("other").join("b.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    b.save_meta(MetaKind::Albums, &b.albums_path(), &doc_b_v2);
+    b.mgr
+        .run_once()
+        .await
+        .expect("B republishes its genuine descendant edit");
+
+    let meta_keys = keys_under(&client, &bucket, ".rrcloud/v1/meta/").await;
+    let conflict_keys: Vec<&String> = meta_keys
+        .iter()
+        .filter(|k| k.starts_with(".rrcloud/v1/meta/albums.conflict-") && k.ends_with(".json"))
+        .collect();
+    assert!(
+        conflict_keys.is_empty(),
+        "B's edit strictly descends from the converged head (there was never \
+         a concurrent remote edit) — no conflict-loser may be manufactured, \
+         got meta keys {meta_keys:?}"
+    );
+    let live = get_bytes(&client, &bucket, ".rrcloud/v1/meta/albums.json").await;
+    assert_eq!(
+        album_names(&live),
+        vec!["FromBv2".to_string()],
+        "B's genuine descendant edit must be the live document, not reverted \
+         or lost to a spurious conflict"
+    );
+
+    // A third device (or A itself, on its next cycle) must plainly adopt
+    // B's edit as a clean descendant too.
+    a.mgr
+        .run_once()
+        .await
+        .expect("A adopts B's descendant edit");
+    let a_local = std::fs::read(a.albums_path()).expect("A local after adopting");
+    assert_eq!(
+        album_names(&a_local),
+        vec!["FromBv2".to_string()],
+        "A must cleanly adopt B's descendant edit, not see a phantom conflict"
+    );
+    let meta_keys_final = keys_under(&client, &bucket, ".rrcloud/v1/meta/").await;
+    assert_eq!(
+        meta_keys_final,
+        vec![".rrcloud/v1/meta/albums.json".to_string()],
+        "A's adopt cycle must not manufacture a conflict either, got {meta_keys_final:?}"
     );
 }

@@ -889,7 +889,7 @@ mod imp {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use rrcloud_core::clock::{DeviceId, VersionVector};
+    use rrcloud_core::clock::{Candidate, DeviceId, VersionVector, VvOrder, compare, pick_winner};
     use rrcloud_core::engine::{
         ChangeOutcome, EngineConsumer, LocalScan, admit_pending, item_local_path,
         notify_local_change, recently_deleted as engine_recently_deleted, reconcile_wholeness,
@@ -1058,9 +1058,22 @@ mod imp {
     /// The result of one [`Configured::act_meta_once`] pass — what the
     /// caller's resolve-and-verify retry loop should check next.
     enum MetaActOutcome {
-        /// Nothing needed writing (§2.6 case 1): the live state already
-        /// satisfies our local edit. Nothing to verify.
-        Converged,
+        /// §2.6 case 1: the live state already satisfies our local edit
+        /// (equal content, possibly under a *concurrent* vv — two devices
+        /// independently producing the same bytes). Nothing is written to
+        /// the shared key, so there is nothing to verify with a follow-up
+        /// `HeadObject` — but the carried head (vv elementwise-maxed,
+        /// exactly like the `AdoptRemote`/`Conflict` arms) must still be
+        /// adopted into the cache, or a LATER genuinely concurrent edit
+        /// would be resolved against a stale local vv.
+        Converged(MetaHead),
+        /// The defensive "no remote published yet, and no local edit of our
+        /// own either" case: nothing to do and nothing to adopt. Unreached
+        /// in practice — the caller already short-circuits before ever
+        /// resolving when there is neither a remote nor a pending local
+        /// edit — but kept distinct from `Converged` since there is no head
+        /// to merge here.
+        Noop,
         /// The decision was made against a remote read that a fresh
         /// recheck, taken immediately before committing the shared key's
         /// overwrite, found already stale — some other write landed in the
@@ -1449,7 +1462,9 @@ mod imp {
         /// the document body stays exactly the relativized JSON the test
         /// suite parses directly, so the version-vector/identity facts ride
         /// as S3 user metadata instead of a sibling object.
-        fn meta_head_to_metadata(head: &MetaHead) -> Result<std::collections::BTreeMap<String, String>, SyncError> {
+        fn meta_head_to_metadata(
+            head: &MetaHead,
+        ) -> Result<std::collections::BTreeMap<String, String>, SyncError> {
             let mut m = std::collections::BTreeMap::new();
             m.insert(
                 "rr-vv".to_string(),
@@ -1471,15 +1486,23 @@ mod imp {
             let missing = |field: &str| se(format!("meta head missing {field}"));
             let vv_json = meta.get("rr-vv").ok_or_else(|| missing("rr-vv"))?;
             let vv: VersionVector = serde_json::from_str(vv_json).map_err(se)?;
-            let blake3 = Blake3Hex::parse(meta.get("rr-blake3").ok_or_else(|| missing("rr-blake3"))?.clone())
-                .map_err(se)?;
+            let blake3 = Blake3Hex::parse(
+                meta.get("rr-blake3")
+                    .ok_or_else(|| missing("rr-blake3"))?
+                    .clone(),
+            )
+            .map_err(se)?;
             let ts: i64 = meta
                 .get("rr-ts")
                 .ok_or_else(|| missing("rr-ts"))?
                 .parse()
                 .map_err(|e| se(format!("meta head rr-ts: {e}")))?;
-            let device = DeviceId::new(meta.get("rr-device").ok_or_else(|| missing("rr-device"))?.clone())
-                .map_err(se)?;
+            let device = DeviceId::new(
+                meta.get("rr-device")
+                    .ok_or_else(|| missing("rr-device"))?
+                    .clone(),
+            )
+            .map_err(se)?;
             Ok(MetaHead {
                 vv,
                 blake3,
@@ -1491,7 +1514,10 @@ mod imp {
         /// The remote head of `kind`, or `None` when nothing has been
         /// published yet (§2.9). A cheap `HeadObject` — no document bytes
         /// move unless the comparison actually needs them.
-        async fn fetch_remote_meta_head(&self, kind: MetaKind) -> Result<Option<MetaHead>, SyncError> {
+        async fn fetch_remote_meta_head(
+            &self,
+            kind: MetaKind,
+        ) -> Result<Option<MetaHead>, SyncError> {
             match self.s3.head_object(&self.bucket, kind.meta_key()).await {
                 Ok(head) => Ok(Some(Self::metadata_to_meta_head(&head.metadata)?)),
                 Err(e) if e.is_no_such_key() => Ok(None),
@@ -1512,7 +1538,12 @@ mod imp {
 
         /// Publishes `bytes` (already relativized) as `kind`'s live meta
         /// document, carrying `head` as the `x-amz-meta-rr-*` metadata.
-        async fn put_meta_document(&self, kind: MetaKind, bytes: Vec<u8>, head: &MetaHead) -> Result<(), SyncError> {
+        async fn put_meta_document(
+            &self,
+            kind: MetaKind,
+            bytes: Vec<u8>,
+            head: &MetaHead,
+        ) -> Result<(), SyncError> {
             let opts = PutObjectOptions {
                 content_type: Some("application/json".to_string()),
                 metadata: Self::meta_head_to_metadata(head)?,
@@ -1609,7 +1640,11 @@ mod imp {
         /// resolves the same conflict computes and uploads the same bytes at
         /// the same key, so a redundant PUT from a second device is a no-op
         /// overwrite with identical content.
-        async fn put_meta_conflict_loser(&self, kind: MetaKind, loser_relativized: &[u8]) -> Result<(), SyncError> {
+        async fn put_meta_conflict_loser(
+            &self,
+            kind: MetaKind,
+            loser_relativized: &[u8],
+        ) -> Result<(), SyncError> {
             let canonical_loser = meta::canonical(loser_relativized).map_err(se)?;
             let key = kind.conflict_key(&canonical_loser);
             self.s3
@@ -1646,7 +1681,11 @@ mod imp {
         /// the shared document was never able to carry in the first place. A
         /// device with no prior local copy (`old` read fails) has nothing to
         /// merge, by construction.
-        fn merge_local_out_of_root(&self, kind: MetaKind, localized: &[u8]) -> Result<Vec<u8>, SyncError> {
+        fn merge_local_out_of_root(
+            &self,
+            kind: MetaKind,
+            localized: &[u8],
+        ) -> Result<Vec<u8>, SyncError> {
             let old = std::fs::read(self.resolved_meta_local_path(kind)).ok();
             meta::merge_out_of_root(kind, old.as_deref(), localized, &self.sync_root).map_err(se)
         }
@@ -1727,12 +1766,31 @@ mod imp {
             }
 
             for attempt in 0..Self::MAX_META_RESOLVE_ATTEMPTS {
-                let outcome = self.act_meta_once(kind, dirty, &local, remote.clone()).await?;
+                let outcome = self
+                    .act_meta_once(kind, dirty, &local, remote.clone())
+                    .await?;
                 let intended = match outcome {
-                    MetaActOutcome::Converged => {
+                    MetaActOutcome::Noop => {
+                        // No remote, no local edit — nothing was written and
+                        // nothing to adopt.
+                        self.clear_meta_dirty(kind);
+                        return Ok(());
+                    }
+                    MetaActOutcome::Converged(adopted) => {
                         // The live state (whatever it is) already satisfies
-                        // our local edit — nothing was written, so there is
-                        // nothing to verify.
+                        // our local edit — nothing was written to the shared
+                        // key, so there is nothing to verify with a
+                        // follow-up `HeadObject`. Still persist the
+                        // vv-elementwise-max adoption (§2.6 case 1), exactly
+                        // like the `AdoptRemote`/`Conflict` arms below do,
+                        // so a LATER genuinely concurrent edit is resolved
+                        // against the merged vv rather than a stale one.
+                        if let Err(e) = self.db.set_synced_meta_head(kind.meta_key(), &adopted) {
+                            log::warn!("sync: meta {kind:?} persist head: {e}");
+                        }
+                        if let Ok(mut heads) = self.meta_heads.lock() {
+                            heads.insert(kind, adopted);
+                        }
                         self.clear_meta_dirty(kind);
                         return Ok(());
                     }
@@ -1810,8 +1868,10 @@ mod imp {
         ///
         /// Returns the head this call believes is now live as a *result* of
         /// (or because of) its action, for the caller to verify with a
-        /// follow-up `HeadObject` — [`MetaActOutcome::Converged`] only for
-        /// the no-op case, where there is nothing to verify.
+        /// follow-up `HeadObject` — [`MetaActOutcome::Converged`] and
+        /// [`MetaActOutcome::Noop`] are the no-op cases, where there is
+        /// nothing to verify (but `Converged` still carries a head to
+        /// adopt into the cache).
         async fn act_meta_once(
             &self,
             kind: MetaKind,
@@ -1821,7 +1881,7 @@ mod imp {
         ) -> Result<MetaActOutcome, SyncError> {
             let Some(remote) = remote_before else {
                 if !dirty {
-                    return Ok(MetaActOutcome::Converged);
+                    return Ok(MetaActOutcome::Noop);
                 }
                 let bytes = self
                     .meta_pending
@@ -1835,18 +1895,78 @@ mod imp {
                 // relying on the caller's separate post-write re-verify to
                 // catch the mismatch on an extra, otherwise-unnecessary round
                 // trip.
-                return Ok(if self.put_meta_document_if_absent(kind, bytes, local).await? {
-                    MetaActOutcome::Acted(local.clone())
-                } else {
-                    MetaActOutcome::Stale
-                });
+                return Ok(
+                    if self.put_meta_document_if_absent(kind, bytes, local).await? {
+                        MetaActOutcome::Acted(local.clone())
+                    } else {
+                        MetaActOutcome::Stale
+                    },
+                );
             };
 
             match meta::decide_meta(local, &remote) {
-                MetaDecision::Converged => Ok(MetaActOutcome::Converged),
+                MetaDecision::Converged => {
+                    // §2.6 case 1 fires on equal content regardless of vv
+                    // order — including a *concurrent* vv (two devices
+                    // independently producing the same bytes). The doc
+                    // comment's "adopt metadata" means the vv itself: merge
+                    // to the elementwise max so a LATER, genuinely
+                    // divergent edit is compared against the full causal
+                    // history, not just whichever side happened to cache
+                    // it last (exactly the `r.vv.merge(&entry.vv)` the
+                    // sidecar engine's `converge` already does for its own
+                    // Converged case).
+                    let mut merged_vv = local.vv.clone();
+                    merged_vv.merge(&remote.vv);
+                    // The (blake3, ts, device) identity to carry forward:
+                    // mirrors the sidecar engine's
+                    // `converged_identity_is_remote` so this can never
+                    // disagree with a device that instead saw this exact
+                    // pair as an actual `Conflict` (the tiebreak must be
+                    // the same deterministic rule either way). A dominant
+                    // side's identity is kept outright; a concurrent pair
+                    // (content-equal, so the identity choice has no
+                    // observable effect beyond `ts`/`device` bookkeeping
+                    // for a future tiebreak) breaks the tie with the same
+                    // `pick_winner` a real conflict would use.
+                    let remote_identity_wins = match compare(&remote.vv, &local.vv) {
+                        VvOrder::Greater => true,
+                        VvOrder::Less | VvOrder::Equal => false,
+                        VvOrder::Concurrent => {
+                            let winner = pick_winner(
+                                Candidate {
+                                    ts: remote.ts,
+                                    device: &remote.device,
+                                },
+                                Candidate {
+                                    ts: local.ts,
+                                    device: &local.device,
+                                },
+                            );
+                            winner.ts == remote.ts && *winner.device == remote.device
+                        }
+                    };
+                    let adopted = if remote_identity_wins {
+                        MetaHead {
+                            vv: merged_vv,
+                            blake3: remote.blake3.clone(),
+                            ts: remote.ts,
+                            device: remote.device.clone(),
+                        }
+                    } else {
+                        MetaHead {
+                            vv: merged_vv,
+                            blake3: local.blake3.clone(),
+                            ts: local.ts,
+                            device: local.device.clone(),
+                        }
+                    };
+                    Ok(MetaActOutcome::Converged(adopted))
+                }
                 MetaDecision::AdoptRemote => {
                     let remote_bytes = self.fetch_remote_meta_bytes(kind).await?;
-                    let localized = meta::localize(kind, &remote_bytes, &self.sync_root).map_err(se)?;
+                    let localized =
+                        meta::localize(kind, &remote_bytes, &self.sync_root).map_err(se)?;
                     let merged = self.merge_local_out_of_root(kind, &localized)?;
                     self.write_local_meta(kind, &merged)?;
                     Ok(MetaActOutcome::Acted(remote))
@@ -1859,11 +1979,14 @@ mod imp {
                             .ok()
                             .and_then(|p| p.get(&kind).cloned())
                             .ok_or_else(|| se("meta: dirty kind has no staged bytes"))?;
-                        self.put_meta_document_guarded(kind, bytes, local, &remote).await
+                        self.put_meta_document_guarded(kind, bytes, local, &remote)
+                            .await
                     } else {
                         // Not dirty — our recorded head already dominates the
-                        // (unchanged) remote; nothing to do or verify.
-                        Ok(MetaActOutcome::Converged)
+                        // (unchanged) remote; nothing to do or verify, and
+                        // merging would be a no-op (local's vv already ⊇
+                        // remote's).
+                        Ok(MetaActOutcome::Noop)
                     }
                 }
                 MetaDecision::Conflict { remote_wins } => {
@@ -1916,8 +2039,10 @@ mod imp {
                     // redundantly from a second device) is a harmless no-op
                     // overwrite with identical bytes.
                     if remote_wins {
-                        self.put_meta_conflict_loser(kind, &local_relativized).await?;
-                        let localized = meta::localize(kind, &remote_bytes, &self.sync_root).map_err(se)?;
+                        self.put_meta_conflict_loser(kind, &local_relativized)
+                            .await?;
+                        let localized =
+                            meta::localize(kind, &remote_bytes, &self.sync_root).map_err(se)?;
                         let merged = self.merge_local_out_of_root(kind, &localized)?;
                         self.write_local_meta(kind, &merged)?;
                         let new_head = MetaHead {
