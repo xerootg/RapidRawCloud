@@ -2154,7 +2154,7 @@ mod imp {
         }
 
         /// Synchronous wrapper over the async eviction read-back (§3.5): runs
-        /// the ranged GET + blake3 compare on a dedicated-thread runtime, so
+        /// a full GET + blake3 re-hash on a dedicated-thread runtime, so
         /// the synchronous "free up space" path need not itself be `async`
         /// (mirroring how [`Configured::hydrate`] drives its download).
         fn readback_verify_blocking(
