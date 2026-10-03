@@ -19,7 +19,7 @@
 //! **skips with a loud eprintln** (so CI without the corpus still passes);
 //! when present they RUN.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rrcloud_core::proxy::{
     self, DecodedMatrices, ProxyOutput, PROXY_BLACK_LEVEL, PROXY_LONG_EDGE, PROXY_SOFTWARE_TAG,
@@ -42,12 +42,12 @@ fn corpus_dir() -> Option<PathBuf> {
 }
 
 /// A representative file per corpus format. Returns the first that exists.
-fn corpus_file(dir: &PathBuf, candidates: &[&str]) -> Option<PathBuf> {
+fn corpus_file(dir: &Path, candidates: &[&str]) -> Option<PathBuf> {
     candidates.iter().map(|n| dir.join(n)).find(|p| p.is_file())
 }
 
 /// One representative RAW per format family present in the golden corpus.
-fn format_samples(dir: &PathBuf) -> Vec<(&'static str, PathBuf)> {
+fn format_samples(dir: &Path) -> Vec<(&'static str, PathBuf)> {
     let specs: &[(&str, &[&str])] = &[
         (
             "CR3",

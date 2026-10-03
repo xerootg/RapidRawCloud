@@ -30,6 +30,18 @@ Status legend: [ ] planned (phase) · [x] landed
 | UI components | status badge, pin/evict menu, sync settings, conflict toast (mount-point one-liners) | [ ] P2/P6 |
 
 Notes:
+- **P4 headless worker touches NO upstream file (documented §6 refinement).** The worker is a
+  `[[bin]]` *inside* `crates/rrcloud-core` (`src/bin/rrcloud-worker.rs` over `worker::run_cycle`),
+  depending on `rrcloud-core` only — not `rapidraw_lib`/tauri/gtk/webkit. ARCHITECTURE.md §6 prose
+  originally put the bin in the host app crate linking `rapidraw_lib` for color parity; that is
+  unnecessary because `proxy.rs` lives in `rrcloud-core` and pins the same rawler rev the app
+  resolves, so parity is already this crate's property. The refinement therefore *removes* a would-be
+  upstream hook (no `src-tauri/Cargo.toml` bin target, no app-crate linkage, no gtk/webkit base
+  image) rather than adding one — strictly additive to `rrcloud-core`. The only manifest change is
+  additive and *inside* `crates/rrcloud-core/Cargo.toml` (the `[[bin]]` plus the `tokio`
+  `rt-multi-thread`/`macros`/`time` runtime features the bin's `#[tokio::main]` needs, already in the
+  test build); no upstream manifest is touched. See `rrcloud_core::worker` module docs and
+  ARCHITECTURE.md §6.
 - `tauri.conf.json` is deliberately untouched — thumbnail seeding hard-links into the existing
   `$APPCACHE/thumbnails` asset-protocol scope (ARCHITECTURE.md §3.5).
 - P0 keeps `crates/rrcloud-core` standalone (own lockfile, no workspace membership) so the
