@@ -20,6 +20,9 @@
 //!   cursors (§2.2).
 //! - [`manifest`]: per-writer manifests — build/encode/transfer/merge
 //!   (§2.3).
+//! - [`meta`]: albums & presets as synced whole-document meta objects —
+//!   `rr://` relativization and the §2.6 whole-document resolution reused
+//!   for them (§2.9).
 //! - [`transfer`]: the per-item transfer engine — resumable
 //!   uploads/downloads, Content-MD5, streamed blake3, temp+verify+rename,
 //!   the backend digest probe, and the concurrency pump (§2.4, §3.5,
@@ -44,6 +47,7 @@ pub mod engine;
 pub mod journal;
 pub mod keys;
 pub mod manifest;
+pub mod meta;
 pub mod proxy;
 pub mod publisher;
 pub mod reader;

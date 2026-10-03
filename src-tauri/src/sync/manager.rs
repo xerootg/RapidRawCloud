@@ -363,6 +363,21 @@ impl SyncManager {
         }
     }
 
+    /// §2.9 save-site intake: the local `albums.json` / `presets.json` at
+    /// `local_path` was just written. Relativize its in-root image / LUT
+    /// paths to `rr://`, store the device-local path so the apply loop can
+    /// write a converged document back here, and mark the meta kind dirty
+    /// for the next cycle. Best-effort (never panics at the upstream save
+    /// site). Only compiled under the `sync` feature — its sole caller, the
+    /// feature-gated `hooks::imp` shim, carries the parity guarantee for
+    /// `--no-default-features` (album/preset save stays plain local JSON).
+    #[cfg(feature = "sync")]
+    pub fn note_local_meta(&self, kind: crate::sync::MetaKind, local_path: &std::path::Path) {
+        if let Ok(cfg) = self.configured() {
+            cfg.note_local_meta(kind, local_path);
+        }
+    }
+
     /// A new original landed locally (import / derived output / duplicate /
     /// copy): records it through the §2.5 intake, keyed by its own relkey,
     /// so the next cycle uploads it (§3.4 new-original hooks). Best-effort.
@@ -898,8 +913,8 @@ mod imp {
         SyncStatus, ThumbVariant, VerifyReport,
     };
     use crate::app_settings::SyncSettings;
-    use crate::sync::WriteOrigin;
     use crate::sync::credentials::Credentials;
+    use crate::sync::{MetaKind, WriteOrigin};
 
     /// Transfer concurrency per lane (§2.4 / §3.3). Small and fixed: the
     /// desktop app is not the bulk worker.
@@ -1065,6 +1080,17 @@ mod imp {
         s3: Arc<S3Client>,
         backend: std::sync::Mutex<Option<BackendProfile>>,
         notify_count: AtomicUsize,
+        /// §2.9 meta kinds with a local edit not yet uploaded this cycle.
+        /// The save-site intake ([`Configured::note_local_meta`]) inserts;
+        /// the cycle's meta upload drains. Empty ⇒ no meta upload work.
+        meta_dirty: std::sync::Mutex<std::collections::HashSet<MetaKind>>,
+        /// §2.9 device-local path of each meta document (where the save site
+        /// wrote it, and where the apply loop writes a converged document
+        /// back). Learned from [`Configured::note_local_meta`]. Written and
+        /// read only once the P6-green intake/apply bodies land; allow dead
+        /// until then (mirrors the `settings` field's pattern).
+        #[allow(dead_code)]
+        meta_local_paths: std::sync::Mutex<std::collections::HashMap<MetaKind, PathBuf>>,
     }
 
     impl Configured {
@@ -1130,6 +1156,8 @@ mod imp {
                 s3: Arc::new(s3),
                 backend: std::sync::Mutex::new(None),
                 notify_count: AtomicUsize::new(0),
+                meta_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
+                meta_local_paths: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         }
 
@@ -1197,6 +1225,71 @@ mod imp {
             if let Err(e) = notify_local_change(&self.db, &rk, Kind::Original, &scan) {
                 log::warn!("sync intake (original): {}: {e}", path.display());
             }
+        }
+
+        /// §2.9 save-site intake for a just-written meta document. Reads the
+        /// local bytes, records the device-local path, relativizes in-root
+        /// image / LUT paths to `rr://` (dropping out-of-root entries from
+        /// the copy the engine will advertise), and records the kind as a
+        /// dirty whole-document version for the next cycle — reusing the
+        /// §2.6 version mint exactly as a sidecar edit does. Best-effort:
+        /// an unreadable or unmappable document is logged, never propagated.
+        pub fn note_local_meta(&self, kind: MetaKind, local_path: &Path) {
+            let _ = (kind, local_path);
+            todo!("P6 green: read + relativize the meta doc and mark the kind dirty")
+        }
+
+        /// The device-local path of meta document `kind`:
+        /// `<app_data_dir>/<stem>/<stem>.json`, where `app_data_dir` is the
+        /// parent of the redb state dir (§3.3) — exactly where
+        /// `file_management::get_albums_path` / `get_presets_path` write. The
+        /// §2.9 apply loop writes a converged document back here even on a
+        /// device that never saved locally (it has no `note_local_meta`
+        /// record), so the location must be derivable, not only remembered.
+        #[allow(dead_code)]
+        fn meta_local_path(&self, kind: MetaKind) -> PathBuf {
+            let (dir, file) = match kind {
+                MetaKind::Albums => ("albums", "albums.json"),
+                MetaKind::Presets => ("presets", "presets.json"),
+            };
+            let app_data_dir = self
+                .db
+                .path()
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| self.sync_root.clone());
+            app_data_dir.join(dir).join(file)
+        }
+
+        /// Whether any meta document needs uploading this cycle (§2.9). Cheap
+        /// local check so [`Configured::run_cycle`] skips the meta lane
+        /// entirely when there is nothing to do (the common case).
+        fn has_meta_upload_work(&self) -> bool {
+            self.meta_dirty
+                .lock()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false)
+        }
+
+        /// The §2.9 meta lane of one cycle: upload every dirty meta document
+        /// (relativized, with a bumped version vector + journal entry) and
+        /// apply any converged remote meta head — download it, `localize`
+        /// it to this device's sync root, atomically replace the local file,
+        /// and surface a conflict loser via a `sync-conflict` event. The
+        /// whole-document resolution reuses `meta::decide_meta` (which in
+        /// turn reuses the §2.6 `compare` / `pick_winner`), never a bespoke
+        /// rule.
+        ///
+        /// Skips cleanly when there is no meta work pending, so a cycle on a
+        /// device that never touched albums/presets is a no-op.
+        async fn sync_meta_documents(&self, cfg: &TransferConfig) -> Result<(), SyncError> {
+            // Nothing dirty locally and nothing converged remotely to write
+            // back ⇒ the meta lane is idle this cycle.
+            if !self.has_meta_upload_work() {
+                return Ok(());
+            }
+            let _ = cfg;
+            todo!("P6 green: upload dirty meta docs and apply converged remote meta heads")
         }
 
         /// §2.7 soft delete — intent only in this unit. The async remote
@@ -2369,6 +2462,12 @@ mod imp {
                     .await
                     .map_err(se)?;
             }
+
+            // §2.9 albums/presets meta lane: upload dirty meta documents and
+            // apply any converged remote meta head. A no-op when no meta work
+            // is pending, so cycles on devices that never touched
+            // albums/presets are unaffected.
+            self.sync_meta_documents(&cfg).await?;
 
             let cancel = CancelFlag::new();
             let down = pump_downloads(

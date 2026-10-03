@@ -35,6 +35,14 @@ pub mod hooks;
 pub mod manager;
 
 pub use credentials::{CredentialStore, Credentials, FileCredentialStore};
+
+// §2.9 albums/presets meta sync. `MetaKind` is a `rrcloud-core` type, and
+// the crate is linked only under the `sync` feature, so the re-export is
+// feature-gated. Its only non-test consumers — the save-site hooks in
+// `hooks::imp` and `SyncManager::note_local_meta` — are feature-gated too,
+// so `--no-default-features` never names it.
+#[cfg(feature = "sync")]
+pub use ::rrcloud_core::meta::MetaKind;
 pub use manager::{
     ConflictKeep, EvictionReport, PeerDevice, RecentlyDeleted, SyncError, SyncManager, SyncState,
     SyncStatus, ThumbVariant, VerifyReport,

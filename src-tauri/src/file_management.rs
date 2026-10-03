@@ -935,7 +935,10 @@ pub fn save_albums(mut tree: Vec<AlbumItem>, app_handle: AppHandle) -> Result<()
     let path = get_albums_path(&app_handle)?;
     sort_album_tree(&mut tree);
     let json_string = serde_json::to_string_pretty(&tree).map_err(|e| e.to_string())?;
-    fs::write(path, json_string).map_err(|e| e.to_string())
+    fs::write(&path, json_string).map_err(|e| e.to_string())?;
+    // §2.9: sync the albums meta document (no-op when sync is off).
+    crate::sync::hooks::notify_albums_saved(&path);
+    Ok(())
 }
 
 #[tauri::command]
@@ -3229,7 +3232,10 @@ pub fn load_presets(app_handle: AppHandle) -> Result<Vec<PresetItem>, String> {
 pub fn save_presets(presets: Vec<PresetItem>, app_handle: AppHandle) -> Result<(), String> {
     let path = get_presets_path(&app_handle)?;
     let json_string = serde_json::to_string_pretty(&presets).map_err(|e| e.to_string())?;
-    fs::write(path, json_string).map_err(|e| e.to_string())
+    fs::write(&path, json_string).map_err(|e| e.to_string())?;
+    // §2.9: sync the presets meta document (no-op when sync is off).
+    crate::sync::hooks::notify_presets_saved(&path);
+    Ok(())
 }
 
 fn get_internal_library_root_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {

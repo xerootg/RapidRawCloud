@@ -41,6 +41,37 @@ pub fn notify_new_original(path: &Path) {
     }
 }
 
+/// The local `albums.json` was saved (§2.9): relativize its in-root image
+/// paths to `rr://` and sync it as the `.rrcloud/v1/meta/albums.json`
+/// whole-document meta object. No-op when sync is off, so `--no-default-
+/// features` keeps album save as plain local JSON (no `rr://` rewrite, no
+/// engine call), functionally identical to upstream.
+pub fn notify_albums_saved(albums_json_path: &Path) {
+    #[cfg(feature = "sync")]
+    {
+        imp::notify_meta_saved(crate::sync::MetaKind::Albums, albums_json_path);
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = albums_json_path;
+    }
+}
+
+/// The local `presets.json` was saved (§2.9): relativize its `lutPath`
+/// references and sync it as the `.rrcloud/v1/meta/presets.json` whole-
+/// document meta object. No-op when sync is off (parity with upstream,
+/// same contract as [`notify_albums_saved`]).
+pub fn notify_presets_saved(presets_json_path: &Path) {
+    #[cfg(feature = "sync")]
+    {
+        imp::notify_meta_saved(crate::sync::MetaKind::Presets, presets_json_path);
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = presets_json_path;
+    }
+}
+
 /// An item was deleted locally → soft delete + tombstone (§2.7). Deferred:
 /// the real body currently only logs (no durable tombstone yet) and has no
 /// upstream call site.
@@ -191,6 +222,17 @@ mod imp {
         // logged, never propagated to the upstream call site.
         if let Some(mgr) = global_manager() {
             mgr.note_new_original(path);
+        }
+    }
+
+    pub fn notify_meta_saved(kind: crate::sync::MetaKind, meta_json_path: &Path) {
+        // §2.9 albums/presets meta sync: hand the just-saved local document
+        // to the process-global manager, which relativizes it and marks the
+        // meta kind dirty for the next cycle. Best-effort: a missing manager
+        // or an unconfigured engine is a cheap no-op, and any failure is
+        // logged, never propagated to the upstream save site.
+        if let Some(mgr) = global_manager() {
+            mgr.note_local_meta(kind, meta_json_path);
         }
     }
 
