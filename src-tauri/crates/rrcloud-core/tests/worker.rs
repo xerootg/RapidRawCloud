@@ -1044,6 +1044,257 @@ async fn one_undecodable_foreign_original_does_not_abort_the_cycle() {
     );
 }
 
+// ===========================================================================
+// PER-ITEM ISOLATION #2 — oversized/over-cap drop (review major: the GET is
+// not per-item isolated, so a poison object permanently wedges the cycle)
+// ===========================================================================
+
+/// §6 forward progress: a foreign original past the adoption buffer cap (an
+/// oversized/corrupt drop whose GET returns `BodyCapExceeded` every cycle)
+/// must be SKIPPED, not abort the cycle — otherwise it permanently wedges
+/// adoption of every other original, the resurrection backstop, hygiene, and
+/// §2.10 GC. A tiny `max_adopt_original_bytes` pins the condition
+/// deterministically (no 2 GiB object needed). The over-cap object sorts
+/// FIRST, so a non-isolated GET aborts before the valid object is reached.
+#[tokio::test]
+async fn an_over_cap_foreign_original_is_skipped_without_wedging_the_cycle() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-overcap");
+    let client = g.client();
+    let state = tempfile::tempdir().expect("state dir");
+    let cfg = worker_cfg(g, &bucket, Some(state.path().to_path_buf()));
+    let worker = Worker::open(&cfg).expect("open worker");
+
+    // Over-cap poison (sorts first) + a small valid original (under cap).
+    let poison = rel("ingest/aaa.JPG");
+    put_raw(
+        &client,
+        &bucket,
+        &library_key(&poison),
+        &vec![0u8; 4096], // > the 16-byte cap below → BodyCapExceeded on GET
+    )
+    .await;
+    let valid = rel("ingest/zzz.JPG");
+    put_raw(&client, &bucket, &library_key(&valid), b"tiny").await; // 4 bytes < cap
+
+    let opts = CycleOptions {
+        max_adopt_original_bytes: Some(16),
+        ..Default::default()
+    };
+    let report = worker::run_cycle(&worker, &opts)
+        .await
+        .expect("an over-cap poison object must NOT abort the cycle");
+
+    assert!(
+        report.adopted.contains(&valid),
+        "the valid original after the poison is still adopted (forward progress) \
+         (adopted={:?})",
+        report.adopted
+    );
+    assert!(
+        !report.adopted.contains(&poison),
+        "the over-cap poison object is skipped, not adopted (adopted={:?})",
+        report.adopted
+    );
+    assert!(
+        worker.db().get_item(&poison).unwrap().is_none(),
+        "the poison object is never recorded (so it is retried, never wedges)"
+    );
+    assert!(
+        worker.db().get_item(&valid).unwrap().is_some(),
+        "the valid original is journal-known after the cycle"
+    );
+
+    // A second cycle still makes forward progress: the poison is re-skipped,
+    // the valid one is not re-adopted.
+    let second = worker::run_cycle(&worker, &opts)
+        .await
+        .expect("second cycle");
+    assert!(
+        second.adopted.is_empty(),
+        "cycle 2 adopts nothing new (poison re-skipped, valid already known)"
+    );
+}
+
+// ===========================================================================
+// ADOPTED MTIME (review major: ISO-8601 LastModified parsed as RFC-1123 →
+// every adopted original is epoch-0)
+// ===========================================================================
+
+/// §2.2/§3.5: an adopted foreign original carries the object's REAL server
+/// mtime (from the `ListObjectsV2` ISO-8601 `LastModified`), not epoch-0, so
+/// phones materialize the stub at the real time, not 1970. Corpus-independent
+/// (a non-RAW original still carries the listing mtime; the proxy is skipped).
+#[tokio::test]
+async fn adopted_original_carries_real_mtime_not_epoch_0() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-mtime");
+    let client = g.client();
+    let state = tempfile::tempdir().expect("state dir");
+    let cfg = worker_cfg(g, &bucket, Some(state.path().to_path_buf()));
+    let worker = Worker::open(&cfg).expect("open worker");
+
+    let item = rel("ingest/when.JPG");
+    put_raw(&client, &bucket, &library_key(&item), b"not-a-real-raw").await;
+
+    let report = worker::run_cycle(&worker, &CycleOptions::default())
+        .await
+        .expect("cycle");
+    assert!(report.adopted.contains(&item), "the original is adopted");
+
+    let rec = worker
+        .db()
+        .get_item(&item)
+        .expect("get_item")
+        .expect("adopted record");
+    assert!(
+        rec.mtime_unix_ns > 0,
+        "the adopted original carries the real server mtime, not epoch-0 \
+         (mtime_unix_ns={})",
+        rec.mtime_unix_ns
+    );
+
+    let w_entries = eh::journal_entries_of(&client, &bucket, worker.device_id()).await;
+    let orig_put = w_entries
+        .iter()
+        .find(|e| e.op == Op::Put && e.kind == Kind::Original && e.key == library_key(&item))
+        .expect("a put-original entry");
+    assert!(
+        orig_put.mtime.is_some_and(|m| m > 0),
+        "the put-original journal entry carries a real mtime, not None/0 (mtime={:?})",
+        orig_put.mtime
+    );
+}
+
+// ===========================================================================
+// ATOMIC ADOPTION (review blocker: stage-before-record → a mid-adopt crash
+// double-publishes on the next cycle)
+// ===========================================================================
+
+/// §6 "idempotent and crash-safe": adoption stages its journal entries and
+/// records the item in ONE transaction, so a crash (SIGKILL/OOM/eviction)
+/// after staging but before recording leaves NEITHER — a re-run re-adopts the
+/// original exactly once, never double-publishing a leftover plus a fresh
+/// copy. The fault is injected via a per-call `CycleOptions.fault` (no
+/// process-global env var — cannot race sibling tests). Corpus-independent.
+#[tokio::test]
+async fn adoption_is_atomic_across_a_mid_adopt_crash() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-atomic");
+    let client = g.client();
+    let state = tempfile::tempdir().expect("state dir");
+    let cfg = worker_cfg(g, &bucket, Some(state.path().to_path_buf()));
+    let worker = Worker::open(&cfg).expect("open worker");
+
+    let item = rel("ingest/crash.JPG");
+    put_raw(&client, &bucket, &library_key(&item), b"foreign-original").await;
+
+    // Cycle 1: crash AFTER staging the adoption entries, BEFORE recording.
+    let crashed = worker::run_cycle(
+        &worker,
+        &CycleOptions {
+            fault: Some("after_stage_before_record"),
+            ..Default::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(crashed, Err(WorkerError::InjectedFault(_))),
+        "the injected mid-adopt fault surfaces as a typed error, got {crashed:?}"
+    );
+    assert!(
+        worker.db().get_item(&item).unwrap().is_none(),
+        "the atomic stage+record left NO item record after the mid-adopt crash"
+    );
+    assert!(
+        eh::journal_entries_of(&client, &bucket, worker.device_id())
+            .await
+            .is_empty(),
+        "nothing was published under the worker prefix after the crash \
+         (the aborted transaction staged nothing)"
+    );
+
+    // Cycle 2 (clean): the original is adopted EXACTLY ONCE — no leftover
+    // staged copy double-published alongside a fresh one.
+    let ok = worker::run_cycle(&worker, &CycleOptions::default())
+        .await
+        .expect("clean re-run");
+    assert_eq!(
+        ok.adopted,
+        vec![item.clone()],
+        "the original is adopted on the clean re-run"
+    );
+    let orig_puts = eh::journal_entries_of(&client, &bucket, worker.device_id())
+        .await
+        .into_iter()
+        .filter(|e| e.op == Op::Put && e.kind == Kind::Original && e.key == library_key(&item))
+        .count();
+    assert_eq!(
+        orig_puts, 1,
+        "the original is published EXACTLY ONCE across the crash + re-run \
+         (no duplicate put-original from a stage-before-record leftover)"
+    );
+}
+
+// ===========================================================================
+// STATELESS READ-ONLY REPORTING (review minor: field counted all originals;
+// the mode must count only genuinely-foreign ones, and must be journal-silent)
+// ===========================================================================
+
+/// `Worker::open_readonly` + `run_cycle` reports only — it counts the
+/// `library/` originals with NO journal-known state (the genuinely foreign
+/// drops) and writes nothing to the journal prefix. A foreign drop beside a
+/// peer-advertised original must count the foreign one only.
+#[tokio::test]
+async fn readonly_reporting_counts_only_foreign_and_journals_nothing() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-report");
+    let client = g.client();
+
+    // A peer advertises one original (journal-known); a second original is a
+    // genuinely foreign drop (no journal state anywhere).
+    let known = rel("ingest/known.JPG");
+    let foreign = rel("ingest/foreign.JPG");
+    let kraw = b"peer-known-original";
+    put_raw(&client, &bucket, &library_key(&known), kraw).await;
+    put_raw(&client, &bucket, &library_key(&foreign), b"foreign-drop").await;
+
+    let d = dev(DEV_B);
+    let (_ddir, _dpath, d_db) = open_db(&d);
+    let mut put = journal_entry(&d, Op::Put, Kind::Original, library_key(&known));
+    put.vv = vv(&[(&d, 1)]);
+    put.content_id = Some(ContentId::from_bytes(kraw));
+    put.blake3 = Some(Blake3Hex::from_bytes(kraw));
+    put.size = Some(kraw.len() as u64);
+    enqueue_entry(&d_db, &put).expect("enqueue known");
+    publish_pending(&d_db, &client, &bucket)
+        .await
+        .expect("publish known");
+
+    // Stateless: no state dir. open_readonly must still report.
+    let cfg = worker_cfg(g, &bucket, None);
+    let worker = Worker::open_readonly(&cfg).expect("open_readonly");
+    let report = worker::run_cycle(&worker, &CycleOptions::default())
+        .await
+        .expect("readonly cycle");
+
+    assert_eq!(
+        report.foreign_originals_seen, 1,
+        "exactly the one genuinely-foreign original is counted (the peer-known \
+         original is excluded), got {}",
+        report.foreign_originals_seen
+    );
+    assert!(
+        report.adopted.is_empty() && report.journal_entries_published == 0,
+        "the read-only reporting mode adopts nothing and publishes nothing"
+    );
+    let w_journal = eh::journal_entries_of(&client, &bucket, worker.device_id()).await;
+    assert!(
+        w_journal.is_empty(),
+        "the ephemeral reporting identity writes no journal, found: {w_journal:?}"
+    );
+}
+
 // A `CompactConfig` field is referenced so the import is load-bearing even
 // while every §2.10 default is exercised through `CycleOptions::default`.
 const _: fn() -> CompactConfig = CompactConfig::default;

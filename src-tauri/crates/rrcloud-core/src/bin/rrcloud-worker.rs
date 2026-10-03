@@ -18,17 +18,27 @@ use rrcloud_core::worker::{
     self, CycleOptions, RunMode, Worker, WorkerConfig, DEFAULT_DAEMON_INTERVAL,
 };
 
-const USAGE: &str = "usage: rrcloud-worker [--once | --daemon --interval <dur>]";
+const USAGE: &str = "usage: rrcloud-worker [--once | --daemon --interval <dur> | --report]";
+
+/// What the CLI resolves argv into.
+enum Invocation {
+    /// Stateless read-only reporting (§6): a single cycle under
+    /// [`Worker::open_readonly`], NO journaling. The one CLI path to the
+    /// documented stateless capability — reachable without `RRCLOUD_STATE_DIR`.
+    Report,
+    /// The journaling role ([`Worker::open`]) driven by `mode`.
+    Run(RunMode),
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
     // A CLI usage error is a clean usage message + nonzero exit (code 2),
     // never a Rust panic/backtrace — it is operator input, not a bug.
-    let Some(mode) = parse_mode() else {
+    let Some(inv) = parse_invocation() else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    match real_main(mode).await {
+    match real_main(inv).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("rrcloud-worker: fatal: {e}");
@@ -37,25 +47,44 @@ async fn main() -> ExitCode {
     }
 }
 
-async fn real_main(mode: RunMode) -> Result<(), worker::WorkerError> {
+async fn real_main(inv: Invocation) -> Result<(), worker::WorkerError> {
     let cfg = WorkerConfig::from_env()?;
-    let worker = Worker::open(&cfg)?;
-    worker::run(&worker, mode, &CycleOptions::default()).await
+    match inv {
+        // Stateless read-only reporting: open_readonly never requires (nor
+        // uses) a persistent state dir and never journals, so `--report`
+        // works with RRCLOUD_STATE_DIR unset — the one CLI path to §6's
+        // "a stateless invocation may at most do read-only reporting".
+        Invocation::Report => {
+            let worker = Worker::open_readonly(&cfg)?;
+            let report = worker::run_cycle(&worker, &CycleOptions::default()).await?;
+            println!(
+                "rrcloud-worker report: foreign_originals_seen={}",
+                report.foreign_originals_seen
+            );
+            Ok(())
+        }
+        Invocation::Run(mode) => {
+            let worker = Worker::open(&cfg)?;
+            worker::run(&worker, mode, &CycleOptions::default()).await
+        }
+    }
 }
 
-/// Parse `--once` (default) or `--daemon --interval <dur>` from argv.
-/// `None` signals a usage error (unknown flag, `--interval` without a
-/// parsable duration, or `--once` and `--daemon` together).
-fn parse_mode() -> Option<RunMode> {
+/// Parse `--once` (default), `--daemon --interval <dur>`, or `--report` from
+/// argv. `None` signals a usage error (unknown flag, `--interval` without a
+/// parsable duration, or mutually-exclusive modes combined).
+fn parse_invocation() -> Option<Invocation> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut once = false;
     let mut daemon = false;
+    let mut report = false;
     let mut interval = DEFAULT_DAEMON_INTERVAL;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--once" => once = true,
             "--daemon" => daemon = true,
+            "--report" => report = true,
             "--interval" => {
                 i += 1;
                 interval = parse_duration(args.get(i)?)?;
@@ -64,13 +93,21 @@ fn parse_mode() -> Option<RunMode> {
         }
         i += 1;
     }
+    // --report is the stateless reporting mode; it cannot combine with the
+    // journaling modes.
+    if report && (daemon || once) {
+        return None;
+    }
+    if report {
+        return Some(Invocation::Report);
+    }
     if once && daemon {
         return None;
     }
     if daemon {
-        Some(RunMode::Daemon { interval })
+        Some(Invocation::Run(RunMode::Daemon { interval }))
     } else {
-        Some(RunMode::Once)
+        Some(Invocation::Run(RunMode::Once))
     }
 }
 

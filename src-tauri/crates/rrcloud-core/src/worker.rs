@@ -74,7 +74,7 @@ use crate::keys::{
 use crate::manifest::{get_manifest, merge as merge_manifests, Manifest, ManifestError};
 use crate::proxy::{generate_proxy_with, ProxyError, ProxyParams};
 use crate::publisher::{
-    enqueue_entry, get_device_entry, publish_pending, put_device_entry, DeviceProfile,
+    enqueue_entry_in, get_device_entry, publish_pending, put_device_entry, DeviceProfile,
     PublisherError,
 };
 use crate::reader::{poll, ReaderError};
@@ -200,6 +200,35 @@ pub enum WorkerError {
         #[source]
         source: std::io::Error,
     },
+
+    /// An adoption GET returned fewer bytes than its `Content-Length`
+    /// declared — a short read not surfaced as a transport error (a proxy
+    /// cleanly terminating a chunked body, a future HTTP/2 path). A foreign
+    /// original has no journal head to verify against, so a silent short
+    /// read would be attested + content-addressed + proxied as if whole,
+    /// yielding a wrong `content_id`/proxy and a later false `corrupt_remote`
+    /// on peers that fetch the full object. The length is asserted explicitly
+    /// and the mismatch skips that one object this cycle (never aborts it).
+    #[error(
+        "short read adopting {key}: collected {got} bytes but Content-Length declared {declared}"
+    )]
+    ShortRead {
+        /// The object key that short-read.
+        key: String,
+        /// The `Content-Length` the response declared.
+        declared: u64,
+        /// The number of bytes actually collected.
+        got: u64,
+    },
+
+    /// A test-only injected fault (only constructible when the `test-util`
+    /// feature is on — the integration suite's crash-injection point for the
+    /// atomic-adoption contract). Never constructed in a release build: the
+    /// variant and its only construction site are both `test-util`-gated, so
+    /// the shipped `rrcloud-worker` binary carries neither.
+    #[cfg(feature = "test-util")]
+    #[error("injected test fault: {0}")]
+    InjectedFault(&'static str),
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +336,27 @@ pub struct CycleOptions {
     pub compact: CompactConfig,
     /// §4.2 proxy / thumb sizes and JPEG quality.
     pub proxy: ProxyParams,
+    /// Cap on a single adopted original's buffered size, or `None` for the
+    /// production default [`MAX_ADOPT_ORIGINAL_BYTES`]. The adoption GET
+    /// buffers the whole object to blake3 it and feed `proxy.rs`; an object
+    /// past this cap (or whose body overruns it against a lying
+    /// `Content-Length`) is a [`crate::s3::S3Error::BodyCapExceeded`] that
+    /// **skips that one object** without aborting the cycle (§6 forward
+    /// progress — see [`adopt_foreign_originals`]). Tunable so an operator can
+    /// bound the adoption buffer below the 2 GiB default, and so tests can
+    /// pin a small cap to exercise the per-item isolation lane deterministically.
+    pub max_adopt_original_bytes: Option<usize>,
+    /// Test-only crash-injection point for the atomic-adoption contract.
+    /// Carried **per call** (not a process-global env var) so a fault in one
+    /// test can never race another test's adoption in the shared test
+    /// process. `Some("after_stage_before_record")` makes
+    /// [`adopt_foreign_originals`] abort its stage+record transaction after
+    /// staging the journal entries but before recording the item — modelling
+    /// a SIGKILL at exactly the window the single transaction closes. Gated
+    /// to the `test-util` feature: the shipped binary's `CycleOptions` has no
+    /// such field and no construction site can set it.
+    #[cfg(feature = "test-util")]
+    pub fault: Option<&'static str>,
 }
 
 /// What one [`run_cycle`] did — the structured log a cycle emits (§6 point
@@ -503,14 +553,24 @@ pub async fn run_cycle(worker: &Worker, opts: &CycleOptions) -> Result<CycleRepo
 
     // A read-only handle ([`Worker::open_readonly`]) does reporting only: it
     // never heartbeats, journals, publishes, or GCs, so its ephemeral
-    // identity never pollutes the device registry / §2.10 horizons (§6). Only
-    // the library listing (a pure read) runs.
+    // identity never pollutes the device registry / §2.10 horizons (§6). It
+    // may still READ: it polls every foreign prefix into its throwaway db (a
+    // pure bucket read — journal GETs applied to local state, no S3 writes)
+    // and merges gapped peers' manifests, so `foreign_originals_seen` counts
+    // only the `library/` originals with **no journal-known state** — the
+    // genuinely foreign drops, not every original already advertised by a
+    // peer or the worker.
     if worker.readonly {
-        report.foreign_originals_seen = list_library_keys(s3, bucket)
-            .await?
-            .into_iter()
-            .filter(|(key, _)| matches!(classify_key(key), KeyClass::Original { .. }))
-            .count();
+        catch_up(worker).await?;
+        let mut seen = 0usize;
+        for (key, _) in list_library_keys(s3, bucket).await? {
+            if let KeyClass::Original { relkey } = classify_key(&key) {
+                if db.get_item(&relkey)?.is_none() && db.get_deleted(&relkey)?.is_none() {
+                    seen += 1;
+                }
+            }
+        }
+        report.foreign_originals_seen = seen;
         return Ok(report);
     }
 
@@ -531,6 +591,18 @@ pub async fn run_cycle(worker: &Worker, opts: &CycleOptions) -> Result<CycleRepo
     // so we learn its advertised items instead of mistaking them for foreign
     // drops. Own prefix is skipped by `poll`.
     catch_up(worker).await?;
+
+    // (1a′) Flush any LEFTOVER staged entries from a prior crashed cycle
+    // BEFORE adopting again. Adoption (1c) now stages its journal entries and
+    // records the item in ONE transaction, so a crash can no longer leave
+    // staged-but-unrecorded adoption entries; this leading drain is the
+    // belt-and-braces cleanup for entries staged by an OLDER (pre-atomic)
+    // binary or any other lane, so they are published under our prefix as
+    // their own entries instead of commingling with (and being
+    // double-counted against) this cycle's fresh staging at (1d). A no-op on
+    // the common path (nothing pending).
+    let leftover = publish_pending(db, s3, bucket).await?;
+    report.journal_entries_published += leftover.entries;
 
     // (1b) §2.7/§6 whole-item backstop at quiescence: re-advertise any
     // original a live sidecar still references that a delete-vs-edit race
@@ -555,7 +627,7 @@ pub async fn run_cycle(worker: &Worker, opts: &CycleOptions) -> Result<CycleRepo
     // under our own prefix in one drain — a single publish point, so a poison
     // item earlier in (1c) can never strand already-staged entries unpublished.
     let published = publish_pending(db, s3, bucket).await?;
-    report.journal_entries_published = published.entries;
+    report.journal_entries_published += published.entries;
 
     // (2) Hygiene: abort stale multipart uploads (the portable mechanism —
     // ListMultipartUploads + AbortMultipartUpload, no lifecycle-rule
@@ -715,6 +787,9 @@ async fn adopt_foreign_originals(
     let bucket = worker.bucket.as_str();
     let device = db.device_id().clone();
     let now_ts = clock.now_server();
+    let cap = opts
+        .max_adopt_original_bytes
+        .unwrap_or(MAX_ADOPT_ORIGINAL_BYTES);
 
     for (key, last_modified) in list_library_keys(s3, bucket).await? {
         let relkey = match classify_key(&key) {
@@ -731,21 +806,35 @@ async fn adopt_foreign_originals(
             continue;
         }
 
-        // Foreign original: GET the bytes and derive identity.
-        let bytes = s3
-            .get_object(bucket, &key, None)
-            .await?
-            .body
-            .collect_capped(MAX_ADOPT_ORIGINAL_BYTES)
-            .await?;
+        // Foreign original: GET the bytes and derive identity. PER-ITEM
+        // ISOLATED (§6 forward progress): the fetch is the ONLY network step
+        // whose failure is per-item — a LIST-vs-GET `NoSuchKey` race, a
+        // transient 5xx, a `BodyCapExceeded` on an object past `cap`, or a
+        // short read (bytes != declared Content-Length) all LOG + SKIP this
+        // one object rather than abort the cycle. A persistent poison object
+        // (oversized/corrupt) is skipped every cycle without ever wedging the
+        // adoption of other originals, the resurrection backstop, hygiene, or
+        // §2.10 GC. A transient failure simply retries next cycle (the object
+        // was never recorded).
+        let bytes = match fetch_foreign_original(s3, bucket, &key, cap).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "rrcloud-worker: skipping {key} this cycle (adoption fetch failed, not \
+                     aborting the cycle): {e}"
+                );
+                continue;
+            }
+        };
         let blake3 = Blake3Hex::from_bytes(&bytes);
         let size = bytes.len() as u64;
         // §2.2/§3.5: carry the object's server mtime so phones materialize
-        // the stub at the real mtime, not epoch-0. The listing's
-        // `LastModified` is the server-provided timestamp.
+        // the stub at the real mtime, not epoch-0. The LIST `LastModified` is
+        // the server-provided ISO-8601 timestamp (NOT an RFC-1123 HTTP-date),
+        // so it is parsed as RFC 3339 first (see `parse_object_last_modified`).
         let mtime_unix = last_modified
             .as_deref()
-            .and_then(crate::publisher::parse_http_date)
+            .and_then(parse_object_last_modified)
             .filter(|s| *s > 0)
             .unwrap_or(0);
         let mtime_unix_ns = mtime_unix.saturating_mul(1_000_000_000);
@@ -801,7 +890,6 @@ async fn adopt_foreign_originals(
         attest.key = library_key(&relkey);
         attest.blake3 = Some(blake3.clone());
         attest.size = Some(size);
-        enqueue_entry(db, &attest)?;
 
         let mut put_original = tmpl.clone();
         put_original.op = Op::Put;
@@ -813,7 +901,11 @@ async fn adopt_foreign_originals(
 
         // The preview/thumb lane only when the proxy was generated; a
         // no-proxy original carries no `content_id` (there is no preview to
-        // address) and no dimensions.
+        // address) and no dimensions. The preview/thumb OBJECTS are PUT here
+        // (network, content-addressed → idempotent on a re-run), and the
+        // matching journal entries are collected into `extra` to be staged
+        // atomically below.
+        let mut extra: Vec<JournalEntry> = Vec::new();
         let (record_content_id, record_w, record_h) = if let Some(proxy) = proxy {
             report.proxies_generated += 1;
             let orig_w = proxy.orig_width;
@@ -861,7 +953,7 @@ async fn adopt_foreign_originals(
             put_preview.blake3 = Some(preview_hash);
             put_preview.size = Some(preview_len);
             put_preview.content_id = Some(content_id.clone());
-            enqueue_entry(db, &put_preview)?;
+            extra.push(put_preview);
 
             let mut put_thumb_small = tmpl.clone();
             put_thumb_small.op = Op::Put;
@@ -870,7 +962,7 @@ async fn adopt_foreign_originals(
             put_thumb_small.blake3 = Some(small_hash);
             put_thumb_small.size = Some(small_len);
             put_thumb_small.content_id = Some(content_id.clone());
-            enqueue_entry(db, &put_thumb_small)?;
+            extra.push(put_thumb_small);
 
             let mut put_thumb_medium = tmpl.clone();
             put_thumb_medium.op = Op::Put;
@@ -879,16 +971,13 @@ async fn adopt_foreign_originals(
             put_thumb_medium.blake3 = Some(medium_hash);
             put_thumb_medium.size = Some(medium_len);
             put_thumb_medium.content_id = Some(content_id.clone());
-            enqueue_entry(db, &put_thumb_medium)?;
+            extra.push(put_thumb_medium);
 
             (Some(content_id.clone()), Some(orig_w), Some(orig_h))
         } else {
             report.adopted_without_proxy.push(relkey.clone());
             (None, None, None)
         };
-
-        // Stage the original put last (its fields above are now final).
-        enqueue_entry(db, &put_original)?;
 
         // Record the adopted original in our own state: a re-run sees it as
         // journal-known (idempotence), and the manifest advertises it as a
@@ -918,11 +1007,81 @@ async fn adopt_foreign_originals(
             admitted_ts: None,
             deleted: false,
         };
-        db.replay_put_item(&relkey, &record)?;
+
+        // ATOMIC stage + record (crash-safe idempotence, the §6 contract):
+        // stage the attest, the preview/thumb puts, and the original put AND
+        // record the item in ONE transaction. Either all of them commit
+        // together, or none do — so a crash (SIGKILL/OOM/pod-eviction) can
+        // never leave staged-but-unrecorded adoption entries that a re-run
+        // would double-publish. The item record is the idempotence guard: if
+        // this commits, the re-run's skip-check (`get_item`) short-circuits;
+        // if it does not, nothing was staged, so the re-run re-adopts cleanly
+        // (exactly once). The preview/thumb OBJECTS were PUT above
+        // content-addressed, so re-PUTting them on a clean re-adopt is a
+        // byte-identical overwrite, never a duplicate.
+        db.with_txn_err::<(), WorkerError>(|t| {
+            enqueue_entry_in(t, &device, &attest)?;
+            for e in &extra {
+                enqueue_entry_in(t, &device, e)?;
+            }
+            enqueue_entry_in(t, &device, &put_original)?;
+            // Test-only crash-injection point: a fault raised HERE — after
+            // staging, before the record write — aborts the whole
+            // transaction (nothing staged, nothing recorded), which is the
+            // very property this single-transaction structure guarantees.
+            #[cfg(feature = "test-util")]
+            if opts.fault == Some("after_stage_before_record") {
+                return Err(WorkerError::InjectedFault("after_stage_before_record"));
+            }
+            t.replay_put_item(&relkey, &record)?;
+            Ok(())
+        })?;
         report.adopted.push(relkey);
     }
 
     Ok(())
+}
+
+/// GET a foreign original with per-item isolation (§6 forward progress): the
+/// whole body is buffered to `cap` and its length is asserted against the
+/// declared `Content-Length`. A body over `cap` (an oversized/over-length
+/// drop) is a [`S3Error::BodyCapExceeded`]; a body SHORTER than its declared
+/// length — a short read not surfaced as a transport error — is the typed
+/// [`WorkerError::ShortRead`]. A foreign original has no journal head to
+/// verify against, so the explicit length check is the only guard against
+/// attesting + content-addressing + proxying a truncated object as if whole.
+/// Every error here is caught by the caller and skips that one object.
+async fn fetch_foreign_original(
+    s3: &S3Client,
+    bucket: &str,
+    key: &str,
+    cap: usize,
+) -> Result<Bytes, WorkerError> {
+    let got = s3.get_object(bucket, key, None).await?;
+    let declared = got.content_length;
+    let bytes = got.body.collect_capped(cap).await?;
+    if bytes.len() as u64 != declared {
+        return Err(WorkerError::ShortRead {
+            key: key.to_string(),
+            declared,
+            got: bytes.len() as u64,
+        });
+    }
+    Ok(bytes)
+}
+
+/// Parse an object's server timestamp to unix seconds. A `ListObjectsV2`
+/// `LastModified` is an ISO-8601 / RFC 3339 value (e.g.
+/// `2026-10-03T13:47:23.060Z` on Garage), so RFC 3339 is tried FIRST; a
+/// HEAD/GET `Last-Modified` header (RFC-1123 IMF-fixdate) is accepted as a
+/// fallback via [`crate::publisher::parse_http_date`]. Returns `None` for an
+/// unparsable value, so the caller falls back to no mtime rather than
+/// epoch-0 masquerading as a real time.
+fn parse_object_last_modified(s: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|dt| dt.unix_timestamp())
+        .or_else(|| crate::publisher::parse_http_date(s))
 }
 
 /// One paged `ListObjectsV2` over `library/`, following continuation tokens.
