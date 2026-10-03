@@ -81,6 +81,32 @@ pub fn compute_thumbnail_cache_hash(path_str: &str, adjustments_bytes: &[u8]) ->
     Some(hasher.finalize().to_hex().to_string())
 }
 
+/// The `adjustments` component of the thumbnail cache key for `path_str`
+/// (§3.5 thumb seeding). Empty when the sidecar is absent, a cloud
+/// placeholder, or unparseable; otherwise the sidecar's serialized
+/// `adjustments` — the exact bytes `generate_single_thumbnail_and_cache`
+/// feeds `compute_thumbnail_cache_hash`. The sync thumb-seeder must key the
+/// webview-cache link with these same bytes, or an edited (sidecar-present)
+/// cloud image's seeded thumb lands under a key the grid never looks up and
+/// the grid shows no thumbnail at all.
+///
+/// Only the `sync` thumb-seeder consumes this; gated so the
+/// `--no-default-features` (upstream-parity) build does not carry it as dead
+/// code.
+#[cfg(feature = "sync")]
+pub fn thumbnail_adjustments_key_bytes(path_str: &str) -> Vec<u8> {
+    let (_source_path, sidecar_path) = parse_virtual_path(path_str);
+    if is_cloud_placeholder(&sidecar_path) {
+        return Vec::new();
+    }
+    if let Ok(content) = fs::read_to_string(&sidecar_path)
+        && let Ok(meta) = serde_json::from_str::<ImageMetadata>(&content)
+    {
+        return serde_json::to_vec(&meta.adjustments).unwrap_or_default();
+    }
+    Vec::new()
+}
+
 struct ImageFileMetadata {
     is_edited: bool,
     tags: Option<Vec<String>>,

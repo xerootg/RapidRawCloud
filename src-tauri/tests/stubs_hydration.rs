@@ -383,3 +383,200 @@ async fn seeding_a_thumb_hard_links_it_into_the_webview_cache_under_the_stub_key
         "the surfaced thumb must carry the seeded JPEG bytes"
     );
 }
+
+#[tokio::test]
+async fn concurrent_ensure_local_waits_for_the_in_flight_hydration() {
+    let _g = global_guard().await;
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("p2-hydrate-singleflight");
+    let settings = settings_for(garage, &bucket);
+    let creds = creds_for(garage);
+
+    // Device A publishes a large-enough original that the hydration download
+    // window is reliably observable.
+    let root_a = tempfile::tempdir().expect("root a");
+    let state_a = tempfile::tempdir().expect("state a");
+    let mgr_a = SyncManager::new_inert();
+    mgr_a
+        .configure(
+            settings.clone(),
+            creds.clone(),
+            root_a.path().to_path_buf(),
+            state_a.path().to_path_buf(),
+        )
+        .expect("configure a");
+    sync::install_global_manager(mgr_a.clone());
+
+    let rel = "race/BIG_0001.NEF";
+    let remote = upload_original(&mgr_a, root_a.path(), rel, &original_bytes(29, 20 * 1024 * 1024)).await;
+
+    // Device B makes a stub.
+    let root_b = tempfile::tempdir().expect("root b");
+    let state_b = tempfile::tempdir().expect("state b");
+    let mgr_b = SyncManager::new_inert();
+    mgr_b
+        .configure(
+            settings,
+            creds,
+            root_b.path().to_path_buf(),
+            state_b.path().to_path_buf(),
+        )
+        .expect("configure b");
+    sync::install_global_manager(mgr_b.clone());
+
+    let stub_path = root_b.path().join(rel);
+    std::fs::create_dir_all(stub_path.parent().unwrap()).expect("mkdir stub dir");
+    mgr_b
+        .create_stub(
+            &stub_path,
+            &remote.blake3_hex,
+            remote.size,
+            remote.mtime_unix,
+        )
+        .expect("create stub");
+
+    // Thread A drives the real hydration.
+    let mgr_thread = mgr_b.clone();
+    let stub_thread = stub_path.clone();
+    let handle = std::thread::spawn(move || mgr_thread.ensure_local(&stub_thread, "thread-a"));
+
+    // Observe the in-flight `downloading` window, then race a second
+    // ensure_local into it. download_item refuses an item already Downloading
+    // with a typed StaleState (the single-driver contract); the manager must
+    // treat that as "already in flight" and WAIT, not surface a hard failure.
+    let mut observed_downloading = false;
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(60) {
+        match mgr_b.item_sync_state(&stub_path).as_deref() {
+            Some("downloading") => {
+                observed_downloading = true;
+                break;
+            }
+            // Thread A already reached a terminal state — window missed.
+            Some("hydrated") | Some("synced") => break,
+            _ => {}
+        }
+        std::thread::sleep(std::time::Duration::from_micros(200));
+    }
+
+    let concurrent = mgr_b.ensure_local(&stub_path, "concurrent");
+    let a_result = handle.join().expect("thread A join");
+
+    a_result.expect("thread A hydration must succeed");
+    assert!(
+        observed_downloading,
+        "the test must observe the in-flight download window to exercise the race"
+    );
+    assert!(
+        concurrent.is_ok(),
+        "a concurrent ensure_local during an in-flight hydration must wait for it, \
+         not hard-fail with StaleState: {concurrent:?}"
+    );
+    assert!(
+        !mgr_b.is_stub(&stub_path),
+        "the path is hydrated after both callers return"
+    );
+    assert_eq!(
+        std::fs::read(&stub_path).expect("read hydrated"),
+        remote.bytes,
+        "the hydrated bytes must match the remote original"
+    );
+}
+
+#[tokio::test]
+async fn seeding_an_edited_stub_keys_the_thumb_where_the_grid_looks_it_up() {
+    let _g = global_guard().await;
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("p2-thumb-seed-edited");
+    let settings = settings_for(garage, &bucket);
+    let creds = creds_for(garage);
+
+    let root_a = tempfile::tempdir().expect("root a");
+    let state_a = tempfile::tempdir().expect("state a");
+    let mgr_a = SyncManager::new_inert();
+    mgr_a
+        .configure(
+            settings.clone(),
+            creds.clone(),
+            root_a.path().to_path_buf(),
+            state_a.path().to_path_buf(),
+        )
+        .expect("configure a");
+    sync::install_global_manager(mgr_a.clone());
+
+    let rel = "seed/THM_EDITED.NEF";
+    let remote = upload_original(&mgr_a, root_a.path(), rel, &original_bytes(13, 16 * 1024)).await;
+
+    let root_b = tempfile::tempdir().expect("root b");
+    let state_b = tempfile::tempdir().expect("state b");
+    let mgr_b = SyncManager::new_inert();
+    mgr_b
+        .configure(
+            settings,
+            creds,
+            root_b.path().to_path_buf(),
+            state_b.path().to_path_buf(),
+        )
+        .expect("configure b");
+    sync::install_global_manager(mgr_b.clone());
+
+    let stub_path = root_b.path().join(rel);
+    std::fs::create_dir_all(stub_path.parent().unwrap()).expect("mkdir stub dir");
+    mgr_b
+        .create_stub(
+            &stub_path,
+            &remote.blake3_hex,
+            remote.size,
+            remote.mtime_unix,
+        )
+        .expect("create stub");
+
+    // §3.5: sidecars are never stubbed — an edited cloud image has its real
+    // sidecar on disk. Write an EDITED sidecar (non-default adjustments) next
+    // to the stub, exactly as the eager sidecar mirror would.
+    let sidecar = {
+        let mut s = stub_path.clone().into_os_string();
+        s.push(".rrdata");
+        std::path::PathBuf::from(s)
+    };
+    let sidecar_json =
+        r#"{"version":1,"rating":3,"adjustments":{"contrast":12.0,"exposure":0.75}}"#;
+    std::fs::write(&sidecar, sidecar_json).expect("write edited sidecar");
+
+    let cache_thumbnails = tempfile::tempdir().expect("cache thumbs");
+    let jpeg = original_bytes(201, 4096);
+    let linked = mgr_b
+        .seed_thumbnail(
+            &stub_path,
+            ThumbVariant::Small,
+            &jpeg,
+            cache_thumbnails.path(),
+        )
+        .expect("seed thumbnail");
+
+    // The key `generate_single_thumbnail_and_cache` looks up for an edited
+    // image: stub path + mtime + the sidecar's serialized adjustments (§3.5
+    // "the exact key generate_single_thumbnail_and_cache looks up"). The
+    // seeded durable thumb must be surfaced under exactly that key, or the
+    // grid gets a permanent cache miss and no thumbnail at all.
+    let content = std::fs::read_to_string(&sidecar).expect("read sidecar");
+    let meta: sync::ImageMetadata = serde_json::from_str(&content).expect("parse sidecar");
+    let adjustments = serde_json::to_vec(&meta.adjustments).expect("serialize adjustments");
+    let expected_hash =
+        sync::compute_thumbnail_cache_hash(&stub_path.to_string_lossy(), &adjustments)
+            .expect("expected cache hash");
+    let expected_name = format!("{expected_hash}_small.jpg");
+
+    assert_eq!(
+        linked.file_name().unwrap().to_string_lossy(),
+        expected_name,
+        "an edited stub's seeded thumb must be keyed where the grid looks it up \
+         (adjustments-keyed), not under the empty-adjustments key"
+    );
+}

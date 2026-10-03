@@ -193,6 +193,23 @@ impl SyncManager {
         #[cfg(feature = "sync")]
         {
             let configured = imp::Configured::open(settings, creds, sync_root, state_dir)?;
+            // Rebuild the in-memory stub mirror from the durable redb records
+            // this `Configured` just reopened (§3.5): the mirror is written
+            // only in-process by create_stub/ensure_local/run_evictor, so
+            // without this seeding every stub persisted by a previous process
+            // would read as a non-stub after restart and every guard site
+            // would touch the 0-byte placeholder as content.
+            let stubs = configured.stub_paths()?;
+            {
+                let mut set = self
+                    .stub_set
+                    .lock()
+                    .map_err(|_| SyncError::msg("sync manager stub_set lock poisoned"))?;
+                // This `configure` binds a fresh engine on `state_dir`, so the
+                // mirror must reflect exactly that redb — start clean.
+                set.clear();
+                set.extend(stubs);
+            }
             let mut guard = self
                 .inner
                 .lock()
@@ -544,10 +561,12 @@ impl SyncManager {
     /// durably under `app_data_dir/rrcloud/thumbs/<content_id>_<variant>.jpg`
     /// and surfaces it to the webview by hard-linking (copy fallback) into
     /// `cache_thumbnails_dir/<hash>_<variant>.jpg`, where `<hash>` is the
-    /// stub-path thumbnail cache key — so the existing asset-protocol scope
-    /// (`$APPCACHE/thumbnails/*`) and `tauri.conf.json` stay untouched.
-    /// Returns the cache path that was linked. Emits `thumbnail-generated`
-    /// so the existing UI picks it up.
+    /// exact thumbnail cache key `generate_single_thumbnail_and_cache` looks
+    /// up (path + mtime + current adjustments) — so the existing
+    /// asset-protocol scope (`$APPCACHE/thumbnails/*`) and `tauri.conf.json`
+    /// stay untouched. Returns the cache path that was linked. It does **not**
+    /// emit `thumbnail-generated`: the §3.5 apply loop that fires that event
+    /// after seeding is wired in the next unit (this fn takes no `AppHandle`).
     pub fn seed_thumbnail(
         &self,
         image_path: &Path,
@@ -626,9 +645,9 @@ mod imp {
     use rrcloud_core::semhash::Blake3Hex;
     use rrcloud_core::state::{ItemRecord, ItemState, StateError, SyncDb};
     use rrcloud_core::transfer::{
-        BackendProfile, CancelFlag, ExpectedDownload, TransferConfig, bucket_key_for,
-        download_item, local_target_path, probe_backend, pump_downloads, pump_uploads,
-        stored_backend_profile,
+        BackendProfile, CancelFlag, ExpectedDownload, TransferConfig, TransferError,
+        bucket_key_for, download_item, local_target_path, probe_backend, pump_downloads,
+        pump_uploads, stored_backend_profile,
     };
 
     use super::{EvictionReport, SyncError, SyncState, SyncStatus, ThumbVariant};
@@ -639,6 +658,33 @@ mod imp {
     /// Transfer concurrency per lane (§2.4 / §3.3). Small and fixed: the
     /// desktop app is not the bulk worker.
     const TRANSFER_CONCURRENCY: usize = 2;
+
+    /// How long a hydration that loses the single-driver race will wait for
+    /// the in-flight transfer owning the item to finish before giving up and
+    /// driving the download itself (§3.5). Generous: a guard-site hydration of
+    /// a multi-tens-of-MB original over flaky mobile can legitimately take a
+    /// while, and the winning downloader has no shorter bound either.
+    const HYDRATE_INFLIGHT_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// The result of one `download_item` attempt inside [`Configured::hydrate`].
+    enum HydrateOutcome {
+        /// This call installed the verified bytes; its path.
+        Installed(PathBuf),
+        /// Another driver owns the live transfer (`download_item` refused with
+        /// `StaleState{found: Downloading}`); the caller must wait, not fail.
+        InFlight,
+    }
+
+    /// The result of [`Configured::wait_for_hydrated`].
+    enum WaitOutcome {
+        /// The in-flight transfer finished; the bytes are installed.
+        Hydrated,
+        /// The in-flight transfer condemned the remote as corrupt.
+        Corrupt,
+        /// The owner released the item to a retryable state (or the wait
+        /// deadline passed); the caller should drive the download itself.
+        Released,
+    }
 
     /// Maps any displayable engine error into a [`SyncError`].
     fn se<E: std::fmt::Display>(e: E) -> SyncError {
@@ -1009,46 +1055,148 @@ mod imp {
                 mtime_unix: record.mtime_unix_ns.div_euclid(1_000_000_000),
             };
 
-            // The resumable ranged GET + blake3 verify + atomic install +
-            // mtime restore + `Stub → Downloading → Hydrated` terminal commit
-            // is the transfer engine's `download_item` (§3.5). Run it on a
-            // dedicated-thread runtime so a guard site already inside the
-            // app's runtime does not panic on a nested `block_on`.
-            let db = self.db.clone();
-            let s3 = self.s3.clone();
-            let bucket = self.bucket.clone();
-            let root = self.sync_root.clone();
-            let rk_dl = rk.clone();
-            let installed = run_blocking(async move {
-                let backend = resolve_backend(&db, s3.as_ref(), &bucket).await?;
-                let cfg = TransferConfig::new(bucket, root.clone(), backend);
-                let outcome = download_item(&db, s3.as_ref(), &cfg, &rk_dl, &root, &expected)
-                    .await
+            // Single-flight per relkey (§3.5 / `download_item`'s single-driver
+            // contract): the transfer engine refuses an item already
+            // `Downloading` with a typed `StaleState` so a second writer never
+            // races onto the live `.rr.part` partial. A guard site that loses
+            // that race — a concurrent `ensure_local` for the same stub, or
+            // the background download pump that already owns the transfer —
+            // must treat it as "already in flight: WAIT", not surface it as a
+            // hard failure to the guarded command (the module docs spell this
+            // out). So on `StaleState{found: Downloading}` we wait for the
+            // in-flight transfer to reach a terminal state and adopt its
+            // installed bytes, rather than erroring.
+            let final_path = local_target_path(&self.sync_root, &rk, record.kind);
+            let deadline = std::time::Instant::now() + HYDRATE_INFLIGHT_WAIT;
+            let (installed, we_installed) = loop {
+                // Another driver may have finished since the initial read;
+                // adopt a terminal result without re-downloading.
+                let cur = self
+                    .db
+                    .get_item(&rk)
+                    .map_err(se)?
+                    .ok_or_else(|| se("hydrate: item record vanished"))?;
+                if matches!(cur.state, ItemState::Hydrated | ItemState::Synced) {
+                    break (final_path.clone(), false);
+                }
+
+                // The resumable ranged GET + blake3 verify + atomic install +
+                // mtime restore + `Stub → Downloading → Hydrated` terminal
+                // commit is the transfer engine's `download_item` (§3.5). Run
+                // it on a dedicated-thread runtime so a guard site already
+                // inside the app's runtime does not panic on a nested
+                // `block_on`. An `InFlight` outcome means another driver owns
+                // the live transfer.
+                let db = self.db.clone();
+                let s3 = self.s3.clone();
+                let bucket = self.bucket.clone();
+                let root = self.sync_root.clone();
+                let rk_dl = rk.clone();
+                let expected_dl = expected.clone();
+                let outcome = run_blocking(async move {
+                    let backend = resolve_backend(&db, s3.as_ref(), &bucket).await?;
+                    let cfg = TransferConfig::new(bucket, root.clone(), backend);
+                    match download_item(&db, s3.as_ref(), &cfg, &rk_dl, &root, &expected_dl).await {
+                        Ok(o) => Ok::<HydrateOutcome, SyncError>(HydrateOutcome::Installed(o.path)),
+                        Err(TransferError::State(StateError::StaleState {
+                            found: Some(ItemState::Downloading),
+                            ..
+                        })) => Ok(HydrateOutcome::InFlight),
+                        Err(e) => Err(se(e)),
+                    }
+                })?;
+
+                match outcome {
+                    HydrateOutcome::Installed(path) => break (path, true),
+                    HydrateOutcome::InFlight => {
+                        // Wait for the owning transfer to finish, then adopt.
+                        match self.wait_for_hydrated(&rk, deadline)? {
+                            WaitOutcome::Hydrated => break (final_path.clone(), false),
+                            WaitOutcome::Corrupt => {
+                                return Err(se(
+                                    "hydrate: the in-flight transfer marked the remote corrupt",
+                                ));
+                            }
+                            // The owner released the item to a retryable state
+                            // (transport blip); we take over and drive it —
+                            // unless we are out of time.
+                            WaitOutcome::Released => {
+                                if std::time::Instant::now() >= deadline {
+                                    return Err(se(
+                                        "hydrate: timed out waiting for an in-flight hydration",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            if we_installed {
+                // Hydration verified the bytes against the journal head, so
+                // this device can attest the current version and gate its own
+                // future eviction without a read-back (§3.5). Bump the LRU
+                // stamp.
+                let attested_record = self
+                    .db
+                    .update_item(&rk, ItemState::Hydrated, |r| {
+                        r.verified_remote = true;
+                        r.attested = true;
+                        r.last_access_unix = access_stamp();
+                    })
                     .map_err(se)?;
-                Ok::<PathBuf, SyncError>(outcome.path)
-            })?;
 
-            // Hydration verified the bytes against the journal head, so this
-            // device can attest the current version and gate its own future
-            // eviction without a read-back (§3.5). Bump the LRU stamp.
-            let attested_record = self
-                .db
-                .update_item(&rk, ItemState::Hydrated, |r| {
-                    r.verified_remote = true;
-                    r.attested = true;
-                    r.last_access_unix = access_stamp();
-                })
-                .map_err(se)?;
-
-            // Emit the `attest` journal entry (§2.2/§3.5). Best-effort: a
-            // staging failure must not fail a successful hydration — the
-            // durable `attested` flag above is the eviction gate; the journal
-            // entry additionally advertises the attestation to peers.
-            if let Err(e) = self.stage_attest(&rk, &attested_record) {
-                log::warn!("hydrate: stage attest for {}: {e}", image_path.display());
+                // Emit the `attest` journal entry (§2.2/§3.5). Best-effort: a
+                // staging failure must not fail a successful hydration — the
+                // durable `attested` flag above is the eviction gate; the
+                // journal entry additionally advertises the attestation.
+                if let Err(e) = self.stage_attest(&rk, &attested_record) {
+                    log::warn!("hydrate: stage attest for {}: {e}", image_path.display());
+                }
+            } else {
+                // Adopted another driver's freshly-installed bytes. That driver
+                // runs its own attest; we only bump our LRU access stamp so a
+                // later eviction treats this guard-site touch as a recent use.
+                // Best-effort: a concurrent transition must not fail hydration.
+                let cur = self.db.get_item(&rk).map_err(se)?;
+                if let Some(cur) = cur {
+                    let _ = self.db.update_item(&rk, cur.state, |r| {
+                        r.last_access_unix = access_stamp();
+                    });
+                }
             }
 
             Ok(installed)
+        }
+
+        /// Blocks until the in-flight transfer for `rk` reaches a terminal
+        /// state, the owner releases it back to a retryable state, or
+        /// `deadline` passes (§3.5 single-flight wait). Polls the durable
+        /// record; the transfer engine commits each state edge, so a reader
+        /// observes the transition without holding any transfer lock.
+        fn wait_for_hydrated(
+            &self,
+            rk: &RelKey,
+            deadline: std::time::Instant,
+        ) -> Result<WaitOutcome, SyncError> {
+            loop {
+                match self.db.get_item(rk).map_err(se)?.map(|r| r.state) {
+                    Some(ItemState::Hydrated | ItemState::Synced) => {
+                        return Ok(WaitOutcome::Hydrated);
+                    }
+                    Some(ItemState::CorruptRemote) => return Ok(WaitOutcome::Corrupt),
+                    // Still owned by the live transfer: keep waiting (bounded).
+                    Some(ItemState::Downloading) => {
+                        if std::time::Instant::now() >= deadline {
+                            return Ok(WaitOutcome::Released);
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    // Any other (Stub / PendingDown / …): the owner released
+                    // it without finishing — we take over and drive it.
+                    _ => return Ok(WaitOutcome::Released),
+                }
+            }
         }
 
         /// Stages an `attest` journal entry for the current head of `rk`
@@ -1295,9 +1443,12 @@ mod imp {
 
             // 1. Durable app-data store: `app_data_dir/rrcloud/thumbs/` is
             //    the redb's own directory (`state_dir`, §3.6). The canonical
-            //    name keys on the content identity when known (survives a
-            //    path move), else on the stub's relkey. This store is *not*
-            //    the OS-clearable cache (§3.5 D1 fix).
+            //    name keys on the content identity when known — the `<content_id>`
+            //    scheme of §1.2, used verbatim (it is already hex `blake3(file
+            //    bytes)`, so it must NOT be re-hashed) so a move/rename reuses
+            //    the content-keyed thumb — else on the stub's relkey (no
+            //    content_id yet). This store is *not* the OS-clearable cache
+            //    (§3.5 D1 fix).
             let store_dir = self
                 .db
                 .path()
@@ -1312,9 +1463,9 @@ mod imp {
                     .map_err(se)?
                     .and_then(|r| r.content_id)
                 {
-                    Some(cid) => Blake3Hex::from_bytes(cid.as_str().as_bytes())
-                        .as_str()
-                        .to_string(),
+                    // §1.2: the thumb store key IS the content_id (already a
+                    // hex blake3 of the original bytes), not a re-hash of it.
+                    Some(cid) => cid.as_str().to_string(),
                     None => Blake3Hex::from_bytes(rk.as_str().as_bytes())
                         .as_str()
                         .to_string(),
@@ -1328,13 +1479,19 @@ mod imp {
 
             // 2. Surface it to the webview by hard-linking (copy fallback)
             //    into `$APPCACHE/thumbnails/<hash>_<suffix>.jpg`, where
-            //    `<hash>` is the exact stub-path cache key
-            //    `generate_single_thumbnail_and_cache` looks up — stub mtime
-            //    + no local adjustments — so the asset-protocol scope and
-            //    `tauri.conf.json` stay untouched (§3.5).
+            //    `<hash>` is the exact cache key
+            //    `generate_single_thumbnail_and_cache` looks up: the stub's
+            //    path + mtime + the **current adjustments** (§3.5). Sidecars
+            //    are never stubbed, so an edited cloud image has its real
+            //    sidecar on disk; keying with empty adjustments here would
+            //    land the thumb under a key the grid never looks up (orphaned
+            //    thumb, permanent cache miss). The asset-protocol scope and
+            //    `tauri.conf.json` stay untouched.
             let path_str = image_path.to_string_lossy();
-            let hash = crate::file_management::compute_thumbnail_cache_hash(&path_str, b"")
-                .ok_or_else(|| se("seed_thumbnail: cannot compute stub thumbnail cache key"))?;
+            let adjustments = crate::file_management::thumbnail_adjustments_key_bytes(&path_str);
+            let hash =
+                crate::file_management::compute_thumbnail_cache_hash(&path_str, &adjustments)
+                    .ok_or_else(|| se("seed_thumbnail: cannot compute thumbnail cache key"))?;
             std::fs::create_dir_all(cache_thumbnails_dir).map_err(se)?;
             let linked = cache_thumbnails_dir.join(format!("{hash}_{suffix}.jpg"));
             // Replace any stale link/file at the key first.
@@ -1344,6 +1501,25 @@ mod imp {
                 std::fs::copy(&durable, &linked).map_err(se)?;
             }
             Ok(linked)
+        }
+
+        /// The absolute local paths of every durable `ItemState::Stub`
+        /// original record (§3.5). `configure`/`open` call this to rebuild the
+        /// manager's in-memory `stub_set` mirror on process start, so a stub
+        /// persisted by a previous run is recognized again. Without it,
+        /// `is_stub`/`is_cloud_placeholder` answer `false` for every persisted
+        /// stub after a restart and every §3.5 guard site reads (or copies)
+        /// the 0-byte stub as content — the "mirror of redb" the doc promises
+        /// is only ever written in-process, never read back on load.
+        pub fn stub_paths(&self) -> Result<Vec<PathBuf>, SyncError> {
+            let mut out = Vec::new();
+            for (rk, record) in self.db.iter_items().map_err(se)? {
+                if record.deleted || record.state != ItemState::Stub {
+                    continue;
+                }
+                out.push(local_target_path(&self.sync_root, &rk, record.kind));
+            }
+            Ok(out)
         }
 
         /// Read-only query of an item's current state as a snake_case string
