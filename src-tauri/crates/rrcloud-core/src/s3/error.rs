@@ -35,10 +35,12 @@ pub enum S3ErrorCode {
     InvalidPartOrder,
     /// A non-final part was smaller than the minimum allowed part size.
     EntityTooSmall,
-    /// A conditional request (`If-Match` etc.) failed. The client does not
-    /// yet send conditional headers (future work for §2.6 conflict
-    /// handling), so today this is only reachable via the synthesized
-    /// body-less 412 mapping or a proxy-injected condition.
+    /// A conditional request failed: the one conditional header the client
+    /// sends is `If-None-Match: *` on
+    /// [`crate::s3::PutObjectOptions::fail_if_exists`] (§2.6/§2.9 meta
+    /// document first-publisher race), which fails this way when the key
+    /// already has an object. Also reachable via the synthesized body-less
+    /// 412 mapping on a `HEAD`.
     PreconditionFailed,
     /// The requested `Range` cannot be satisfied (HTTP 416) — e.g. a resume
     /// offset at or past the current object length after a remote rewrite.
@@ -201,6 +203,13 @@ impl S3Error {
     /// `true` when this is an API error with code `NoSuchBucket`.
     pub fn is_no_such_bucket(&self) -> bool {
         self.code() == Some(&S3ErrorCode::NoSuchBucket)
+    }
+
+    /// `true` when this is an API error with code `PreconditionFailed` —
+    /// the response to a [`crate::s3::PutObjectOptions::fail_if_exists`]
+    /// PUT whose key already had an object.
+    pub fn is_precondition_failed(&self) -> bool {
+        self.code() == Some(&S3ErrorCode::PreconditionFailed)
     }
 }
 

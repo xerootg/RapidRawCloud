@@ -86,6 +86,7 @@ async fn put_get_head_delete_roundtrip_with_metadata() {
         content_md5: Some(md5_b64(&body)),
         content_type: Some("application/octet-stream".to_string()),
         metadata: meta(&[("rr-blake3", "0123abcd"), ("rr-origin", "conformance")]),
+        ..PutObjectOptions::default()
     };
     let put = client
         .put_object(&bucket, "dir/item.bin", body.clone(), &opts)

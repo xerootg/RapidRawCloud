@@ -8,7 +8,8 @@ use std::path::Path;
 use rrcloud_core::clock::{DeviceId, VersionVector};
 use rrcloud_core::journal::Kind;
 use rrcloud_core::meta::{
-    canonical, decide_meta, localize, relativize, MetaDecision, MetaHead, MetaKind, RR_SCHEME,
+    canonical, decide_meta, localize, merge_out_of_root, relativize, MetaDecision, MetaHead,
+    MetaKind, RR_SCHEME,
 };
 use rrcloud_core::semhash::Blake3Hex;
 
@@ -234,6 +235,66 @@ fn localize_albums_maps_rr_back_to_this_device_root() {
 }
 
 #[test]
+fn merge_out_of_root_restores_local_only_album_membership_after_adopt() {
+    // The device's own prior local file: album "a1" has one in-root image
+    // and one out-of-root image the uploaded copy never carried.
+    let old_local = serde_json::to_vec(&serde_json::json!([
+        {
+            "type": "album", "id": "a1", "name": "Trip", "icon": null,
+            "images": ["/rootA/trip/a.jpg", "/somewhere/else/c.jpg"]
+        }
+    ]))
+    .unwrap();
+    // A peer's adopted-and-localized remote: same album, gained an extra
+    // in-root image, but (correctly) has never seen the out-of-root one.
+    let new_localized = serde_json::to_vec(&serde_json::json!([
+        {
+            "type": "album", "id": "a1", "name": "Trip", "icon": null,
+            "images": ["/rootA/trip/a.jpg", "/rootA/trip/b.jpg"]
+        }
+    ]))
+    .unwrap();
+    let merged = merge_out_of_root(
+        MetaKind::Albums,
+        Some(&old_local),
+        &new_localized,
+        Path::new("/rootA"),
+    )
+    .expect("merge");
+    assert_eq!(
+        all_album_images(&merged),
+        vec![
+            "/rootA/trip/a.jpg".to_string(),
+            "/rootA/trip/b.jpg".to_string(),
+            "/somewhere/else/c.jpg".to_string(),
+        ],
+        "the remote's new in-root image is kept AND the device's own \
+         out-of-root image survives the adopt"
+    );
+
+    // Idempotent: merging again (e.g. a second consecutive AdoptRemote)
+    // does not duplicate the restored entry.
+    let merged_again = merge_out_of_root(
+        MetaKind::Albums,
+        Some(&old_local),
+        &merged,
+        Path::new("/rootA"),
+    )
+    .expect("merge again");
+    assert_eq!(all_album_images(&merged_again), all_album_images(&merged));
+}
+
+#[test]
+fn merge_out_of_root_is_noop_with_no_prior_local_copy() {
+    let new_localized = relativize(MetaKind::Albums, &albums_doc(), Path::new("/rootA"))
+        .and_then(|rel| localize(MetaKind::Albums, &rel, Path::new("/dev2")))
+        .expect("prep localized doc");
+    let merged = merge_out_of_root(MetaKind::Albums, None, &new_localized, Path::new("/dev2"))
+        .expect("merge with no prior local");
+    assert_eq!(merged, new_localized);
+}
+
+#[test]
 fn presets_lutpath_relativizes_in_root_and_drops_out_of_root() {
     let out =
         relativize(MetaKind::Presets, &presets_doc(), Path::new("/rootA")).expect("relativize");
@@ -294,9 +355,12 @@ fn decide_meta_converged_on_equal_vv() {
 
 #[test]
 fn decide_meta_adopts_dominating_remote_and_keeps_dominating_local() {
-    let doc = albums_doc();
-    let lo = head(&[(DEV_A, 1)], 10, DEV_A, &doc);
-    let hi = head(&[(DEV_A, 2)], 20, DEV_A, &doc);
+    // Distinct content on each side (the real-world shape of a dominating
+    // version: a later edit actually changed something) — §2.6 case 1's
+    // content-equality fast path must not mask the vv-order outcome this
+    // test isolates.
+    let lo = head(&[(DEV_A, 1)], 10, DEV_A, &albums_doc());
+    let hi = head(&[(DEV_A, 2)], 20, DEV_A, &presets_doc());
     assert_eq!(decide_meta(&lo, &hi), MetaDecision::AdoptRemote);
     assert_eq!(decide_meta(&hi, &lo), MetaDecision::KeepLocal);
 }
@@ -317,5 +381,29 @@ fn decide_meta_concurrent_picks_deterministic_winner() {
     assert_eq!(
         decide_meta(&remote, &local),
         MetaDecision::Conflict { remote_wins: false },
+    );
+}
+
+#[test]
+fn decide_meta_concurrent_vv_with_identical_content_converges() {
+    // §2.6 case 1: "remote.vv == local.vv OR remote.sem_hash == local.sem_hash
+    // → converged" applies regardless of vv order. Two devices that
+    // independently produce the SAME bytes (e.g. both create the same
+    // default/empty document on first run) must never be flagged as a
+    // conflict just because their vvs happen to be concurrent — doing so
+    // writes a spurious, permanent conflict-loser object for content that
+    // never actually diverged.
+    let doc = albums_doc();
+    let local = head(&[(DEV_A, 1)], 100, DEV_A, &doc);
+    let remote = head(&[(DEV_B, 1)], 200, DEV_B, &doc);
+    assert_eq!(
+        decide_meta(&local, &remote),
+        MetaDecision::Converged,
+        "identical content under a concurrent vv must converge, not conflict"
+    );
+    assert_eq!(
+        decide_meta(&remote, &local),
+        MetaDecision::Converged,
+        "symmetric: the same holds with sides swapped"
     );
 }

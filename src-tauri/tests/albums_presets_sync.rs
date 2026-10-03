@@ -90,6 +90,38 @@ impl Device {
         std::fs::write(path, bytes).expect("write meta doc");
         self.mgr.note_local_meta(kind, path);
     }
+
+    /// Simulates a process restart: drops this device's live manager
+    /// (releasing its redb handle — required before reopening the same
+    /// `state.redb`) and returns a fresh one pointed at the SAME app-data
+    /// dir / sync root. Whatever was only ever in that process's memory is
+    /// gone; whatever was durably persisted survives.
+    fn restart(self, garage: &garage::Garage, bucket: &str) -> Device {
+        let Device {
+            _app_data,
+            app_data_dir,
+            _root,
+            sync_root,
+            mgr,
+        } = self;
+        drop(mgr);
+        let state_dir = app_data_dir.join("rrcloud");
+        let mgr = SyncManager::new_inert();
+        mgr.configure(
+            settings_for(garage, bucket),
+            creds_for(garage),
+            sync_root.clone(),
+            state_dir,
+        )
+        .expect("reconfigure device after simulated restart");
+        Device {
+            _app_data,
+            app_data_dir,
+            _root,
+            sync_root,
+            mgr,
+        }
+    }
 }
 
 /// Every key in `bucket` under `prefix`, sorted.
@@ -374,5 +406,158 @@ async fn concurrent_album_edits_converge_to_one_winner_and_one_recoverable_loser
         got,
         ["FromA".to_string(), "FromB".to_string()],
         "the winner and the recoverable loser together preserve both devices' edits"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_first_publishers_recover_on_next_appearance_after_restart() {
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run the race-recovery test");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("albums-race-restart");
+    let a = device(garage, &bucket);
+    let b = device(garage, &bucket);
+
+    // Both devices save a DISTINCT album while NEITHER has ever polled —
+    // each believes it is the first publisher of albums.json.
+    let doc_a = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "fa", "name": "FromA", "icon": null,
+          "images": [a.sync_root.join("a.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    let doc_b = serde_json::to_vec(&serde_json::json!([
+        { "type": "album", "id": "fb", "name": "FromB", "icon": null,
+          "images": [b.sync_root.join("b.jpg").to_string_lossy()] }
+    ]))
+    .unwrap();
+    a.save_meta(MetaKind::Albums, &a.albums_path(), &doc_a);
+    b.save_meta(MetaKind::Albums, &b.albums_path(), &doc_b);
+
+    // Race the two "first publish" cycles directly against each other. A
+    // bare client-side retry cannot always out-race a second device writing
+    // to the very same shared key with no conditional-PUT guarantee from
+    // the backend to lean on (verified empirically: Garage v2.2.0 answers
+    // 2xx to a PUT with `If-None-Match: *` regardless of whether the key
+    // already has an object) — so this may, rarely, still leave the race
+    // itself undetected by either side in the same instant.
+    let (ra, rb) = tokio::join!(a.mgr.run_once(), b.mgr.run_once());
+    ra.expect("A's racing cycle");
+    rb.expect("B's racing cycle");
+
+    // The scenario the finding actually describes: whichever device lost
+    // the race goes offline immediately afterward — a process exit, not
+    // just "the same still-running manager happens to poll again" — and
+    // later comes back (a fresh process, same on-disk state). Each
+    // device's own authored head must have survived that restart, so its
+    // very next appearance deterministically resolves the conflict,
+    // without relying on the original racing processes staying alive or on
+    // winning a timing race a second time.
+    let a = a.restart(garage, &bucket);
+    let b = b.restart(garage, &bucket);
+    a.mgr.run_once().await.expect("A's post-restart cycle");
+    b.mgr.run_once().await.expect("B's post-restart cycle");
+
+    let client = garage.client();
+    let meta_keys = keys_under(&client, &bucket, ".rrcloud/v1/meta/").await;
+    assert!(
+        meta_keys.iter().any(|k| k == ".rrcloud/v1/meta/albums.json"),
+        "albums.json must exist after recovery, got {meta_keys:?}"
+    );
+    let live = get_bytes(&client, &bucket, ".rrcloud/v1/meta/albums.json").await;
+    let live_names = album_names(&live);
+    assert_eq!(live_names.len(), 1, "exactly one album is live");
+
+    let conflict_keys: Vec<&String> = meta_keys
+        .iter()
+        .filter(|k| k.starts_with(".rrcloud/v1/meta/albums.conflict-") && k.ends_with(".json"))
+        .collect();
+    // The core guarantee this test exists to prove: the losing edit is
+    // NEVER silently gone without a trace once each device has appeared
+    // again after the race — at least one recoverable copy of it must
+    // exist. (A fully adversarial same-instant race with no conditional-PUT
+    // backend support can, rarely, leave more than one superseded-snapshot
+    // copy rather than the single deterministic one a non-racing §2.6
+    // resolution produces — still fully recoverable, never a silent loss,
+    // just not a hard single-copy guarantee under true simultaneous
+    // multi-way racing against a backend with no compare-and-swap.)
+    assert!(
+        !conflict_keys.is_empty(),
+        "the losing edit must be recoverable as at least one conflict-loser object \
+         once each device has appeared again after the race, got {meta_keys:?}"
+    );
+
+    let mut all_names = vec![live_names[0].clone()];
+    for key in &conflict_keys {
+        let loser_bytes = get_bytes(&client, &bucket, key).await;
+        all_names.extend(album_names(&loser_bytes));
+    }
+    all_names.sort();
+    all_names.dedup();
+    assert_eq!(
+        all_names,
+        vec!["FromA".to_string(), "FromB".to_string()],
+        "both devices' edits are preserved between the live doc and the \
+         conflict-loser copies, got {meta_keys:?}"
+    );
+}
+
+#[tokio::test]
+async fn adopt_remote_preserves_this_devices_out_of_root_album_membership() {
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run the adopt-merge test");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("albums-adopt-merge");
+    let a = device(garage, &bucket);
+    let b = device(garage, &bucket);
+
+    // A publishes an album with one in-root image and one out-of-root
+    // image (the upload drops the out-of-root one; A's local copy keeps it).
+    let in1 = a.sync_root.join("trip").join("a.jpg");
+    let outside = Path::new("/not/under/the/sync/root/z.jpg");
+    let doc_a = serde_json::to_vec(&serde_json::json!([
+        {
+            "type": "album", "id": "al1", "name": "Trip", "icon": null,
+            "images": [in1.to_string_lossy(), outside.to_string_lossy()]
+        }
+    ]))
+    .unwrap();
+    a.save_meta(MetaKind::Albums, &a.albums_path(), &doc_a);
+    a.mgr.run_once().await.expect("A publishes");
+
+    // B adopts (a plain, non-conflicting AdoptRemote — B never touched
+    // albums.json before this), then makes an ordinary descendant edit
+    // (adds another in-root image) and republishes it.
+    b.mgr.run_once().await.expect("B adopts");
+    let b_doc = std::fs::read(b.albums_path()).expect("B local after adopt");
+    let mut v: serde_json::Value = serde_json::from_slice(&b_doc).unwrap();
+    let in2_b = b.sync_root.join("trip").join("b.jpg");
+    v[0]["images"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::Value::String(in2_b.to_string_lossy().into_owned()));
+    let b_doc = serde_json::to_vec(&v).unwrap();
+    b.save_meta(MetaKind::Albums, &b.albums_path(), &b_doc);
+    b.mgr.run_once().await.expect("B republishes its descendant edit");
+
+    // A's next cycle is a plain (non-dirty) AdoptRemote: it must gain B's
+    // new image WITHOUT losing its own out-of-root membership, which the
+    // shared document never carried and never can.
+    a.mgr.run_once().await.expect("A adopts B's descendant edit");
+    let a_local = std::fs::read(a.albums_path()).expect("A local after second adopt");
+    let imgs = album_images(&a_local);
+    assert!(
+        imgs.iter().any(|p| p == &outside.to_string_lossy()),
+        "A's out-of-root image must survive a later AdoptRemote, got {imgs:?}"
+    );
+    assert!(
+        imgs.iter().any(|p| p == &in1.to_string_lossy()),
+        "A's original in-root image must still be present, got {imgs:?}"
+    );
+    assert!(
+        imgs.iter()
+            .any(|p| p == &a.sync_root.join("trip").join("b.jpg").to_string_lossy()),
+        "B's new in-root image must be adopted, rebased onto A's root, got {imgs:?}"
     );
 }

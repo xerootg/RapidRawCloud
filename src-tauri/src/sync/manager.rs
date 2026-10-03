@@ -1055,6 +1055,18 @@ mod imp {
         }
     }
 
+    /// The result of one [`Configured::act_meta_once`] pass — what the
+    /// caller's resolve-and-verify retry loop should check next.
+    enum MetaActOutcome {
+        /// Nothing needed writing (§2.6 case 1): the live state already
+        /// satisfies our local edit. Nothing to verify.
+        Converged,
+        /// A write (publish, conflict resolution) or an adopt happened; the
+        /// carried head is what the caller believes is now live, to confirm
+        /// with a follow-up `HeadObject`.
+        Acted(MetaHead),
+    }
+
     /// The outcome of a §3.5 eviction read-back re-hash.
     enum Readback {
         /// Remote bytes blake3-match the journal head — safe to evict.
@@ -1162,6 +1174,23 @@ mod imp {
             })
             .map_err(se)?;
 
+            // Reseed the in-memory meta-head cache from redb (§2.9): the
+            // durable half of each kind's "last head this device authored or
+            // adopted", mirroring exactly how the §3.5 stub-set mirror is
+            // reseeded a few lines above in `SyncManager::configure`. Without
+            // this, a device that restarts right after losing a §2.9
+            // first-publisher race (its in-memory vv is otherwise gone)
+            // would adopt a concurrent peer's version unconditionally on its
+            // next appearance — silently discarding its own edit with no
+            // conflict record — instead of correctly detecting the
+            // concurrency and resolving it.
+            let mut meta_heads = std::collections::HashMap::new();
+            for kind in [MetaKind::Albums, MetaKind::Presets] {
+                if let Some(head) = db.synced_meta_head(kind.meta_key()).map_err(se)? {
+                    meta_heads.insert(kind, head);
+                }
+            }
+
             Ok(Configured {
                 bucket: settings.bucket.clone(),
                 settings,
@@ -1172,7 +1201,7 @@ mod imp {
                 notify_count: AtomicUsize::new(0),
                 meta_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
                 meta_local_paths: std::sync::Mutex::new(std::collections::HashMap::new()),
-                meta_heads: std::sync::Mutex::new(std::collections::HashMap::new()),
+                meta_heads: std::sync::Mutex::new(meta_heads),
                 meta_pending: std::sync::Mutex::new(std::collections::HashMap::new()),
             })
         }
@@ -1286,16 +1315,23 @@ mod imp {
             // reused verbatim, never reimplemented.
             let mut vv = heads.get(&kind).map(|h| h.vv.clone()).unwrap_or_default();
             vv.bump(&device);
-            heads.insert(
-                kind,
-                MetaHead {
-                    vv,
-                    blake3,
-                    ts,
-                    device,
-                },
-            );
+            let new_head = MetaHead {
+                vv,
+                blake3,
+                ts,
+                device,
+            };
+            heads.insert(kind, new_head.clone());
             drop(heads);
+            // Persisted immediately, not only once a cycle later confirms
+            // delivery (§2.9): a crash between this save-site intake and the
+            // next cycle must not lose the version bump itself, even though
+            // the pending relativized bytes (reconstructable from the local
+            // file, which the save site already wrote durably) are not
+            // separately persisted here.
+            if let Err(e) = self.db.set_synced_meta_head(kind.meta_key(), &new_head) {
+                log::warn!("sync intake (meta): persist head: {e}");
+            }
             if let Ok(mut pending) = self.meta_pending.lock() {
                 pending.insert(kind, relativized);
             }
@@ -1448,6 +1484,43 @@ mod imp {
             Ok(())
         }
 
+        /// The "first publisher" PUT for `kind`: like [`Self::put_meta_document`]
+        /// but with `fail_if_exists` (`If-None-Match: *`), so a second device
+        /// racing the same empty key cannot silently last-write-wins over us
+        /// with zero conflict record (§2.9). Unlike every other object this
+        /// engine writes, `kind.meta_key()` is a single key **shared across
+        /// every device**, with no per-device namespacing to make an
+        /// unconditional PUT safe (contrast the per-device journal segment
+        /// keys, where no two devices ever address the same key).
+        ///
+        /// Returns `Ok(true)` when this PUT created the object (we were
+        /// first); `Ok(false)` on `412 PreconditionFailed` — a concurrent
+        /// publisher's object is now live and the caller must resolve against
+        /// it (via [`Self::resolve_with_remote`]) instead of assuming its own
+        /// write landed.
+        async fn put_meta_document_if_absent(
+            &self,
+            kind: MetaKind,
+            bytes: Vec<u8>,
+            head: &MetaHead,
+        ) -> Result<bool, SyncError> {
+            let opts = PutObjectOptions {
+                content_type: Some("application/json".to_string()),
+                metadata: Self::meta_head_to_metadata(head)?,
+                fail_if_exists: true,
+                ..PutObjectOptions::default()
+            };
+            match self
+                .s3
+                .put_object(&self.bucket, kind.meta_key(), bytes.into(), &opts)
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(e) if e.is_precondition_failed() => Ok(false),
+                Err(e) => Err(se(e)),
+            }
+        }
+
         /// Materializes the deterministic §2.6 conflict loser for `kind`:
         /// canonicalizes `loser_relativized` ([`meta::canonical`]) and PUTs
         /// it at [`MetaKind::conflict_key`]. Idempotent — every device that
@@ -1482,6 +1555,20 @@ mod imp {
             write_atomic(&path, bytes)
         }
 
+        /// Merges this device's own out-of-root membership (§2.9: dropped
+        /// from the uploaded copy, "kept locally") into `localized` before it
+        /// overwrites the local file ([`meta::merge_out_of_root`]). Must run
+        /// on every site that replaces the local file with an adopted/won
+        /// remote document (`AdoptRemote`, and the remote-wins half of
+        /// `Conflict`) — otherwise a later apply round-trips away membership
+        /// the shared document was never able to carry in the first place. A
+        /// device with no prior local copy (`old` read fails) has nothing to
+        /// merge, by construction.
+        fn merge_local_out_of_root(&self, kind: MetaKind, localized: &[u8]) -> Result<Vec<u8>, SyncError> {
+            let old = std::fs::read(self.resolved_meta_local_path(kind)).ok();
+            meta::merge_out_of_root(kind, old.as_deref(), localized, &self.sync_root).map_err(se)
+        }
+
         /// The §2.9 meta lane of one cycle: for each [`MetaKind`], compare
         /// this device's head (a fresh local edit staged by
         /// [`Configured::note_local_meta`], or the last head this process
@@ -1512,6 +1599,22 @@ mod imp {
             Ok(())
         }
 
+        /// Bound on [`Configured::sync_one_meta_document`]'s resolve-and-verify
+        /// retry loop. The shared meta key (unlike every per-device key this
+        /// engine otherwise writes) can race across devices, and the backend
+        /// is not depended on for a conditional-PUT guarantee (architecture:
+        /// "no reliance on conditional PUT" — verified empirically: Garage
+        /// v2.2.0 answers 2xx to a PUT with `If-None-Match: *` regardless of
+        /// whether the key already has an object). So convergence is driven
+        /// by local retry against the *actually observed* remote instead: a
+        /// competitor's write landing in our gap is caught by the
+        /// post-action verify and re-resolved against, in the same cycle.
+        /// Each round is two small requests (a HEAD plus a PUT); a handful is
+        /// far more than two real devices racing a single key ever need —
+        /// this is a hard backstop against a pathological loop, not a tuned
+        /// budget.
+        const MAX_META_RESOLVE_ATTEMPTS: u32 = 8;
+
         async fn sync_one_meta_document(&self, kind: MetaKind) -> Result<(), SyncError> {
             let dirty = self
                 .meta_dirty
@@ -1532,34 +1635,110 @@ mod imp {
                     .unwrap_or_else(|| self.default_meta_head())
             };
 
-            let Some(remote) = self.fetch_remote_meta_head(kind).await? else {
-                // Nothing published yet: if we have a pending edit, we are
-                // the first publisher.
-                if dirty {
-                    let bytes = self
-                        .meta_pending
-                        .lock()
-                        .ok()
-                        .and_then(|mut p| p.remove(&kind))
-                        .ok_or_else(|| se("meta: dirty kind has no staged bytes"))?;
-                    self.put_meta_document(kind, bytes, &local).await?;
-                    self.clear_meta_dirty(kind);
-                }
+            let mut remote = self.fetch_remote_meta_head(kind).await?;
+            if !dirty && remote.is_none() {
+                // No pending edit of our own and nothing published yet:
+                // nothing to adopt, nothing to write. No race is reachable
+                // on this path (we never write the shared key here), so no
+                // retry loop is needed.
                 return Ok(());
+            }
+
+            for attempt in 0..Self::MAX_META_RESOLVE_ATTEMPTS {
+                let outcome = self.act_meta_once(kind, dirty, &local, remote.clone()).await?;
+                let MetaActOutcome::Acted(intended) = outcome else {
+                    // Converged: the live state (whatever it is) already
+                    // satisfies our local edit — nothing was written, so
+                    // there is nothing to verify.
+                    self.clear_meta_dirty(kind);
+                    return Ok(());
+                };
+                let observed = self.fetch_remote_meta_head(kind).await?;
+                if observed.as_ref() == Some(&intended) {
+                    // Durable half of the cache (§2.9): persisted before
+                    // clearing dirty, so a crash immediately after this
+                    // point still has the authored/adopted head on disk —
+                    // see `synced_meta_head`'s doc for why this matters for
+                    // the first-publisher race specifically.
+                    if let Err(e) = self.db.set_synced_meta_head(kind.meta_key(), &intended) {
+                        log::warn!("sync: meta {kind:?} persist head: {e}");
+                    }
+                    if let Ok(mut heads) = self.meta_heads.lock() {
+                        heads.insert(kind, intended);
+                    }
+                    self.clear_meta_dirty(kind);
+                    return Ok(());
+                }
+                // A competitor's write landed in our gap (between deciding
+                // and verifying, or — for the "nothing published yet"
+                // branch — between our HeadObject-miss and our PUT). Loop,
+                // re-resolving against what is now actually live, instead of
+                // silently treating our own write as delivered.
+                remote = observed;
+                if attempt + 1 == Self::MAX_META_RESOLVE_ATTEMPTS {
+                    log::warn!(
+                        "sync: meta {kind:?} did not converge after {} attempts this cycle \
+                         (persistent racing writer?); leaving dirty for the next cycle",
+                        Self::MAX_META_RESOLVE_ATTEMPTS
+                    );
+                }
+            }
+            Ok(())
+        }
+
+        /// One resolve-and-act pass of the §2.6/§2.9 unified decision
+        /// ([`meta::decide_meta`], which in turn reuses
+        /// [`rrcloud_core::clock::compare`] / `pick_winner` — never a
+        /// bespoke rule), given `remote_before` (a fresh `HeadObject`
+        /// snapshot, `None` meaning nothing is published yet):
+        ///
+        /// - No remote yet: publish our pending edit, if any (opportunistic
+        ///   `fail_if_exists` — see [`Self::put_meta_document_if_absent`]).
+        /// - `AdoptRemote`: download, `localize` onto this device's sync
+        ///   root, merge back this device's own out-of-root membership
+        ///   ([`Self::merge_local_out_of_root`]), atomically replace the
+        ///   local file. No write to the shared key.
+        /// - `KeepLocal`: publish our pending edit (it already dominates).
+        /// - `Converged`: nothing to do.
+        /// - `Conflict`: the loser's relativized bytes are canonicalized and
+        ///   preserved at [`MetaKind::conflict_key`]; the winner's bytes
+        ///   become (or stay) the live document; the stored head's vv
+        ///   becomes the elementwise max of both sides, so the same pair can
+        ///   never reopen the conflict (§2.9).
+        ///
+        /// Returns the head this call believes is now live as a *result* of
+        /// (or because of) its action, for the caller to verify with a
+        /// follow-up `HeadObject` — [`MetaActOutcome::Converged`] only for
+        /// the no-op case, where there is nothing to verify.
+        async fn act_meta_once(
+            &self,
+            kind: MetaKind,
+            dirty: bool,
+            local: &MetaHead,
+            remote_before: Option<MetaHead>,
+        ) -> Result<MetaActOutcome, SyncError> {
+            let Some(remote) = remote_before else {
+                if !dirty {
+                    return Ok(MetaActOutcome::Converged);
+                }
+                let bytes = self
+                    .meta_pending
+                    .lock()
+                    .ok()
+                    .and_then(|p| p.get(&kind).cloned())
+                    .ok_or_else(|| se("meta: dirty kind has no staged bytes"))?;
+                self.put_meta_document_if_absent(kind, bytes, local).await?;
+                return Ok(MetaActOutcome::Acted(local.clone()));
             };
 
-            match meta::decide_meta(&local, &remote) {
-                MetaDecision::Converged => {
-                    self.clear_meta_dirty(kind);
-                }
+            match meta::decide_meta(local, &remote) {
+                MetaDecision::Converged => Ok(MetaActOutcome::Converged),
                 MetaDecision::AdoptRemote => {
                     let remote_bytes = self.fetch_remote_meta_bytes(kind).await?;
                     let localized = meta::localize(kind, &remote_bytes, &self.sync_root).map_err(se)?;
-                    self.write_local_meta(kind, &localized)?;
-                    if let Ok(mut heads) = self.meta_heads.lock() {
-                        heads.insert(kind, remote);
-                    }
-                    self.clear_meta_dirty(kind);
+                    let merged = self.merge_local_out_of_root(kind, &localized)?;
+                    self.write_local_meta(kind, &merged)?;
+                    Ok(MetaActOutcome::Acted(remote))
                 }
                 MetaDecision::KeepLocal => {
                     if dirty {
@@ -1567,11 +1746,15 @@ mod imp {
                             .meta_pending
                             .lock()
                             .ok()
-                            .and_then(|mut p| p.remove(&kind))
+                            .and_then(|p| p.get(&kind).cloned())
                             .ok_or_else(|| se("meta: dirty kind has no staged bytes"))?;
-                        self.put_meta_document(kind, bytes, &local).await?;
+                        self.put_meta_document(kind, bytes, local).await?;
+                        Ok(MetaActOutcome::Acted(local.clone()))
+                    } else {
+                        // Not dirty — our recorded head already dominates the
+                        // (unchanged) remote; nothing to do or verify.
+                        Ok(MetaActOutcome::Converged)
                     }
-                    self.clear_meta_dirty(kind);
                 }
                 MetaDecision::Conflict { remote_wins } => {
                     // The relativized bytes on our side: the fresh pending
@@ -1582,7 +1765,7 @@ mod imp {
                         self.meta_pending
                             .lock()
                             .ok()
-                            .and_then(|mut p| p.remove(&kind))
+                            .and_then(|p| p.get(&kind).cloned())
                             .ok_or_else(|| se("meta: dirty kind has no staged bytes"))?
                     } else {
                         let path = self.resolved_meta_local_path(kind);
@@ -1596,7 +1779,8 @@ mod imp {
 
                     let new_head = if remote_wins {
                         let localized = meta::localize(kind, &remote_bytes, &self.sync_root).map_err(se)?;
-                        self.write_local_meta(kind, &localized)?;
+                        let merged = self.merge_local_out_of_root(kind, &localized)?;
+                        self.write_local_meta(kind, &merged)?;
                         self.put_meta_conflict_loser(kind, &local_relativized).await?;
                         MetaHead {
                             vv: merged_vv,
@@ -1616,13 +1800,9 @@ mod imp {
                         self.put_meta_conflict_loser(kind, &remote_bytes).await?;
                         new_head
                     };
-                    if let Ok(mut heads) = self.meta_heads.lock() {
-                        heads.insert(kind, new_head);
-                    }
-                    self.clear_meta_dirty(kind);
+                    Ok(MetaActOutcome::Acted(new_head))
                 }
             }
-            Ok(())
         }
 
         fn clear_meta_dirty(&self, kind: MetaKind) {

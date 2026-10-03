@@ -128,7 +128,7 @@ impl MetaKind {
 /// Deliberately the same five facts [`crate::clock::pick_winner`] and
 /// [`crate::clock::compare`] already consume, so [`decide_meta`] is pure
 /// reuse of the engine's version-vector machinery.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MetaHead {
     /// The document version's version vector (§2.6).
     pub vv: VersionVector,
@@ -171,6 +171,14 @@ pub enum MetaDecision {
 /// same [`MetaDecision`], and the concurrent winner is stable regardless of
 /// arrival order (`pick_winner` is symmetric).
 pub fn decide_meta(local: &MetaHead, remote: &MetaHead) -> MetaDecision {
+    // §2.6 case 1: `remote.vv == local.vv` OR `remote.sem_hash ==
+    // local.sem_hash` → converged, checked before the vv order at all —
+    // identical content never conflicts, even under a concurrent vv (two
+    // devices independently producing the same bytes, e.g. both creating
+    // the same default/empty document on first run).
+    if local.blake3 == remote.blake3 {
+        return MetaDecision::Converged;
+    }
     match compare(&remote.vv, &local.vv) {
         VvOrder::Equal => MetaDecision::Converged,
         VvOrder::Greater => MetaDecision::AdoptRemote,
@@ -277,6 +285,133 @@ fn relativize_albums(value: &mut Value, sync_root: &Path) {
             }
             if let Some(children) = map.get_mut("children") {
                 relativize_albums(children, sync_root);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Merges this device's out-of-root album membership from `old_local`
+/// (the bytes currently on disk, if any) into `new_localized` (a document
+/// just adopted from the remote via [`localize`], about to replace the
+/// local file) before the caller overwrites it (§2.9).
+///
+/// A meta document's shared/remote form never carries an out-of-root path
+/// at all — it is dropped at whichever device's upload first relativized
+/// it ([`relativize_albums`]'s drop rule, "kept locally"). So a plain
+/// atomic replace of the local file with every adopted/won remote
+/// document — not just the first one — would silently destroy that
+/// out-of-root membership on every subsequent apply, since the remote the
+/// device is adopting was never in a position to carry it forward. This
+/// restores it: albums are matched by `"id"`, and an out-of-root image
+/// present on the old local album but absent from the new one is appended
+/// (skipped if already present, so a repeated apply is idempotent).
+///
+/// `old_local` absent (this device has never held a local copy before) is
+/// a no-op — there is no prior local-only membership to preserve. Malformed
+/// `old_local` bytes are likewise treated as "nothing to merge" rather than
+/// failing the whole adopt (the remote is still a valid document on its
+/// own); `new_localized` is assumed well-formed (it just round-tripped
+/// through [`localize`]) and its errors propagate.
+pub fn merge_out_of_root(
+    kind: MetaKind,
+    old_local: Option<&[u8]>,
+    new_localized: &[u8],
+    sync_root: &Path,
+) -> Result<Vec<u8>, MetaError> {
+    let Some(old_local) = old_local else {
+        return Ok(new_localized.to_vec());
+    };
+    let Ok(old) = serde_json::from_slice::<Value>(old_local) else {
+        return Ok(new_localized.to_vec());
+    };
+    let mut new_value: Value = serde_json::from_slice(new_localized)?;
+    if kind == MetaKind::Albums {
+        let out_of_root = collect_album_out_of_root(&old, sync_root);
+        if !out_of_root.is_empty() {
+            merge_album_out_of_root(&mut new_value, &out_of_root);
+        }
+    }
+    Ok(serde_json::to_vec_pretty(&new_value)?)
+}
+
+/// Walks an albums document (local, absolute-path form) and collects, per
+/// album `id`, the images that are *not* under `sync_root` — exactly the
+/// set [`relativize_albums`] would drop from an uploaded copy.
+fn collect_album_out_of_root(
+    value: &Value,
+    sync_root: &Path,
+) -> std::collections::HashMap<String, Vec<String>> {
+    fn walk(
+        value: &Value,
+        sync_root: &Path,
+        out: &mut std::collections::HashMap<String, Vec<String>>,
+    ) {
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    walk(item, sync_root, out);
+                }
+            }
+            Value::Object(map) => {
+                if let (Some(Value::String(id)), Some(Value::Array(images))) =
+                    (map.get("id"), map.get("images"))
+                {
+                    let oor: Vec<String> = images
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .filter(|s| relativize_path_str(s, sync_root).is_none())
+                        .map(str::to_string)
+                        .collect();
+                    if !oor.is_empty() {
+                        out.insert(id.clone(), oor);
+                    }
+                }
+                if let Some(children) = map.get("children") {
+                    walk(children, sync_root, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = std::collections::HashMap::new();
+    walk(value, sync_root, &mut out);
+    out
+}
+
+/// The reverse direction of [`collect_album_out_of_root`]: for every album
+/// in `value` whose `id` has a recorded out-of-root set, appends any entry
+/// not already present in that album's `images` array (order-preserving,
+/// idempotent).
+fn merge_album_out_of_root(
+    value: &mut Value,
+    out_of_root: &std::collections::HashMap<String, Vec<String>>,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items.iter_mut() {
+                merge_album_out_of_root(item, out_of_root);
+            }
+        }
+        Value::Object(map) => {
+            let id = map.get("id").and_then(Value::as_str).map(str::to_string);
+            if let Some(extra) = id.as_deref().and_then(|id| out_of_root.get(id)) {
+                let images = map
+                    .entry("images".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Value::Array(images) = images {
+                    for path in extra {
+                        let already_present = images
+                            .iter()
+                            .any(|v| v.as_str() == Some(path.as_str()));
+                        if !already_present {
+                            images.push(Value::String(path.clone()));
+                        }
+                    }
+                }
+            }
+            if let Some(children) = map.get_mut("children") {
+                merge_album_out_of_root(children, out_of_root);
             }
         }
         _ => {}

@@ -102,6 +102,19 @@ pub struct PutObjectOptions {
     /// `boundary="a  b"` is stored as `boundary="a b"`). Avoid values that
     /// depend on exact interior whitespace.
     pub metadata: BTreeMap<String, String>,
+    /// Sends `If-None-Match: *`: the server must reject the PUT with
+    /// `412 PreconditionFailed` ([`S3Error::is_precondition_failed`]) if the
+    /// key already has an object, instead of silently overwriting it.
+    ///
+    /// Opportunistic, not depended on for correctness everywhere (the
+    /// top-level design assumption is "no reliance on conditional PUT" —
+    /// most lanes write to a key only their own device ever touches, so no
+    /// race is possible there regardless). It *is* required for the one
+    /// lane that writes to a key **shared across devices** with no other
+    /// serialization: the §2.9 meta-document "first publisher" PUT, where
+    /// two devices racing an empty key would otherwise silently last-write-
+    /// wins with zero conflict record. Verified against Garage v2.2.0.
+    pub fail_if_exists: bool,
 }
 
 /// Result of a `PutObject`.
@@ -1093,6 +1106,9 @@ fn put_option_headers(
             format!("x-amz-meta-{lowered}"),
             sanitize_header_value(value),
         ));
+    }
+    if opts.fail_if_exists {
+        extra.push(("if-none-match".to_string(), "*".to_string()));
     }
     Ok(extra)
 }

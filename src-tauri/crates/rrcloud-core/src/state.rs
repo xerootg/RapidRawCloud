@@ -117,6 +117,7 @@ use serde::{Deserialize, Serialize};
 use crate::clock::{DeviceId, VersionVector};
 use crate::journal::{JournalError, Kind};
 use crate::keys::RelKey;
+use crate::meta::MetaHead;
 use crate::semhash::{Blake3Hex, ContentId, SemHash};
 
 /// The state-store schema version this build reads and writes.
@@ -437,12 +438,21 @@ const K_BACKEND_DIGEST_REJECTION: &str = "backend_digest_rejection";
 const K_APPLIED_PROOF_SERVER_TS: &str = "applied_proof_server_ts";
 /// Per-segment server-time publish stamp key prefix (§2.10 14-day cap).
 const K_SEGMENT_PUB_TS_PREFIX: &str = "seg_pub_ts:";
+/// §2.9 per-kind authored/adopted meta-document head key prefix (see
+/// [`SyncDb::synced_meta_head`]).
+const K_META_HEAD_PREFIX: &str = "meta_head:";
 
 /// The meta key holding the server-time publish stamp of the own-prefix
 /// segment starting at `first_seq` (zero-padded hex, so keys sort in seq
 /// order under a prefix scan should one ever be needed).
 fn segment_pub_ts_key(first_seq: u64) -> String {
     format!("{K_SEGMENT_PUB_TS_PREFIX}{first_seq:016x}")
+}
+
+/// The meta key holding the persisted §2.9 head for the document whose
+/// bucket key is `meta_key` (e.g. `.rrcloud/v1/meta/albums.json`).
+fn meta_head_key(meta_key: &str) -> String {
+    format!("{K_META_HEAD_PREFIX}{meta_key}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2174,6 +2184,33 @@ impl SyncDb {
                 to_json(&server_ts)?.as_slice(),
             )
             .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// The §2.9 meta-document head this device last authored or adopted for
+    /// `meta_key` (e.g. `.rrcloud/v1/meta/albums.json`), or `None` if this
+    /// device has never synced that kind. This is the durable half of the
+    /// in-memory `meta_heads` cache the sync manager keeps per process: on
+    /// reconfigure (app start, mirroring the §3.5 stub-set reseed) the cache
+    /// is seeded from here, so a device that crashes or goes offline right
+    /// after losing a §2.9 first-publisher race still recalls its own
+    /// authored version the next time it runs **at all** — not only if that
+    /// same process happens to poll again before exiting.
+    pub fn synced_meta_head(&self, meta_key: &str) -> Result<Option<MetaHead>, StateError> {
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(T_META).map_err(db_err)?;
+        meta_get(&meta, &meta_head_key(meta_key))
+    }
+
+    /// Persists the authored/adopted head for `meta_key` (see
+    /// [`SyncDb::synced_meta_head`]). Overwrites any previous value — the
+    /// latest resolution always wins.
+    pub fn set_synced_meta_head(&self, meta_key: &str, head: &MetaHead) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(meta_head_key(meta_key).as_str(), to_json(head)?.as_slice())
+                .map_err(db_err)?;
             Ok(())
         })
     }
