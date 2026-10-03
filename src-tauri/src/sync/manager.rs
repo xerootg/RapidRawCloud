@@ -889,7 +889,9 @@ mod imp {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use rrcloud_core::clock::{Candidate, DeviceId, VersionVector, VvOrder, compare, pick_winner};
+    use rrcloud_core::clock::{
+        Candidate, DeviceId, VersionVector, compare, identity_order_wins_remote,
+    };
     use rrcloud_core::engine::{
         ChangeOutcome, EngineConsumer, LocalScan, admit_pending, item_local_path,
         notify_local_change, recently_deleted as engine_recently_deleted, reconcile_wholeness,
@@ -1577,11 +1579,20 @@ mod imp {
         /// after-the-write resolve-and-verify ([`Configured::sync_one_meta_document`])
         /// cannot tell "we landed cleanly" apart from "we just clobbered a
         /// competitor" — both read back as exactly the head we ourselves
-        /// just wrote. Checking immediately before the write instead closes
-        /// that blind spot: a mismatch here means the decision is already
-        /// void, so nothing is written at all, and [`MetaActOutcome::Stale`]
-        /// tells the caller to re-fetch and re-resolve against what is now
-        /// actually live rather than act on stale information.
+        /// just wrote. Checking immediately before the write instead
+        /// *narrows* that blind spot rather than closing it outright:
+        /// Garage has no compare-and-swap primitive (§2.9), so two guards
+        /// can still both observe the same stale remote in the same instant
+        /// and one write can still silently clobber the other at the
+        /// storage layer. A mismatch caught here means the decision is
+        /// already void, so nothing is written at all and
+        /// [`MetaActOutcome::Stale`] tells the caller to re-fetch and
+        /// re-resolve — but the real guarantee against permanent data loss
+        /// is further out: `synced_meta_head` is persisted on every
+        /// successful write, and every cycle re-diffs the device's own last
+        /// head against live remote regardless of dirty state, so a
+        /// clobbered side self-heals into a detected `Conflict` on its very
+        /// next poll rather than staying silently lost.
         async fn put_meta_document_guarded(
             &self,
             kind: MetaKind,
@@ -1919,33 +1930,31 @@ mod imp {
                     let mut merged_vv = local.vv.clone();
                     merged_vv.merge(&remote.vv);
                     // The (blake3, ts, device) identity to carry forward:
-                    // mirrors the sidecar engine's
-                    // `converged_identity_is_remote` so this can never
-                    // disagree with a device that instead saw this exact
-                    // pair as an actual `Conflict` (the tiebreak must be
-                    // the same deterministic rule either way). A dominant
-                    // side's identity is kept outright; a concurrent pair
-                    // (content-equal, so the identity choice has no
-                    // observable effect beyond `ts`/`device` bookkeeping
-                    // for a future tiebreak) breaks the tie with the same
-                    // `pick_winner` a real conflict would use.
-                    let remote_identity_wins = match compare(&remote.vv, &local.vv) {
-                        VvOrder::Greater => true,
-                        VvOrder::Less | VvOrder::Equal => false,
-                        VvOrder::Concurrent => {
-                            let winner = pick_winner(
-                                Candidate {
-                                    ts: remote.ts,
-                                    device: &remote.device,
-                                },
-                                Candidate {
-                                    ts: local.ts,
-                                    device: &local.device,
-                                },
-                            );
-                            winner.ts == remote.ts && *winner.device == remote.device
-                        }
-                    };
+                    // calls the exact same shared [`identity_order_wins_remote`]
+                    // rule as the sidecar engine's `converged_identity_is_remote`,
+                    // so this can never disagree with a device that instead
+                    // saw this exact pair as an actual `Conflict` (the
+                    // tiebreak must be the same deterministic rule either
+                    // way, and sharing the one `pub fn` in clock.rs — rather
+                    // than two independently-maintained copies of this
+                    // match — makes that guaranteed instead of merely
+                    // currently-true). A dominant side's identity is kept
+                    // outright; a concurrent pair (content-equal, so the
+                    // identity choice has no observable effect beyond
+                    // `ts`/`device` bookkeeping for a future tiebreak)
+                    // breaks the tie with the same `pick_winner` a real
+                    // conflict would use.
+                    let remote_identity_wins = identity_order_wins_remote(
+                        compare(&remote.vv, &local.vv),
+                        Candidate {
+                            ts: remote.ts,
+                            device: &remote.device,
+                        },
+                        Candidate {
+                            ts: local.ts,
+                            device: &local.device,
+                        },
+                    );
                     let adopted = if remote_identity_wins {
                         MetaHead {
                             vv: merged_vv,

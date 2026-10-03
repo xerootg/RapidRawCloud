@@ -123,7 +123,9 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::clock::{compare, pick_winner, Candidate, DeviceId, VersionVector, VvOrder};
+use crate::clock::{
+    compare, identity_order_wins_remote, Candidate, DeviceId, VersionVector, VvOrder,
+};
 use crate::journal::{JournalEntry, JournalError, Kind, Op, Tombstone, JOURNAL_VERSION};
 use crate::keys::{classify_key, library_key, tombstone_key, KeyClass, KeyError, RelKey};
 use crate::publisher::{enqueue_entry_in, PublisherError};
@@ -332,16 +334,14 @@ fn state_holds_local_bytes(state: ItemState) -> bool {
 /// pair, so the outcome is fleet-deterministic whatever the clocks said.
 fn remote_wins_identity(local: &ItemRecord, entry: &JournalEntry) -> bool {
     match (local.head_ts, &local.device) {
-        (Some(ts), Some(device)) => {
-            let winner = pick_winner(
-                Candidate {
-                    ts: entry.ts,
-                    device: &entry.device,
-                },
-                Candidate { ts, device },
-            );
-            winner.ts == entry.ts && *winner.device == entry.device
-        }
+        (Some(ts), Some(device)) => identity_order_wins_remote(
+            VvOrder::Concurrent,
+            Candidate {
+                ts: entry.ts,
+                device: &entry.device,
+            },
+            Candidate { ts, device },
+        ),
         _ => true,
     }
 }
@@ -360,10 +360,21 @@ fn remote_wins_identity(local: &ItemRecord, entry: &JournalEntry) -> bool {
 /// falling back to `written_server_ts`) corrupt the version's recorded
 /// `(ts, device)` (review round 0).
 fn converged_identity_is_remote(local: &ItemRecord, entry: &JournalEntry, ord: VvOrder) -> bool {
-    match ord {
-        VvOrder::Greater => true,
-        VvOrder::Less | VvOrder::Equal => false,
-        VvOrder::Concurrent => remote_wins_identity(local, entry),
+    match (local.head_ts, &local.device) {
+        (Some(ts), Some(device)) => identity_order_wins_remote(
+            ord,
+            Candidate {
+                ts: entry.ts,
+                device: &entry.device,
+            },
+            Candidate { ts, device },
+        ),
+        // No local identity to arbitrate against: `Greater`/`Concurrent`
+        // both resolve to the remote entry (nothing locally to prefer, same
+        // as `remote_wins_identity`'s no-identity fallback); `Less`/`Equal`
+        // still keep the (identity-less) local side, matching this
+        // function's own dominance rule above.
+        _ => matches!(ord, VvOrder::Greater | VvOrder::Concurrent),
     }
 }
 

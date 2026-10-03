@@ -267,3 +267,29 @@ pub fn pick_winner<'a>(a: Candidate<'a>, b: Candidate<'a>) -> Candidate<'a> {
         b
     }
 }
+
+/// The converged/concurrent-pair identity tiebreak (§2.6 case 1 / case 4):
+/// a strict [`VvOrder`] decides the adopted `(ts, device)` identity outright
+/// (`Greater` → `remote` wins, `Less`/`Equal` → `local` wins, matching the
+/// causal order itself rather than the wall clock); only a genuinely
+/// [`VvOrder::Concurrent`] pair falls to the deterministic [`pick_winner`]
+/// over the same two candidates. Factored out so every call site performing
+/// this exact adoption decision — the sidecar engine's
+/// `remote_wins_identity`/`converged_identity_is_remote` and the meta-sync
+/// manager's converged-head arm — shares one rule instead of maintaining
+/// independent copies that could silently diverge if the tiebreak ever
+/// changes.
+pub fn identity_order_wins_remote<'a>(
+    ord: VvOrder,
+    remote: Candidate<'a>,
+    local: Candidate<'a>,
+) -> bool {
+    match ord {
+        VvOrder::Greater => true,
+        VvOrder::Less | VvOrder::Equal => false,
+        VvOrder::Concurrent => {
+            let winner = pick_winner(remote, local);
+            winner.ts == remote.ts && *winner.device == *remote.device
+        }
+    }
+}
