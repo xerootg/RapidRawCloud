@@ -1964,6 +1964,13 @@ pub async fn stitch_focus_stack(
         return Err("Please select at least two images to stack.".to_string());
     }
 
+    // §3.5 guard: hydrate any stub originals before the stack reads them.
+    // No-op passthrough when sync is off or the path is local.
+    for p in &paths {
+        let (src, _) = parse_virtual_path(p);
+        crate::sync::hooks::ensure_local(&src, "stitch_focus_stack").map_err(|e| e.to_string())?;
+    }
+
     let source_paths: Vec<String> = paths
         .iter()
         .map(|p| parse_virtual_path(p).0.to_string_lossy().into_owned())

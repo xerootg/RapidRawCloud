@@ -938,10 +938,19 @@ pub async fn load_image(
         (cached_img, cached_exif)
     } else {
         if crate::file_management::is_cloud_placeholder(&source_path) {
-            return Err(format!(
-                "'{}' is stored in iCloud and hasn't been downloaded yet. Download it in Finder, then try again.",
-                source_path_str
-            ));
+            // §3.5 guard: a RapidRawCloud sync stub is hydrated in place and
+            // the load proceeds on the real bytes. A non-stub placeholder (a
+            // macOS iCloud dataless file, or any placeholder with sync off,
+            // where `is_stub` is a const `false`) keeps the upstream error.
+            if crate::sync::hooks::is_stub(&source_path) {
+                crate::sync::hooks::ensure_local(&source_path, "load_image")
+                    .map_err(|e| e.to_string())?;
+            } else {
+                return Err(format!(
+                    "'{}' is stored in iCloud and hasn't been downloaded yet. Download it in Finder, then try again.",
+                    source_path_str
+                ));
+            }
         }
 
         let (pristine_img, exif_data_loaded) = tokio::task::spawn_blocking(move || {

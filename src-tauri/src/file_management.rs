@@ -63,7 +63,7 @@ fn emit_thumbnail_cache_setup_error(app_handle: &AppHandle, path: &str, reason: 
     );
 }
 
-fn compute_thumbnail_cache_hash(path_str: &str, adjustments_bytes: &[u8]) -> Option<String> {
+pub fn compute_thumbnail_cache_hash(path_str: &str, adjustments_bytes: &[u8]) -> Option<String> {
     let (source_path, _) = parse_virtual_path(path_str);
 
     let img_mod_time = fs::metadata(&source_path)
@@ -297,6 +297,12 @@ pub struct ImageFile {
     is_cloud_placeholder: bool,
     is_raw: bool,
     group_id: Option<String>,
+    /// Per-item sync lane state for the grid cloud/local/uploading badge
+    /// (§3.8, e.g. `"stub"` / `"hydrated"` / `"synced"`). `#[serde(default)]`
+    /// so an older frontend/listing payload without it decodes cleanly and
+    /// the field is simply absent when sync is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sync_state: Option<String>,
 }
 
 fn make_group_key(source_path: &Path) -> String {
@@ -691,6 +697,7 @@ pub fn list_images_in_dir(path: String, app_handle: AppHandle) -> Result<Vec<Ima
                     group_id: None,
                     rating: metadata.rating,
                     is_cloud_placeholder,
+                    sync_state: None,
                 });
             }
 
@@ -824,6 +831,7 @@ pub fn list_images_recursive(
                     group_id: None,
                     rating: metadata.rating,
                     is_cloud_placeholder,
+                    sync_state: None,
                 });
             }
 
@@ -1095,6 +1103,7 @@ pub fn get_album_images(
                 group_id: None,
                 rating: metadata.rating,
                 is_cloud_placeholder,
+                sync_state: None,
             })
         })
         .collect();
@@ -1373,7 +1382,13 @@ pub async fn get_pinned_folder_trees(
     }
 }
 
-/// Checks if the given path exists and is an iCloud placeholder file on macOS.
+/// Checks if the given path exists and is an iCloud placeholder file on
+/// macOS, **or** a RapidRawCloud sync stub on any platform (§3.5). The
+/// `|| crate::sync::hooks::is_stub(path)` hook lights up every existing
+/// placeholder consumer (listing flags, CloudOff icon, thumbnail skip,
+/// MetadataManager deferral, the `load_image` guard) for free; with the
+/// `sync` feature off the hook is a const `false`, so this reverts to the
+/// upstream macOS-only check.
 #[cfg(target_os = "macos")]
 pub fn is_cloud_placeholder(path: &Path) -> bool {
     use std::os::unix::ffi::OsStrExt;
@@ -1381,16 +1396,16 @@ pub fn is_cloud_placeholder(path: &Path) -> bool {
 
     let c_path = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
         Ok(p) => p,
-        Err(_) => return false,
+        Err(_) => return crate::sync::hooks::is_stub(path),
     };
     let mut stat_buf: libc::stat = unsafe { std::mem::zeroed() };
     let ret = unsafe { libc::lstat(c_path.as_ptr(), &mut stat_buf) };
-    ret == 0 && (stat_buf.st_flags & SF_DATALESS) != 0
+    (ret == 0 && (stat_buf.st_flags & SF_DATALESS) != 0) || crate::sync::hooks::is_stub(path)
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn is_cloud_placeholder(_path: &Path) -> bool {
-    false
+pub fn is_cloud_placeholder(path: &Path) -> bool {
+    crate::sync::hooks::is_stub(path)
 }
 
 pub fn read_file_mapped(path: &Path) -> Result<Mmap, ReadFileError> {
@@ -2276,6 +2291,10 @@ pub fn duplicate_file(
     if !source_path.is_file() {
         return Err("Source path is not a file.".to_string());
     }
+    // §3.5 guard: hydrate a stub original before duplicating so the new copy
+    // carries the real bytes, not the 0-byte placeholder. No-op when sync is
+    // off or already local.
+    crate::sync::hooks::ensure_local(&source_path, "duplicate_file").map_err(|e| e.to_string())?;
 
     let parent = source_path
         .parent()
@@ -2398,6 +2417,11 @@ pub fn copy_files(source_paths: Vec<String>, destination_folder: String) -> Resu
     let mut operations_to_perform = Vec::new();
 
     for source_image_path in &unique_source_images {
+        // §3.5 guard: hydrate a stub original before copying so the copy
+        // reproduces the real bytes rather than the 0-byte placeholder
+        // (hydrate-then-copy). No-op when sync is off or already local.
+        crate::sync::hooks::ensure_local(source_image_path, "copy_files")
+            .map_err(|e| e.to_string())?;
         let all_files_to_copy = find_all_associated_files(source_image_path)?;
 
         let source_parent = source_image_path
@@ -2483,6 +2507,11 @@ pub fn move_files(
     let mut renames = HashMap::new();
 
     for source_image_path in &unique_source_images {
+        // §3.5 guard: hydrate a stub original before moving so the moved
+        // file carries the real bytes rather than the 0-byte placeholder.
+        // No-op when sync is off or already local.
+        crate::sync::hooks::ensure_local(source_image_path, "move_files")
+            .map_err(|e| e.to_string())?;
         let source_parent = source_image_path
             .parent()
             .ok_or("Could not get parent directory")?;
@@ -2669,8 +2698,7 @@ pub async fn apply_adjustments_to_paths(
                 |existing_metadata| {
                     crate::exif_processing::merge_exif_from_source(existing_metadata, &source_path);
 
-                    let mut new_adjustments =
-                        std::mem::take(&mut existing_metadata.adjustments);
+                    let mut new_adjustments = std::mem::take(&mut existing_metadata.adjustments);
                     if new_adjustments.is_null() {
                         new_adjustments = serde_json::json!({});
                     }
@@ -2694,9 +2722,7 @@ pub async fn apply_adjustments_to_paths(
                 },
             );
 
-            if enable_xmp_sync
-                && let Ok(existing_metadata) = updated
-            {
+            if enable_xmp_sync && let Ok(existing_metadata) = updated {
                 sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
             }
         });
@@ -2773,9 +2799,7 @@ pub async fn reset_adjustments_for_paths(
                 },
             );
 
-            if enable_xmp_sync
-                && let Ok(existing_metadata) = updated
-            {
+            if enable_xmp_sync && let Ok(existing_metadata) = updated {
                 let source_path = parse_virtual_path(path).0;
                 sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
             }
@@ -2884,9 +2908,7 @@ pub async fn apply_auto_lens_correction_to_paths(
                 },
             );
 
-            if enable_xmp_sync
-                && let Ok(existing_metadata) = updated
-            {
+            if enable_xmp_sync && let Ok(existing_metadata) = updated {
                 sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
             }
 
@@ -3001,9 +3023,7 @@ pub async fn apply_auto_adjustments_to_paths(
                     },
                 );
 
-                if enable_xmp_sync
-                    && let Ok(existing_metadata) = updated
-                {
+                if enable_xmp_sync && let Ok(existing_metadata) = updated {
                     sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
                 }
                 Ok(image)
@@ -3071,9 +3091,7 @@ pub fn set_color_label_for_paths(
             },
         );
 
-        if enable_xmp_sync
-            && let Ok(metadata) = updated
-        {
+        if enable_xmp_sync && let Ok(metadata) = updated {
             let source_path = parse_virtual_path(path).0;
             sync_metadata_to_xmp(&source_path, &metadata, create_xmp_if_missing);
         }
@@ -3105,9 +3123,7 @@ pub fn set_rating_for_paths(
             },
         );
 
-        if enable_xmp_sync
-            && let Ok(metadata) = updated
-        {
+        if enable_xmp_sync && let Ok(metadata) = updated {
             let source_path = parse_virtual_path(path).0;
             sync_metadata_to_xmp(&source_path, &metadata, create_xmp_if_missing);
         }
@@ -3746,6 +3762,12 @@ pub fn get_cached_or_generate_thumbnail_image(
             );
         }
 
+        // §3.5 guard: a stub with no cached thumbnail is skipped rather than
+        // decoded from its 0-byte placeholder (cached thumbs above are still
+        // served; only the generate-from-bytes path is gated).
+        if crate::sync::hooks::is_stub(&parse_virtual_path(path_str).0) {
+            anyhow::bail!("'{path_str}' is a cloud stub without a cached thumbnail; skipped");
+        }
         let thumb_image = generate_thumbnail_data(path_str, gpu_context, None, app_handle)?;
         if let (Ok(small_data), Ok(medium_data)) = (
             encode_thumbnail(&thumb_image, target_width_small),
@@ -3763,6 +3785,10 @@ pub fn get_cached_or_generate_thumbnail_image(
 
         Ok(thumb_image)
     } else {
+        // §3.5 guard: same stub skip for the no-cache-key path.
+        if crate::sync::hooks::is_stub(&parse_virtual_path(path_str).0) {
+            anyhow::bail!("'{path_str}' is a cloud stub without a cached thumbnail; skipped");
+        }
         generate_thumbnail_data(path_str, gpu_context, None, app_handle)
     }
 }

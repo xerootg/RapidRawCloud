@@ -266,6 +266,11 @@ fn compute_patched_and_warped(
 #[tauri::command]
 fn get_image_dimensions(path: String) -> Result<ImageDimensions, String> {
     let (source_path, _) = parse_virtual_path(&path);
+    // §3.5 guard: hydrate a stub before reading its dimensions, so this
+    // never measures a 0-byte placeholder. No-op passthrough when sync is
+    // off or the path is already local.
+    let source_path = crate::sync::hooks::ensure_local(&source_path, "get_image_dimensions")
+        .map_err(|e| e.to_string())?;
     image::image_dimensions(&source_path)
         .map(|(width, height)| ImageDimensions { width, height })
         .map_err(|e| e.to_string())
@@ -1236,6 +1241,13 @@ async fn merge_hdr(
         return Err("Please select at least two images to merge.".to_string());
     }
 
+    // §3.5 guard: hydrate any stub originals before the merge reads their
+    // bytes. No-op passthrough when sync is off or the path is local.
+    for p in &paths {
+        let (src, _) = parse_virtual_path(p);
+        crate::sync::hooks::ensure_local(&src, "merge_hdr").map_err(|e| e.to_string())?;
+    }
+
     let hdr_result_handle = state.hdr_result.clone();
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
 
@@ -1365,6 +1377,11 @@ async fn generate_preview_for_path(
         let state = app_handle.state::<AppState>();
         let context = get_or_init_gpu_context(&state, &app_handle)?;
         let (source_path, _) = parse_virtual_path(&path);
+        // §3.5 guard: hydrate a stub before generating its preview, so the
+        // reader below never maps a 0-byte placeholder. No-op passthrough
+        // when sync is off or the path is already local.
+        let source_path = crate::sync::hooks::ensure_local(&source_path, "generate_preview")
+            .map_err(|e| e.to_string())?;
         let source_path_str = source_path.to_string_lossy().to_string();
         let is_raw = is_raw_file(&source_path_str);
         let settings = load_settings(app_handle.clone()).unwrap_or_default();

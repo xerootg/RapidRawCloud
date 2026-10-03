@@ -33,13 +33,33 @@ pub mod hooks;
 pub mod manager;
 
 pub use credentials::{CredentialStore, Credentials, FileCredentialStore};
-pub use manager::{SyncError, SyncManager, SyncState, SyncStatus};
+pub use manager::{EvictionReport, SyncError, SyncManager, SyncState, SyncStatus, ThumbVariant};
 
 // Re-exports so the integration tests (and future command layer) reach the
 // chokepoint and settings types through one module path.
 pub use crate::app_settings::SyncSettings;
 pub use crate::exif_processing::{save_sidecar, update_sidecar};
 pub use crate::image_processing::ImageMetadata;
+
+// §3.5 guard-site test seams. The upstream placeholder check and the stub
+// thumbnail-cache key live in the private `file_management` module; re-export
+// them through `sync` (pure visibility, no behavior change) so the P2
+// integration suite can assert placeholder/hash behavior. Both are plain
+// functions (not `#[tauri::command]`s), so a `pub use` is safe.
+pub use crate::file_management::{compute_thumbnail_cache_hash, is_cloud_placeholder};
+
+/// Test seam for the §3.5 `copy_files` guard: a plain-function wrapper over
+/// the private `file_management::copy_files` command so the integration suite
+/// can drive the real hydrate-then-copy guard. A direct `pub use` of the
+/// command is avoided — `#[tauri::command]` also defines a same-named macro,
+/// which a re-export would pull into this module. No behavior change.
+#[doc(hidden)]
+pub fn copy_files_guarded(
+    source_paths: Vec<String>,
+    destination_folder: String,
+) -> Result<(), String> {
+    crate::file_management::copy_files(source_paths, destination_folder)
+}
 
 /// Where a sidecar write came from, threaded through the [`save_sidecar`]
 /// chokepoint (ARCHITECTURE.md §3.4). Lets the engine distinguish a user

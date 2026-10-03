@@ -127,6 +127,12 @@ sha2 = "0.11"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
 hex = "0.4"
 
+[dev-dependencies]
+# `bytes` is needed only by the P2 §3.5 eviction integration test, to plant a
+# corrupt remote object through the re-exported S3 client (`put_object` takes
+# a `Bytes` body). Test-only; it does not enter the shipping build.
+bytes = "1"
+
 [profile.dev]
 opt-level = 2
 debug = 1

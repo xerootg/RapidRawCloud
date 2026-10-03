@@ -57,6 +57,9 @@ pub async fn apply_denoising(
     state: tauri::State<'_, AppState>,
 ) -> Result<(), String> {
     let (source_path, _) = parse_virtual_path(&path);
+    // §3.5 guard: hydrate a stub original before denoising reads its bytes.
+    // No-op passthrough when sync is off or the path is local.
+    crate::sync::hooks::ensure_local(&source_path, "apply_denoising").map_err(|e| e.to_string())?;
     let path_str = source_path.to_string_lossy().to_string();
 
     let mut ai_session = None;
@@ -122,6 +125,12 @@ pub async fn batch_denoise_images(
 
             let (source_path, source_sidecar_path) =
                 crate::file_management::parse_virtual_path(path_str);
+            // §3.5 guard: hydrate a stub original before denoising reads it.
+            // No-op passthrough when sync is off or the path is local.
+            if let Err(e) = crate::sync::hooks::ensure_local(&source_path, "batch_denoise") {
+                let _ = app_handle.emit("denoise-error", e.to_string());
+                continue;
+            }
             let real_path = source_path.to_string_lossy().to_string();
 
             match crate::denoising::denoise_image(

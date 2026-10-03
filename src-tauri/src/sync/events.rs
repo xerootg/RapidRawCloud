@@ -29,6 +29,23 @@ pub struct SyncItemStateEvent {
     pub state: String,
 }
 
+/// `sync-hydrate-progress` payload (§3.5): per-stub hydration byte progress.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncHydrateProgressEvent {
+    pub path: String,
+    pub bytes: u64,
+    pub total: u64,
+}
+
+/// `sync-hydrated` payload (§3.5): a stub finished hydrating to the real
+/// original bytes.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncHydratedEvent {
+    pub path: String,
+}
+
 /// Emits `sync-status`.
 pub fn emit_status(app: &AppHandle, status: &SyncStatusEvent) {
     emit(app, "sync-status", status);
@@ -37,6 +54,16 @@ pub fn emit_status(app: &AppHandle, status: &SyncStatusEvent) {
 /// Emits a batch of `sync-item-state` updates.
 pub fn emit_item_states(app: &AppHandle, items: &[SyncItemStateEvent]) {
     emit(app, "sync-item-state", items);
+}
+
+/// Emits `sync-hydrate-progress {path, bytes, total}` (§3.5).
+pub fn emit_hydrate_progress(app: &AppHandle, progress: &SyncHydrateProgressEvent) {
+    emit(app, "sync-hydrate-progress", progress);
+}
+
+/// Emits `sync-hydrated {path}` (§3.5).
+pub fn emit_hydrated(app: &AppHandle, hydrated: &SyncHydratedEvent) {
+    emit(app, "sync-hydrated", hydrated);
 }
 
 /// Emits `sync-error {path?, message}`.

@@ -182,18 +182,26 @@ mod imp {
     }
 
     pub fn is_stub(path: &Path) -> bool {
-        // Stubs are created only once the §3.5 hydration/eviction unit (P2)
-        // lands; until then no path is a cloud stub, so the honest answer is
-        // always `false` (every original is present on disk).
-        let _ = path;
-        false
+        // Route through the process-global manager's in-memory stub mirror
+        // (§3.5). No configured manager, or a path that is not a stub, both
+        // answer `false` — exactly upstream behavior.
+        global_manager()
+            .map(|mgr| mgr.is_stub(path))
+            .unwrap_or(false)
     }
 
-    pub fn ensure_local(path: &Path, _reason: &str) -> std::io::Result<PathBuf> {
-        // No stubs exist yet (see `is_stub`), so hydration is an identity
-        // pass: the real original is already present at `path` (P2 adds the
-        // ranged-resume download).
-        Ok(path.to_path_buf())
+    pub fn ensure_local(path: &Path, reason: &str) -> std::io::Result<PathBuf> {
+        // §3.5 guard-site hook: hydrate a stub before any reader touches it.
+        // No configured manager ⇒ identity pass (the real original is
+        // already present). A hydration failure is surfaced as an io error
+        // so the guarded call site reports it rather than decoding a 0-byte
+        // stub.
+        match global_manager() {
+            Some(mgr) => mgr
+                .ensure_local(path, reason)
+                .map_err(|e| std::io::Error::other(e.to_string())),
+            None => Ok(path.to_path_buf()),
+        }
     }
 
     pub fn sync_flush_path(path: &Path) {

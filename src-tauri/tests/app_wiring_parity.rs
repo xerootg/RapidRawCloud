@@ -9,7 +9,7 @@
 
 #![cfg(not(feature = "sync"))]
 
-use rapidraw_lib::sync::{ImageMetadata, WriteOrigin, hooks, save_sidecar};
+use rapidraw_lib::sync::{self, ImageMetadata, WriteOrigin, hooks, save_sidecar};
 
 fn meta() -> ImageMetadata {
     ImageMetadata {
@@ -88,4 +88,42 @@ fn sync_off_hooks_are_inert_noops() {
     hooks::notify_deleted(&path);
     hooks::notify_moved(&path, &path);
     hooks::sync_flush_path(&path);
+}
+
+#[test]
+fn sync_off_is_cloud_placeholder_reverts_to_the_upstream_check() {
+    // With sync off, `is_cloud_placeholder` must have no stub augmentation:
+    // it is exactly the upstream macOS-only `SF_DATALESS` check, which on any
+    // non-macOS target is a constant `false` — even for a 0-byte file that
+    // WOULD be a stub under the `sync` feature (§3.5 / §7 parity).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let normal = dir.path().join("photo.NEF");
+    std::fs::write(&normal, b"not empty").expect("write normal");
+    let empty = dir.path().join("empty.NEF");
+    std::fs::write(&empty, b"").expect("write empty");
+
+    assert!(
+        !hooks::is_stub(&empty),
+        "is_stub is a const false with sync off"
+    );
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert!(
+            !sync::is_cloud_placeholder(&normal),
+            "no sync-stub augmentation off-feature"
+        );
+        assert!(
+            !sync::is_cloud_placeholder(&empty),
+            "a 0-byte file is not a placeholder off-feature (upstream parity)"
+        );
+    }
+
+    // The stub thumbnail-cache key helper is still exposed and stable (same
+    // function the stub-stability path pins when sync is on).
+    let p = normal.to_string_lossy().to_string();
+    let h1 = sync::compute_thumbnail_cache_hash(&p, b"{}");
+    let h2 = sync::compute_thumbnail_cache_hash(&p, b"{}");
+    assert_eq!(h1, h2, "the thumbnail cache hash is deterministic");
+    assert!(h1.is_some(), "a readable file hashes to Some(_)");
 }

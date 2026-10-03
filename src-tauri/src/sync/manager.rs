@@ -9,8 +9,10 @@
 //! `new_inert` constructs it, `is_configured` is always `false`, and the
 //! engine methods report [`SyncError::FeatureDisabled`].
 
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -44,6 +46,45 @@ pub struct SyncStatus {
     pub downloaded: usize,
     /// Dirty items not yet backed up remotely (§3.3 exit-flush accounting).
     pub dirty_unbacked: usize,
+}
+
+/// Which cached-thumbnail size class is being seeded (§3.5 thumb seeding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThumbVariant {
+    /// The grid thumbnail (`<hash>_small.jpg`).
+    Small,
+    /// The filmstrip / detail thumbnail (`<hash>_medium.jpg`).
+    Medium,
+}
+
+impl ThumbVariant {
+    /// The `_small` / `_medium` suffix used in both the durable app-data
+    /// store and the hard-linked webview cache key (§3.5).
+    pub fn suffix(self) -> &'static str {
+        match self {
+            ThumbVariant::Small => "small",
+            ThumbVariant::Medium => "medium",
+        }
+    }
+}
+
+/// What one evictor pass did (§3.5 LRU eviction gate), returned by
+/// [`SyncManager::run_evictor`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvictionReport {
+    /// Originals demoted back to 0-byte stubs this pass, LRU order.
+    pub evicted: Vec<PathBuf>,
+    /// Originals kept because they are pinned (never evicted, §3.5).
+    pub kept_pinned: Vec<PathBuf>,
+    /// Originals kept because their remote copy is not content-verified
+    /// (no attest entry and read-back disabled/failed) — the "never evict
+    /// unverified bytes" invariant (§3.5).
+    pub kept_unverified: Vec<PathBuf>,
+    /// Originals whose remote bytes were found wrong on the eviction
+    /// read-back: routed to `corrupt_remote`, never evicted, never served.
+    pub corrupt: Vec<PathBuf>,
+    /// Total bytes still resident in hydrated originals after the pass.
+    pub resident_bytes: u64,
 }
 
 /// Errors from the manager's plain-Rust API.
@@ -97,6 +138,13 @@ pub struct SyncConfig {
 /// The sync lifecycle object (§3.3).
 pub struct SyncManager {
     configured: AtomicBool,
+    /// In-memory mirror of the redb `Stub`-state item set (§3.5): the set
+    /// of absolute original paths that are currently 0-byte cloud stubs.
+    /// Always compiled (so [`SyncManager::is_stub`] answers even in an
+    /// inert build), populated only by the stub-creation / hydration paths
+    /// under the `sync` feature. Empty ⇒ every `is_stub` query is `false`,
+    /// which is exactly upstream behavior.
+    stub_set: Mutex<HashSet<PathBuf>>,
     #[cfg(feature = "sync")]
     inner: std::sync::Mutex<Option<Arc<imp::Configured>>>,
 }
@@ -107,6 +155,7 @@ impl SyncManager {
     pub fn new_inert() -> Arc<Self> {
         Arc::new(SyncManager {
             configured: AtomicBool::new(false),
+            stub_set: Mutex::new(HashSet::new()),
             #[cfg(feature = "sync")]
             inner: std::sync::Mutex::new(None),
         })
@@ -314,6 +363,210 @@ impl SyncManager {
         }
     }
 
+    // ---- §3.5 stubs / hydration / pinning / eviction / thumb seeding ----
+
+    /// Whether `path` is currently a 0-byte cloud stub (§3.5). Reads the
+    /// in-memory [`Self::stub_set`] mirror, so it is cheap and answers even
+    /// in an inert / sync-off build (always `false` there). Backs
+    /// [`crate::sync::hooks::is_stub`] and, through it,
+    /// `file_management::is_cloud_placeholder`.
+    pub fn is_stub(&self, path: &Path) -> bool {
+        match self.stub_set.lock() {
+            Ok(set) => set.contains(path),
+            Err(poisoned) => poisoned.into_inner().contains(path),
+        }
+    }
+
+    /// Records `path` as a stub in the in-memory mirror. The durable
+    /// `ItemState::Stub` record and the 0-byte file are written by
+    /// [`Self::create_stub`]; this keeps the fast-path set in sync.
+    #[cfg(feature = "sync")]
+    fn mark_stub(&self, path: &Path, is_stub: bool) {
+        let mut set = match self.stub_set.lock() {
+            Ok(set) => set,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if is_stub {
+            set.insert(path.to_path_buf());
+        } else {
+            set.remove(path);
+        }
+    }
+
+    /// Creates a 0-byte cloud stub for a remote-only original at
+    /// `image_path` (§3.5): writes the empty file, sets its mtime to the
+    /// remote original's `remote_mtime_unix` via `filetime` (so
+    /// `compute_thumbnail_cache_hash` stays stable across a later
+    /// hydration), and records an `ItemState::Stub` item carrying the
+    /// remote `blake3_hex`/`size` so hydration and the eviction gate have
+    /// the verified-remote facts.
+    ///
+    /// This is the API the engine apply / reconcile path drives when it
+    /// learns of an original it does not hold locally (§3.5); the P2 tests
+    /// drive it directly to stand in for that apply step.
+    pub fn create_stub(
+        &self,
+        image_path: &Path,
+        blake3_hex: &str,
+        size: u64,
+        remote_mtime_unix: i64,
+    ) -> Result<(), SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let cfg = self.configured()?;
+            cfg.create_stub(image_path, blake3_hex, size, remote_mtime_unix)?;
+            self.mark_stub(image_path, true);
+            Ok(())
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = (image_path, blake3_hex, size, remote_mtime_unix);
+            Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    /// Ensures the original at `path` is present locally, hydrating a stub
+    /// if needed (§3.5): resumable ranged GET through the transfer engine,
+    /// blake3 verify, atomic rename over the stub, restore mtime, mark the
+    /// item `Hydrated`, emit an `attest` journal entry, bump LRU last
+    /// access, and emit `sync-hydrate-progress` / `sync-hydrated`.
+    /// Idempotent: a no-op that returns `path` when the item is already
+    /// local. Synchronous (the guard sites call it inline); the ranged
+    /// download runs on a bounded worker runtime internally.
+    pub fn ensure_local(&self, path: &Path, reason: &str) -> Result<PathBuf, SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            // Fast path: not a stub ⇒ the real bytes are already present
+            // (idempotent hydration, the common guard-site case).
+            if !self.is_stub(path) {
+                return Ok(path.to_path_buf());
+            }
+            let cfg = self.configured()?;
+            let hydrated = cfg.hydrate(path, reason)?;
+            self.mark_stub(path, false);
+            Ok(hydrated)
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = reason;
+            Ok(path.to_path_buf())
+        }
+    }
+
+    /// Pins (or unpins) the originals at `image_paths` so the evictor never
+    /// reclaims them (§3.5). A directory path fans out to every item under
+    /// it ("pin this folder offline"). Returns the number of items whose
+    /// pin flag changed.
+    pub fn pin_paths(&self, image_paths: &[PathBuf], pinned: bool) -> Result<usize, SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let cfg = self.configured()?;
+            cfg.pin_paths(image_paths, pinned)
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = (image_paths, pinned);
+            Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    /// Runs one LRU eviction pass (§3.5): keeps the sum of hydrated-original
+    /// sizes `≤ settings.sync.cache_size_gb` by demoting the
+    /// least-recently-accessed, **non-pinned**, `Synced`-state originals
+    /// back to 0-byte stubs (restoring the remote mtime so thumbnail keys
+    /// survive) — and **only** originals whose remote copy is
+    /// content-verified: `verified_remote == true` and (an `attest` journal
+    /// entry exists for the blake3 **or** a one-time full ranged-GET
+    /// re-hash confirms the remote bytes). A hash mismatch routes the item
+    /// to `corrupt_remote` and never evicts it (the "never evict unverified
+    /// bytes" invariant).
+    pub async fn run_evictor(&self) -> Result<EvictionReport, SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let cfg = self.configured()?;
+            let report = cfg.run_evictor().await?;
+            for p in &report.evicted {
+                self.mark_stub(p, true);
+            }
+            Ok(report)
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    /// [`Self::run_evictor`] with an explicit byte budget instead of
+    /// `settings.sync.cache_size_gb` — the test seam that exercises the LRU
+    /// order and the verification gate at byte granularity (the public
+    /// setting is whole gigabytes).
+    pub async fn run_evictor_with_budget(
+        &self,
+        max_resident_bytes: u64,
+    ) -> Result<EvictionReport, SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let cfg = self.configured()?;
+            let report = cfg.run_evictor_with_budget(max_resident_bytes).await?;
+            for p in &report.evicted {
+                self.mark_stub(p, true);
+            }
+            Ok(report)
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = max_resident_bytes;
+            Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    /// The current per-item sync-lane state for `image_path`, as the
+    /// snake_case string the §3.8 `sync-item-state` event and the
+    /// `ImageFile.sync_state` badge use (e.g. `"stub"`, `"hydrated"`,
+    /// `"synced"`, `"corrupt_remote"`). `None` when the path has no item
+    /// record (or sync is off). A read-only query, not part of the §3.5
+    /// mutation surface.
+    pub fn item_sync_state(&self, image_path: &Path) -> Option<String> {
+        #[cfg(feature = "sync")]
+        {
+            self.configured()
+                .ok()
+                .and_then(|cfg| cfg.item_sync_state(image_path))
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = image_path;
+            None
+        }
+    }
+
+    /// Seeds a downloaded/engine-provided JPEG thumbnail (§3.5): stores it
+    /// durably under `app_data_dir/rrcloud/thumbs/<content_id>_<variant>.jpg`
+    /// and surfaces it to the webview by hard-linking (copy fallback) into
+    /// `cache_thumbnails_dir/<hash>_<variant>.jpg`, where `<hash>` is the
+    /// stub-path thumbnail cache key — so the existing asset-protocol scope
+    /// (`$APPCACHE/thumbnails/*`) and `tauri.conf.json` stay untouched.
+    /// Returns the cache path that was linked. Emits `thumbnail-generated`
+    /// so the existing UI picks it up.
+    pub fn seed_thumbnail(
+        &self,
+        image_path: &Path,
+        variant: ThumbVariant,
+        jpeg_bytes: &[u8],
+        cache_thumbnails_dir: &Path,
+    ) -> Result<PathBuf, SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let cfg = self.configured()?;
+            cfg.seed_thumbnail(image_path, variant, jpeg_bytes, cache_thumbnails_dir)
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = (image_path, variant, jpeg_bytes, cache_thumbnails_dir);
+            Err(SyncError::FeatureDisabled)
+        }
+    }
+
     /// Bounded opportunistic flush of queued small sidecar uploads on exit
     /// (§3.3): drains within `budget`, or returns cleanly on timeout —
     /// never hangs.
@@ -376,7 +629,7 @@ mod imp {
         stored_backend_profile,
     };
 
-    use super::{SyncError, SyncState, SyncStatus};
+    use super::{EvictionReport, SyncError, SyncState, SyncStatus, ThumbVariant};
     use crate::app_settings::SyncSettings;
     use crate::sync::WriteOrigin;
     use crate::sync::credentials::Credentials;
@@ -567,6 +820,114 @@ mod imp {
                 from.display(),
                 to.display()
             );
+        }
+
+        /// §3.5 stub creation — writes the 0-byte placeholder at
+        /// `image_path`, sets its mtime to `remote_mtime_unix` via
+        /// `filetime`, and records an `ItemState::Stub` item carrying the
+        /// remote `blake3_hex`/`size`/`verified_remote` facts. Scaffold:
+        /// unimplemented until the P2 green pass.
+        pub fn create_stub(
+            &self,
+            image_path: &Path,
+            blake3_hex: &str,
+            size: u64,
+            remote_mtime_unix: i64,
+        ) -> Result<(), SyncError> {
+            let _ = (
+                &self.db,
+                &self.sync_root,
+                image_path,
+                blake3_hex,
+                size,
+                remote_mtime_unix,
+            );
+            todo!("P2 green: write 0-byte stub + set remote mtime + record ItemState::Stub")
+        }
+
+        /// §3.5 hydration — the resumable ranged download of a stub's real
+        /// bytes, blake3 verify, atomic install over the stub, mtime
+        /// restore, `Hydrated` transition, `attest` entry, LRU bump, and
+        /// `sync-hydrate-progress` / `sync-hydrated` emits. Synchronous
+        /// wrapper over the async transfer-engine download (runs on a
+        /// bounded worker runtime, like the exit-flush path). Scaffold:
+        /// unimplemented until the P2 green pass.
+        pub fn hydrate(&self, image_path: &Path, reason: &str) -> Result<PathBuf, SyncError> {
+            let _ = (
+                &self.db,
+                &self.s3,
+                &self.bucket,
+                &self.sync_root,
+                image_path,
+                reason,
+            );
+            todo!("P2 green: resumable ranged GET + blake3 verify + atomic install + attest")
+        }
+
+        /// §3.5 pin/unpin — sets the `pinned` flag on each named original,
+        /// fanning a directory out to every item under it. Scaffold:
+        /// unimplemented until the P2 green pass.
+        pub fn pin_paths(&self, image_paths: &[PathBuf], pinned: bool) -> Result<usize, SyncError> {
+            let _ = (&self.db, &self.sync_root, image_paths, pinned);
+            todo!("P2 green: set pinned flag, folder fan-out")
+        }
+
+        /// §3.5 LRU eviction pass using `settings.sync.cache_size_gb` as the
+        /// resident-bytes budget. Scaffold: unimplemented until the P2 green
+        /// pass.
+        pub async fn run_evictor(&self) -> Result<EvictionReport, SyncError> {
+            let budget = (self.settings.cache_size_gb as u64) << 30;
+            self.run_evictor_with_budget(budget).await
+        }
+
+        /// §3.5 LRU eviction pass with an explicit `max_resident_bytes`
+        /// budget — the attestation/read-back-gated demotion of
+        /// least-recently-accessed non-pinned verified originals back to
+        /// stubs. Scaffold: unimplemented until the P2 green pass.
+        pub async fn run_evictor_with_budget(
+            &self,
+            max_resident_bytes: u64,
+        ) -> Result<EvictionReport, SyncError> {
+            let _ = (
+                &self.db,
+                &self.s3,
+                &self.bucket,
+                &self.sync_root,
+                max_resident_bytes,
+            );
+            todo!("P2 green: LRU eviction with the 'never evict unverified bytes' gate")
+        }
+
+        /// §3.5 thumb seeding — durable app-data store + hard-link into the
+        /// webview thumbnail cache under the stub-path cache key. Scaffold:
+        /// unimplemented until the P2 green pass.
+        pub fn seed_thumbnail(
+            &self,
+            image_path: &Path,
+            variant: ThumbVariant,
+            jpeg_bytes: &[u8],
+            cache_thumbnails_dir: &Path,
+        ) -> Result<PathBuf, SyncError> {
+            let _ = (
+                &self.db,
+                &self.sync_root,
+                image_path,
+                variant,
+                jpeg_bytes,
+                cache_thumbnails_dir,
+            );
+            todo!("P2 green: durable thumbs store + hard-link into $APPCACHE/thumbnails")
+        }
+
+        /// Read-only query of an item's current state as a snake_case string
+        /// (§3.8 badge / test observability). Not part of the §3.5 mutation
+        /// surface, so it is implemented rather than scaffolded.
+        pub fn item_sync_state(&self, image_path: &Path) -> Option<String> {
+            let rk = relkey(image_path, &self.sync_root).ok()?;
+            let record = self.db.get_item(&rk).ok().flatten()?;
+            serde_json::to_value(record.state)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
         }
 
         /// Lazily resolves the §2.4 backend profile: the persisted value if

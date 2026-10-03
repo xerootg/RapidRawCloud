@@ -1560,6 +1560,11 @@ pub(crate) async fn export_images_impl(
 
                 let state = app_handle_clone.state::<AppState>();
                 let (source_path, sidecar_path) = parse_virtual_path(&image_path_str);
+                // §3.5 guard: hydrate a stub before this image is loaded and
+                // composited, so the export never reads a 0-byte placeholder.
+                // No-op passthrough when sync is off or the path is local.
+                let source_path = crate::sync::hooks::ensure_local(&source_path, "export")
+                    .map_err(|e| e.to_string())?;
                 let source_path_str = source_path.to_string_lossy().to_string();
 
                 let is_current_edit = match &adjustments_mode {
