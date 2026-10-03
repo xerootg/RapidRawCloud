@@ -58,6 +58,7 @@ import { Color, COLOR_LABELS, INITIAL_ADJUSTMENTS, normalizeLoadedAdjustments } 
 import TaggingSubMenu from '../context/TaggingSubMenu';
 import { useEditorActions } from './useEditorActions';
 import { useLibraryActions } from './useLibraryActions';
+import { useSyncItemMenu } from './useSyncItemMenu';
 import { globalImageCache } from '../utils/ImageLRUCache';
 
 export interface UseAppContextMenusProps {
@@ -84,6 +85,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
     handlePasteAdjustments,
   } = useEditorActions();
   const { handleRate, handleSetColorLabel, handleTagsChanged } = useLibraryActions();
+  const buildSyncItemMenu = useSyncItemMenu();
 
   const albumIcons = useMemo(
     () => [
@@ -540,6 +542,8 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
         }
       };
 
+      const syncEntries = buildSyncItemMenu(finalSelection);
+
       const options = [
         ...(!isEditingThisImage
           ? [
@@ -785,6 +789,9 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
               },
             ]
           : []),
+        // Cloud-sync entries (ARCHITECTURE.md §3.5). Empty on an upstream build,
+        // so the separator + entries only appear when sync is available.
+        ...(syncEntries.length > 0 ? [{ type: OPTION_SEPARATOR }, ...syncEntries] : []),
         { type: OPTION_SEPARATOR },
         {
           disabled: !isSingleSelection,
@@ -821,6 +828,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
     [
       getCommonTags,
       buildAddToAlbumMenu,
+      buildSyncItemMenu,
       handleCopyAdjustments,
       handlePasteAdjustments,
       handleRate,

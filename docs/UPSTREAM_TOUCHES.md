@@ -29,6 +29,8 @@ Status legend: [ ] planned (phase) · [x] landed
 | `src/hooks/useAppNavigation.ts` | `sync_flush_path` hint at the three debouncedSave flush points | [x] U8 |
 | `src/components/ui/AppProperties.tsx` | `Invokes.Sync*` entries + `SyncSettings`/`SyncStatusDto`/`SyncPeerDevice`/`SyncRecentlyDeleted`/`SyncConflict` types + `ImageFile.sync_state` + `AppSettings.sync` | [x] U8 |
 | UI components | MainLibrary status badge, SettingsPanel "Sync" category, App.tsx conflict toast (mount-point one-liners); new `components/panel/sync/*` + `useSyncStore`/`useSyncActions`/`useSyncItemMenu` are additive | [x] U8 |
+| `src/components/panel/library/LibraryItems.tsx` | `SyncItemBadge` overlay on grid `Thumbnail` + list `ListItem` (fed by `imageFile.sync_state`); mount-point one-liners | [x] U8 |
+| `src/hooks/useAppContextMenus.ts` | `useSyncItemMenu()` entries spliced into the thumbnail context menu behind the empty-list guard (inert upstream) | [x] U8 |
 
 Notes:
 - **P4 headless worker touches NO upstream file (documented §6 refinement).** The worker is a

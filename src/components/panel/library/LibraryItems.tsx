@@ -19,6 +19,7 @@ import { ColumnWidths } from '../MainLibrary';
 import { useProcessStore } from '../../../store/useProcessStore';
 import { useSettingsStore } from '../../../store/useSettingsStore';
 import { IconAperture, IconFocalLength, IconIso, IconShutter } from '../editor/ExifIcons';
+import SyncItemBadge from '../sync/SyncItemBadge';
 
 interface ImageLayer {
   id: string;
@@ -41,6 +42,7 @@ const ThumbnailComponent = ({
   isEdited,
   exif,
   isCloudPlaceholder,
+  syncState,
   groupBadgeLabel,
   onAspectRatioLoaded,
 }: any) => {
@@ -241,6 +243,12 @@ const ThumbnailComponent = ({
             <CloudOff size={12} className="text-white" />
           </div>
         )}
+
+        {/* Per-item cloud-sync state badge (ARCHITECTURE.md §3.8). Renders
+            nothing when sync is unavailable or the item is fully local. */}
+        <div className="absolute top-1.5 right-1.5 z-10 rounded-full h-5 w-5 flex items-center justify-center bg-black/40 shadow-md pointer-events-none empty:hidden">
+          <SyncItemBadge path={path} fallbackState={syncState} />
+        </div>
       </div>
 
       <div
@@ -479,6 +487,7 @@ const ListItemComponent = ({
   columnWidths,
   exif,
   isCloudPlaceholder,
+  syncState,
   isPrevSelected,
   isNextSelected,
 }: any) => {
@@ -683,6 +692,11 @@ const ListItemComponent = ({
               <CloudOff size={9} className="text-white" />
             </div>
           )}
+
+          {/* Per-item cloud-sync state badge (ARCHITECTURE.md §3.8). */}
+          <div className="absolute bottom-0.5 right-0.5 z-10 flex items-center justify-center pointer-events-none empty:hidden">
+            <SyncItemBadge path={path} fallbackState={syncState} />
+          </div>
         </div>
       </div>
 
@@ -924,6 +938,7 @@ const RowComponent = ({
                 modified={imageFile.modified}
                 columnWidths={columnWidths}
                 isCloudPlaceholder={imageFile.is_cloud_placeholder}
+                syncState={imageFile.sync_state}
                 isPrevSelected={isPrevSelected}
                 isNextSelected={isNextSelected}
               />
@@ -942,6 +957,7 @@ const RowComponent = ({
                 isEdited={imageFile.is_edited}
                 aspectRatio={thumbnailAspectRatio}
                 isCloudPlaceholder={imageFile.is_cloud_placeholder}
+                syncState={imageFile.sync_state}
                 groupBadgeLabel={imageFile.group_id && groupBadgeInfo?.get(imageFile.group_id)?.label}
                 onAspectRatioLoaded={onAspectRatioLoaded}
               />
