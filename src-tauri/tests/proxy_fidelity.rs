@@ -400,7 +400,7 @@ fn clamp_limit_preserves_linear_headroom() {
     // earlier version of this test asserted the proxy ALWAYS decodes a channel
     // >1.0 — but that is a property of the FILE, not the code: several corpus
     // samples simply have no highlight overshoot (their brightest pixel sits
-    // below saturation, e.g. CR3 ~0.57, RAF ~0.34), so the original assertion
+    // below saturation, e.g. CR3 ~0.62, RAF ~0.42), so the original assertion
     // was contradicted by the corpus, not by the clamp fix. A file with no
     // overshoot cannot prove anything about clamping.
     //
