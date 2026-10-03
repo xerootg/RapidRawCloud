@@ -1295,6 +1295,69 @@ async fn readonly_reporting_counts_only_foreign_and_journals_nothing() {
     );
 }
 
+/// `Worker::open_readonly` mints a throwaway redb state dir under the system
+/// temp dir for its ephemeral reporting identity. Dropping the worker must
+/// REMOVE that directory — otherwise a recurring `--report` cron leaks a redb
+/// dir per invocation into `/tmp` without bound (P4 review round 2). The
+/// journaling `Worker::open` path, whose state dir is operator-owned and
+/// persistent, must NOT be touched by the same cleanup.
+#[tokio::test]
+async fn open_readonly_cleans_up_its_ephemeral_state_dir_on_drop() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-ro-cleanup");
+
+    // The ephemeral dir lives beside the redb file the worker opened.
+    let cfg = worker_cfg(g, &bucket, None);
+    let dir = {
+        let worker = Worker::open_readonly(&cfg).expect("open_readonly");
+        let dir = worker
+            .db()
+            .path()
+            .parent()
+            .expect("ephemeral redb has a parent dir")
+            .to_path_buf();
+        assert!(
+            dir.exists(),
+            "the ephemeral reporting dir exists while the worker is live: {}",
+            dir.display()
+        );
+        assert!(
+            dir.starts_with(std::env::temp_dir()),
+            "the ephemeral reporting dir lives under the system temp dir, got {}",
+            dir.display()
+        );
+        dir
+    }; // worker dropped here
+
+    assert!(
+        !dir.exists(),
+        "dropping the read-only worker must remove its ephemeral state dir \
+         (no /tmp leak on a recurring --report), still present: {}",
+        dir.display()
+    );
+}
+
+/// A persistent (journaling) worker's operator-owned state dir must SURVIVE
+/// the worker being dropped — the ephemeral cleanup is scoped to the
+/// read-only path only and must never delete real state.
+#[tokio::test]
+async fn open_journaling_does_not_delete_its_persistent_state_dir_on_drop() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-persist-nodrop");
+    let state = tempfile::tempdir().expect("state dir");
+    let dir = state.path().to_path_buf();
+    let cfg = worker_cfg(g, &bucket, Some(dir.clone()));
+    {
+        let worker = Worker::open(&cfg).expect("open journaling worker");
+        assert_eq!(worker.db().path().parent().unwrap(), dir);
+    } // worker dropped here
+    assert!(
+        dir.exists(),
+        "the persistent journaling state dir must survive drop: {}",
+        dir.display()
+    );
+}
+
 // A `CompactConfig` field is referenced so the import is load-bearing even
 // while every §2.10 default is exercised through `CycleOptions::default`.
 const _: fn() -> CompactConfig = CompactConfig::default;

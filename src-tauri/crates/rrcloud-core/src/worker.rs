@@ -417,6 +417,26 @@ pub struct Worker {
     /// publishes, or GCs, so the ephemeral identity never pollutes the
     /// device registry / §2.10 horizons with a phantom device (§6).
     readonly: bool,
+    /// Set only for a [`Worker::open_readonly`] handle: the throwaway redb
+    /// directory minted under the system temp dir for its ephemeral
+    /// reporting identity. [`Drop`] removes it so a recurring `--report`
+    /// cron cannot leak a redb dir per invocation into `/tmp` without bound
+    /// (P4 review round 2). `None` for the journaling role, whose state dir
+    /// is operator-owned and persistent and must never be removed here.
+    ephemeral_dir: Option<PathBuf>,
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        // Remove the ephemeral read-only reporting dir (never the persistent
+        // journaling state dir, which is `None` here). Best-effort: a cleanup
+        // failure on a throwaway temp dir is not worth a panic in a `Drop`,
+        // and on Linux `remove_dir_all` unlinks the still-open redb file
+        // cleanly (the fd stays valid until `db` drops immediately after).
+        if let Some(dir) = self.ephemeral_dir.take() {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
 }
 
 impl Worker {
@@ -461,13 +481,18 @@ impl Worker {
             s3,
             bucket: cfg.bucket.clone(),
             readonly: false,
+            // The journaling role's state dir is operator-owned and
+            // persistent — never removed on drop.
+            ephemeral_dir: None,
         })
     }
 
     /// Open the worker in a **read-only reporting** role, with no persistent
     /// state directory. It cannot journal, adopt, or GC — it is the only
     /// path a stateless invocation may take (§6). The ephemeral identity
-    /// lives in a throwaway temp directory and is never used to publish.
+    /// lives in a throwaway temp directory that is removed when the handle is
+    /// dropped (see the `Drop` impl), so a recurring `--report` cron leaks no
+    /// redb dirs into `/tmp`; it is never used to publish.
     pub fn open_readonly(cfg: &WorkerConfig) -> Result<Worker, WorkerError> {
         let base = std::env::temp_dir();
         let id = mint_worker_device_id(&base)?;
@@ -483,6 +508,9 @@ impl Worker {
             s3,
             bucket: cfg.bucket.clone(),
             readonly: true,
+            // The ephemeral reporting dir is removed on drop (no /tmp leak on
+            // a recurring --report, P4 review round 2).
+            ephemeral_dir: Some(dir),
         })
     }
 

@@ -126,5 +126,49 @@ fn parse_duration(s: &str) -> Option<Duration> {
         _ => (s, 1),
     };
     let n: u64 = num.parse().ok()?;
-    Some(Duration::from_secs(n.checked_mul(mult)?))
+    let secs = n.checked_mul(mult)?;
+    // Reject a zero interval: `--daemon --interval 0` would otherwise loop
+    // with `sleep(0)`, hammering poll/list/S3 at ~100% CPU with no backoff
+    // (P4 review round 2). A zero duration is an operator typo, so it is a
+    // clean usage error (`None` → the CLI prints USAGE and exits 2), never a
+    // busy-loop. Any positive value — down to `1s` — is accepted as-is.
+    if secs == 0 {
+        return None;
+    }
+    Some(Duration::from_secs(secs))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_rejects_zero_so_the_daemon_cannot_busy_loop() {
+        // Every spelling of "zero" is a usage error, not a Duration::ZERO that
+        // would make `--daemon --interval 0` spin on `sleep(0)`.
+        for z in ["0", "0s", "0m", "0h", "0d"] {
+            assert!(
+                parse_duration(z).is_none(),
+                "a zero interval ({z:?}) must be rejected, not accepted as a busy-loop"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_duration_accepts_positive_values_down_to_one_second() {
+        assert_eq!(parse_duration("1"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_duration("1s"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_duration("15m"), Some(Duration::from_secs(15 * 60)));
+        assert_eq!(parse_duration("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(parse_duration("2d"), Some(Duration::from_secs(2 * 86_400)));
+    }
+
+    #[test]
+    fn parse_duration_rejects_garbage_and_overflow() {
+        assert!(parse_duration("").is_none());
+        assert!(parse_duration("abc").is_none());
+        assert!(parse_duration("12x").is_none());
+        // n * mult overflow → None (no panic).
+        assert!(parse_duration("99999999999999999999d").is_none());
+    }
 }
