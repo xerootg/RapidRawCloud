@@ -33,8 +33,12 @@ fn prepare_source_image(
     };
 
     let (base_image, _) = crate::get_original_image(state)?;
-    let composited = composite_patches_on_image(&base_image, &source_image_adjustments)
-        .map_err(|e| format!("Failed to prepare source image: {}", e))?;
+    // §4.4: `get_original_image` returns the loaded base, which is the proxy in
+    // proxy edit mode; scale the OTHER patches' original-space geometry/bitmaps
+    // into that base's space (1.0 no-op when the loaded base is the original).
+    let composited =
+        composite_patches_on_image(&base_image, &source_image_adjustments, crate::current_proxy_scale(state))
+            .map_err(|e| format!("Failed to prepare source image: {}", e))?;
 
     let source_image = if is_raw {
         apply_linear_to_srgb(composited)

@@ -1597,7 +1597,10 @@ pub fn generate_thumbnail_data(
                 // loaded path matches — so reading the global proxy_scale here
                 // cannot misattribute another photo's scale.)
                 raw_scale_factor = crate::current_proxy_scale(&state);
-                image_loader::composite_patches_on_image(img, &adjustments)?
+                // §4.4: `img` is the editor's loaded base (the proxy in proxy edit
+                // mode); scale original-space patch geometry/bitmaps by the same
+                // proxy_scale carried as the decode scale above.
+                image_loader::composite_patches_on_image(img, &adjustments, raw_scale_factor)?
             } else {
                 let mmap_guard;
                 let vec_guard;
@@ -1796,7 +1799,11 @@ pub fn generate_thumbnail_data(
     }
 
     let mut final_image = if let Some(img) = preloaded_image {
-        image_loader::composite_patches_on_image(img, &adjustments)?
+        // §4.4: the preloaded base is the editor's loaded image (the proxy in
+        // proxy edit mode); scale original-space patch geometry/bitmaps by
+        // proxy_scale (1.0 no-op otherwise).
+        let proxy_scale = crate::current_proxy_scale(&app_handle.state::<AppState>());
+        image_loader::composite_patches_on_image(img, &adjustments, proxy_scale)?
     } else {
         match read_file_mapped(&source_path) {
             Ok(mmap) => image_loader::load_and_composite(

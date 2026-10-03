@@ -1718,8 +1718,17 @@ pub(crate) async fn export_images_impl(
                     let base_image = if is_current_edit {
                         match crate::get_original_image(&state) {
                             Ok((orig_data_arc, _)) => {
-                                composite_patches_on_image(&orig_data_arc, &js_adjustments)
-                                    .map_err(|e| format!("Failed to composite AI patches: {}", e))?
+                                // §4.4: `get_original_image` returns the loaded base;
+                                // scale patch geometry/bitmaps by proxy_scale so a
+                                // cropped patch lands correctly whether that base is
+                                // the proxy (proxy edit mode) or the full original
+                                // (proxy_scale == 1.0 no-op).
+                                composite_patches_on_image(
+                                    &orig_data_arc,
+                                    &js_adjustments,
+                                    crate::current_proxy_scale(&state),
+                                )
+                                .map_err(|e| format!("Failed to composite AI patches: {}", e))?
                             }
                             Err(_) => {
                                 let bytes =

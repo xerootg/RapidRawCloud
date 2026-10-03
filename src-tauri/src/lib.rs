@@ -282,12 +282,12 @@ fn compute_full_transformed_res(
             if *hash == geo_hash {
                 Arc::clone(img)
             } else {
-                let new_img = compute_patched_and_warped(loaded_image, adjustments)?;
+                let new_img = compute_patched_and_warped(loaded_image, adjustments, proxy_scale)?;
                 *cache_lock = Some((geo_hash, Arc::clone(&new_img)));
                 new_img
             }
         } else {
-            let new_img = compute_patched_and_warped(loaded_image, adjustments)?;
+            let new_img = compute_patched_and_warped(loaded_image, adjustments, proxy_scale)?;
             *cache_lock = Some((geo_hash, Arc::clone(&new_img)));
             new_img
         }
@@ -321,6 +321,7 @@ fn compute_full_transformed_res(
 fn compute_patched_and_warped(
     loaded_image: &LoadedImage,
     adjustments: &serde_json::Value,
+    proxy_scale: f32,
 ) -> Result<Arc<DynamicImage>, String> {
     let has_patches = adjustments
         .get("aiPatches")
@@ -328,8 +329,11 @@ fn compute_patched_and_warped(
         .is_some_and(|a| !a.is_empty());
 
     let patched_image = if has_patches {
+        // §4.4: in proxy edit mode `loaded_image.image` is the downscaled proxy,
+        // so original-space cropped-patch geometry/bitmaps are scaled by
+        // `proxy_scale` (1.0 = no-op when the base is the original).
         Cow::Owned(
-            composite_patches_on_image(&loaded_image.image, adjustments)
+            composite_patches_on_image(&loaded_image.image, adjustments, proxy_scale)
                 .map_err(|e| format!("Failed to composite AI patches: {}", e))?,
         )
     } else {
@@ -903,9 +907,15 @@ async fn generate_uncropped_preview(
                     .and_then(|v| v.as_array())
                     .is_some_and(|a| !a.is_empty());
                 let patched_image = if has_patches {
+                    // §4.4: `loaded_image.image` is the proxy in proxy edit mode;
+                    // scale original-space patch geometry/bitmaps by proxy_scale.
                     Cow::Owned(
-                        composite_patches_on_image(&loaded_image.image, &adjustments_clone)
-                            .unwrap_or_else(|_| loaded_image.image.as_ref().clone()),
+                        composite_patches_on_image(
+                            &loaded_image.image,
+                            &adjustments_clone,
+                            current_proxy_scale(&state),
+                        )
+                        .unwrap_or_else(|_| loaded_image.image.as_ref().clone()),
                     )
                 } else {
                     Cow::Borrowed(loaded_image.image.as_ref())

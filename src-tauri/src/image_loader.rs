@@ -74,7 +74,9 @@ pub fn load_and_composite(
 ) -> Result<DynamicImage> {
     let base_image =
         load_base_image_from_bytes(base_image, path, use_fast_raw_dev, settings, cancel_token)?;
-    composite_patches_on_image(&base_image, adjustments)
+    // Base is a full decode of the original bytes, so patch geometry is already
+    // in this image's pixel space: proxy_scale = 1.0 (§4.4, no-op).
+    composite_patches_on_image(&base_image, adjustments, 1.0)
 }
 
 pub fn load_base_image_from_bytes(
@@ -560,9 +562,22 @@ pub fn load_image_with_orientation(
     Ok(DynamicImage::ImageRgb32F(oriented_image.to_rgb32f()))
 }
 
+/// Composite AI patches onto `base_image`.
+///
+/// §4.4: a cropped patch (`offsetX`/`offsetY`/`width`/`height` present) stores
+/// its geometry — and its `mask`/`color` bitmaps — in ORIGINAL pixel space. When
+/// the base is a smart-preview proxy the base is downscaled by `proxy_scale`
+/// (`= proxy_long_edge / orig_long_edge`, always `<= 1.0`), so the patch offset
+/// and bitmaps must be scaled into proxy space before compositing; pasting them
+/// verbatim lands the patch grossly displaced (mostly off-canvas) and mis-sized.
+/// Non-cropped (full-frame) patches resize their bitmaps to the base dimensions
+/// and so are already correct at any resolution. Callers whose base IS the
+/// original (export / hydrate / load-from-original) pass `proxy_scale = 1.0`,
+/// which makes every scaling step below an exact no-op.
 pub fn composite_patches_on_image(
     base_image: &DynamicImage,
     current_adjustments: &Value,
+    proxy_scale: f32,
 ) -> Result<DynamicImage> {
     let patches_val = match current_adjustments.get("aiPatches") {
         Some(val) => val,
@@ -620,6 +635,18 @@ pub fn composite_patches_on_image(
                 .map(|v| v as u32);
             let is_cropped = offset_x.is_some() && offset_y.is_some();
 
+            // §4.4: a cropped patch's offset/size and its mask/color bitmaps are
+            // stored in ORIGINAL pixel space. When the base is a downscaled proxy
+            // (`proxy_scale < 1.0`) scale them into proxy space; verbatim use lands
+            // the patch displaced/off-canvas and mis-sized. No-op at scale 1.0
+            // (original base). Full-frame patches resize to base dims below, so
+            // only cropped patches need this.
+            let scale_patch = is_cropped && (proxy_scale - 1.0).abs() > f32::EPSILON;
+            let scale_off = |v: u32| (v as f32 * proxy_scale).round() as u32;
+            let scale_size = |v: u32| ((v as f32 * proxy_scale).round() as u32).max(1);
+            let offset_x = offset_x.map(|v| if scale_patch { scale_off(v) } else { v });
+            let offset_y = offset_y.map(|v| if scale_patch { scale_off(v) } else { v });
+
             let is_srgb_encoded = patch_data
                 .get("isSrgbEncoded")
                 .and_then(|v| v.as_bool())
@@ -634,6 +661,14 @@ pub fn composite_patches_on_image(
                 let mask_img = image::load_from_memory(&mask_bytes)?.to_luma8();
                 if !is_cropped && (mask_img.width() != base_w || mask_img.height() != base_h) {
                     imageops::resize(&mask_img, base_w, base_h, imageops::FilterType::Lanczos3)
+                } else if scale_patch {
+                    // Cropped mask is original-space; downscale into proxy space.
+                    imageops::resize(
+                        &mask_img,
+                        scale_size(mask_img.width()),
+                        scale_size(mask_img.height()),
+                        imageops::FilterType::Lanczos3,
+                    )
                 } else {
                     mask_img
                 }
@@ -669,15 +704,22 @@ pub fn composite_patches_on_image(
                     crate::image_processing::inverse_transform_mask(gen_mask, current_adjustments);
 
                 if let (Some(ox), Some(oy)) = (offset_x, offset_y) {
+                    // `gen_mask` is generated at base (= proxy) dims, so the crop
+                    // offset `ox`/`oy` is already in proxy space (scaled above).
+                    // The width/height come from patchData in ORIGINAL space, so
+                    // scale them too (only when actually provided; an absent field
+                    // means "to the base edge" and must not be scaled).
                     let w = patch_data
                         .get("width")
                         .and_then(|v| v.as_u64())
                         .map(|v| v as u32)
+                        .map(|v| if scale_patch { scale_size(v) } else { v })
                         .unwrap_or(base_w);
                     let h = patch_data
                         .get("height")
                         .and_then(|v| v.as_u64())
                         .map(|v| v as u32)
+                        .map(|v| if scale_patch { scale_size(v) } else { v })
                         .unwrap_or(base_h);
                     let crop_w = w.min(base_w.saturating_sub(ox));
                     let crop_h = h.min(base_h.saturating_sub(oy));
@@ -694,11 +736,23 @@ pub fn composite_patches_on_image(
             let color_image_u8 = image::load_from_memory(&color_bytes)?.to_rgb8();
 
             let (patch_w, patch_h) = color_image_u8.dimensions();
+            // The compositing loop indexes `color` by the mask's linear index, so
+            // color and mask MUST share dimensions. Full-frame: resize to base.
+            // Cropped: match the (possibly proxy-scaled) mask so the invariant
+            // holds whether or not `proxy_scale` shrank the mask.
+            let (mask_w, mask_h) = mask_bitmap.dimensions();
             let final_color = if !is_cropped && (base_w != patch_w || base_h != patch_h) {
                 imageops::resize(
                     &color_image_u8,
                     base_w,
                     base_h,
+                    imageops::FilterType::Lanczos3,
+                )
+            } else if is_cropped && (patch_w != mask_w || patch_h != mask_h) {
+                imageops::resize(
+                    &color_image_u8,
+                    mask_w,
+                    mask_h,
                     imageops::FilterType::Lanczos3,
                 )
             } else {
@@ -1203,4 +1257,112 @@ pub async fn load_image(
         exif: exif_data,
         is_raw,
     })
+}
+
+#[cfg(test)]
+mod proxy_patch_tests {
+    //! §4.4 regression: an offset-cropped AI patch stores its offset/size and
+    //! its mask/color bitmaps in ORIGINAL pixel space. When `composite_patches_
+    //! on_image` runs over a smart-preview PROXY base it must scale that geometry
+    //! and those bitmaps by `proxy_scale`; before the fix the offset was applied
+    //! verbatim, so on a 2x-downscaled proxy an original-space offset of 600 px
+    //! fell past the 500 px proxy edge and the patch was dropped entirely
+    //! (crop width saturated to 0) — a grossly displaced / missing patch in the
+    //! editor preview. `proxy_scale == 1.0` (original base) must stay a no-op.
+
+    use super::*;
+    use image::{DynamicImage, GrayImage, Rgb, RgbImage};
+
+    fn png_b64_rgb(w: u32, h: u32, px: [u8; 3]) -> String {
+        let img = RgbImage::from_pixel(w, h, Rgb(px));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        general_purpose::STANDARD.encode(buf.into_inner())
+    }
+
+    fn png_b64_mask(w: u32, h: u32, v: u8) -> String {
+        let img = GrayImage::from_pixel(w, h, image::Luma([v]));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        DynamicImage::ImageLuma8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .unwrap();
+        general_purpose::STANDARD.encode(buf.into_inner())
+    }
+
+    /// A fully-opaque solid-red cropped patch at ORIGINAL offset (ox, oy) of
+    /// size (pw, ph). `isSrgbEncoded=false` so red decodes to linear (1,0,0).
+    fn cropped_red_patch(ox: u32, oy: u32, pw: u32, ph: u32) -> Value {
+        serde_json::json!({
+            "aiPatches": [{
+                "visible": true,
+                "patchData": {
+                    "offsetX": ox,
+                    "offsetY": oy,
+                    "width": pw,
+                    "height": ph,
+                    "isSrgbEncoded": false,
+                    "color": png_b64_rgb(pw, ph, [255, 0, 0]),
+                    "mask": png_b64_mask(pw, ph, 255),
+                }
+            }]
+        })
+    }
+
+    fn black_base(w: u32, h: u32) -> DynamicImage {
+        DynamicImage::ImageRgb32F(image::ImageBuffer::from_pixel(w, h, Rgb([0.0, 0.0, 0.0])))
+    }
+
+    fn is_red(p: &Rgb<f32>) -> bool {
+        p[0] > 0.9 && p[1] < 0.1 && p[2] < 0.1
+    }
+    fn is_black(p: &Rgb<f32>) -> bool {
+        p[0] < 0.1 && p[1] < 0.1 && p[2] < 0.1
+    }
+
+    #[test]
+    fn cropped_patch_is_scaled_into_proxy_space() {
+        // Original 1000x1000, proxy 500x500 => proxy_scale 0.5. The patch lives
+        // at original [600,800)x[600,800); scaled it must land at proxy
+        // [300,400)x[300,400).
+        let proxy = black_base(500, 500);
+        let adj = cropped_red_patch(600, 600, 200, 200);
+        let out = composite_patches_on_image(&proxy, &adj, 0.5).unwrap();
+        let rgb = out.to_rgb32f();
+
+        // Center of the scaled patch must be red (before the fix the verbatim
+        // offset 600 > 500 saturated crop width to 0 and this stayed black).
+        assert!(
+            is_red(rgb.get_pixel(350, 350)),
+            "scaled patch center must be red; got {:?}",
+            rgb.get_pixel(350, 350)
+        );
+        // Just inside the scaled patch edges.
+        assert!(is_red(rgb.get_pixel(305, 305)));
+        assert!(is_red(rgb.get_pixel(395, 395)));
+        // Outside the scaled patch stays untouched.
+        assert!(is_black(rgb.get_pixel(50, 50)));
+        assert!(
+            is_black(rgb.get_pixel(450, 450)),
+            "pixel beyond the scaled patch must stay black"
+        );
+        // The UNSCALED (buggy) location is off the 500px proxy canvas entirely,
+        // so there is nothing to check there — the whole point of the bug.
+    }
+
+    #[test]
+    fn cropped_patch_unscaled_base_is_unchanged() {
+        // proxy_scale == 1.0: the base IS the original, so the offset/bitmaps are
+        // used verbatim (export / hydrate / load-from-original parity).
+        let base = black_base(1000, 1000);
+        let adj = cropped_red_patch(600, 600, 200, 200);
+        let out = composite_patches_on_image(&base, &adj, 1.0).unwrap();
+        let rgb = out.to_rgb32f();
+        assert!(
+            is_red(rgb.get_pixel(700, 700)),
+            "at scale 1.0 the patch must sit at its original coords"
+        );
+        assert!(is_black(rgb.get_pixel(300, 300)));
+    }
 }
