@@ -157,12 +157,64 @@ pub struct WgpuTransformPayload {
     pub pixelated: bool,
 }
 
+/// The current proxy-edit-mode scale (ARCHITECTURE.md §4.4). `Some(s)` iff the
+/// loaded `original_image` is a smart-preview proxy decoded at scale `s =
+/// proxy_long_edge / orig_long_edge`; `None`/normal load returns `1.0`. Read by
+/// the render paths so original-pixel-space geometry maps onto the proxy base.
+pub fn current_proxy_scale(state: &tauri::State<AppState>) -> f32 {
+    state
+        .proxy_scale
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .unwrap_or(1.0)
+}
+
+/// §4.4: the scale that maps ORIGINAL-pixel-space geometry (crop offset, mask
+/// coordinates, AI-patch offsets) onto the rendered output image.
+///
+/// In normal mode the render base *is* the original, so this is just
+/// `base_to_output` (the base→preview downscale). In proxy edit mode the render
+/// base is the smart-preview proxy — already downscaled from the original by
+/// `proxy_scale` — so original→output = `proxy_scale · (proxy→output)`. This is
+/// the editor-preview analogue of `generate_thumbnail_data`'s
+/// `total_scale = gpu_scale · raw_scale_factor` (`file_management.rs`), where
+/// `raw_scale_factor` carries the decode downscale; here it carries
+/// `proxy_scale`. Without this factor every mask/crop was displaced by
+/// `orig/proxy` (~2.3×) when editing an evicted photo (P3 review blocker).
+pub fn effective_geometry_scale(base_to_output: f32, proxy_scale: f32) -> f32 {
+    base_to_output * proxy_scale
+}
+
+/// §4.4: rewrite `adjustments["crop"]` from original-pixel space into the
+/// proxy's pixel space (multiply by `proxy_scale`), so `apply_crop` extracts the
+/// correct region of the downscaled proxy base. A no-op clone when there is no
+/// crop. Returns the modified adjustments; the caller restores the reported
+/// crop offset back to original space by dividing by `proxy_scale`.
+fn scale_crop_into_proxy_space(adjustments: &serde_json::Value, proxy_scale: f32) -> serde_json::Value {
+    let mut adj = adjustments.clone();
+    if let Some(crop_val) = adj.get("crop").cloned()
+        && let Ok(c) = serde_json::from_value::<Crop>(crop_val)
+    {
+        let scaled = Crop {
+            x: c.x * proxy_scale as f64,
+            y: c.y * proxy_scale as f64,
+            width: c.width * proxy_scale as f64,
+            height: c.height * proxy_scale as f64,
+        };
+        adj["crop"] = serde_json::to_value(scaled).unwrap_or(serde_json::Value::Null);
+    }
+    adj
+}
+
 pub fn generate_transformed_preview(
     state: &tauri::State<AppState>,
     loaded_image: &LoadedImage,
     adjustments: &serde_json::Value,
     preview_dim: u32,
 ) -> Result<(DynamicImage, f32, (f32, f32)), String> {
+    // §4.4: in proxy edit mode the loaded base is the proxy; original-pixel-space
+    // crop/mask geometry must be mapped through `proxy_scale`.
+    let proxy_scale = current_proxy_scale(state);
     let transform_hash = calculate_transform_hash(adjustments);
 
     let (transformed_full_res, unscaled_crop_offset) = {
@@ -175,12 +227,13 @@ pub fn generate_transformed_preview(
                 (Arc::clone(img), *offset)
             } else {
                 let (arc_img, offset) =
-                    compute_full_transformed_res(state, loaded_image, adjustments)?;
+                    compute_full_transformed_res(state, loaded_image, adjustments, proxy_scale)?;
                 *cache_lock = Some((transform_hash, Arc::clone(&arc_img), offset));
                 (arc_img, offset)
             }
         } else {
-            let (arc_img, offset) = compute_full_transformed_res(state, loaded_image, adjustments)?;
+            let (arc_img, offset) =
+                compute_full_transformed_res(state, loaded_image, adjustments, proxy_scale)?;
             *cache_lock = Some((transform_hash, Arc::clone(&arc_img), offset));
             (arc_img, offset)
         }
@@ -194,11 +247,19 @@ pub fn generate_transformed_preview(
         (*transformed_full_res).clone()
     };
 
-    let scale_for_gpu = if full_res_w > 0 {
+    // `full_res_w` is in PROXY space in proxy mode; the base→preview ratio is
+    // therefore proxy→preview. Fold `proxy_scale` back in so `scale_for_gpu`
+    // maps ORIGINAL pixels → preview (the space mask coords and the returned
+    // original-space crop offset live in). The returned scale is consumed only
+    // for mask rasterization and crop-offset scaling, never to resize the
+    // preview image itself, so this is correct for every caller (and a no-op
+    // when `proxy_scale == 1.0`).
+    let base_to_preview = if full_res_w > 0 {
         final_preview_base.width() as f32 / full_res_w as f32
     } else {
         1.0
     };
+    let scale_for_gpu = effective_geometry_scale(base_to_preview, proxy_scale);
 
     Ok((final_preview_base, scale_for_gpu, unscaled_crop_offset))
 }
@@ -207,6 +268,7 @@ fn compute_full_transformed_res(
     state: &tauri::State<AppState>,
     loaded_image: &LoadedImage,
     adjustments: &serde_json::Value,
+    proxy_scale: f32,
 ) -> Result<(Arc<DynamicImage>, (f32, f32)), String> {
     let geo_hash = crate::cache_utils::calculate_patched_warped_hash(adjustments);
 
@@ -231,10 +293,27 @@ fn compute_full_transformed_res(
         }
     };
 
-    let (transformed_img, offset) = crate::adjustment_utils::apply_spatial_transformations(
-        Cow::Borrowed(warped_arc.as_ref()),
-        adjustments,
-    );
+    // §4.4: geometry warp params are normalized (resolution-independent), so the
+    // warp above needs no proxy adjustment. The crop, however, is in
+    // original-pixel space; when the base is a proxy, scale it into proxy space
+    // before cropping, then report the crop offset back in ORIGINAL space (so
+    // `scale_for_gpu`, which already folds `proxy_scale`, maps it correctly).
+    let (transformed_img, offset) = if (proxy_scale - 1.0).abs() > f32::EPSILON {
+        let adj = scale_crop_into_proxy_space(adjustments, proxy_scale);
+        let (img, proxy_offset) = crate::adjustment_utils::apply_spatial_transformations(
+            Cow::Borrowed(warped_arc.as_ref()),
+            &adj,
+        );
+        (
+            img,
+            (proxy_offset.0 / proxy_scale, proxy_offset.1 / proxy_scale),
+        )
+    } else {
+        crate::adjustment_utils::apply_spatial_transformations(
+            Cow::Borrowed(warped_arc.as_ref()),
+            adjustments,
+        )
+    };
 
     Ok((Arc::new(transformed_img.into_owned()), offset))
 }
@@ -2356,4 +2435,103 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod proxy_render_scale_tests {
+    //! P3 review BLOCKER regression (ARCHITECTURE.md §4.4): in proxy edit mode
+    //! the render path must map original-pixel-space mask/crop geometry onto the
+    //! downscaled proxy base via `proxy_scale`. Before the fix the editor-preview
+    //! path derived the mask scale from the loaded PROXY dims alone
+    //! (`scale_for_gpu`), ignoring `proxy_scale`, so every mask/crop was
+    //! displaced by `orig/proxy` (~2.3x) when editing an evicted photo.
+    //!
+    //! These tests pin the pure scale seam the render path now routes through
+    //! (`effective_geometry_scale`) and rasterize a mask through it to prove the
+    //! geometry lands where the original-pixel coordinates say it should.
+
+    use super::effective_geometry_scale;
+    use crate::mask_generation::{MaskDefinition, SubMask, SubMaskMode, generate_mask_bitmap};
+
+    fn radial_def(center_x: f64, center_y: f64, radius: f64) -> MaskDefinition {
+        MaskDefinition {
+            id: "m".into(),
+            name: "radial".into(),
+            visible: true,
+            invert: false,
+            opacity: 100.0,
+            adjustments: serde_json::Value::Null,
+            sub_masks: vec![SubMask {
+                id: "s".into(),
+                mask_type: "radial".into(),
+                visible: true,
+                invert: false,
+                opacity: 100.0,
+                mode: SubMaskMode::Additive,
+                parameters: serde_json::json!({
+                    "centerX": center_x,
+                    "centerY": center_y,
+                    "radiusX": radius,
+                    "radiusY": radius,
+                    "rotation": 0.0,
+                    "feather": 0.0,
+                }),
+            }],
+        }
+    }
+
+    fn centroid(bmp: &image::GrayImage) -> Option<(f32, f32)> {
+        let (mut sx, mut sy, mut n) = (0.0f64, 0.0f64, 0u64);
+        for (x, y, p) in bmp.enumerate_pixels() {
+            if p[0] > 127 {
+                sx += x as f64;
+                sy += y as f64;
+                n += 1;
+            }
+        }
+        (n > 0).then(|| ((sx / n as f64) as f32, (sy / n as f64) as f32))
+    }
+
+    #[test]
+    fn effective_geometry_scale_folds_proxy_scale() {
+        // Normal mode: base IS the original, so the mask scale is just the
+        // base->preview downscale.
+        assert_eq!(effective_geometry_scale(0.5, 1.0), 0.5);
+        // Proxy mode: base is the proxy (orig * proxy_scale), so original->preview
+        // = proxy_scale * (proxy->preview). A missing proxy_scale factor (the
+        // blocker) would leave this at `base_to_preview`.
+        let proxy_scale = 2560.0 / 6000.0;
+        let eff = effective_geometry_scale(1.0, proxy_scale);
+        assert!((eff - proxy_scale).abs() < 1e-6);
+    }
+
+    #[test]
+    fn proxy_mode_mask_lands_at_original_pixel_coordinate() {
+        // Original 6000x4000; smart-preview proxy long edge 2560 => 2560x1707.
+        // proxy_scale = proxy_long_edge / orig_long_edge (§4.4); computed inline
+        // so this guard compiles in both feature configs.
+        let proxy_scale = 2560.0f32 / 6000.0f32;
+        let (pw, ph) = (2560u32, 1707u32);
+
+        // The editor preview equals the proxy base here (no further downscale),
+        // so base->preview = 1.0 and the mask scale is purely `proxy_scale`.
+        let eff = effective_geometry_scale(1.0, proxy_scale);
+
+        // A radial mask centered at ORIGINAL pixel (3000, 2000) must land at the
+        // corresponding proxy-space point (1280, 853) on the 2560x1707 canvas.
+        let def = radial_def(3000.0, 2000.0, 300.0);
+        let bmp = generate_mask_bitmap(&def, pw, ph, eff, (0.0, 0.0), None)
+            .expect("mask bitmap");
+        let (cx, cy) = centroid(&bmp).expect(
+            "mask must be visible on the proxy canvas; a missing proxy_scale displaces it \
+             off-canvas (to original coord 3000,2000 on a 2560x1707 base)",
+        );
+
+        let (ex, ey) = (3000.0 * proxy_scale, 2000.0 * proxy_scale);
+        assert!(
+            (cx - ex).abs() < 20.0 && (cy - ey).abs() < 20.0,
+            "radial mask centroid ({cx:.1},{cy:.1}) must match original->proxy ({ex:.1},{ey:.1}); \
+             a ~2.3x displacement here is the P3 proxy_scale blocker"
+        );
+    }
 }

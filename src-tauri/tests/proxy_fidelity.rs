@@ -36,7 +36,7 @@
 
 #![cfg(feature = "sync")]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rapidraw_lib::rrcloud_core::proxy;
 use rapidraw_lib::sync::proxy_support::{
@@ -44,6 +44,17 @@ use rapidraw_lib::sync::proxy_support::{
 };
 
 const HL: f32 = 2.5;
+
+/// Clipped-neighborhood p99 ΔE00 budget (§4.1/E1/§8-P3), shared by the core and
+/// GPU-confirmation tests so the two never drift. Calibrated from the spec's
+/// original 6.0 to **8.0** during P3: the E1 divergence (downscale-then-recover
+/// ≠ recover-then-downscale near clipped highlights) is an INHERENT property of
+/// resolution reduction, not a bug — it floors at a measured ~7.35 p99 on Sony
+/// ARW, and the recover-then-downscale alternative measured WORSE (~10.5). 8.0
+/// sits just above the ~7.35 floor with margin yet still trips a gross
+/// regression. The unclipped budget (the real proof) is unchanged and passes by
+/// ~2 orders of magnitude. ARCHITECTURE.md §8-P3 documents the same number.
+const CLIPPED_P99_BUDGET: f64 = 8.0;
 
 fn corpus_dir() -> Option<PathBuf> {
     let p = std::env::var("RRCLOUD_RAW_CORPUS")
@@ -54,7 +65,7 @@ fn corpus_dir() -> Option<PathBuf> {
     if pb.is_dir() { Some(pb) } else { None }
 }
 
-fn format_samples(dir: &PathBuf) -> Vec<(&'static str, PathBuf)> {
+fn format_samples(dir: &Path) -> Vec<(&'static str, PathBuf)> {
     let specs: &[(&str, &[&str])] = &[
         (
             "CR3",
@@ -105,7 +116,7 @@ macro_rules! skip_without_corpus {
     };
 }
 
-fn read(path: &PathBuf) -> Vec<u8> {
+fn read(path: &Path) -> Vec<u8> {
     std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
@@ -119,7 +130,7 @@ fn develop_rgb(bytes: &[u8], fast: bool, linear_mode: &str) -> (Vec<f32>, u32, u
     let (w, h) = (img.width(), img.height());
     let rgba = img.into_rgba32f().into_raw();
     let mut rgb = Vec::with_capacity((w * h * 3) as usize);
-    for px in rgba.chunks_exact(4) {
+    for px in rgba.as_chunks::<4>().0 {
         rgb.push(px[0]);
         rgb.push(px[1]);
         rgb.push(px[2]);
@@ -269,7 +280,7 @@ fn fidelity_core_delta_e_within_budget() {
 
         let mut unclipped = Vec::new();
         let mut clipped = Vec::new();
-        for (pa, pb) in a_ds.chunks_exact(3).zip(b.chunks_exact(3)) {
+        for (pa, pb) in a_ds.as_chunks::<3>().0.iter().zip(b.as_chunks::<3>().0.iter()) {
             let (la, aa, ba) = lin_rgb_to_lab(pa[0], pa[1], pa[2]);
             let (lb, ab, bb) = lin_rgb_to_lab(pb[0], pb[1], pb[2]);
             let de = ciede2000(la, aa, ba, lb, ab, bb);
@@ -342,8 +353,10 @@ fn fidelity_core_delta_e_within_budget() {
     // passing unclipped budget confirms is correct). The budget is set to 8.0:
     // above the measured ~7.35 inherent floor with a small margin, yet still
     // tight enough to catch a gross regression (the worse ~10.5 ordering, or
-    // any real clipped-highlight breakage, trips it).
-    const CLIPPED_P99_BUDGET: f64 = 8.0;
+    // any real clipped-highlight breakage, trips it). The budget is the
+    // module-level `CLIPPED_P99_BUDGET`, shared with the GPU-confirmation test
+    // so the two cannot drift (P3 review: the GPU test previously hardcoded a
+    // stale 6.0).
 
     for r in &results {
         assert!(
@@ -483,8 +496,10 @@ fn wh_provenance_matches_develop() {
 /// The proxy decode pin neutralizes the user's `linear_raw_mode` (§4.1/§4.4).
 #[test]
 fn proxy_decode_settings_pins_linear_mode() {
-    let mut base = rapidraw_lib::AppSettings::default();
-    base.linear_raw_mode = "skip_calib".to_string();
+    let base = rapidraw_lib::AppSettings {
+        linear_raw_mode: "skip_calib".to_string(),
+        ..Default::default()
+    };
     let pinned = proxy_decode_settings(&base);
     assert!(
         pinned.linear_raw_mode.is_empty(),
@@ -519,7 +534,7 @@ fn shadow_push_banding_16bit_beats_8bit() {
 
     // Look at the darkest decile of the green channel (shadows), push +4 EV
     // (×16), and count distinct quantized levels under 16-bit vs 8-bit.
-    let mut greens: Vec<f32> = base.chunks_exact(3).map(|p| p[1]).collect();
+    let mut greens: Vec<f32> = base.as_chunks::<3>().0.iter().map(|p| p[1]).collect();
     greens.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let cut = greens[greens.len() / 10].max(1e-6);
     let shadow: Vec<f32> = greens.into_iter().filter(|&g| g <= cut).collect();
@@ -602,14 +617,16 @@ fn fidelity_gpu_confirmation_under_aggressive_settings() {
     // ΔE00 under the same budgets as fidelity_core.
     let o = rendered_orig.into_rgba32f();
     let (ow, oh) = (o.width(), o.height());
+    let o_raw = o.into_raw();
     let mut o_rgb = Vec::with_capacity((ow * oh * 3) as usize);
-    for px in o.into_raw().chunks_exact(4) {
+    for px in o_raw.as_chunks::<4>().0 {
         o_rgb.extend_from_slice(&px[..3]);
     }
     let p = rendered_proxy.into_rgba32f();
     let (pw, ph) = (p.width(), p.height());
+    let p_raw = p.into_raw();
     let mut p_rgb = Vec::with_capacity((pw * ph * 3) as usize);
-    for px in p.into_raw().chunks_exact(4) {
+    for px in p_raw.as_chunks::<4>().0 {
         p_rgb.extend_from_slice(&px[..3]);
     }
     let long = pw.max(ph);
@@ -618,7 +635,7 @@ fn fidelity_gpu_confirmation_under_aggressive_settings() {
 
     let mut unclipped = Vec::new();
     let mut clipped = Vec::new();
-    for (pa, pb) in o_ds.chunks_exact(3).zip(p_rgb.chunks_exact(3)) {
+    for (pa, pb) in o_ds.as_chunks::<3>().0.iter().zip(p_rgb.as_chunks::<3>().0.iter()) {
         let (la, aa, ba) = lin_rgb_to_lab(pa[0], pa[1], pa[2]);
         let (lb, ab, bb) = lin_rgb_to_lab(pb[0], pb[1], pb[2]);
         let de = ciede2000(la, aa, ba, lb, ab, bb);
@@ -640,9 +657,17 @@ fn fidelity_gpu_confirmation_under_aggressive_settings() {
     );
     if !clipped.is_empty() {
         clipped.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        // Shared budget with the core test (§4.1/E1); see `CLIPPED_P99_BUDGET`.
+        // NOTE: this GPU path currently scores `samples[0]` only — on the known
+        // corpus that is a CR3 whose clipped bucket is empty (n=0), so this
+        // branch does not execute. ARW clipped fidelity is validated by the core
+        // ΔE test. Kept consistent so it is correct if a clipped sample lands
+        // first (P3 review minor).
         assert!(
-            percentile(&clipped, 0.99) <= 6.0,
-            "{fmt}: GPU clipped p99 > 6.0"
+            percentile(&clipped, 0.99) <= CLIPPED_P99_BUDGET,
+            "{fmt}: GPU clipped p99 ΔE00 {:.3} > {:.1}",
+            percentile(&clipped, 0.99),
+            CLIPPED_P99_BUDGET
         );
     }
 }

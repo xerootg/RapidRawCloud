@@ -246,9 +246,12 @@ pub fn proxy_decode_settings(base: &AppSettings) -> AppSettings {
 /// `original_image`, and returns a [`LoadImageResult`] reporting the ORIGINAL
 /// (journal) dimensions via [`proxy_reported_dimensions`].
 ///
-/// RED scaffold: unimplemented until the P3 green pass. Unreachable in RED
-/// because `SyncManager::proxy_handle` returns `None`, so the loader always
-/// falls through to the §3.5 hydrate path.
+/// Reached when `SyncManager::proxy_handle` returns a handle — i.e. the original
+/// is an evicted stub with a present `.pxy.dng` proxy and journaled `(w,h)`.
+/// Otherwise `load_image` falls through to the §3.5 hydrate path. The stored
+/// `proxy_scale` (§4.4) is consumed by the render paths
+/// (`generate_transformed_preview` / `generate_thumbnail_data`) so
+/// original-pixel-space mask/crop geometry maps onto the proxy base.
 #[cfg(feature = "sync")]
 #[allow(clippy::needless_pass_by_value)]
 async fn load_image_from_proxy(

@@ -106,6 +106,42 @@ fn recover_clipped_pixel(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
     (cur_r, cur_g, cur_b)
 }
 
+/// P3 CLAMP FIX (ARCHITECTURE.md §4.1/E3 + §7 parity), feature-gated.
+///
+/// Upstream sets `clamp_limit = 1.0` for *any* `fast_demosaic` decode, which
+/// clips exactly the >1.0 above-nominal-white headroom a linear-DNG smart
+/// preview exists to carry (the thumbnail path decodes fast). Fast demosaic is
+/// meaningless for a LinearRaw decode anyway — the `is_linear_format` branch in
+/// `develop_internal` skips Demosaic entirely — so relaxing the clamp for linear
+/// formats is semantically sound and is what the proxy needs.
+///
+/// The relaxation is gated on the `sync` feature so a `--no-default-features`
+/// build is byte-identical to upstream (`1.0` for every fast-demosaic decode),
+/// which is the hard §7 parity guarantee the fork makes. The P3 review flagged
+/// that the earlier, *ungated* `fast_demosaic && !is_linear_format` also changed
+/// the fast decode of a FOREIGN linear DNG (the `linear_mode` setting's reason
+/// to exist) in a `--no-default-features` build — a parity break. With the gate,
+/// a non-sync build never diverges from upstream. In a `sync` build the
+/// relaxation does reach foreign linear DNGs decoded fast; that is intentional
+/// and harmless (fast demosaic is a no-op for LinearRaw), and it is documented
+/// in `docs/UPSTREAM_TOUCHES.md` rather than claimed to be proxy-only.
+#[inline]
+fn resolve_clamp_limit(fast_demosaic: bool, is_linear_format: bool, highlight: f32) -> f32 {
+    #[cfg(feature = "sync")]
+    {
+        if fast_demosaic && !is_linear_format {
+            1.0
+        } else {
+            highlight
+        }
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = is_linear_format; // upstream ignores format: fast => clamp to 1.0
+        if fast_demosaic { 1.0 } else { highlight }
+    }
+}
+
 fn develop_internal(
     file_bytes: &[u8],
     fast_demosaic: bool,
@@ -191,20 +227,7 @@ fn develop_internal(
 
     let safe_highlight_compression = 1000.0;
 
-    // P3 CLAMP FIX (ARCHITECTURE.md §4.1/E3).
-    //
-    // Fast demosaic is meaningless for a LinearRaw decode (the `is_linear_format`
-    // branch above skips Demosaic entirely), yet a `fast_demosaic` thumbnail
-    // decode of a proxy would clamp to 1.0 and destroy exactly the >1.0
-    // above-nominal-white headroom the proxy exists to carry. For non-linear
-    // formats this is behavior-preserving (upstream parity); the LinearRaw
-    // decode is only ever reached by proxies, which do not exist upstream — so
-    // `--no-default-features` parity holds.
-    let clamp_limit = if fast_demosaic && !is_linear_format {
-        1.0
-    } else {
-        safe_highlight_compression
-    };
+    let clamp_limit = resolve_clamp_limit(fast_demosaic, is_linear_format, safe_highlight_compression);
 
     let (width, height) = {
         let dim = developed_intermediate.dim();
@@ -301,4 +324,47 @@ pub fn get_fast_demosaic_scale_factor(
         }
     }
     1.0
+}
+
+#[cfg(test)]
+mod clamp_gate_tests {
+    //! P3 review MAJOR regression (ARCHITECTURE.md §4.1/E3 + §7): the LinearRaw
+    //! clamp relaxation must be gated on the `sync` feature so a
+    //! `--no-default-features` build stays byte-identical to upstream
+    //! (`clamp_limit = 1.0` for every fast-demosaic decode). Each assertion is
+    //! cfg-specific so it runs under the config it pins; run both:
+    //!   cargo test -p rapidraw_lib                       (sync on)
+    //!   cargo test -p rapidraw_lib --no-default-features (sync off / parity)
+    use super::resolve_clamp_limit;
+
+    const HL: f32 = 1000.0;
+
+    #[test]
+    fn non_linear_fast_demosaic_always_clamps_to_one() {
+        // Upstream behavior, unchanged by the fix in BOTH configs.
+        assert_eq!(resolve_clamp_limit(true, false, HL), 1.0);
+    }
+
+    #[test]
+    fn non_fast_never_clamps() {
+        assert_eq!(resolve_clamp_limit(false, true, HL), HL);
+        assert_eq!(resolve_clamp_limit(false, false, HL), HL);
+    }
+
+    #[cfg(feature = "sync")]
+    #[test]
+    fn sync_build_relaxes_clamp_for_linear_fast_demosaic() {
+        // The proxy needs its >1.0 headroom preserved under fast demosaic.
+        assert_eq!(resolve_clamp_limit(true, true, HL), HL);
+    }
+
+    #[cfg(not(feature = "sync"))]
+    #[test]
+    fn no_default_features_is_upstream_parity_for_linear_fast_demosaic() {
+        // §7 hard guarantee: with sync off, a fast-demosaic decode of a FOREIGN
+        // linear DNG clamps to 1.0 exactly like upstream. The pre-fix ungated
+        // `fast_demosaic && !is_linear_format` returned 1000.0 here — the
+        // parity break this test guards against.
+        assert_eq!(resolve_clamp_limit(true, true, HL), 1.0);
+    }
 }

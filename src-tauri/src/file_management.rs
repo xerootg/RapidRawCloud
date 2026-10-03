@@ -1585,6 +1585,18 @@ pub fn generate_thumbnail_data(
             let mut raw_scale_factor = 1.0f32;
 
             let composite_image = if let Some(img) = preloaded_image {
+                // §4.4: the preloaded image is the editor's loaded base. When
+                // that base is a smart-preview proxy (`proxy_scale` is set), it
+                // is already downscaled from the original, while the crop/mask
+                // geometry below is in original-pixel space. Carry `proxy_scale`
+                // as the decode scale exactly as the non-preloaded branch
+                // carries the fast-demosaic scale, so `total_scale = gpu_scale *
+                // raw_scale_factor` maps original → processing space. (The
+                // preloaded image is only ever this path's own loaded image —
+                // `generate_single_thumbnail_and_cache` passes it only when the
+                // loaded path matches — so reading the global proxy_scale here
+                // cannot misattribute another photo's scale.)
+                raw_scale_factor = crate::current_proxy_scale(&state);
                 image_loader::composite_patches_on_image(img, &adjustments)?
             } else {
                 let mmap_guard;
