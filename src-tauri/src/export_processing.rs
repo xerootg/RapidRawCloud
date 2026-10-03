@@ -42,6 +42,41 @@ use crate::{
     hydrate_adjustments, load_settings, resolve_warped_image_for_masks,
 };
 
+/// Which base image a *current-edit* export (the `is_current_edit` branch of
+/// [`export_images_impl`]) must render from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CurrentEditBaseSource {
+    /// Reuse the already-decoded in-memory base in `state.original_image`.
+    /// Valid ONLY when that base is the full-resolution original.
+    InMemoryBase,
+    /// Discard the in-memory base and reload (then composite onto) the
+    /// just-hydrated full-resolution original from disk.
+    ReloadHydratedOriginal,
+}
+
+/// ARCHITECTURE.md §4.1/§4.4: *export always forces hydration and re-renders
+/// from the original.* In proxy edit mode the in-memory base held in
+/// `state.original_image` is the ≤2560px smart-preview proxy (decoded at
+/// `proxy_scale < 1.0` by `load_image_from_proxy`), NOT the full original.
+/// Rendering a current-edit export from that proxy would silently emit a
+/// proxy-resolution file carrying the §4.1 2× highlight clamp, and the mask /
+/// crop geometry — stored in original pixel space — would be displaced because
+/// `process_image_for_export_pipeline` rasterizes it at scale 1.0 onto the
+/// proxy-size canvas. So whenever the loaded base is a proxy
+/// (`proxy_scale != 1.0`), the current-edit export MUST discard the in-memory
+/// base and reload the hydrated full-res original from disk (`ensure_local`
+/// has already placed it there). When the loaded base already IS the original
+/// (`proxy_scale == 1.0` — normal mode, or hydration completed mid-edit and
+/// `load_image` re-ran loading the original), the in-memory base is reused to
+/// avoid a redundant full-res decode.
+pub(crate) fn select_current_edit_base_source(proxy_scale: f32) -> CurrentEditBaseSource {
+    if (proxy_scale - 1.0).abs() > f32::EPSILON {
+        CurrentEditBaseSource::ReloadHydratedOriginal
+    } else {
+        CurrentEditBaseSource::InMemoryBase
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(try_from = "u8", into = "u8")]
 pub enum TiffBitDepth {
@@ -1716,21 +1751,20 @@ pub(crate) async fn export_images_impl(
                     }
 
                     let base_image = if is_current_edit {
-                        match crate::get_original_image(&state) {
-                            Ok((orig_data_arc, _)) => {
-                                // §4.4: `get_original_image` returns the loaded base;
-                                // scale patch geometry/bitmaps by proxy_scale so a
-                                // cropped patch lands correctly whether that base is
-                                // the proxy (proxy edit mode) or the full original
-                                // (proxy_scale == 1.0 no-op).
-                                composite_patches_on_image(
-                                    &orig_data_arc,
-                                    &js_adjustments,
-                                    crate::current_proxy_scale(&state),
-                                )
-                                .map_err(|e| format!("Failed to composite AI patches: {}", e))?
-                            }
-                            Err(_) => {
+                        // §4.1/§4.4: export always re-renders from the full
+                        // original. In proxy edit mode the in-memory base
+                        // (`state.original_image`) is the ≤2560px smart-preview
+                        // proxy, so reusing it would emit a proxy-resolution
+                        // file (2× highlight clamp) with original-space masks
+                        // displaced onto the proxy canvas. `ensure_local`
+                        // (above) already hydrated the full original to disk, so
+                        // reload it; otherwise reuse the in-memory original.
+                        match select_current_edit_base_source(crate::current_proxy_scale(&state)) {
+                            CurrentEditBaseSource::ReloadHydratedOriginal => {
+                                // Reload the hydrated full-res original and
+                                // composite the current edit in ORIGINAL pixel
+                                // space (the reloaded base IS the original, so
+                                // proxy_scale is 1.0 — masks/crop land correctly).
                                 let bytes =
                                     fs::read(&source_path_str).map_err(|e| e.to_string())?;
                                 load_and_composite(
@@ -1741,7 +1775,45 @@ pub(crate) async fn export_images_impl(
                                     &settings,
                                     None,
                                 )
-                                .map_err(|e| format!("Failed to load fallback image: {}", e))?
+                                .map_err(|e| {
+                                    format!(
+                                        "Failed to load hydrated original for current-edit export: {}",
+                                        e
+                                    )
+                                })?
+                            }
+                            CurrentEditBaseSource::InMemoryBase => {
+                                match crate::get_original_image(&state) {
+                                    Ok((orig_data_arc, _)) => {
+                                        // Normal mode: the in-memory base IS the
+                                        // full original (proxy_scale == 1.0), so
+                                        // `composite_patches_on_image` at scale 1.0
+                                        // is a geometry no-op.
+                                        composite_patches_on_image(
+                                            &orig_data_arc,
+                                            &js_adjustments,
+                                            crate::current_proxy_scale(&state),
+                                        )
+                                        .map_err(|e| {
+                                            format!("Failed to composite AI patches: {}", e)
+                                        })?
+                                    }
+                                    Err(_) => {
+                                        let bytes = fs::read(&source_path_str)
+                                            .map_err(|e| e.to_string())?;
+                                        load_and_composite(
+                                            &bytes,
+                                            &source_path_str,
+                                            &js_adjustments,
+                                            false,
+                                            &settings,
+                                            None,
+                                        )
+                                        .map_err(|e| {
+                                            format!("Failed to load fallback image: {}", e)
+                                        })?
+                                    }
+                                }
                             }
                         }
                     } else {
@@ -2350,4 +2422,46 @@ pub async fn estimate_export_sizes(
     };
 
     Ok(single_image_extrapolated_size * paths.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CurrentEditBaseSource, select_current_edit_base_source};
+
+    /// Regression (ARCHITECTURE.md §4.1/§4.4, P3 round-2 blocker): "export
+    /// always forces hydration and re-renders from the original." Editing an
+    /// evicted photo loads the ≤2560px smart-preview proxy into
+    /// `state.original_image` at `proxy_scale < 1.0`. The current-edit export
+    /// branch previously reused that in-memory proxy base unconditionally,
+    /// silently emitting a proxy-resolution file (with the §4.1 2× highlight
+    /// clamp) and displacing original-space masks onto the proxy canvas. This
+    /// pins the fix: in proxy edit mode the export must RELOAD the hydrated
+    /// full-res original instead of reusing the in-memory proxy.
+    #[test]
+    fn current_edit_export_reloads_hydrated_original_in_proxy_mode() {
+        // A real proxy_scale for a 6000px original downscaled to a 2560px
+        // proxy long edge (~0.427). Must reload the hydrated original.
+        assert_eq!(
+            select_current_edit_base_source(2560.0 / 6000.0),
+            CurrentEditBaseSource::ReloadHydratedOriginal,
+            "proxy edit mode must re-render export from the hydrated original, \
+             not the in-memory proxy base (§4.1/§4.4)"
+        );
+        // A tiny-but-nonzero downscale is still a proxy → still reload.
+        assert_eq!(
+            select_current_edit_base_source(0.99),
+            CurrentEditBaseSource::ReloadHydratedOriginal,
+        );
+    }
+
+    /// In normal (non-proxy) mode the in-memory base IS the full original
+    /// (`proxy_scale == 1.0`), so the export reuses it and skips a redundant
+    /// full-res decode. This arm must NOT regress into always-reloading.
+    #[test]
+    fn current_edit_export_reuses_inmemory_original_when_not_proxy() {
+        assert_eq!(
+            select_current_edit_base_source(1.0),
+            CurrentEditBaseSource::InMemoryBase,
+        );
+    }
 }
