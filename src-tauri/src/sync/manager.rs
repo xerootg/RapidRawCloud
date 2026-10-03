@@ -614,18 +614,20 @@ mod imp {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use rrcloud_core::clock::DeviceId;
+    use rrcloud_core::clock::{DeviceId, VersionVector};
     use rrcloud_core::engine::{
         ChangeOutcome, EngineConsumer, LocalScan, admit_pending, notify_local_change,
     };
-    use rrcloud_core::journal::Kind;
-    use rrcloud_core::keys::relkey;
-    use rrcloud_core::publisher::publish_pending;
+    use rrcloud_core::journal::{JournalEntry, Kind, Op};
+    use rrcloud_core::keys::{RelKey, relkey};
+    use rrcloud_core::publisher::{enqueue_entry, publish_pending};
     use rrcloud_core::reader::poll;
     use rrcloud_core::s3::{S3Client, S3Config};
-    use rrcloud_core::state::{ItemState, StateError, SyncDb};
+    use rrcloud_core::semhash::Blake3Hex;
+    use rrcloud_core::state::{ItemRecord, ItemState, StateError, SyncDb};
     use rrcloud_core::transfer::{
-        BackendProfile, CancelFlag, TransferConfig, probe_backend, pump_downloads, pump_uploads,
+        BackendProfile, CancelFlag, ExpectedDownload, TransferConfig, bucket_key_for,
+        download_item, local_target_path, probe_backend, pump_downloads, pump_uploads,
         stored_backend_profile,
     };
 
@@ -651,6 +653,95 @@ mod imp {
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_nanos() as i64)
             .unwrap_or(0)
+    }
+
+    /// Wall-clock unix seconds (attest `ts`, §2.2).
+    fn now_unix() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    /// A strictly-monotonic access stamp for the LRU order
+    /// (`last_access_unix`, §3.5). Seeded from wall-clock **nanoseconds** so
+    /// the ordering survives a process restart (newer bytes keep a larger
+    /// stamp), but forced strictly increasing within the process via a
+    /// process-global floor so two accesses in the same wall-clock
+    /// nanosecond — two guard-site hydrations microseconds apart — still
+    /// order deterministically (the eviction tests pin which of two
+    /// back-to-back hydrations is the LRU victim). The field is documented
+    /// as unix seconds but is only ever compared, never read as a clock, so
+    /// a finer unit is safe.
+    fn access_stamp() -> u64 {
+        use std::sync::atomic::AtomicU64;
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        loop {
+            let prev = LAST.load(Ordering::Relaxed);
+            let next = now.max(prev.saturating_add(1));
+            if LAST
+                .compare_exchange(prev, next, Ordering::SeqCst, Ordering::Relaxed)
+                .is_ok()
+            {
+                return next;
+            }
+        }
+    }
+
+    /// Drives one `async` body to completion from a **synchronous** caller
+    /// that may itself be inside a tokio runtime (the §3.5 `ensure_local`
+    /// guard sites run on the app's runtime). A nested `block_on` on the
+    /// calling thread would panic with "Cannot start a runtime from within a
+    /// runtime"; running on a dedicated thread that owns a fresh
+    /// current-thread runtime removes the ambient runtime entirely, exactly
+    /// as the §3.3 exit-flush wrapper does.
+    fn run_blocking<T, F>(fut: F) -> Result<T, SyncError>
+    where
+        T: Send + 'static,
+        F: std::future::Future<Output = Result<T, SyncError>> + Send + 'static,
+    {
+        let handle = std::thread::spawn(move || -> Result<T, SyncError> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| se(format!("blocking runtime: {e}")))?;
+            runtime.block_on(fut)
+        });
+        match handle.join() {
+            Ok(result) => result,
+            Err(_) => Err(se("blocking worker thread panicked")),
+        }
+    }
+
+    /// Resolves the §2.4 backend profile without the `self.backend` cache
+    /// (the cached path is [`Configured::ensure_backend`]): the persisted
+    /// value if present, else a one-shot digest probe that persists itself.
+    /// Used from the dedicated-thread hydrate runtime, which holds only
+    /// owned clones.
+    async fn resolve_backend(
+        db: &SyncDb,
+        s3: &S3Client,
+        bucket: &str,
+    ) -> Result<BackendProfile, SyncError> {
+        match stored_backend_profile(db).map_err(se)? {
+            Some(b) => Ok(b),
+            None => probe_backend(db, s3, bucket).await.map_err(se),
+        }
+    }
+
+    /// The outcome of a §3.5 eviction read-back re-hash.
+    enum Readback {
+        /// Remote bytes blake3-match the journal head — safe to evict.
+        Confirmed,
+        /// The remote object could not be read (deleted / unreachable) — the
+        /// "never evict unverified bytes" invariant keeps the local copy.
+        Unverifiable,
+        /// Remote bytes exist but hash wrong — route to `corrupt_remote`.
+        Mismatch,
     }
 
     /// The live engine handle populated by `configure`: the redb state
@@ -834,15 +925,57 @@ mod imp {
             size: u64,
             remote_mtime_unix: i64,
         ) -> Result<(), SyncError> {
-            let _ = (
-                &self.db,
-                &self.sync_root,
+            let rk = relkey(image_path, &self.sync_root).map_err(se)?;
+            let blake3 = Blake3Hex::parse(blake3_hex)
+                .map_err(|e| se(format!("create_stub: bad remote blake3: {e}")))?;
+
+            // The 0-byte placeholder at the real path, with the remote
+            // original's mtime replayed so `compute_thumbnail_cache_hash`
+            // (blake3 of abs path + mtime + adjustments) is identical before
+            // and after a later hydration (§3.5).
+            if let Some(parent) = image_path.parent() {
+                std::fs::create_dir_all(parent).map_err(se)?;
+            }
+            std::fs::File::create(image_path).map_err(se)?;
+            filetime::set_file_mtime(
                 image_path,
-                blake3_hex,
+                filetime::FileTime::from_unix_time(remote_mtime_unix, 0),
+            )
+            .map_err(se)?;
+
+            // The durable `ItemState::Stub` record carrying the verified
+            // remote facts the hydration + eviction gate read. A remote-only
+            // original the engine learned of from a journal/manifest head is
+            // content-verified upstream (§2.4), so `verified_remote` holds;
+            // `attested` stays false until this device itself hydrates and
+            // verifies the bytes. `replay_put_item` is the §2.4 ingest path
+            // for materializing an adopted record in an entry state.
+            let record = ItemRecord {
+                kind: Kind::Original,
+                state: ItemState::Stub,
                 size,
-                remote_mtime_unix,
-            );
-            todo!("P2 green: write 0-byte stub + set remote mtime + record ItemState::Stub")
+                mtime_unix_ns: remote_mtime_unix.saturating_mul(1_000_000_000),
+                blake3: Some(blake3),
+                sem_hash: None,
+                vv: VersionVector::new(),
+                content_id: None,
+                w: None,
+                h: None,
+                pinned: false,
+                last_access_unix: 0,
+                verified_remote: true,
+                attested: false,
+                base_unknown: false,
+                rating: None,
+                color_label: None,
+                device: None,
+                head_ts: None,
+                admitted_vv: None,
+                admitted_ts: None,
+                deleted: false,
+            };
+            self.db.replay_put_item(&rk, &record).map_err(se)?;
+            Ok(())
         }
 
         /// §3.5 hydration — the resumable ranged download of a stub's real
@@ -853,23 +986,152 @@ mod imp {
         /// bounded worker runtime, like the exit-flush path). Scaffold:
         /// unimplemented until the P2 green pass.
         pub fn hydrate(&self, image_path: &Path, reason: &str) -> Result<PathBuf, SyncError> {
-            let _ = (
-                &self.db,
-                &self.s3,
-                &self.bucket,
-                &self.sync_root,
-                image_path,
-                reason,
-            );
-            todo!("P2 green: resumable ranged GET + blake3 verify + atomic install + attest")
+            let _ = reason; // threaded for the command-layer event emit (next unit)
+            let rk = relkey(image_path, &self.sync_root).map_err(se)?;
+            let record = self
+                .db
+                .get_item(&rk)
+                .map_err(se)?
+                .ok_or_else(|| se("hydrate: no item record for stub"))?;
+
+            // Idempotent: the bytes are already present.
+            if matches!(record.state, ItemState::Hydrated | ItemState::Synced) {
+                return Ok(image_path.to_path_buf());
+            }
+
+            let blake3 = record
+                .blake3
+                .clone()
+                .ok_or_else(|| se("hydrate: stub has no remote blake3"))?;
+            let expected = ExpectedDownload {
+                blake3,
+                size: record.size,
+                mtime_unix: record.mtime_unix_ns.div_euclid(1_000_000_000),
+            };
+
+            // The resumable ranged GET + blake3 verify + atomic install +
+            // mtime restore + `Stub → Downloading → Hydrated` terminal commit
+            // is the transfer engine's `download_item` (§3.5). Run it on a
+            // dedicated-thread runtime so a guard site already inside the
+            // app's runtime does not panic on a nested `block_on`.
+            let db = self.db.clone();
+            let s3 = self.s3.clone();
+            let bucket = self.bucket.clone();
+            let root = self.sync_root.clone();
+            let rk_dl = rk.clone();
+            let installed = run_blocking(async move {
+                let backend = resolve_backend(&db, s3.as_ref(), &bucket).await?;
+                let cfg = TransferConfig::new(bucket, root.clone(), backend);
+                let outcome = download_item(&db, s3.as_ref(), &cfg, &rk_dl, &root, &expected)
+                    .await
+                    .map_err(se)?;
+                Ok::<PathBuf, SyncError>(outcome.path)
+            })?;
+
+            // Hydration verified the bytes against the journal head, so this
+            // device can attest the current version and gate its own future
+            // eviction without a read-back (§3.5). Bump the LRU stamp.
+            let attested_record = self
+                .db
+                .update_item(&rk, ItemState::Hydrated, |r| {
+                    r.verified_remote = true;
+                    r.attested = true;
+                    r.last_access_unix = access_stamp();
+                })
+                .map_err(se)?;
+
+            // Emit the `attest` journal entry (§2.2/§3.5). Best-effort: a
+            // staging failure must not fail a successful hydration — the
+            // durable `attested` flag above is the eviction gate; the journal
+            // entry additionally advertises the attestation to peers.
+            if let Err(e) = self.stage_attest(&rk, &attested_record) {
+                log::warn!("hydrate: stage attest for {}: {e}", image_path.display());
+            }
+
+            Ok(installed)
+        }
+
+        /// Stages an `attest` journal entry for the current head of `rk`
+        /// (§2.2 full v1 envelope; `vv` snapshots the verified version). The
+        /// next publish cycle freezes and uploads it.
+        fn stage_attest(&self, rk: &RelKey, record: &ItemRecord) -> Result<(), SyncError> {
+            let key = bucket_key_for(rk, Kind::Original).map_err(se)?;
+            let blake3 = record
+                .blake3
+                .clone()
+                .ok_or_else(|| se("stage_attest: record has no blake3"))?;
+            let entry = JournalEntry {
+                v: rrcloud_core::journal::JOURNAL_VERSION,
+                seq: 0, // allocated at freeze time (publisher contract)
+                ts: now_unix(),
+                device: self.db.device_id().clone(),
+                op: Op::Attest,
+                kind: Kind::Original,
+                key,
+                vv: record.vv.clone(),
+                size: Some(record.size),
+                blake3: Some(blake3),
+                sem_hash: None,
+                rating: None,
+                color_label: None,
+                content_id: record.content_id.clone(),
+                w: None,
+                h: None,
+                mtime: Some(record.mtime_unix_ns.div_euclid(1_000_000_000)),
+                from_key: None,
+            };
+            enqueue_entry(&self.db, &entry).map_err(se)?;
+            Ok(())
         }
 
         /// §3.5 pin/unpin — sets the `pinned` flag on each named original,
         /// fanning a directory out to every item under it. Scaffold:
         /// unimplemented until the P2 green pass.
         pub fn pin_paths(&self, image_paths: &[PathBuf], pinned: bool) -> Result<usize, SyncError> {
-            let _ = (&self.db, &self.sync_root, image_paths, pinned);
-            todo!("P2 green: set pinned flag, folder fan-out")
+            // Resolve each argument to the set of item relkeys it covers: a
+            // file maps to its own relkey; a directory fans out to every
+            // item whose local path is under it ("pin this folder offline",
+            // §3.5). Dedupe so an overlapping file + folder argument counts
+            // one item once.
+            let mut targets: std::collections::HashSet<RelKey> = std::collections::HashSet::new();
+            for arg in image_paths {
+                if arg.is_dir() {
+                    for (rk, record) in self.db.iter_items().map_err(se)? {
+                        if record.deleted {
+                            continue;
+                        }
+                        let local = local_target_path(&self.sync_root, &rk, record.kind);
+                        if local.starts_with(arg) {
+                            targets.insert(rk);
+                        }
+                    }
+                } else if let Ok(rk) = relkey(arg, &self.sync_root)
+                    && self.db.get_item(&rk).map_err(se)?.is_some()
+                {
+                    targets.insert(rk);
+                }
+            }
+
+            let mut changed = 0usize;
+            for rk in targets {
+                let Some(record) = self.db.get_item(&rk).map_err(se)? else {
+                    continue;
+                };
+                if record.pinned == pinned {
+                    continue;
+                }
+                // State-preserving durable write (§3.5): CAS against the
+                // observed state so a concurrent legal transition is not
+                // stomped. A `StaleState` race just skips this item.
+                if self
+                    .db
+                    .update_item(&rk, record.state, |r| r.pinned = pinned)
+                    .is_ok()
+                {
+                    changed += 1;
+                }
+            }
+            Ok(changed)
         }
 
         /// §3.5 LRU eviction pass using `settings.sync.cache_size_gb` as the
@@ -888,14 +1150,135 @@ mod imp {
             &self,
             max_resident_bytes: u64,
         ) -> Result<EvictionReport, SyncError> {
-            let _ = (
-                &self.db,
-                &self.s3,
-                &self.bucket,
-                &self.sync_root,
-                max_resident_bytes,
-            );
-            todo!("P2 green: LRU eviction with the 'never evict unverified bytes' gate")
+            // Resident originals: items holding local bytes (`Hydrated`, or a
+            // `Synced` original this device uploaded) — never stubs. Sidecars
+            // are never stubbed (§3.5), so they never enter the budget.
+            let mut candidates: Vec<(RelKey, ItemRecord, PathBuf)> = self
+                .db
+                .iter_items()
+                .map_err(se)?
+                .into_iter()
+                .filter(|(_, r)| {
+                    !r.deleted
+                        && r.kind == Kind::Original
+                        && matches!(r.state, ItemState::Hydrated | ItemState::Synced)
+                })
+                .map(|(rk, r)| {
+                    let path = local_target_path(&self.sync_root, &rk, r.kind);
+                    (rk, r, path)
+                })
+                .collect();
+
+            // Least-recently-accessed first (eviction order, §3.5).
+            candidates.sort_by_key(|(_, r, _)| r.last_access_unix);
+
+            let mut report = EvictionReport::default();
+            let mut resident: u64 = candidates.iter().map(|(_, r, _)| r.size).sum();
+
+            for (rk, record, path) in candidates {
+                if resident <= max_resident_bytes {
+                    break;
+                }
+                // Pinned originals are never evicted (§3.5).
+                if record.pinned {
+                    report.kept_pinned.push(path);
+                    continue;
+                }
+                // Upload-side integrity must hold before anything else (§2.4).
+                if !record.verified_remote {
+                    report.kept_unverified.push(path);
+                    continue;
+                }
+                // The content-verified gate: an `attest` entry covers the
+                // version, OR a one-time read-back re-hash confirms the
+                // remote bytes. A mismatch is `corrupt_remote`; an
+                // unreadable remote keeps the local copy — the "never evict
+                // unverified bytes" invariant (§3.5).
+                if !record.attested {
+                    match self.readback_verify(&rk, &record).await? {
+                        Readback::Confirmed => {}
+                        Readback::Unverifiable => {
+                            report.kept_unverified.push(path);
+                            continue;
+                        }
+                        Readback::Mismatch => {
+                            let _ = self.db.transition(
+                                &rk,
+                                record.state,
+                                ItemState::CorruptRemote,
+                                |_| {},
+                            );
+                            report.corrupt.push(path);
+                            continue;
+                        }
+                    }
+                }
+                // Demote to a 0-byte stub: terminal transition, truncate the
+                // file, restore the remote mtime so the thumbnail cache key
+                // survives (§3.5).
+                self.evict_to_stub(&rk, &record, &path)?;
+                resident = resident.saturating_sub(record.size);
+                report.evicted.push(path);
+            }
+
+            report.resident_bytes = resident;
+            Ok(report)
+        }
+
+        /// Reads the remote original back in full and blake3-compares it
+        /// against the journal head (§3.5 eviction read-back gate).
+        async fn readback_verify(
+            &self,
+            rk: &RelKey,
+            record: &ItemRecord,
+        ) -> Result<Readback, SyncError> {
+            let key = bucket_key_for(rk, Kind::Original).map_err(se)?;
+            let output = match self.s3.get_object(&self.bucket, &key, None).await {
+                Ok(o) => o,
+                // A deleted / unreachable remote cannot be confirmed: keep
+                // the only good copy (the local bytes).
+                Err(_) => return Ok(Readback::Unverifiable),
+            };
+            let bytes = match output.body.collect().await {
+                Ok(b) => b,
+                Err(_) => return Ok(Readback::Unverifiable),
+            };
+            let actual = Blake3Hex::from_bytes(&bytes);
+            match &record.blake3 {
+                Some(expected) if &actual == expected => Ok(Readback::Confirmed),
+                Some(_) => Ok(Readback::Mismatch),
+                None => Ok(Readback::Unverifiable),
+            }
+        }
+
+        /// Demotes one verified resident original back to a 0-byte stub:
+        /// `Hydrated`/`Synced → Stub`, truncate the file, restore the remote
+        /// mtime (§3.5 — keeps the thumbnail cache key stable).
+        fn evict_to_stub(
+            &self,
+            rk: &RelKey,
+            record: &ItemRecord,
+            path: &Path,
+        ) -> Result<(), SyncError> {
+            self.db
+                .transition(rk, record.state, ItemState::Stub, |_| {})
+                .map_err(se)?;
+            // Truncate in place (never a remove+recreate: the directory entry
+            // and inode stay put under any concurrent reader).
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .map_err(se)?;
+            filetime::set_file_mtime(
+                path,
+                filetime::FileTime::from_unix_time(
+                    record.mtime_unix_ns.div_euclid(1_000_000_000),
+                    0,
+                ),
+            )
+            .map_err(se)?;
+            Ok(())
         }
 
         /// §3.5 thumb seeding — durable app-data store + hard-link into the
@@ -908,15 +1291,59 @@ mod imp {
             jpeg_bytes: &[u8],
             cache_thumbnails_dir: &Path,
         ) -> Result<PathBuf, SyncError> {
-            let _ = (
-                &self.db,
-                &self.sync_root,
-                image_path,
-                variant,
-                jpeg_bytes,
-                cache_thumbnails_dir,
-            );
-            todo!("P2 green: durable thumbs store + hard-link into $APPCACHE/thumbnails")
+            let suffix = variant.suffix();
+
+            // 1. Durable app-data store: `app_data_dir/rrcloud/thumbs/` is
+            //    the redb's own directory (`state_dir`, §3.6). The canonical
+            //    name keys on the content identity when known (survives a
+            //    path move), else on the stub's relkey. This store is *not*
+            //    the OS-clearable cache (§3.5 D1 fix).
+            let store_dir = self
+                .db
+                .path()
+                .parent()
+                .unwrap_or(self.sync_root.as_path())
+                .join("thumbs");
+            std::fs::create_dir_all(&store_dir).map_err(se)?;
+            let content_key = match relkey(image_path, &self.sync_root) {
+                Ok(rk) => match self
+                    .db
+                    .get_item(&rk)
+                    .map_err(se)?
+                    .and_then(|r| r.content_id)
+                {
+                    Some(cid) => Blake3Hex::from_bytes(cid.as_str().as_bytes())
+                        .as_str()
+                        .to_string(),
+                    None => Blake3Hex::from_bytes(rk.as_str().as_bytes())
+                        .as_str()
+                        .to_string(),
+                },
+                Err(_) => Blake3Hex::from_bytes(image_path.to_string_lossy().as_bytes())
+                    .as_str()
+                    .to_string(),
+            };
+            let durable = store_dir.join(format!("{content_key}_{suffix}.jpg"));
+            std::fs::write(&durable, jpeg_bytes).map_err(se)?;
+
+            // 2. Surface it to the webview by hard-linking (copy fallback)
+            //    into `$APPCACHE/thumbnails/<hash>_<suffix>.jpg`, where
+            //    `<hash>` is the exact stub-path cache key
+            //    `generate_single_thumbnail_and_cache` looks up — stub mtime
+            //    + no local adjustments — so the asset-protocol scope and
+            //    `tauri.conf.json` stay untouched (§3.5).
+            let path_str = image_path.to_string_lossy();
+            let hash = crate::file_management::compute_thumbnail_cache_hash(&path_str, b"")
+                .ok_or_else(|| se("seed_thumbnail: cannot compute stub thumbnail cache key"))?;
+            std::fs::create_dir_all(cache_thumbnails_dir).map_err(se)?;
+            let linked = cache_thumbnails_dir.join(format!("{hash}_{suffix}.jpg"));
+            // Replace any stale link/file at the key first.
+            let _ = std::fs::remove_file(&linked);
+            if std::fs::hard_link(&durable, &linked).is_err() {
+                // Cross-filesystem (desktop) — copy fallback (§3.5).
+                std::fs::copy(&durable, &linked).map_err(se)?;
+            }
+            Ok(linked)
         }
 
         /// Read-only query of an item's current state as a snake_case string

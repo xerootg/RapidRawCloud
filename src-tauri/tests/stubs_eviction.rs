@@ -207,7 +207,9 @@ async fn evictor_demotes_lru_verified_originals_and_keeps_pinned() {
     mgr_b
         .ensure_local(&stub_old, "test")
         .expect("re-hydrate old");
-    let pinned = mgr_b.pin_paths(&[stub_new.clone()], true).expect("pin new");
+    let pinned = mgr_b
+        .pin_paths(std::slice::from_ref(&stub_new), true)
+        .expect("pin new");
     assert_eq!(pinned, 1, "one item's pin flag changed");
 
     let report2 = mgr_b.run_evictor_with_budget(0).await.expect("evictor 2");

@@ -224,6 +224,10 @@ admin_token = "{admin_token}"
         "garage"
     }
 
+    // Used only by the test binaries that drive the S3 client directly
+    // (app_wiring_e2e, stubs_eviction); `mod common` compiles per binary, so
+    // it reads as dead code in the binaries that only need the manager API.
+    #[allow(dead_code)]
     pub fn s3_config(&self) -> S3Config {
         S3Config {
             endpoint: self.endpoint(),
@@ -236,6 +240,7 @@ admin_token = "{admin_token}"
         }
     }
 
+    #[allow(dead_code)]
     pub fn client(&self) -> S3Client {
         S3Client::new(self.s3_config()).expect("S3Client construction failed")
     }
