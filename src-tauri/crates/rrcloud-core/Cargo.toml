@@ -164,16 +164,22 @@ libc = "0.2"
 # §5 pure-logic modules stay testable with no JNI/Android toolchain.
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
-# `ndk_context::initialize_android_context` (bridge.rs step 1) — same major
-# as `src-tauri`'s own `android_integration.rs` dependency.
+# `ndk_context::initialize_android_context` (bridge.rs step 1, called
+# through `android::platform_init`'s process-wide shared guard — see that
+# module's doc for why it must be shared, not a `Once` local to this
+# crate) — same major as `src-tauri`'s own `android_integration.rs`
+# dependency.
 ndk-context = "0.1"
-# `rustls_platform_verifier::android::init_with_env` (bridge.rs step 2): the
-# worker process's own TLS trust-anchor init, separate from the app
-# process's (see bridge.rs doc on why a second init is needed). Pinned to
-# the same `0.7` the app crate uses so a workspace-unified android build
-# never resolves two versions; its `init_with_env` takes a `jni` 0.22
-# `Env`/`JObject`, hence the `jni22` alias below (identical shim
-# `android_integration.rs` already uses).
+# `rustls_platform_verifier::android::init_with_env` (bridge.rs step 2,
+# also routed through `android::platform_init`'s shared guard): this
+# process's TLS trust-anchor init — the SAME process as the app, since
+# this app sets no `android:process` override anywhere, so a
+# `SyncCycleWorker`/`DcimScanWorker` dispatched to it shares `rustls`'s
+# process-global trust-anchor state with the app rather than needing a
+# separate one. Pinned to the same `0.7` the app crate uses so a
+# workspace-unified android build never resolves two versions; its
+# `init_with_env` takes a `jni` 0.22 `Env`/`JObject`, hence the `jni22`
+# alias below (identical shim `android_integration.rs` already uses).
 rustls-platform-verifier = "0.7"
 jni22 = { package = "jni", version = "0.22" }
 

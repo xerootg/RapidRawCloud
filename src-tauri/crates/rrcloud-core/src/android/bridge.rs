@@ -32,7 +32,7 @@
 #[cfg(target_os = "android")]
 mod imp {
     use std::path::PathBuf;
-    use std::sync::{Mutex, Once};
+    use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use jni::objects::{JClass, JObject, JObjectArray, JString};
@@ -68,16 +68,6 @@ mod imp {
     /// already owns the retry/backoff policy, this just refuses to run two
     /// cycles concurrently in-process.
     static CYCLE_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Per-process one-time `ndk_context` init (bridge step 1). Separate
-    /// from the app process's own `Once` in `android_integration.rs`: a
-    /// `SyncCycleWorker`/`DcimScanWorker` dispatched to a *different*
-    /// process under WorkManager's default configuration has its own
-    /// process-global `ndk_context`, uninitialized until this runs there.
-    static INIT_NDK_CONTEXT: Once = Once::new();
-    /// Per-process one-time `rustls_platform_verifier` init (bridge step
-    /// 2), same rationale as [`INIT_NDK_CONTEXT`].
-    static INIT_RUSTLS_PLATFORM_VERIFIER: Once = Once::new();
 
     /// Minimal subset of `AppSettings.sync` this bridge needs to build an
     /// `S3Client` + `TransferConfig` (ARCHITECTURE.md §5.1). Deliberately
@@ -482,8 +472,8 @@ mod imp {
             Err(_) => return BridgeResult::RetryLockHeld.to_code(),
         };
 
-        super::init_ndk_context(&mut env, &ctx, &INIT_NDK_CONTEXT);
-        super::init_rustls_platform_verifier(&mut env, &ctx, &INIT_RUSTLS_PLATFORM_VERIFIER);
+        super::init_ndk_context(&mut env, &ctx);
+        super::init_rustls_platform_verifier(&mut env, &ctx);
 
         let Some((settings, creds)) = load_config(&mut env, &ctx) else {
             return BridgeResult::FailureNotConfigured.to_code();
@@ -867,54 +857,35 @@ mod imp {
 #[cfg(target_os = "android")]
 pub use imp::*;
 
-/// Per-process one-time Android platform init shared by every entry point
-/// above: `ndk_context` (so this process's `rrcloud-core` code — none of
-/// which calls it today, but keeping the context initialized is cheap and
-/// matches `android_integration::initialize_android`'s own pattern exactly)
-/// and `rustls_platform_verifier` (so the `S3Client`'s `reqwest`/`rustls`
-/// stack trusts the Android platform's certificate store in *this*
-/// process, not just the app process's — see the module doc on why a
-/// worker-process `Worker` needs its own init).
+/// Android platform init shared by every entry point above: `ndk_context`
+/// (so this process's `rrcloud-core` code — none of which calls it today,
+/// but keeping the context initialized is cheap and matches
+/// `android_integration::initialize_android`'s own pattern exactly) and
+/// `rustls_platform_verifier` (so the `S3Client`'s `reqwest`/`rustls`
+/// stack trusts the Android platform's certificate store in this
+/// process). Both calls here go through [`super::platform_init`]'s
+/// process-wide shared guards, NOT a `Once` local to this module — this
+/// process is the SAME process as the app (ARCHITECTURE.md §5.1; no
+/// `android:process` override exists on any manifest entry), so a local
+/// guard here would have no idea `android_integration.rs`'s own call site
+/// already ran, or is about to. See `platform_init`'s module doc for the
+/// on-device crash that shape caused.
 #[cfg(target_os = "android")]
-fn init_ndk_context(env: &mut jni::JNIEnv, ctx: &jni::objects::JObject, once: &std::sync::Once) {
-    once.call_once(|| {
-        if let Ok(vm) = env.get_java_vm() {
-            let vm_ptr = vm.get_java_vm_pointer() as *mut std::ffi::c_void;
-            let context_ptr = ctx.as_raw() as *mut std::ffi::c_void;
-            unsafe {
-                ndk_context::initialize_android_context(vm_ptr, context_ptr);
-            }
-        } else {
-            eprintln!("rrcloud bridge: could not obtain JavaVM for ndk_context init");
-        }
-    });
+fn init_ndk_context(env: &mut jni::JNIEnv, ctx: &jni::objects::JObject) {
+    if let Ok(vm) = env.get_java_vm() {
+        let vm_ptr = vm.get_java_vm_pointer() as *mut std::ffi::c_void;
+        let context_ptr = ctx.as_raw() as *mut std::ffi::c_void;
+        super::platform_init::ensure_ndk_context_initialized(vm_ptr, context_ptr);
+    } else {
+        eprintln!("rrcloud bridge: could not obtain JavaVM for ndk_context init");
+    }
 }
 
+/// See [`init_ndk_context`] — same shared-guard rationale, routed through
+/// [`super::platform_init::ensure_rustls_platform_verifier_initialized`].
 #[cfg(target_os = "android")]
-fn init_rustls_platform_verifier(
-    env: &mut jni::JNIEnv,
-    ctx: &jni::objects::JObject,
-    once: &std::sync::Once,
-) {
-    once.call_once(|| {
-        let raw_env = env.get_raw() as *mut jni22::sys::JNIEnv;
-        let raw_context = ctx.as_raw() as jni22::sys::jobject;
-        let mut env_unowned = unsafe { jni22::EnvUnowned::from_raw(raw_env) };
-        match env_unowned
-            .with_env(|env22| {
-                let verifier_context =
-                    unsafe { jni22::objects::JObject::from_raw(env22, raw_context) };
-                rustls_platform_verifier::android::init_with_env(env22, verifier_context)
-            })
-            .into_outcome()
-        {
-            jni22::Outcome::Ok(()) => {}
-            jni22::Outcome::Err(e) => {
-                eprintln!("rrcloud bridge: rustls_platform_verifier init failed: {e}");
-            }
-            jni22::Outcome::Panic(_) => {
-                eprintln!("rrcloud bridge: rustls_platform_verifier init panicked");
-            }
-        }
-    });
+fn init_rustls_platform_verifier(env: &mut jni::JNIEnv, ctx: &jni::objects::JObject) {
+    let raw_env = env.get_raw() as *mut jni22::sys::JNIEnv;
+    let raw_context = ctx.as_raw() as jni22::sys::jobject;
+    super::platform_init::ensure_rustls_platform_verifier_initialized(raw_env, raw_context);
 }

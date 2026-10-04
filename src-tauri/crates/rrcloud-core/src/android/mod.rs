@@ -27,9 +27,19 @@
 //! - [`scan_window`]: the §5.2 API 24-29 `DATE_ADDED` 48 h overlap-window
 //!   arithmetic (the API 30+ path uses `MediaStore.getGeneration()`
 //!   instead, which has no host-side arithmetic to pull out).
+//! - [`platform_init`]: the process-wide `ndk_context`/
+//!   `rustls_platform_verifier` init guards shared by [`bridge`]'s JNI
+//!   entry points **and** `src-tauri`'s own `android_integration.rs` —
+//!   see that module's doc for the double-init crash this exists to
+//!   prevent. The guard mechanic itself has no `target_os` gate, so its
+//!   regression tests run on the host.
 
 pub mod bounded_cycle;
 pub mod bridge;
 pub mod dcim_dedupe;
+pub mod platform_init;
 pub mod result_code;
 pub mod scan_window;
+
+#[cfg(target_os = "android")]
+pub use platform_init::{ensure_ndk_context_initialized, ensure_rustls_platform_verifier_initialized};
