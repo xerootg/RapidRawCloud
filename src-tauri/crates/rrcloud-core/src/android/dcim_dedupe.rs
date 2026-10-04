@@ -9,10 +9,17 @@
 //! Deliberately decoupled from redb: [`decide`] takes the previously
 //! recorded row for this path (or its absence) as a plain value, so the
 //! decision table is host-testable without opening a database. The
-//! intended caller shape is one row-per-path fetch (e.g.
-//! `SyncDb::dcim_seen` queried, or a batch pre-fetch of every watched
-//! path's last-known row) compared against each freshly observed
-//! `(size, mtime)` candidate from the `MediaStore` cursor.
+//! intended caller shape is one row-per-**path** fetch —
+//! [`crate::state::SyncDb::dcim_seen_for_path`], which returns whatever
+//! row currently exists for a path regardless of its recorded `(size,
+//! mtime)` — compared against each freshly observed `(size, mtime)`
+//! candidate from the `MediaStore` cursor. Note this is deliberately
+//! *not* [`crate::state::SyncDb::dcim_seen`], which is keyed by the exact
+//! `(path, size, mtime)` tuple: looking a candidate up by its own
+//! `(size, mtime)` can only ever confirm an unchanged file (a changed one
+//! simply misses, making [`DcimDecision::Rehash`] unreachable) — see
+//! `dcim_seen_for_path`'s doc for why a single row-per-path lookup is
+//! safe (at most one row per path ever exists).
 
 use crate::semhash::ContentId;
 

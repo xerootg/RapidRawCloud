@@ -21,10 +21,12 @@ use rrcloud_core::clock::DeviceId;
 use rrcloud_core::keys::{journal_segment_key, CONTROL_PREFIX};
 use rrcloud_core::publisher::{enqueue_entry, publish_pending};
 use rrcloud_core::reader::{
-    poll, CorruptSegment, FetchFailed, GapDetected, MidStreamGap, PrefixHalted, ReaderError,
+    poll, poll_with_cancel, CorruptSegment, FetchFailed, GapDetected, MidStreamGap, PrefixHalted,
+    ReaderError,
 };
 use rrcloud_core::s3::PutObjectOptions;
 use rrcloud_core::state::SyncDb;
+use rrcloud_core::transfer::CancelFlag;
 
 /// Seqs applied for `device`, in transcript order.
 fn seqs_for(consumer: &RecordingConsumer, device: &DeviceId) -> Vec<u64> {
@@ -1178,6 +1180,61 @@ impl rrcloud_core::s3::S3Api for FloodingList {
             next_continuation_token: Some((page + 1).to_string()),
         })
     }
+}
+
+// ---------------------------------------------------------------------------
+// `poll_with_cancel` (P5 review round 0): the §5.1 budget-bounded Android
+// cycle needs an inbound-journal checkpoint between work units, not one
+// all-or-nothing call — confirm a cancellation stops cleanly (nothing
+// applied, nothing lost) and a later uncancelled poll still catches up
+// fully.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn poll_with_cancel_already_cancelled_applies_nothing_and_resumes_cleanly() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-poll-cancel");
+    let client = g.client();
+    let a = dev(DEV_A);
+    let b = dev(DEV_B);
+    let (_adir, _apath, db_a) = open_db(&a);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // Two segments from a foreign device, same as the plain happy path.
+    publish_batch(&db_a, &client, &bucket, &a, "t1", 2).await;
+    publish_batch(&db_a, &client, &bucket, &a, "t2", 2).await;
+
+    // A flag that is already cancelled before the pass even starts: the
+    // per-device check at the top of `poll_with_cancel`'s loop must fire
+    // before `apply_device_prefix` is called at all.
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    let mut consumer = RecordingConsumer::default();
+    let report = poll_with_cancel(&db_b, &client, &bucket, &mut consumer, &cancel)
+        .await
+        .expect("poll_with_cancel");
+    assert_eq!(
+        report.entries_applied, 0,
+        "a pre-cancelled pass must apply nothing"
+    );
+    assert!(
+        report.halted.is_empty()
+            && report.gaps.is_empty()
+            && report.mid_stream_gaps.is_empty()
+            && report.corrupt.is_empty()
+            && report.fetch_failed.is_empty(),
+        "cancellation is not a failure outcome of any kind: {report:?}"
+    );
+    assert!(consumer.transcript.is_empty());
+
+    // Nothing was lost: an ordinary uncancelled poll right after still
+    // catches up on everything, in order, exactly once.
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_eq!(report.entries_applied, 4);
+    assert_eq!(seqs_for(&consumer, &a), vec![1, 2, 3, 4]);
 }
 
 #[tokio::test]

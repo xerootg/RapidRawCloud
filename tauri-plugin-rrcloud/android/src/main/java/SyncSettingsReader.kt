@@ -50,8 +50,32 @@ object RrcloudSyncSettingsReader {
             requiresUnmetered = sync.optBoolean("uploadRequiresUnmetered", false),
             requiresCharging = sync.optBoolean("uploadRequiresCharging", false),
             autoWatchDcim = sync.optBoolean("autoWatchDcim", false),
-            enabled = sync.optBoolean("enabled", false)
+            enabled = sync.optBoolean("enabled", false),
+            watchedMediaBuckets = readWatchedMediaBuckets(sync)
         )
+    }
+
+    /** `sync.watchedMediaBuckets` (`app_settings::SyncSettings
+     * ::watched_media_buckets`, a `Vec<String>` of MediaStore bucket
+     * display names, `#[serde(rename_all = "camelCase")]`'d) — the list
+     * of camera-roll folders ARCHITECTURE.md §5.2 says the DCIM scan
+     * filters to. Empty (missing key, wrong type, or an explicit `[]`,
+     * matching `SyncSettings::default()`'s empty `Vec`) means "not
+     * configured yet"; the caller ([`DcimScanWorker`]) falls back to the
+     * default `DCIM/Camera` bucket in that case, not here, so this
+     * function's return value always reflects exactly what is in
+     * `settings.json`.
+     */
+    private fun readWatchedMediaBuckets(sync: JSONObject): List<String> {
+        val array = sync.optJSONArray("watchedMediaBuckets") ?: return emptyList()
+        val out = ArrayList<String>(array.length())
+        for (i in 0 until array.length()) {
+            val name = array.optString(i, "")
+            if (name.isNotEmpty()) {
+                out.add(name)
+            }
+        }
+        return out
     }
 }
 
@@ -59,5 +83,6 @@ data class WorkConstraintSettings(
     val requiresUnmetered: Boolean = false,
     val requiresCharging: Boolean = false,
     val autoWatchDcim: Boolean = false,
-    val enabled: Boolean = false
+    val enabled: Boolean = false,
+    val watchedMediaBuckets: List<String> = emptyList()
 )

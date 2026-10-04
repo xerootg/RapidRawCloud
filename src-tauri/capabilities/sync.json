@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "sync",
+  "description": "Capability for the rrcloud sync plugin (ARCHITECTURE.md §5/§7) — only loaded when the `sync` Cargo feature links `tauri-plugin-rrcloud` (see build.rs's feature-conditional `capabilities_path_pattern`); a `--no-default-features` build never reads this file.",
+  "windows": ["main"],
+  "permissions": ["rrcloud:default"]
+}

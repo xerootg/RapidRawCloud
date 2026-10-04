@@ -2078,6 +2078,37 @@ impl SyncDb {
         }
     }
 
+    /// The `dcim_seen` row currently recorded for `path`, **regardless of
+    /// its `(size, mtime)`** — unlike [`SyncDb::dcim_seen`], which is keyed
+    /// by the exact `(path, size, mtime)` tuple and therefore can only ever
+    /// confirm an unchanged file (a changed one simply misses). This is
+    /// the one-row-per-path lookup
+    /// [`crate::android::dcim_dedupe::decide`] actually needs to be able
+    /// to produce `Rehash`: [`SyncDb::set_dcim_seen`] already prunes every
+    /// older `(size, mtime)` observation for a path in the same
+    /// transaction it writes the new one, so at most one row per path
+    /// ever exists and a short range scan over that path's key space
+    /// finds it (or confirms there is none).
+    pub fn dcim_seen_for_path(
+        &self,
+        path: &str,
+    ) -> Result<Option<(u64, i64, ContentId)>, StateError> {
+        let txn = self.begin_read()?;
+        let seen = txn.open_table(T_DCIM_SEEN).map_err(db_err)?;
+        let mut range = seen
+            .range((path, 0u64, i64::MIN)..=(path, u64::MAX, i64::MAX))
+            .map_err(db_err)?;
+        match range.next() {
+            Some(entry) => {
+                let (key, value) = entry.map_err(db_err)?;
+                let (_, size, mtime_unix) = key.value();
+                let content_id = from_stored_str(value.value())?;
+                Ok(Some((size, mtime_unix, content_id)))
+            }
+            None => Ok(None),
+        }
+    }
+
     /// Records a DCIM scan result. Any previous rows for the **same source
     /// path** (older `(size, mtime)` observations) are pruned in the same
     /// transaction — a modified watched file replaces its cache row rather

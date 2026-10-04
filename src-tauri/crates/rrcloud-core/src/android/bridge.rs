@@ -43,7 +43,7 @@ mod imp {
     use crate::journal::Kind;
     use crate::keys::relkey;
     use crate::publisher::publish_pending;
-    use crate::reader::poll;
+    use crate::reader::poll_with_cancel;
     use crate::s3::{S3Client, S3Config};
     use crate::semhash::ContentId;
     use crate::state::{StateError, SyncDb};
@@ -329,6 +329,16 @@ mod imp {
     /// primitives, with a budget check between each lane and between each
     /// pump's admitted items.
     ///
+    /// A per-item failure in the upload or download lane does NOT abort
+    /// the cycle early: every lane still runs (budget permitting) —
+    /// `publish_pending` still advertises whatever did upload, the
+    /// inbound journal still applies, the download lane still runs — and
+    /// only the first collected error is returned at the end, purely so
+    /// the caller still maps this cycle to a retry. Returning early on
+    /// the first failed item would otherwise waste a whole WorkManager
+    /// window under ordinary flaky mobile connectivity (§5.1: "every
+    /// window uploads a few items, applies journal pages, and commits").
+    ///
     /// Proxy backfill (§4.3) and the §2.9 albums/presets meta lane are
     /// deliberately left to the desktop/worker roles for this first
     /// Android cut: both are best-effort additions layered on top of the
@@ -351,6 +361,20 @@ mod imp {
         };
         let cfg = TransferConfig::new(bucket, root.clone(), backend);
 
+        // Collected across every lane rather than returned on the first
+        // failure (regression, P5 review round 0): an ordinary per-item
+        // transient failure — one flaky S3 PUT/GET among several, not an
+        // unrecoverable one — used to abort the WHOLE cycle immediately,
+        // before `publish_pending` advertised whatever *did* upload
+        // successfully and before the poll/download lanes got to run at
+        // all that cycle. Every lane below now always runs (budget
+        // permitting), and only the first collected error is surfaced at
+        // the end — still enough to make the caller map this cycle to
+        // [`BridgeResult::RetryTransient`], but no longer at the cost of
+        // silently withholding already-finished work or skipping inbound
+        // sync entirely under realistic flaky mobile connectivity.
+        let mut first_error: Option<String> = None;
+
         if budget.is_expired(now_ms()) {
             return Ok(());
         }
@@ -358,41 +382,39 @@ mod imp {
         // Upload lane: admit every quiesced-dirty item (P1 admission
         // policy, same as desktop), pump under a budget-bound cancel flag,
         // publish whatever got staged either way (so a budget-interrupted
-        // pass still advertises what it did finish).
+        // OR partially-failed pass still advertises what it did finish).
         admit_pending(db, |_, _| true).map_err(|e| e.to_string())?;
         let cancel = budget_cancel_flag(budget);
         let up = pump_uploads(db, s3, &cfg, 2, &cancel)
             .await
             .map_err(|e| e.to_string())?;
         if let Some((relkey, err)) = up.failed.into_iter().next() {
-            return Err(format!("upload failed for {relkey}: {err}"));
+            first_error.get_or_insert(format!("upload failed for {relkey}: {err}"));
         }
         publish_pending(db, s3, bucket)
             .await
             .map_err(|e| e.to_string())?;
 
         if budget.is_expired(now_ms()) {
-            return Ok(());
+            return first_error.map_or(Ok(()), Err);
         }
 
-        // Inbound journal: one poll pass. `reader::poll` has no per-page
-        // cancellation hook of its own (unlike the transfer pumps) — one
-        // pass is bounded in practice (one LIST plus each foreign device's
-        // unread segments), so checking the budget immediately before and
-        // after it, rather than inside it, is an honest approximation of
-        // "between work units" for this lane specifically; threading a
-        // budget through `poll`'s own per-device loop is left to a future
-        // unit rather than widening this crate's most central read path
-        // for one caller.
+        // Inbound journal: one poll pass, checked against the same
+        // budget-bound cancel flag the transfer pumps use so a large
+        // foreign backlog cannot alone run this lane past the caller's
+        // execution window (regression, P5 review round 0 — see
+        // `reader::poll_with_cancel`'s doc for the between-device/
+        // between-segment checkpoint granularity).
         let mut events = ();
         let mut consumer =
             EngineConsumer::new(db, root.clone(), &mut events).map_err(|e| e.to_string())?;
-        poll(db, s3, bucket, &mut consumer)
+        let poll_cancel = budget_cancel_flag(budget);
+        poll_with_cancel(db, s3, bucket, &mut consumer, &poll_cancel)
             .await
             .map_err(|e| e.to_string())?;
 
         if budget.is_expired(now_ms()) {
-            return Ok(());
+            return first_error.map_or(Ok(()), Err);
         }
 
         let cancel = budget_cancel_flag(budget);
@@ -400,9 +422,9 @@ mod imp {
             .await
             .map_err(|e| e.to_string())?;
         if let Some((relkey, err)) = down.failed.into_iter().next() {
-            return Err(format!("download failed for {relkey}: {err}"));
+            first_error.get_or_insert(format!("download failed for {relkey}: {err}"));
         }
-        Ok(())
+        first_error.map_or(Ok(()), Err)
     }
 
     /// Runs one bounded sync cycle (ARCHITECTURE.md §5.1).
@@ -522,9 +544,13 @@ mod imp {
     /// the whole batch (not once per candidate) and returns a JSON array
     /// `[{"path":str,"decision":"skip"|"rehash"|"new",
     /// "contentId":str|null}, ...]` in the same order, by delegating each
-    /// row to [`decide`] against the existing `dcim_seen` table
-    /// ([`SyncDb::dcim_seen`] — reused as-is, not re-queried per item by
-    /// hand). On `skip` Kotlin does no I/O at all; on `rehash`/`new`
+    /// row to [`decide`] against the existing `dcim_seen` table, fetched
+    /// per candidate via [`SyncDb::dcim_seen_for_path`] — **not**
+    /// [`SyncDb::dcim_seen`], whose exact-`(size, mtime)` key can only
+    /// ever confirm an unchanged file; `dcim_seen_for_path` reuses the
+    /// table as-is but at the one-row-per-path granularity `decide` needs
+    /// to be able to return `Rehash`. On `skip` Kotlin does no I/O at all;
+    /// on `rehash`/`new`
     /// Kotlin streams the file and calls
     /// [`Java_com_plugin_rrcloud_RrcloudBridge_dcimRecordImport`], whose
     /// content-hash churn gate ([`notify_local_change`]) is the actual
@@ -592,16 +618,22 @@ mod imp {
         }
         let mut out = Vec::with_capacity(candidates.len());
         for c in candidates {
-            let row = match db.dcim_seen(&c.path, c.size, c.mtime_unix) {
-                Ok(Some(content_id)) => Some(SeenRow {
-                    size: c.size,
-                    mtime_unix: c.mtime_unix,
+            // `dcim_seen_for_path` (not `dcim_seen`, which is keyed by the
+            // exact candidate `(size, mtime)` and so can only ever confirm
+            // an unchanged file) fetches whatever row currently exists for
+            // this path regardless of its recorded `(size, mtime)` — the
+            // one-row-per-path shape `decide` needs to be able to return
+            // `Rehash` for a changed file.
+            let row = match db.dcim_seen_for_path(&c.path) {
+                Ok(Some((size, mtime_unix, content_id))) => Some(SeenRow {
+                    size,
+                    mtime_unix,
                     content_id,
                 }),
                 Ok(None) => None,
                 Err(e) => {
                     eprintln!(
-                        "rrcloud bridge: dcimScanDecisions: dcim_seen {}: {e}",
+                        "rrcloud bridge: dcimScanDecisions: dcim_seen_for_path {}: {e}",
                         c.path
                     );
                     None

@@ -39,12 +39,13 @@ class DcimScanWorker(context: Context, params: WorkerParameters) : Worker(contex
             return ListenableWorker.Result.success()
         }
 
+        val watchedBuckets = watchedBucketNames(settings)
         val prefs = applicationContext.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
         return try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                scanWithGeneration(prefs)
+                scanWithGeneration(prefs, watchedBuckets)
             } else {
-                scanWithDateAdded(prefs)
+                scanWithDateAdded(prefs, watchedBuckets)
             }
             ListenableWorker.Result.success()
         } catch (e: Exception) {
@@ -53,27 +54,37 @@ class DcimScanWorker(context: Context, params: WorkerParameters) : Worker(contex
         }
     }
 
-    private fun scanWithGeneration(prefs: android.content.SharedPreferences) {
+    private fun scanWithGeneration(prefs: android.content.SharedPreferences, watchedBuckets: Set<String>) {
         val volume = MediaStore.VOLUME_EXTERNAL
         val lastGeneration = prefs.getLong(KEY_GENERATION, 0L)
+        // Snapshot the generation BEFORE issuing the query, not after
+        // processing it (regression, P5 review round 0: a photo whose
+        // GENERATION_ADDED lands between the pre-query snapshot and the
+        // query itself is still > lastGeneration and so is included in
+        // THIS pass's results; reading the generation only after the slow
+        // per-file processCandidates() call would instead let it slip
+        // between "not in this pass's query results" and "<= the newly
+        // stored cursor", i.e. silently and permanently lost).
+        val nowGeneration = MediaStore.getGeneration(applicationContext, volume)
         val selection = if (lastGeneration > 0) {
             "${MediaStore.MediaColumns.GENERATION_ADDED} > ?"
         } else {
             null
         }
         val args = if (lastGeneration > 0) arrayOf(lastGeneration.toString()) else null
-        val candidates = queryCandidates(selection, args)
+        val candidates = queryCandidates(selection, args, watchedBuckets)
         processCandidates(candidates)
-        prefs.edit().putLong(KEY_GENERATION, MediaStore.getGeneration(applicationContext, volume)).apply()
+        prefs.edit().putLong(KEY_GENERATION, nowGeneration).apply()
     }
 
-    private fun scanWithDateAdded(prefs: android.content.SharedPreferences) {
+    private fun scanWithDateAdded(prefs: android.content.SharedPreferences, watchedBuckets: Set<String>) {
         val lastCursor = if (prefs.contains(KEY_DATE_ADDED_CURSOR)) prefs.getLong(KEY_DATE_ADDED_CURSOR, 0L) else null
         val nowUnix = System.currentTimeMillis() / 1000L
         val floor = effectiveFloor(lastCursor, nowUnix)
         val candidates = queryCandidates(
             "${MediaStore.MediaColumns.DATE_ADDED} > ?",
-            arrayOf(floor.toString())
+            arrayOf(floor.toString()),
+            watchedBuckets
         )
         processCandidates(candidates)
         prefs.edit().putLong(KEY_DATE_ADDED_CURSOR, nowUnix).apply()
@@ -89,7 +100,11 @@ class DcimScanWorker(context: Context, params: WorkerParameters) : Worker(contex
 
     private data class Candidate(val id: Long, val path: String, val size: Long, val mtimeUnix: Long, val displayName: String)
 
-    private fun queryCandidates(selection: String?, args: Array<String>?): List<Candidate> {
+    private fun queryCandidates(
+        selection: String?,
+        args: Array<String>?,
+        watchedBuckets: Set<String>
+    ): List<Candidate> {
         val projection = arrayOf(
             MediaStore.MediaColumns._ID,
             MediaStore.MediaColumns.SIZE,
@@ -98,7 +113,6 @@ class DcimScanWorker(context: Context, params: WorkerParameters) : Worker(contex
             MediaStore.MediaColumns.BUCKET_DISPLAY_NAME,
             MediaStore.MediaColumns.MIME_TYPE
         )
-        val watchedBuckets = watchedBucketNames()
         val out = mutableListOf<Candidate>()
         applicationContext.contentResolver.query(
             MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
@@ -143,12 +157,16 @@ class DcimScanWorker(context: Context, params: WorkerParameters) : Worker(contex
         return out
     }
 
-    private fun watchedBucketNames(): Set<String> {
+    private fun watchedBucketNames(settings: WorkConstraintSettings): Set<String> {
         // ARCHITECTURE.md §5.2: "Filtered to configured bucket ids (default
         // `DCIM/Camera`)". The configured list (`watchedMediaBuckets`) is
         // read from the same `settings.json` block as everything else;
         // empty means "not configured yet" and falls back to the default.
-        return setOf("Camera")
+        return if (settings.watchedMediaBuckets.isEmpty()) {
+            DEFAULT_WATCHED_BUCKETS
+        } else {
+            settings.watchedMediaBuckets.toSet()
+        }
     }
 
     private fun isRawCandidate(displayName: String, mimeType: String): Boolean {
@@ -246,6 +264,7 @@ class DcimScanWorker(context: Context, params: WorkerParameters) : Worker(contex
         private const val PREFS_FILE = "rrcloud_dcim_scan"
         private const val KEY_GENERATION = "generation"
         private const val KEY_DATE_ADDED_CURSOR = "date_added_cursor"
+        private val DEFAULT_WATCHED_BUCKETS = setOf("Camera")
 
         private val RAW_EXTENSIONS = listOf(
             ".dng", ".crw", ".cr2", ".cr3", ".raw", ".erf", ".raf", ".3fr", ".fff", ".iiq",

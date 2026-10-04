@@ -28,11 +28,22 @@ object DirtyWatch {
         val count = RrcloudBridge.dirtyUnbackedCount(context)
         val prefs = context.getSharedPreferences(PREFS_FILE, Context.MODE_PRIVATE)
 
-        if (count <= 0) {
-            // Either nothing dirty, or the count is unknown (-1, e.g. sync
-            // not configured yet) — either way there is nothing to warn
-            // about right now, so clear any standing timer and dismiss a
-            // stale notification.
+        if (count < 0) {
+            // Unknown (-1: state db unavailable, e.g. CYCLE_LOCK contention
+            // from a concurrent cycle, or sync simply not configured yet —
+            // RrcloudBridge.dirtyUnbackedCount's own doc says to treat this
+            // as "skip this check", NOT as "nothing is dirty". Regression
+            // (P5 review round 0): a transient failure must never reset the
+            // standing-dirty timer or dismiss an already-shown warning —
+            // §5.4 requires the uninstall data-loss window stay "visible,
+            // not silent", and lumping -1 in with a genuine 0 would let a
+            // flaky read silently restart the 24h clock.
+            return
+        }
+
+        if (count == 0) {
+            // Genuinely nothing dirty: clear any standing timer and dismiss
+            // a stale notification.
             prefs.edit().remove(KEY_DIRTY_SINCE_MS).apply()
             dismiss(context)
             return

@@ -20,7 +20,9 @@
 //!   mapping to the `Result.success()` / `.retry()` / `.failure()` the
 //!   Kotlin `Worker.doWork()` returns.
 //! - [`dcim_dedupe`]: the §5.2 `dcim_seen` skip/rehash/new decision —
-//!   reuses the existing [`crate::state::SyncDb::dcim_seen`] row shape,
+//!   reuses the existing `dcim_seen` table's row shape (fetched per path
+//!   via [`crate::state::SyncDb::dcim_seen_for_path`], not the
+//!   exact-`(size, mtime)`-keyed [`crate::state::SyncDb::dcim_seen`]),
 //!   does not touch redb itself.
 //! - [`scan_window`]: the §5.2 API 24-29 `DATE_ADDED` 48 h overlap-window
 //!   arithmetic (the API 30+ path uses `MediaStore.getGeneration()`

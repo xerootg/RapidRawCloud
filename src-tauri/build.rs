@@ -175,5 +175,30 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
 
-    tauri_build::build()
+    // The `rrcloud:default` permission only exists when `tauri-plugin-
+    // rrcloud` is actually a compiled dependency (gated by the `sync`
+    // Cargo feature — see that feature's doc comment above) — the
+    // plugin's own `build.rs` is what registers its permission schema at
+    // all. Referencing `rrcloud:default` from the SAME capabilities file
+    // every build reads, regardless of `sync`, would make a
+    // `--no-default-features` build fail capability resolution outright
+    // ("Permission rrcloud:default not found") even though no rrcloud
+    // code is linked — contradicting this crate's own stated parity goal
+    // ("a `--no-default-features` build ... is functionally identical to
+    // upstream", `Cargo.toml`'s `sync` feature doc). `capabilities/
+    // default.json` therefore carries only the permissions every build
+    // needs; `capabilities/sync.json` carries just `rrcloud:default` and
+    // is picked up ONLY when `sync` is enabled (Cargo always sets
+    // `CARGO_FEATURE_<NAME>` for the crate's own enabled features during
+    // its build script).
+    println!("cargo:rerun-if-changed=capabilities");
+    let capabilities_path_pattern = if env::var_os("CARGO_FEATURE_SYNC").is_some() {
+        "./capabilities/*.json"
+    } else {
+        "./capabilities/default.json"
+    };
+    tauri_build::try_build(
+        tauri_build::Attributes::new().capabilities_path_pattern(capabilities_path_pattern),
+    )
+    .expect("tauri_build::try_build failed");
 }

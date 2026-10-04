@@ -1057,6 +1057,56 @@ fn dcim_seen_keys_on_path_size_and_mtime() {
 }
 
 #[test]
+fn dcim_seen_for_path_finds_a_row_regardless_of_size_and_mtime() {
+    // Regression (P5 review, round 0): `dcim_seen` alone is keyed by the
+    // exact `(path, size, mtime)` tuple, so a caller that looks a changed
+    // file up by its *own* fresh `(size, mtime)` always misses — the
+    // `dcim_dedupe::decide` `Rehash` branch becomes unreachable in
+    // production even though `decide` itself is unit-tested for it.
+    // `dcim_seen_for_path` is the one-row-per-path lookup that actually
+    // lets a caller see "a row exists for this path, at a different
+    // (size, mtime)".
+    let (_dir, path) = scratch();
+    let db = open_fresh(&path);
+    let cid = ContentId::parse(CONTENT_HEX).expect("cid");
+
+    // Unseen path: no row.
+    assert_eq!(db.dcim_seen_for_path("/dcim/IMG_1.jpg").expect("get"), None);
+
+    db.set_dcim_seen("/dcim/IMG_1.jpg", 100, 1_769_000_000, &cid)
+        .expect("set");
+
+    // Exact (size, mtime) match: `dcim_seen` finds it (sanity check), and
+    // so does `dcim_seen_for_path`.
+    assert_eq!(
+        db.dcim_seen("/dcim/IMG_1.jpg", 100, 1_769_000_000)
+            .expect("get"),
+        Some(cid.clone())
+    );
+    assert_eq!(
+        db.dcim_seen_for_path("/dcim/IMG_1.jpg").expect("get"),
+        Some((100, 1_769_000_000, cid.clone()))
+    );
+
+    // Changed (size, mtime): `dcim_seen` keyed on the *new* values misses
+    // entirely (the bug this regression test pins), but
+    // `dcim_seen_for_path` still finds the recorded row, with its
+    // *original* (size, mtime) — exactly what `dcim_dedupe::decide` needs
+    // to compare against the candidate and return `Rehash`.
+    assert_eq!(
+        db.dcim_seen("/dcim/IMG_1.jpg", 999, 1_769_999_999)
+            .expect("get"),
+        None,
+        "exact-key lookup misses a changed file"
+    );
+    assert_eq!(
+        db.dcim_seen_for_path("/dcim/IMG_1.jpg").expect("get"),
+        Some((100, 1_769_000_000, cid)),
+        "path-level lookup still finds the prior row"
+    );
+}
+
+#[test]
 fn server_time_offset_roundtrip_across_reopen() {
     let (_dir, path) = scratch();
     {

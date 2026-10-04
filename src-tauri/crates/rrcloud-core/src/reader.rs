@@ -95,6 +95,7 @@ use crate::journal::{
 use crate::keys::{classify_key, journal_segment_key, KeyClass, CONTROL_PREFIX};
 use crate::s3::{ListObjectsV2Request, S3Api, S3Error};
 use crate::state::{StateError, StateTxn, SyncDb};
+use crate::transfer::CancelFlag;
 
 /// A consumer failure: opaque to the reader, which only needs to abort
 /// the entry's transaction and surface it
@@ -308,11 +309,44 @@ pub enum ReaderError {
 ///
 /// Version halts and gaps are per-device **outcomes** in the returned
 /// [`PollReport`]; see the module docs for their pinned semantics.
+///
+/// Uncancellable: equivalent to [`poll_with_cancel`] with a [`CancelFlag`]
+/// that never fires, for every caller that polls to quiescence rather than
+/// against a time budget (the worker binary's `catch_up`, every
+/// integration test).
 pub async fn poll(
     db: &SyncDb,
     s3: &impl S3Api,
     bucket: &str,
     consumer: &mut impl JournalConsumer,
+) -> Result<PollReport, ReaderError> {
+    poll_with_cancel(db, s3, bucket, consumer, &CancelFlag::new()).await
+}
+
+/// [`poll`], but checked against `cancel` **between work units** — once
+/// per foreign device and once per segment within a device's prefix,
+/// never mid-segment (a segment's entries commit together through one
+/// state-store transaction regardless; module docs §Atomicity) — so a
+/// caller racing a time budget (ARCHITECTURE.md §5.1 point 3's "applies
+/// one journal page" per check) can bound this lane the same way
+/// [`crate::transfer::pump_uploads`]/[`crate::transfer::pump_downloads`]
+/// already bound theirs, instead of this lane alone running unchecked for
+/// however long a foreign device's entire unread backlog takes.
+///
+/// A cancellation mid-pass stops cleanly: the device/segment loops simply
+/// return early, exactly as they already do for a per-device
+/// [`FetchFailed`]/[`PrefixHalted`] outcome — the cursor stays at the last
+/// committed position, nothing already applied is lost, and the next poll
+/// (cancelled or not) resumes exactly there. The returned [`PollReport`]
+/// reflects only what was actually applied before cancellation; it carries
+/// no separate "cancelled" marker because the caller already holds the
+/// flag it checked.
+pub async fn poll_with_cancel(
+    db: &SyncDb,
+    s3: &impl S3Api,
+    bucket: &str,
+    consumer: &mut impl JournalConsumer,
+    cancel: &CancelFlag,
 ) -> Result<PollReport, ReaderError> {
     // (1) One paged LIST over the journal prefix: exactly one request in
     // the single-page steady state.
@@ -341,10 +375,27 @@ pub async fn poll(
     }
 
     // (3) Per foreign device: strict-ordered application beyond the
-    // cursor, with the pinned gap and min-reader-halt semantics.
+    // cursor, with the pinned gap and min-reader-halt semantics. Checked
+    // against `cancel` between devices (a budget-bounded caller stops
+    // admitting further devices' backlogs, same shape as the transfer
+    // pumps between items) and, within each device's prefix, between
+    // segments (see [`apply_device_prefix`]).
     let mut report = PollReport::default();
     for (device, segments) in per_device {
-        apply_device_prefix(db, s3, bucket, consumer, &device, &segments, &mut report).await?;
+        if cancel.is_cancelled() {
+            break;
+        }
+        apply_device_prefix(
+            db,
+            s3,
+            bucket,
+            consumer,
+            &device,
+            &segments,
+            &mut report,
+            cancel,
+        )
+        .await?;
     }
     Ok(report)
 }
@@ -423,6 +474,7 @@ impl From<StateError> for ApplyError {
 /// strict seq order, updating `report` with per-device outcomes (module
 /// docs: gap semantics, min-reader halts). Returns `Err` only for
 /// whole-pass failures (S3, state store, consumer refusal).
+#[allow(clippy::too_many_arguments)] // internal seam of one device-prefix walk
 async fn apply_device_prefix(
     db: &SyncDb,
     s3: &impl S3Api,
@@ -431,10 +483,20 @@ async fn apply_device_prefix(
     device: &DeviceId,
     segments: &BTreeMap<u64, u32>,
     report: &mut PollReport,
+    cancel: &CancelFlag,
 ) -> Result<(), ReaderError> {
     let mut cursor = db.cursor(device)?;
     let firsts: Vec<u64> = segments.keys().copied().collect();
     for (i, &first_seq) in firsts.iter().enumerate() {
+        // Between-segment cancellation check (never mid-segment: a
+        // segment's entries already commit together through one
+        // transaction regardless, module docs §Atomicity). Stops exactly
+        // like a per-device FetchFailed/PrefixHalted outcome below: the
+        // cursor stays put, nothing applied is lost, the next poll
+        // resumes here.
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
         let next_first = firsts.get(i + 1).copied();
         // A segment is provably fully covered when the NEXT present
         // segment starts at or below cursor + 1 (its span ends at the next
