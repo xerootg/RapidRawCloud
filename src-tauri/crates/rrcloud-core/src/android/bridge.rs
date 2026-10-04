@@ -246,6 +246,22 @@ mod imp {
     /// routine) the redb state store under `state_dir`. Classifies
     /// [`StateError::AlreadyLocked`] distinctly so the caller can map it to
     /// [`BridgeResult::RetryLockHeld`] (§5.1 cross-process exclusion).
+    ///
+    /// Only [`Java_com_plugin_rrcloud_RrcloudBridge_runSyncCycle`] takes
+    /// [`CYCLE_LOCK`] before calling this; `dcimScanDecisions`,
+    /// `dcimRecordImport` and `dirtyUnbackedCount` call it directly and
+    /// rely on this function's own `AlreadyLocked`/`Locked` path for
+    /// exclusion against a concurrently-running cycle. That is sound even
+    /// same-process (not just cross-process): redb's `FileBackend` takes
+    /// the OS file lock with a plain `libc::flock(fd, LOCK_EX | LOCK_NB)`
+    /// (see redb's `src/tree_store/page_store/file_backend/unix.rs`), and
+    /// POSIX `flock()` conflicts across *any* two open file descriptors on
+    /// the same file, including two fds opened by the same process — not
+    /// only across processes. So a `dcimScanDecisions` call racing a
+    /// `runSyncCycle` in the same process still gets a real `Locked`
+    /// result here, never a false "lock free". Verified by reading that
+    /// redb source directly (redb 2.6.3); this is not inferred from
+    /// behavior observed on a device.
     enum OpenOutcome {
         Opened(SyncDb),
         Locked,
