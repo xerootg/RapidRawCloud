@@ -58,7 +58,9 @@
 //!   application context: it goes through Tauri's `wry` webview, whose
 //!   `JniHandle::exec`/`dispatch` hand the closure `&activity` where
 //!   `activity` is wry's own `ActivityProxy.activity` — a `GlobalRef`
-//!   cloned once per dispatch (`wry` 0.57.0,
+//!   cloned once per dispatch (`wry` 0.55.1, the version this workspace's
+//!   `Cargo.lock` actually resolves — checked there directly, there is
+//!   only one `wry` entry —
 //!   `src/android/main_pipe.rs`'s `WebViewMessage::Jni` handling) — and
 //!   `wry`'s own doc comment on `dispatch`/`exec` says so explicitly:
 //!   "the Android **activity** instance". `ndk_context`'s own doc comment
@@ -229,14 +231,34 @@ pub fn ensure_ndk_context_initialized(
     make_context_ptr: impl FnOnce() -> *mut std::ffi::c_void,
 ) {
     init_context_exactly_once(&NDK_CONTEXT_INIT, make_context_ptr, |context_ptr| {
+        // A null `context_ptr` means the winning call's `make_context_ptr`
+        // failed (in production: `bridge.rs`'s `env.new_global_ref(ctx)`
+        // hit a JNI OOM) and could not produce a context good for the
+        // rest of the process's life. This closure runs at most once per
+        // process (`init_context_exactly_once`'s guarantee), so there is
+        // no retry inside the `Once` -- storing a null `Context` into
+        // `ndk_context` here would make every later
+        // `android_context().context()` read dereference it, UB for the
+        // rest of the process's life. Skip the store and just leave
+        // `ndk_context` uninitialized; this is still strictly better than
+        // today, where the failure is silently swallowed one level up and
+        // the bad pointer gets stored unconditionally.
+        if context_ptr.is_null() {
+            eprintln!(
+                "rrcloud: ndk_context init skipped -- make_context_ptr returned null \
+                 (shared guard already consumed the one init attempt for this process)."
+            );
+            return;
+        }
         // SAFETY: `vm_ptr` comes from a live `JNIEnv` in the caller's
-        // current JNI call. `context_ptr` is whatever `make_context_ptr`
-        // produced, which by this function's own contract (see doc above)
-        // must already be valid for the rest of the process's life. This
-        // closure runs at most once per process (guarded by
-        // `NDK_CONTEXT_INIT` via `init_context_exactly_once`), which is
-        // exactly `ndk_context::initialize_android_context`'s own
-        // documented safety/panic contract.
+        // current JNI call. `context_ptr` is non-null here (checked
+        // above) and is whatever `make_context_ptr` produced, which by
+        // this function's own contract (see doc above) must already be
+        // valid for the rest of the process's life. This closure runs at
+        // most once per process (guarded by `NDK_CONTEXT_INIT` via
+        // `init_context_exactly_once`), which is exactly
+        // `ndk_context::initialize_android_context`'s own documented
+        // safety/panic contract.
         unsafe {
             ndk_context::initialize_android_context(vm_ptr, context_ptr);
         }
