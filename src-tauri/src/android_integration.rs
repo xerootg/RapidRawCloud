@@ -762,3 +762,53 @@ pub fn get_android_internal_library_root() -> Result<PathBuf, String> {
     }
     Ok(library_dir)
 }
+
+// ---------------------------------------------------------------------------
+// §5.1 foreground/background handoff (P5 review round-1 major).
+//
+// The *opposite* JNI direction from everything else in this file: Kotlin
+// calls INTO Rust here, rather than Rust calling a Kotlin `@JvmStatic`
+// callback. `RrcloudPlugin`'s `onStop()`/`onResume()` overrides
+// (`tauri-plugin-rrcloud/android/src/main/java/RrcloudPlugin.kt`) call
+// these two native entry points directly on `RrcloudBridge` (declared
+// there as plain `external fun releaseStateLock()` /
+// `external fun reacquireStateLock()`, no `@JvmStatic` needed — a Kotlin
+// `object`'s own `external fun`s already compile to static native methods,
+// exactly like `runSyncCycle` already does) so the app-process
+// `SyncManager` actually yields its redb lock while merely backgrounded,
+// instead of holding it for the whole process lifetime and starving every
+// `SyncCycleWorker`/`DcimScanWorker` window per ARCHITECTURE.md §5.1 (see
+// `sync::manager::SyncManager::release_for_background`'s doc for the full
+// rationale).
+//
+// These two are intentionally defined here, in the app crate, and not in
+// `rrcloud_core::android::bridge`: the real `SyncManager` instance they
+// must act on is an app-crate concept (`sync::global_manager()`) that
+// `rrcloud-core` deliberately has no dependency on (see that module's own
+// doc comment). Both link into the same `rapidraw_lib` cdylib either way,
+// so the JNI symbol table ends up identical to if they lived in one file.
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_plugin_rrcloud_RrcloudBridge_releaseStateLock(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+) {
+    if let Some(manager) = crate::sync::global_manager() {
+        if let Err(e) = manager.release_for_background() {
+            log::warn!("rrcloud: release_for_background failed: {e}");
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_com_plugin_rrcloud_RrcloudBridge_reacquireStateLock(
+    _env: jni::JNIEnv,
+    _class: jni::objects::JClass,
+) {
+    if let Some(manager) = crate::sync::global_manager() {
+        if let Err(e) = manager.reacquire_after_foreground() {
+            log::warn!("rrcloud: reacquire_after_foreground failed: {e}");
+        }
+    }
+}

@@ -42,6 +42,27 @@ class RrcloudPlugin(private val activity: Activity) : Plugin(activity) {
         requestNotificationPermissionIfNeeded()
     }
 
+    /** §5.1 round-1 major fix: yield the app-process redb lock once the
+     * app is no longer visible, so `SyncCycleWorker`/`DcimScanWorker`
+     * (which may run in-process under WorkManager's default executor) can
+     * actually acquire it instead of backing off for as long as this
+     * process merely survives in the background. `onStop` (not `onPause`,
+     * which also fires for transient interruptions like a permission
+     * dialog or an incoming call) is the "no longer visible" signal — see
+     * `Plugin.onStop`'s own doc. */
+    override fun onStop() {
+        super.onStop()
+        RrcloudBridge.releaseStateLock()
+    }
+
+    /** The other half: reacquire on return to foreground. Also fires on a
+     * cold start (before any `configure()` has ever run), which the
+     * Rust-side `reacquire_after_foreground` treats as a no-op. */
+    override fun onResume() {
+        super.onResume()
+        RrcloudBridge.reacquireStateLock()
+    }
+
     private fun registerDcimObserver() {
         if (dcimObserver != null) {
             return

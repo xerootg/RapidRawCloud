@@ -1237,6 +1237,156 @@ async fn poll_with_cancel_already_cancelled_applies_nothing_and_resumes_cleanly(
     assert_eq!(seqs_for(&consumer, &a), vec![1, 2, 3, 4]);
 }
 
+/// A [`JournalConsumer`] wrapping a [`RecordingConsumer`] that fires a
+/// shared [`CancelFlag`] once a target number of entries has been applied
+/// — lets a test cancel mid-pass at an exact, deterministic point (after
+/// segment N, after device N) rather than racing a timer.
+struct CancelAfter<'a> {
+    inner: RecordingConsumer,
+    cancel: &'a CancelFlag,
+    remaining: usize,
+}
+
+impl rrcloud_core::reader::JournalConsumer for CancelAfter<'_> {
+    fn apply(
+        &mut self,
+        txn: &rrcloud_core::state::StateTxn<'_>,
+        entry: &rrcloud_core::journal::JournalEntry,
+    ) -> Result<(), rrcloud_core::reader::ConsumerError> {
+        self.inner.apply(txn, entry)?;
+        self.remaining = self.remaining.saturating_sub(1);
+        if self.remaining == 0 {
+            self.cancel.cancel();
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `poll_with_cancel` mid-pass cancellation (P5 review round-1 minor): the
+// existing round-0 regression only covered a flag already cancelled
+// *before* `poll_with_cancel` is even called. These exercise the actual
+// §5.1 point 3 budget-exhaustion case — cancellation firing *during* a
+// pass, between segments within one device's prefix and between two
+// foreign devices — confirming each checkpoint stops cleanly (nothing
+// lost, nothing re-applied) and a later uncancelled poll finishes the job.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn poll_with_cancel_cancels_between_segments_within_one_device_and_resumes_cleanly() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-poll-cancel-seg");
+    let client = g.client();
+    let a = dev(DEV_A);
+    let b = dev(DEV_B);
+    let (_adir, _apath, db_a) = open_db(&a);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // Three segments from one foreign device (seqs 1-2, 3-4, 5-6).
+    publish_batch(&db_a, &client, &bucket, &a, "t1", 2).await;
+    publish_batch(&db_a, &client, &bucket, &a, "t2", 2).await;
+    publish_batch(&db_a, &client, &bucket, &a, "t3", 2).await;
+
+    // Cancel exactly after the first segment's two entries apply — the
+    // between-segment checkpoint in `apply_device_prefix` must see it
+    // before starting the second segment, not mid-way through it.
+    let cancel = CancelFlag::new();
+    let mut consumer = CancelAfter {
+        inner: RecordingConsumer::default(),
+        cancel: &cancel,
+        remaining: 2,
+    };
+    let report = poll_with_cancel(&db_b, &client, &bucket, &mut consumer, &cancel)
+        .await
+        .expect("poll_with_cancel");
+    assert_eq!(
+        report.entries_applied, 2,
+        "only the first segment must apply before the mid-pass cancellation is observed"
+    );
+    assert_eq!(seqs_for(&consumer.inner, &a), vec![1, 2]);
+    assert!(
+        report.halted.is_empty()
+            && report.gaps.is_empty()
+            && report.mid_stream_gaps.is_empty()
+            && report.corrupt.is_empty()
+            && report.fetch_failed.is_empty(),
+        "mid-pass cancellation is not a failure outcome of any kind: {report:?}"
+    );
+    assert_eq!(
+        db_b.cursor(&a).expect("cursor"),
+        2,
+        "the cursor must stop exactly where the cancelled pass left off"
+    );
+
+    // Nothing was lost: an uncancelled poll right after catches up on the
+    // remaining two segments, in order, exactly once.
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_eq!(report.entries_applied, 4);
+    assert_eq!(seqs_for(&consumer, &a), vec![3, 4, 5, 6]);
+}
+
+#[tokio::test]
+async fn poll_with_cancel_cancels_between_devices_and_resumes_cleanly() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("rdr-poll-cancel-dev");
+    let client = g.client();
+    let a = dev(DEV_A);
+    let c = dev(DEV_C);
+    let b = dev(DEV_B);
+    let (_adir, _apath, db_a) = open_db(&a);
+    let (_cdir, _cpath, db_c) = open_db(&c);
+    let (_bdir, _bpath, db_b) = open_db(&b);
+
+    // Two foreign devices, one segment each (A's seqs 1-2, C's seqs 1-2).
+    // `per_device` iterates devices in `DeviceId`'s `Ord` order — derived
+    // from the inner UUID *string*, not parsed/numeric — and
+    // `DEV_C = "c0ffee00-…"` sorts before `DEV_A = "d1f0c2aa-…"`
+    // lexicographically ('c' < 'd'), so device C is visited first.
+    publish_batch(&db_a, &client, &bucket, &a, "t1", 2).await;
+    publish_batch(&db_c, &client, &bucket, &c, "t1", 2).await;
+
+    // Cancel exactly after device C's two entries apply — the
+    // between-device checkpoint at the top of `poll_with_cancel`'s loop
+    // must see it before starting device A's prefix at all.
+    let cancel = CancelFlag::new();
+    let mut consumer = CancelAfter {
+        inner: RecordingConsumer::default(),
+        cancel: &cancel,
+        remaining: 2,
+    };
+    let report = poll_with_cancel(&db_b, &client, &bucket, &mut consumer, &cancel)
+        .await
+        .expect("poll_with_cancel");
+    assert_eq!(
+        report.entries_applied, 2,
+        "only device C's entries must apply before the mid-pass cancellation is observed"
+    );
+    assert_eq!(seqs_for(&consumer.inner, &c), vec![1, 2]);
+    assert_eq!(
+        seqs_for(&consumer.inner, &a),
+        Vec::<u64>::new(),
+        "device A must not have been touched at all yet"
+    );
+    assert_eq!(db_b.cursor(&c).expect("cursor c"), 2);
+    assert_eq!(
+        db_b.cursor(&a).expect("cursor a"),
+        0,
+        "device A's cursor must still be untouched"
+    );
+
+    // Nothing was lost: an uncancelled poll right after catches up on
+    // device A's entries too.
+    let mut consumer = RecordingConsumer::default();
+    let report = poll(&db_b, &client, &bucket, &mut consumer)
+        .await
+        .expect("poll");
+    assert_eq!(report.entries_applied, 2);
+    assert_eq!(seqs_for(&consumer, &a), vec![1, 2]);
+}
+
 #[tokio::test]
 async fn a_flooding_listing_is_refused_with_bounded_key_buffering() {
     // No Garage: the hostile backend is the stub itself. The LIST lane

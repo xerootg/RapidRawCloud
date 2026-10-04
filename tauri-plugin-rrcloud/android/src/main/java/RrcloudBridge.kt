@@ -122,4 +122,30 @@ object RrcloudBridge {
     fun enqueueExpeditedSync(context: Context) {
         RrcloudWorkScheduler.enqueueExpeditedSyncCycle(context)
     }
+
+    // ---- §5.1 foreground/background handoff (P5 review round-1 major) -----
+    // The opposite direction from everything else below [runSyncCycle]:
+    // these two are plain (non-`@JvmStatic`) `external fun`s declared
+    // directly on this `object` — Kotlin already compiles a plain
+    // `object`'s `external fun`s to static native methods, the same as
+    // [runSyncCycle] above, no annotation needed — bound to
+    // `Java_com_plugin_rrcloud_RrcloudBridge_releaseStateLock`/
+    // `reacquireStateLock` in the APP crate's `android_integration.rs`
+    // (not `rrcloud-core`: see that file's doc comment for why). Called
+    // from [RrcloudPlugin]'s `onStop()`/`onResume()` overrides so the
+    // app-process `SyncManager` actually yields its redb lock while the
+    // app is merely backgrounded, instead of starving every
+    // `SyncCycleWorker`/`DcimScanWorker` window for as long as the process
+    // survives in the background (see `sync::manager::SyncManager::
+    // release_for_background`'s Rust-side doc for the full rationale).
+    // Both are fire-and-forget: a failure on either side only logs (see
+    // the Rust-side `log::warn!`), it never throws back into the caller —
+    // backgrounding/foregrounding the activity must never crash on a sync
+    // internals hiccup.
+
+    /** Drops the app-process `SyncManager`'s open redb handle. */
+    external fun releaseStateLock()
+
+    /** Reopens it from the last successful `configure()` call's params. */
+    external fun reacquireStateLock()
 }

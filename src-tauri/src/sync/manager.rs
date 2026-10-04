@@ -208,6 +208,14 @@ pub struct SyncManager {
     stub_set: Mutex<HashSet<PathBuf>>,
     #[cfg(feature = "sync")]
     inner: std::sync::Mutex<Option<Arc<imp::Configured>>>,
+    /// The parameters of the last successful [`Self::configure`] call
+    /// (P5 review round-1 major: the §5.1 foreground/background handoff).
+    /// [`Self::release_for_background`] drops `inner` without forgetting
+    /// these, so [`Self::reacquire_after_foreground`] can reopen the exact
+    /// same engine without the Kotlin side having to resupply settings or
+    /// credentials.
+    #[cfg(feature = "sync")]
+    last_config: std::sync::Mutex<Option<(SyncSettings, Credentials, PathBuf, PathBuf)>>,
 }
 
 impl SyncManager {
@@ -219,6 +227,8 @@ impl SyncManager {
             stub_set: Mutex::new(HashSet::new()),
             #[cfg(feature = "sync")]
             inner: std::sync::Mutex::new(None),
+            #[cfg(feature = "sync")]
+            last_config: std::sync::Mutex::new(None),
         })
     }
 
@@ -253,6 +263,16 @@ impl SyncManager {
     ) -> Result<(), SyncError> {
         #[cfg(feature = "sync")]
         {
+            // Stashed before `imp::Configured::open` consumes the owned
+            // params, so a later `release_for_background` /
+            // `reacquire_after_foreground` pair can reopen the identical
+            // engine without needing them resupplied.
+            let cached = (
+                settings.clone(),
+                creds.clone(),
+                sync_root.clone(),
+                state_dir.clone(),
+            );
             let configured = imp::Configured::open(settings, creds, sync_root, state_dir)?;
             // Rebuild the in-memory stub mirror from the durable redb records
             // this `Configured` just reopened (§3.5): the mirror is written
@@ -277,6 +297,12 @@ impl SyncManager {
                 .map_err(|_| SyncError::msg("sync manager lock poisoned"))?;
             *guard = Some(Arc::new(configured));
             self.configured.store(true, Ordering::SeqCst);
+            drop(guard);
+            *self
+                .last_config
+                .lock()
+                .map_err(|_| SyncError::msg("sync manager last_config lock poisoned"))? =
+                Some(cached);
             Ok(())
         }
         #[cfg(not(feature = "sync"))]
@@ -295,6 +321,108 @@ impl SyncManager {
             .map_err(|_| SyncError::msg("sync manager lock poisoned"))?
             .clone()
             .ok_or(SyncError::NotConfigured)
+    }
+
+    /// The §5.1 Android foreground→background handoff (P5 review round-1
+    /// major). Drops the open `Arc<imp::Configured>` — and with it, once
+    /// every other clone (e.g. an in-flight [`run_once`](Self::run_once))
+    /// has also dropped, the redb `Database` handle and the OS file lock it
+    /// holds on `state_dir/state.redb`.
+    ///
+    /// Why this exists: ARCHITECTURE.md §5.1 says redb's file lock plus an
+    /// in-process `Mutex` "make app-process and worker-process cycles
+    /// mutually exclusive", which is meant to bound a single *in-flight
+    /// cycle* — not the app's entire time in the background. Before this
+    /// method, [`Self::configure`] opened its `Configured` once and nothing
+    /// ever closed it short of process death, so `rrcloud_core::android::
+    /// bridge`'s independent redb open (run from `SyncCycleWorker`/
+    /// `DcimScanWorker`, possibly in the very same OS process under
+    /// WorkManager's default in-process executor) saw the lock held —
+    /// and backed off with `RetryLockHeld` — for as long as the app
+    /// process merely stayed alive in the background, which on stock
+    /// Android can be indefinitely. The Kotlin side calls this from
+    /// `RrcloudPlugin.onStop()` (`tauri-plugin-rrcloud`'s JNI
+    /// `releaseStateLock`/`reacquireStateLock` pair, `android_integration.
+    /// rs`) so a backgrounded-but-alive app actually yields the lock to
+    /// WorkManager between foreground sessions.
+    ///
+    /// Leaves [`Self::is_configured`] `true`: the manager is conceptually
+    /// still configured, merely parked. Any call that needs the engine
+    /// while parked sees [`SyncError::NotConfigured`] (exactly the same
+    /// error an unconfigured manager would give) until
+    /// [`Self::reacquire_after_foreground`] runs — acceptable because the
+    /// only caller is the Android lifecycle hook, which always pairs a
+    /// `release` with a later `reacquire` before the foregrounded webview
+    /// could issue a sync command.
+    ///
+    /// Idempotent: a no-op `Ok(())` when never configured or already
+    /// released (some OEM skins can fire the lifecycle callback more than
+    /// once in a row).
+    pub fn release_for_background(&self) -> Result<(), SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|_| SyncError::msg("sync manager lock poisoned"))?;
+            *guard = None;
+            Ok(())
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            Ok(())
+        }
+    }
+
+    /// The other half of [`Self::release_for_background`]: reopens the
+    /// engine from the parameters cached by the last successful
+    /// [`Self::configure`] call, so the app's own foreground sync resumes
+    /// once it is visible again.
+    ///
+    /// Idempotent in both directions it needs to be: `Ok(())` without
+    /// reopening anything when `inner` is already `Some` (cold start calls
+    /// this from `onResume` too, before any `configure` has ever run, or a
+    /// stray double-fire of the lifecycle callback), and `Ok(())` without
+    /// error when nothing has ever been configured (`last_config` is
+    /// `None`) — there is nothing to reacquire yet, and that is not a
+    /// failure.
+    ///
+    /// Shares the same best-effort caveat [`Self::configure`]'s own doc
+    /// comment already states for the reconfigure-while-running case: if a
+    /// cycle is still in flight holding its own `Arc<Configured>` clone
+    /// when `release_for_background` ran, the underlying redb handle (and
+    /// its OS lock) is not actually released until that clone drops, so
+    /// this may reopen cleanly before the old handle is truly gone — redb's
+    /// own lock then fails this call with [`SyncError`], and the caller
+    /// (the Android lifecycle hook) just logs and lets the next
+    /// `onResume`/periodic retry pick it up.
+    pub fn reacquire_after_foreground(&self) -> Result<(), SyncError> {
+        #[cfg(feature = "sync")]
+        {
+            let already_open = self
+                .inner
+                .lock()
+                .map_err(|_| SyncError::msg("sync manager lock poisoned"))?
+                .is_some();
+            if already_open {
+                return Ok(());
+            }
+            let cached = self
+                .last_config
+                .lock()
+                .map_err(|_| SyncError::msg("sync manager last_config lock poisoned"))?
+                .clone();
+            match cached {
+                Some((settings, creds, sync_root, state_dir)) => {
+                    self.configure(settings, creds, sync_root, state_dir)
+                }
+                None => Ok(()),
+            }
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            Ok(())
+        }
     }
 
     /// Runs one full sync cycle to quiescence: admit quiesced-dirty items,
