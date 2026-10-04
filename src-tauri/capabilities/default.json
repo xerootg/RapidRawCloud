@@ -15,6 +15,7 @@
     "os:allow-os-type",
     "core:window:allow-set-fullscreen",
     "core:window:allow-set-decorations",
-    "shell:default"
+    "shell:default",
+    "rrcloud:default"
   ]
 }

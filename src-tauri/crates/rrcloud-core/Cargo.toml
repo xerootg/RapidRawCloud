@@ -164,6 +164,18 @@ libc = "0.2"
 # §5 pure-logic modules stay testable with no JNI/Android toolchain.
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
+# `ndk_context::initialize_android_context` (bridge.rs step 1) — same major
+# as `src-tauri`'s own `android_integration.rs` dependency.
+ndk-context = "0.1"
+# `rustls_platform_verifier::android::init_with_env` (bridge.rs step 2): the
+# worker process's own TLS trust-anchor init, separate from the app
+# process's (see bridge.rs doc on why a second init is needed). Pinned to
+# the same `0.7` the app crate uses so a workspace-unified android build
+# never resolves two versions; its `init_with_env` takes a `jni` 0.22
+# `Env`/`JObject`, hence the `jni22` alias below (identical shim
+# `android_integration.rs` already uses).
+rustls-platform-verifier = "0.7"
+jni22 = { package = "jni", version = "0.22" }
 
 # Crash-injection + lock-exclusivity suite for the redb state store (§2.1.5,
 # §5.1). harness = false: the binary re-execs itself as a writer/locker child

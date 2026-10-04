@@ -35,6 +35,11 @@ pub const OVERLAP_SECS: i64 = 48 * 60 * 60;
 ///   `now_unix`**, so a corrupt forward cursor cannot invert the scan
 ///   window into one that matches nothing.
 pub fn effective_floor(cursor_unix: Option<i64>, now_unix: i64) -> i64 {
-    let _ = (cursor_unix, now_unix);
-    todo!("P5 green: None => 0; Some(c) => (c - OVERLAP_SECS).max(0).min(now_unix.max(0))")
+    match cursor_unix {
+        None => 0,
+        Some(cursor) => cursor
+            .saturating_sub(OVERLAP_SECS)
+            .max(0)
+            .min(now_unix.max(0)),
+    }
 }

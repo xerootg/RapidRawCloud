@@ -53,4 +53,73 @@ object RrcloudBridge {
     const val RESULT_RETRY_LOCK_HELD = 2
     const val RESULT_FAILURE_NOT_CONFIGURED = 3
     const val RESULT_FAILURE_PERMANENT = 4
+
+    /**
+     * Maps a [runSyncCycle]/etc result code to the `androidx.work.
+     * ListenableWorker.Result` a `Worker.doWork()` must return, per the
+     * table above. Centralized here so `SyncCycleWorker`/`DcimScanWorker`
+     * do not each hand-duplicate the switch.
+     */
+    fun toWorkResult(code: Int): androidx.work.ListenableWorker.Result = when (code) {
+        RESULT_SUCCESS -> androidx.work.ListenableWorker.Result.success()
+        RESULT_RETRY_TRANSIENT, RESULT_RETRY_LOCK_HELD -> androidx.work.ListenableWorker.Result.retry()
+        else -> androidx.work.ListenableWorker.Result.failure()
+    }
+
+    // ---- §5.2 DCIM batch dedupe / import recording -------------------------
+
+    /**
+     * Batch dedupe decision over one scan pass's candidates (§5.2).
+     * `candidatesJson` is `[{"path":str,"size":u64,"mtimeUnix":i64}, ...]`;
+     * the result is `[{"path":str,"decision":"skip"|"rehash"|"new",
+     * "contentId":str?}, ...]` in the same order, or `null` on failure (the
+     * caller should simply retry this pass next time — see the Rust doc).
+     */
+    external fun dcimScanDecisions(context: Context, candidatesJson: String): String?
+
+    /**
+     * Records one freshly-streamed-and-renamed DCIM import (§5.2). Returns
+     * a [RESULT_SUCCESS]-family code, same table as [runSyncCycle].
+     */
+    external fun dcimRecordImport(
+        context: Context,
+        sourcePath: String,
+        sourceSize: Long,
+        sourceMtimeUnix: Long,
+        finalPath: String
+    ): Int
+
+    /**
+     * The §5.4 "N edits not backed up" count — items dirty-and-not-yet-
+     * uploaded. `-1` on failure (state db unavailable): callers should skip
+     * the check for this run rather than treat it as zero.
+     */
+    external fun dirtyUnbackedCount(context: Context): Int
+
+    // ---- Keystore `CredentialStore` callbacks (called BY the native side) --
+    // `@JvmStatic` so `JNIEnv::call_static_method` can find them: these are
+    // the Kotlin-to-nowhere-else half of the contract, invoked FROM
+    // `rrcloud_core::android::bridge` via `GetStaticMethodID` — a plain
+    // (non-`external`) Kotlin function, the mirror image of `runSyncCycle`
+    // above.
+
+    @JvmStatic
+    fun loadCredentialsJson(context: Context): String? = AndroidCredentialStore.load(context)
+
+    @JvmStatic
+    fun storeCredentialsJson(context: Context, json: String): Boolean =
+        AndroidCredentialStore.store(context, json)
+
+    @JvmStatic
+    fun clearCredentials(context: Context): Boolean = AndroidCredentialStore.clear(context)
+
+    @JvmStatic
+    fun loadSyncSettingsJson(context: Context): String? =
+        RrcloudSyncSettingsReader.readSyncSettingsJson(context)
+
+    /** Called by `sync::hooks::sync_exit_flush` on Android (§3.3 exit flush). */
+    @JvmStatic
+    fun enqueueExpeditedSync(context: Context) {
+        RrcloudWorkScheduler.enqueueExpeditedSyncCycle(context)
+    }
 }

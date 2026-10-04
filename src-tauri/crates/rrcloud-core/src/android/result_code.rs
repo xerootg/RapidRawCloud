@@ -66,19 +66,37 @@ impl BridgeResult {
     /// unrecognized value is a decode failure, not a silently-defaulted
     /// outcome.
     pub fn from_code(code: i32) -> Option<Self> {
-        let _ = code;
-        todo!("P5 green: exhaustive match 0..=4, None otherwise")
+        match code {
+            0 => Some(BridgeResult::Success),
+            1 => Some(BridgeResult::RetryTransient),
+            2 => Some(BridgeResult::RetryLockHeld),
+            3 => Some(BridgeResult::FailureNotConfigured),
+            4 => Some(BridgeResult::FailurePermanent),
+            _ => None,
+        }
     }
 
     /// Encodes `self` back to the `jint` the bridge returns. Round-trips
     /// with [`BridgeResult::from_code`] for every variant (pinned by the
     /// exhaustive test).
     pub fn to_code(self) -> i32 {
-        todo!("P5 green: exhaustive match, the exact inverse of from_code")
+        match self {
+            BridgeResult::Success => 0,
+            BridgeResult::RetryTransient => 1,
+            BridgeResult::RetryLockHeld => 2,
+            BridgeResult::FailureNotConfigured => 3,
+            BridgeResult::FailurePermanent => 4,
+        }
     }
 
     /// The WorkManager outcome this code maps to (see the module table).
     pub fn work_outcome(self) -> WorkOutcome {
-        todo!("P5 green: exhaustive match per the module table")
+        match self {
+            BridgeResult::Success => WorkOutcome::Success,
+            BridgeResult::RetryTransient | BridgeResult::RetryLockHeld => WorkOutcome::Retry,
+            BridgeResult::FailureNotConfigured | BridgeResult::FailurePermanent => {
+                WorkOutcome::Failure
+            }
+        }
     }
 }

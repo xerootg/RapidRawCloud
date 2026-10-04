@@ -59,6 +59,13 @@ pub fn decide(
     candidate_size: u64,
     candidate_mtime_unix: i64,
 ) -> DcimDecision {
-    let _ = (row, candidate_size, candidate_mtime_unix);
-    todo!("P5 green: None => New; Some matching both fields => Skip; else => Rehash")
+    match row {
+        None => DcimDecision::New,
+        Some(row) if row.size == candidate_size && row.mtime_unix == candidate_mtime_unix => {
+            DcimDecision::Skip {
+                content_id: row.content_id.clone(),
+            }
+        }
+        Some(_) => DcimDecision::Rehash,
+    }
 }

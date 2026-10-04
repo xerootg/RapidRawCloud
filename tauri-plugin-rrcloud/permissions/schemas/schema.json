@@ -295,10 +295,34 @@
       "type": "string",
       "oneOf": [
         {
-          "description": "Default permissions for the plugin",
+          "description": "Enables the sync_dcim_access_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-sync-dcim-access-status",
+          "markdownDescription": "Enables the sync_dcim_access_status command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the sync_dcim_access_status command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-sync-dcim-access-status",
+          "markdownDescription": "Denies the sync_dcim_access_status command without any pre-configured scope."
+        },
+        {
+          "description": "Enables the sync_start_foreground_sync command without any pre-configured scope.",
+          "type": "string",
+          "const": "allow-sync-start-foreground-sync",
+          "markdownDescription": "Enables the sync_start_foreground_sync command without any pre-configured scope."
+        },
+        {
+          "description": "Denies the sync_start_foreground_sync command without any pre-configured scope.",
+          "type": "string",
+          "const": "deny-sync-start-foreground-sync",
+          "markdownDescription": "Denies the sync_start_foreground_sync command without any pre-configured scope."
+        },
+        {
+          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-sync-start-foreground-sync`\n- `allow-sync-dcim-access-status`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the plugin"
+          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-sync-start-foreground-sync`\n- `allow-sync-dcim-access-status`"
         }
       ]
     }

@@ -50,8 +50,13 @@ impl CycleBudget {
     /// never expires within any realistic test or process lifetime, rather
     /// than wrapping to a deadline in the past).
     pub fn from_budget_ms(start_ms: i64, budget_ms: i64) -> Self {
-        let _ = (start_ms, budget_ms);
-        todo!("P5 green: non-positive budget_ms => already-expired; else saturating_add deadline")
+        if budget_ms <= 0 {
+            CycleBudget { deadline_ms: None }
+        } else {
+            CycleBudget {
+                deadline_ms: Some(start_ms.saturating_add(budget_ms)),
+            }
+        }
     }
 
     /// Whether the cycle must stop admitting new work units as of `now_ms`
@@ -60,15 +65,19 @@ impl CycleBudget {
     /// units only; a unit already popped/in-flight always runs to
     /// completion (mirroring [`crate::transfer::CancelFlag`]'s contract).
     pub fn is_expired(&self, now_ms: i64) -> bool {
-        let _ = now_ms;
-        todo!("P5 green: now_ms >= deadline_ms (Some) or true (None, already-expired)")
+        match self.deadline_ms {
+            Some(deadline) => now_ms >= deadline,
+            None => true,
+        }
     }
 
     /// Milliseconds remaining as of `now_ms`; `0` once expired, never
     /// negative (so a caller can use it directly as e.g. a per-item
     /// timeout without an extra clamp).
     pub fn remaining_ms(&self, now_ms: i64) -> i64 {
-        let _ = now_ms;
-        todo!("P5 green: (deadline_ms - now_ms).max(0), or 0 when already-expired")
+        match self.deadline_ms {
+            Some(deadline) => deadline.saturating_sub(now_ms).max(0),
+            None => 0,
+        }
     }
 }

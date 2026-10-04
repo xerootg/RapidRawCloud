@@ -25,7 +25,11 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::app_settings::SyncSettings;
 use crate::app_state::AppState;
-use crate::sync::credentials::{CredentialStore, Credentials, FileCredentialStore};
+#[cfg(target_os = "android")]
+use crate::sync::credentials::AndroidCredentialStore;
+#[cfg(not(target_os = "android"))]
+use crate::sync::credentials::FileCredentialStore;
+use crate::sync::credentials::{CredentialStore, Credentials};
 use crate::sync::manager::{
     ConflictKeep, PeerDevice, RecentlyDeleted, SyncManager, SyncState, VerifyReport,
 };
@@ -144,14 +148,31 @@ pub fn hydrate_core(manager: &SyncManager, path: PathBuf) -> Result<(), String> 
 
 // ===== credential store location ==========================================
 
-/// The desktop credential store under `app_data_dir/rrcloud` (§3.6).
-fn credential_store(app: &AppHandle) -> Result<FileCredentialStore, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| e.to_string())?
-        .join("rrcloud");
-    Ok(FileCredentialStore::new(&dir))
+/// The platform credential store seam (§3.6/§5.1): a Keystore-backed JNI
+/// shim on Android, a `0600` JSON file under `app_data_dir/rrcloud` on
+/// desktop. Boxed so both platforms share one return type at this, the
+/// single decision point every command below goes through — the Android
+/// `tauri-plugin-rrcloud` JNI bridge's own worker-process credential read
+/// is a *separate* call path (it has no `AppHandle`/webview to be a Tauri
+/// command in the first place) that happens to reach the exact same
+/// Kotlin-side Keystore store via the same JNI methods (see
+/// `android_integration::android_credential_store_load` and
+/// `rrcloud_core::android::bridge`'s doc).
+fn credential_store(app: &AppHandle) -> Result<Box<dyn CredentialStore>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = app;
+        Ok(Box::new(AndroidCredentialStore::new()))
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        let dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| e.to_string())?
+            .join("rrcloud");
+        Ok(Box::new(FileCredentialStore::new(&dir)))
+    }
 }
 
 // ===== Tauri commands =====================================================
@@ -160,7 +181,7 @@ fn credential_store(app: &AppHandle) -> Result<FileCredentialStore, String> {
 #[tauri::command]
 pub fn sync_status(state: State<'_, AppState>, app: AppHandle) -> Result<SyncStatusDto, String> {
     let store = credential_store(&app)?;
-    let creds = credentials_configured_core(&store);
+    let creds = credentials_configured_core(&*store);
     Ok(status_core(&state.sync_manager, creds))
 }
 
@@ -194,7 +215,7 @@ pub async fn sync_configure(
         .join("rrcloud");
 
     let store = credential_store(&app)?;
-    configure_core(&state.sync_manager, &store, settings, sync_root, state_dir)
+    configure_core(&state.sync_manager, &*store, settings, sync_root, state_dir)
 }
 
 /// Writes credentials to the Rust-only store (§3.6). Returns `()`, never an
@@ -206,7 +227,7 @@ pub fn sync_set_credentials(
     app: AppHandle,
 ) -> Result<(), String> {
     let store = credential_store(&app)?;
-    set_credentials_core(&store, access_key, secret_key)
+    set_credentials_core(&*store, access_key, secret_key)
 }
 
 /// Pins paths so the evictor never reclaims them (§3.5).

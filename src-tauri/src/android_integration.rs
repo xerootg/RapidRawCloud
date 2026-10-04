@@ -576,6 +576,143 @@ pub fn save_file_bytes_to_android_downloads(
     )
 }
 
+/// The `com.plugin.rrcloud.RrcloudBridge` Kotlin class name, as a JNI
+/// slash-separated path. Shared by every `sync::credentials::
+/// AndroidCredentialStore` call below so the class name is spelled once.
+#[cfg(target_os = "android")]
+const RRCLOUD_BRIDGE_CLASS: &str = "com/plugin/rrcloud/RrcloudBridge";
+
+/// ARCHITECTURE.md §5.1 app-process half of the Keystore `CredentialStore`
+/// JNI contract: calls the `@JvmStatic fun loadCredentialsJson(Context):
+/// String?` Kotlin method backing `sync::credentials::
+/// AndroidCredentialStore::load`. `Ok(None)` when nothing is stored yet
+/// (not an error) — the exact same "unconfigured" meaning `FileCredential
+/// Store::load`'s `Ok(None)` carries on desktop.
+#[cfg(target_os = "android")]
+pub fn android_credential_store_load() -> Result<Option<String>, String> {
+    let vm = unsafe { JavaVM::from_raw(android_context().vm().cast()) }
+        .map_err(|e| format!("Failed to access Android JVM: {}", e))?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|e| format!("Failed to attach current thread to Android JVM: {}", e))?;
+    let context = env
+        .new_local_ref(unsafe { JObject::from_raw(android_context().context().cast()) })
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+
+    let result = env
+        .call_static_method(
+            RRCLOUD_BRIDGE_CLASS,
+            "loadCredentialsJson",
+            "(Landroid/content/Context;)Ljava/lang/String;",
+            &[(&context).into()],
+        )
+        .and_then(|v| v.l())
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+
+    if result.is_null() {
+        return Ok(None);
+    }
+    let result_jstring: JString = result.into();
+    let java_str = env
+        .get_string(&result_jstring)
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+    Ok(Some(java_str.into()))
+}
+
+/// §5.1 app-process half: calls `@JvmStatic fun storeCredentialsJson
+/// (Context, String): Boolean`, backing `AndroidCredentialStore::store`. A
+/// `false` return (a Keystore write failure) is surfaced as an error — per
+/// the Kotlin-side standard (security-relevant paths fail loud, never
+/// silently), never treated as a quiet success.
+#[cfg(target_os = "android")]
+pub fn android_credential_store_save(json: &str) -> Result<(), String> {
+    let vm = unsafe { JavaVM::from_raw(android_context().vm().cast()) }
+        .map_err(|e| format!("Failed to access Android JVM: {}", e))?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|e| format!("Failed to attach current thread to Android JVM: {}", e))?;
+    let context = env
+        .new_local_ref(unsafe { JObject::from_raw(android_context().context().cast()) })
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+    let json_java = env
+        .new_string(json)
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+
+    let ok = env
+        .call_static_method(
+            RRCLOUD_BRIDGE_CLASS,
+            "storeCredentialsJson",
+            "(Landroid/content/Context;Ljava/lang/String;)Z",
+            &[(&context).into(), (&json_java).into()],
+        )
+        .and_then(|v| v.z())
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+
+    if ok {
+        Ok(())
+    } else {
+        Err("Android Keystore credential store rejected the write".to_string())
+    }
+}
+
+/// §5.1 app-process half: calls `@JvmStatic fun clearCredentials(Context):
+/// Boolean`, backing `AndroidCredentialStore::clear`.
+#[cfg(target_os = "android")]
+pub fn android_credential_store_clear() -> Result<(), String> {
+    let vm = unsafe { JavaVM::from_raw(android_context().vm().cast()) }
+        .map_err(|e| format!("Failed to access Android JVM: {}", e))?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|e| format!("Failed to attach current thread to Android JVM: {}", e))?;
+    let context = env
+        .new_local_ref(unsafe { JObject::from_raw(android_context().context().cast()) })
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+
+    let ok = env
+        .call_static_method(
+            RRCLOUD_BRIDGE_CLASS,
+            "clearCredentials",
+            "(Landroid/content/Context;)Z",
+            &[(&context).into()],
+        )
+        .and_then(|v| v.z())
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+
+    if ok {
+        Ok(())
+    } else {
+        Err("Android Keystore credential store rejected the clear".to_string())
+    }
+}
+
+/// ARCHITECTURE.md §3.3/§5.1: enqueues the expedited one-shot
+/// `SyncCycleWorker` run (`WorkManager.enqueueUniqueWork` with
+/// `ExistingWorkPolicy.KEEP`, Kotlin-side) on app-background when the queue
+/// is non-empty. Called from `sync::hooks::sync_exit_flush` — best-effort,
+/// like every other exit-flush step: a failure here only means the next
+/// periodic `SyncCycleWorker` run (within the hour) picks up the drain
+/// instead of an expedited one running sooner, never data loss.
+#[cfg(target_os = "android")]
+pub fn android_enqueue_expedited_sync() -> Result<(), String> {
+    let vm = unsafe { JavaVM::from_raw(android_context().vm().cast()) }
+        .map_err(|e| format!("Failed to access Android JVM: {}", e))?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|e| format!("Failed to attach current thread to Android JVM: {}", e))?;
+    let context = env
+        .new_local_ref(unsafe { JObject::from_raw(android_context().context().cast()) })
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+
+    env.call_static_method(
+        RRCLOUD_BRIDGE_CLASS,
+        "enqueueExpeditedSync",
+        "(Landroid/content/Context;)V",
+        &[(&context).into()],
+    )
+    .map_err(|e| map_android_jni_error(&mut env, e))?;
+    Ok(())
+}
+
 #[cfg(target_os = "android")]
 pub fn get_android_internal_library_root() -> Result<PathBuf, String> {
     let vm = unsafe { JavaVM::from_raw(android_context().vm().cast()) }

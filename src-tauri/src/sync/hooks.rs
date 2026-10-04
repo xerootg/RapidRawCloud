@@ -303,6 +303,23 @@ mod imp {
         // process-global manager.
         let _ = app;
         run_exit_flush(EXIT_FLUSH_BUDGET);
+
+        // §5.1 point 3 / §3.3: on Android, also enqueue the expedited
+        // one-shot `SyncCycleWorker` run when the queue is still non-empty
+        // after the bounded drain above — the in-process engine is about to
+        // go away (app backgrounding), so the only thing that can finish
+        // the drain from here is WorkManager. Best-effort: a failure here
+        // is logged and otherwise harmless (the periodic worker still runs
+        // within the hour).
+        #[cfg(target_os = "android")]
+        {
+            if let Some(mgr) = global_manager()
+                && mgr.dirty_count() > 0
+                && let Err(e) = crate::android_integration::android_enqueue_expedited_sync()
+            {
+                log::warn!("exit flush: could not enqueue expedited Android sync: {e}");
+            }
+        }
     }
 
     /// Drives the bounded exit flush to completion from a *synchronous*

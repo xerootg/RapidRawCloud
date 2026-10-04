@@ -1,3 +1,37 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  ARCHITECTURE.md §5.3 manifest additions, declared on the PLUGIN's own
+  manifest (not gen/android/app's) so the Android Gradle manifest merger
+  folds them into the final app manifest — keeping gen/android/app's own
+  edits to the minimum the architecture promises (plugin registration +
+  gradle dep lines only).
+-->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- DCIM watch (§5.2): full access pre-API33, the split
+         images/video grant API33+, and the Android 14 partial-selection
+         grant this plugin detects (RrcloudPlugin.checkPartialMediaAccess). -->
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+
+    <!-- §5.1: WorkManager's network-aware scheduling (`NetworkType.
+         CONNECTED`/`UNMETERED`) and the hand-rolled S3 client's own
+         connectivity needs. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- §5.1 point 2: the user-initiated foreground sync service. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <!-- §5.3: the sync progress / "N edits not backed up" notification
+         channels (runtime-requested on Android 13+, RrcloudPlugin.load). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application>
+        <service
+            android:name="com.plugin.rrcloud.SyncForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+    </application>
 </manifest>

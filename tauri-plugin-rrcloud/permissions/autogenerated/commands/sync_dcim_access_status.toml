@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-sync-dcim-access-status"
+description = "Enables the sync_dcim_access_status command without any pre-configured scope."
+commands.allow = ["sync_dcim_access_status"]
+
+[[permission]]
+identifier = "deny-sync-dcim-access-status"
+description = "Denies the sync_dcim_access_status command without any pre-configured scope."
+commands.deny = ["sync_dcim_access_status"]

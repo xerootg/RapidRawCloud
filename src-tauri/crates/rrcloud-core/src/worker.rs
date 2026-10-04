@@ -1201,7 +1201,7 @@ fn log_cycle(report: &CycleReport) {
 /// with the state-dir path so two deployments on one host never collide. The
 /// result is persisted by [`crate::state::SyncDb`] on first open and read
 /// back on every reopen, so it is minted exactly once per state volume.
-fn mint_worker_device_id(salt: &Path) -> Result<DeviceId, WorkerError> {
+pub(crate) fn mint_worker_device_id(salt: &Path) -> Result<DeviceId, WorkerError> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

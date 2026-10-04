@@ -58,6 +58,66 @@ impl FileCredentialStore {
     }
 }
 
+/// Android credential store (ARCHITECTURE.md §5.1): a thin JNI shim over
+/// the Keystore-backed `CredentialStore` Kotlin owns
+/// (`tauri-plugin-rrcloud/android/src/main/java/com/plugin/rrcloud/
+/// AndroidCredentialStore.kt`, `EncryptedSharedPreferences` wrapping a
+/// Keystore-generated AES key). Credentials never touch Rust-side disk on
+/// Android — this struct makes exactly the same three JNI calls
+/// (`loadCredentialsJson`/`storeCredentialsJson`/`clearCredentials` on
+/// `com.plugin.rrcloud.RrcloudBridge`) that `rrcloud_core::android::bridge`
+/// makes from the worker process, so both the app-foreground command path
+/// (this struct) and the WorkManager/FGS path read/write the identical
+/// store.
+///
+/// Requires `ndk_context` to already be initialized
+/// (`android_integration::initialize_android`, which the app's webview
+/// setup calls before any sync command can run) — this struct attaches to
+/// the JVM `ndk_context` already holds rather than taking its own
+/// `Context`/`JNIEnv`, since every call site here is already inside the
+/// app process with that context live.
+#[cfg(target_os = "android")]
+pub struct AndroidCredentialStore;
+
+#[cfg(target_os = "android")]
+impl AndroidCredentialStore {
+    pub fn new() -> Self {
+        AndroidCredentialStore
+    }
+}
+
+#[cfg(target_os = "android")]
+impl Default for AndroidCredentialStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(target_os = "android")]
+impl CredentialStore for AndroidCredentialStore {
+    fn load(&self) -> std::io::Result<Option<Credentials>> {
+        let json = crate::android_integration::android_credential_store_load()
+            .map_err(std::io::Error::other)?;
+        let Some(json) = json else {
+            return Ok(None);
+        };
+        let creds: Credentials = serde_json::from_str(&json)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        Ok(Some(creds))
+    }
+
+    fn store(&self, creds: &Credentials) -> std::io::Result<()> {
+        let json = serde_json::to_string(creds)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        crate::android_integration::android_credential_store_save(&json)
+            .map_err(std::io::Error::other)
+    }
+
+    fn clear(&self) -> std::io::Result<()> {
+        crate::android_integration::android_credential_store_clear().map_err(std::io::Error::other)
+    }
+}
+
 impl CredentialStore for FileCredentialStore {
     fn load(&self) -> std::io::Result<Option<Credentials>> {
         match std::fs::read(&self.path) {
