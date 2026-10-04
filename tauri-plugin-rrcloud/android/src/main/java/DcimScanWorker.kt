@@ -105,13 +105,27 @@ class DcimScanWorker(context: Context, params: WorkerParameters) : Worker(contex
         args: Array<String>?,
         watchedBuckets: Set<String>
     ): List<Candidate> {
+        // The dedupe-key "path" must survive MediaStore row-id churn (§5.2:
+        // the key "survives re-scans, re-mounts, and MediaStore id churn").
+        // A row's `_ID` is NOT stable across a provider rebuild (factory
+        // reset+restore, SD card reinsert, OS media-DB rescan) — exactly
+        // the events §5.2 calls out — so it must never be embedded in the
+        // key (P5 review round 1: the previous `uri.toString()` key baked
+        // the `_ID` into a `content://.../media/<id>` string and broke the
+        // invariant). Instead: RELATIVE_PATH+DISPLAY_NAME on API 29+ (both
+        // populated under scoped storage), or the legacy DATA column on
+        // API 24-28 (pre-scoped-storage, still fully populated for reads).
+        // `_ID` is kept on the candidate only to build the content:// URI
+        // used for the streaming read/import, never as the dedupe key.
+        val useRelativePath = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
         val projection = arrayOf(
             MediaStore.MediaColumns._ID,
             MediaStore.MediaColumns.SIZE,
             MediaStore.MediaColumns.DATE_MODIFIED,
             MediaStore.MediaColumns.DISPLAY_NAME,
             MediaStore.MediaColumns.BUCKET_DISPLAY_NAME,
-            MediaStore.MediaColumns.MIME_TYPE
+            MediaStore.MediaColumns.MIME_TYPE,
+            if (useRelativePath) MediaStore.MediaColumns.RELATIVE_PATH else MediaStore.MediaColumns.DATA
         )
         val out = mutableListOf<Candidate>()
         applicationContext.contentResolver.query(
@@ -127,6 +141,9 @@ class DcimScanWorker(context: Context, params: WorkerParameters) : Worker(contex
             val nameCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
             val bucketCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.BUCKET_DISPLAY_NAME)
             val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.MIME_TYPE)
+            val stablePathCol = cursor.getColumnIndexOrThrow(
+                if (useRelativePath) MediaStore.MediaColumns.RELATIVE_PATH else MediaStore.MediaColumns.DATA
+            )
             while (cursor.moveToNext()) {
                 val bucket = cursor.getString(bucketCol)
                 if (watchedBuckets.isNotEmpty() && bucket !in watchedBuckets) {
@@ -138,15 +155,16 @@ class DcimScanWorker(context: Context, params: WorkerParameters) : Worker(contex
                     continue
                 }
                 val id = cursor.getLong(idCol)
-                val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+                val stablePath = if (useRelativePath) {
+                    val relativePath = cursor.getString(stablePathCol)
+                    if (relativePath.isNullOrEmpty()) name else relativePath + name
+                } else {
+                    cursor.getString(stablePathCol)?.takeIf { it.isNotEmpty() } ?: name
+                }
                 out.add(
                     Candidate(
                         id = id,
-                        // The content URI string is the dedupe-key "path" —
-                        // stable across re-scans and not subject to the
-                        // scoped-storage `DATA` column's deprecation, unlike
-                        // a filesystem path.
-                        path = uri.toString(),
+                        path = stablePath,
                         size = cursor.getLong(sizeCol),
                         mtimeUnix = cursor.getLong(mtimeCol),
                         displayName = name
