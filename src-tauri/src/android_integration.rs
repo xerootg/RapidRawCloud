@@ -47,7 +47,17 @@ pub fn initialize_android(window: &tauri::WebviewWindow) {
                     // through `rrcloud_core`'s one shared `Once` -- instead of
                     // each keeping its own, as this code used to -- is what
                     // prevents the on-device crash.
-                    rrcloud_core::android::ensure_ndk_context_initialized(vm_ptr, context_ptr);
+                    //
+                    // No local-to-global promotion needed on this side (unlike
+                    // the bridge's): `context` here derefs from `wry`'s own
+                    // `ActivityProxy.activity` `GlobalRef`, cloned into every
+                    // dispatch (see `rrcloud_core::android::platform_init`'s
+                    // module doc), so `context_ptr` is already a global
+                    // reference's raw handle, good for the life of the
+                    // process -- the closure just hands that pointer through
+                    // unchanged. It only runs at all if this call wins the
+                    // shared race.
+                    rrcloud_core::android::ensure_ndk_context_initialized(vm_ptr, || context_ptr);
                 }
                 #[cfg(not(feature = "sync"))]
                 {

@@ -874,8 +874,47 @@ pub use imp::*;
 fn init_ndk_context(env: &mut jni::JNIEnv, ctx: &jni::objects::JObject) {
     if let Ok(vm) = env.get_java_vm() {
         let vm_ptr = vm.get_java_vm_pointer() as *mut std::ffi::c_void;
-        let context_ptr = ctx.as_raw() as *mut std::ffi::c_void;
-        super::platform_init::ensure_ndk_context_initialized(vm_ptr, context_ptr);
+        // `ctx` here is a plain native-method argument -- the JNI spec
+        // guarantees that is a fresh LOCAL reference, valid only for this
+        // one call. It must NOT be handed to the shared guard as-is: if
+        // this call wins the process-wide `Once` race (plausible -- a
+        // `WorkManager` worker can run before the app ever opens a
+        // webview in a cold-started process), `ndk_context` would keep
+        // this local's raw pointer forever, and every later
+        // `android_integration.rs` read of
+        // `ndk_context::android_context().context()` would dereference a
+        // handle freed when this JNI call returns -- see
+        // `platform_init`'s module doc for the full "local vs. global
+        // reference" rationale.
+        //
+        // `ensure_ndk_context_initialized` only calls this closure at
+        // all if this call actually wins that race (at most once per
+        // process, see that function's doc), so only the single winning
+        // call ever promotes-and-leaks a global ref here -- a losing
+        // call (the common case: this runs on every `SyncCycleWorker`/
+        // `DcimScanWorker` invocation) never does.
+        super::platform_init::ensure_ndk_context_initialized(vm_ptr, || {
+            match env.new_global_ref(ctx) {
+                Ok(global_ctx) => {
+                    let context_ptr = global_ctx.as_obj().as_raw() as *mut std::ffi::c_void;
+                    // Intentionally leaked: this global reference must
+                    // outlive this native call -- outlive this whole
+                    // process, in fact, exactly like `ndk_context` itself
+                    // assumes of whatever pointer it is given. Dropping
+                    // `global_ctx` would `DeleteGlobalRef` it and
+                    // reintroduce the exact dangling-pointer bug this
+                    // promotion exists to prevent.
+                    std::mem::forget(global_ctx);
+                    context_ptr
+                }
+                Err(e) => {
+                    eprintln!(
+                        "rrcloud bridge: failed to promote ctx to a global ref for ndk_context init: {e}"
+                    );
+                    std::ptr::null_mut()
+                }
+            }
+        });
     } else {
         eprintln!("rrcloud bridge: could not obtain JavaVM for ndk_context init");
     }

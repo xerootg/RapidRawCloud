@@ -19,17 +19,21 @@
 //! root cause this module fixes.
 //!
 //! `ndk_context::initialize_android_context` panics if the process-global
-//! it sets has already been set (its own internal `Once::call_once`
-//! body). Each call site previously guarded itself with its OWN local
-//! `static ...: std::sync::Once` — `android_integration.rs` had one,
-//! `bridge.rs` had another — which only stops THAT call site from calling
-//! twice; neither knows the other exists. Whichever call site runs first
-//! in a given process wins silently, and the next caller from the *other*
-//! site still panics on the already-initialized global, taking the whole
-//! process down with it (no process isolation to contain the panic to a
-//! worker thread). Confirmed on-device: `DcimScanWorker` won the race in
-//! the background, `SyncCycleWorker` lost it seconds later on
-//! `androidx.work-2` and crashed the app with `SIGABRT`.
+//! it sets has already been set: checked against `ndk-context` 0.1.1's
+//! actual source, the guard inside it is a bare, unsynchronized
+//! `static mut ANDROID_CONTEXT: Option<AndroidContext>`, set via
+//! `.replace()` followed by `assert!(previous.is_none())` — there is no
+//! `std::sync::Once` anywhere in that crate; an earlier draft of this doc
+//! claimed otherwise. Each call site previously guarded itself with its
+//! OWN local `static ...: std::sync::Once` — `android_integration.rs` had
+//! one, `bridge.rs` had another — which only stops THAT call site from
+//! calling twice; neither knows the other exists. Whichever call site
+//! runs first in a given process wins silently, and the next caller from
+//! the *other* site still panics on the already-initialized global,
+//! taking the whole process down with it (no process isolation to contain
+//! the panic to a worker thread). Confirmed on-device: `DcimScanWorker`
+//! won the race in the background, `SyncCycleWorker` lost it seconds
+//! later on `androidx.work-2` and crashed the app with `SIGABRT`.
 //!
 //! The fix is one process-wide `Once` **per global**, shared by every
 //! call site via the `pub fn`s below — not two (or more) independent
@@ -40,25 +44,85 @@
 //!
 //! ## Is a stored vm/context pointer pair from either call site as good as the other's?
 //!
-//! Yes, for this app's lifecycle. Whichever caller's `(vm_ptr,
-//! context_ptr)` pair wins the race is the one
-//! `ndk_context::android_context()` serves back to every later reader in
-//! this process, from either call site. There is exactly one `JavaVM` per
-//! process, so the VM half is identical no matter who wins. The context
-//! half is an `ApplicationContext` from both sides in this app:
-//! `SyncCycleWorker`/`DcimScanWorker` are hitting this through their own
-//! `applicationContext` (a `Worker`'s `applicationContext` is always the
-//! process's `Application` object, never an `Activity`), and
-//! `android_integration.rs`'s call site is handed the `Context` behind
-//! Tauri's webview setup, which is likewise the application's context,
-//! not a bare `Activity` context — `ndk_context` only needs a `Context`
-//! good enough for JNI `FindClass`/resource-lookup purposes, which an
-//! `ApplicationContext` satisfies for the lifetime of the process either
-//! way.
+//! Yes, for this app's lifecycle, but the two sides are NOT handing
+//! `ndk_context` the *same kind* of `Context` — an earlier draft of this
+//! doc claimed they were both an `ApplicationContext`, which does not
+//! survive checking either side's actual source:
+//!
+//! - `bridge.rs`'s side genuinely is an `ApplicationContext`:
+//!   `SyncCycleWorker.kt`/`DcimScanWorker.kt` call the native bridge
+//!   through their own `applicationContext` (a `Worker`'s
+//!   `applicationContext` is always the process's `Application` object,
+//!   never an `Activity`).
+//! - `android_integration.rs`'s side is the **Activity**, not the
+//!   application context: it goes through Tauri's `wry` webview, whose
+//!   `JniHandle::exec`/`dispatch` hand the closure `&activity` where
+//!   `activity` is wry's own `ActivityProxy.activity` — a `GlobalRef`
+//!   cloned once per dispatch (`wry` 0.57.0,
+//!   `src/android/main_pipe.rs`'s `WebViewMessage::Jni` handling) — and
+//!   `wry`'s own doc comment on `dispatch`/`exec` says so explicitly:
+//!   "the Android **activity** instance". `ndk_context`'s own doc comment
+//!   agrees this is normal: `context()` is "In most cases ... a ptr to an
+//!   `Activity`, but this isn't guaranteed."
+//!
+//! Whichever caller's `(vm_ptr, context_ptr)` pair wins the race is the
+//! one `ndk_context::android_context()` serves back to every later reader
+//! in this process, from either call site. There is exactly one `JavaVM`
+//! per process, so the VM half is identical no matter who wins. The
+//! context half differs in *kind* (`Activity` vs. `ApplicationContext`)
+//! depending on who wins, but `ndk_context` only needs a `Context` good
+//! enough for JNI `FindClass`/resource-lookup purposes, and both kinds
+//! satisfy that for the lifetime of the process either way — this is why
+//! the race's outcome is safe to leave non-deterministic rather than why
+//! sharing one `Once` is safe (that part is unconditional: see the next
+//! section on local vs. global references, which is what actually makes
+//! sharing the resulting pointer safe).
+//!
+//! ## Is the WINNING call site's context pointer actually safe to store forever?
+//!
+//! Only if it is backed by a JNI *global* reference — a *local* reference
+//! is scoped to the one native call that received it and becomes invalid
+//! (freed, or reused for something else) once that call returns, no
+//! matter what Java-side object it pointed to.
+//!
+//! - `android_integration.rs`'s `context` parameter is already safe: per
+//!   the previous section, it derefs from wry's `ActivityProxy.activity`
+//!   `GlobalRef` directly (`main_pipe.rs` passes `&activity`, not a freshly
+//!   minted local), so its raw `jobject` handle IS the global reference's
+//!   own handle, kept alive by `wry` for the life of the process. No
+//!   extra promotion needed on this side.
+//! - `bridge.rs`'s `ctx` parameter is **not** safe as-is: every
+//!   `Java_com_plugin_rrcloud_RrcloudBridge_*` entry point receives `ctx`
+//!   as a plain JNI native-method argument, which the JNI spec guarantees
+//!   is a fresh *local* reference, valid only for that one call. If a
+//!   `bridge.rs` call won the shared `Once` race and stored that local
+//!   reference's raw pointer, every later `android_integration.rs` read
+//!   of `ndk_context::android_context().context()` (there are many —
+//!   `src-tauri/src/android_integration.rs`'s many
+//!   `android_context().context()` call sites) would dereference a
+//!   dangling handle: undefined behavior, typically a fatal
+//!   "use of deleted/invalid local reference" JNI abort, potentially long
+//!   after the `bridge.rs` call that caused it returned.
+//!
+//!   The fix: [`ensure_ndk_context_initialized`] takes a
+//!   `make_context_ptr` closure instead of a plain pointer, and only ever
+//!   calls it from *inside* the shared `Once`'s `init` closure — i.e., at
+//!   most once per process, and only for the call that actually wins the
+//!   race (`std::sync::Once::call_once`'s losers block until the winner
+//!   returns and then return themselves; they never invoke `init`, so
+//!   they never invoke `make_context_ptr` either — pinned by the
+//!   `make_context_ptr_runs_only_on_the_winning_call` test below).
+//!   `bridge.rs`'s `init_ndk_context` uses that hook to call
+//!   `env.new_global_ref(ctx)` and deliberately leak the result
+//!   (`std::mem::forget`) — turning its local into a global exactly once,
+//!   for exactly the one call whose pointer will actually be kept
+//!   forever. `android_integration.rs`'s call site has no promotion to
+//!   do, so its `make_context_ptr` closure just returns the already-good
+//!   pointer it already had.
 //!
 //! ## Does `rustls_platform_verifier::android::init_with_env` need this?
 //!
-//! Checked by reading its source (`rustls-platform-verifier` 0.7.1,
+//! Checked by reading its source (`rustls-platform-verifier` 0.7.0,
 //! `src/android.rs`): it stores its global state in a
 //! `once_cell::sync::OnceCell` and initializes via
 //! `OnceCell::get_or_try_init`, so a second call in the same process is
@@ -80,7 +144,11 @@
 //! every caller (winner and loser alike) returns normally, with no panic
 //! escaping to a loser — is provable with `cargo test` on the host. See
 //! the tests below, including a regression pinning the actual bug shape
-//! (two independent `Once`s both firing).
+//! (two independent `Once`s both firing) and a regression pinning the
+//! "only the winner runs `make_context_ptr`" property the local-vs-global
+//! reference fix above depends on ([`init_context_exactly_once`] is the
+//! same kind of `target_os`-ungated, host-testable core as
+//! [`run_exactly_once`], for the same reason).
 
 use std::sync::Once;
 
@@ -113,20 +181,60 @@ static NDK_CONTEXT_INIT: Once = Once::new();
 #[cfg(target_os = "android")]
 static RUSTLS_PLATFORM_VERIFIER_INIT: Once = Once::new();
 
+/// Host-testable core of [`ensure_ndk_context_initialized`]: runs
+/// `make_context_ptr` and hands its result to `store`, guarded by `once`
+/// exactly like [`run_exactly_once`] — but, unlike that function, pins the
+/// specific property the local-vs-global-reference fix in this module's
+/// doc depends on: `make_context_ptr` runs from *inside* the `Once`'s
+/// `init` closure, so it executes **at most once per process, and only
+/// for the call that actually wins the race**. A losing caller blocks
+/// inside `call_once` until the winner's `init` (which includes
+/// `make_context_ptr` and `store`) returns, then returns itself — it
+/// never calls `make_context_ptr`. In production, `make_context_ptr` is
+/// what does the `env.new_global_ref` JNI promotion on `bridge.rs`'s side
+/// (see the module doc); a loser invoking it too would mean every losing
+/// call also promotes-and-leaks a JNI global reference it has no business
+/// creating, on top of the one the winner correctly keeps.
+pub fn init_context_exactly_once(
+    once: &Once,
+    make_context_ptr: impl FnOnce() -> *mut std::ffi::c_void,
+    store: impl FnOnce(*mut std::ffi::c_void),
+) {
+    run_exactly_once(once, || {
+        store(make_context_ptr());
+    });
+}
+
 /// Initializes `ndk_context` for this process exactly once, no matter
-/// which call site gets here first. `vm_ptr`/`context_ptr` are a
-/// `JavaVM`/`Context` pointer pair, obtained exactly as every call site
-/// already computes them: `JNIEnv::get_java_vm().get_java_vm_pointer()`
-/// and `JObject::as_raw()`, both cast to `*mut c_void`.
+/// which call site gets here first. `vm_ptr` is the `JavaVM` pointer,
+/// obtained exactly as every call site already computes it:
+/// `JNIEnv::get_java_vm().get_java_vm_pointer()` cast to `*mut c_void`
+/// (identical no matter who wins — there is exactly one `JavaVM` per
+/// process).
+///
+/// `make_context_ptr` is called **at most once**, and only by the call
+/// that wins the race (see [`init_context_exactly_once`]'s doc) — it must
+/// produce a `Context` pointer that stays valid for the rest of the
+/// process's life, because `ndk_context::android_context()` hands that
+/// exact pointer back to every later reader, from either call site,
+/// forever. `android_integration.rs`'s call site can just return its
+/// already-good pointer; `bridge.rs`'s call site must promote its JNI
+/// *local* reference to a *global* one first and deliberately leak it —
+/// see this module's doc for why a plain `JObject::as_raw()` from a
+/// native-method parameter is not safe to store past the call that
+/// received it.
 #[cfg(target_os = "android")]
 pub fn ensure_ndk_context_initialized(
     vm_ptr: *mut std::ffi::c_void,
-    context_ptr: *mut std::ffi::c_void,
+    make_context_ptr: impl FnOnce() -> *mut std::ffi::c_void,
 ) {
-    run_exactly_once(&NDK_CONTEXT_INIT, || {
-        // SAFETY: `vm_ptr`/`context_ptr` come from a live `JNIEnv`/`JObject`
-        // pair in the caller's current JNI call, and this closure runs at
-        // most once per process (guarded by `NDK_CONTEXT_INIT`), which is
+    init_context_exactly_once(&NDK_CONTEXT_INIT, make_context_ptr, |context_ptr| {
+        // SAFETY: `vm_ptr` comes from a live `JNIEnv` in the caller's
+        // current JNI call. `context_ptr` is whatever `make_context_ptr`
+        // produced, which by this function's own contract (see doc above)
+        // must already be valid for the rest of the process's life. This
+        // closure runs at most once per process (guarded by
+        // `NDK_CONTEXT_INIT` via `init_context_exactly_once`), which is
         // exactly `ndk_context::initialize_android_context`'s own
         // documented safety/panic contract.
         unsafe {
@@ -263,5 +371,71 @@ mod tests {
              fix is the single shared Once exercised by the test above"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Regression for the blocker this round fixes ("shared guard is not
+    /// actually symmetric: `bridge.rs` winning the race stores a dangling
+    /// JNI local reference"). The fix routes the context-pointer
+    /// production through `make_context_ptr`, called only from inside the
+    /// shared `Once`'s `init` -- this pins that EVERY caller's
+    /// `make_context_ptr` is invoked AT MOST ONCE total, by the single
+    /// winner, never by a loser, no matter how many callers race.
+    ///
+    /// Why this matters: in production, `bridge.rs`'s `make_context_ptr`
+    /// is what calls `env.new_global_ref(ctx)` and leaks the result to
+    /// promote its JNI *local* reference (invalid once its native call
+    /// returns) into a *global* one (valid for the rest of the process).
+    /// If a LOSING caller also ran `make_context_ptr`, every losing
+    /// `bridge.rs` call -- which happens on every `SyncCycleWorker`/
+    /// `DcimScanWorker` run after the first, i.e. routinely -- would also
+    /// promote-and-leak a JNI global reference it has no business
+    /// creating, on top of the one the winner correctly keeps forever.
+    /// This test proves `init_context_exactly_once` cannot regress into
+    /// that shape: `make_context_ptr` fires exactly once, period.
+    #[test]
+    fn make_context_ptr_runs_only_on_the_winning_call_never_on_a_loser() {
+        let once = Arc::new(Once::new());
+        let make_context_ptr_calls = Arc::new(AtomicUsize::new(0));
+        let stored_calls = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let once = Arc::clone(&once);
+            let make_context_ptr_calls = Arc::clone(&make_context_ptr_calls);
+            let stored_calls = Arc::clone(&stored_calls);
+            handles.push(thread::spawn(move || {
+                init_context_exactly_once(
+                    &once,
+                    // Stands in for `bridge.rs`'s `env.new_global_ref(ctx)`
+                    // + `mem::forget` promotion: this must run at most
+                    // once, by the winner only.
+                    || {
+                        make_context_ptr_calls.fetch_add(1, Ordering::SeqCst);
+                        std::ptr::null_mut()
+                    },
+                    |_context_ptr| {
+                        stored_calls.fetch_add(1, Ordering::SeqCst);
+                    },
+                );
+            }));
+        }
+
+        for h in handles {
+            h.join()
+                .expect("no caller should panic, winner or loser");
+        }
+
+        assert_eq!(
+            make_context_ptr_calls.load(Ordering::SeqCst),
+            1,
+            "make_context_ptr (the JNI local-to-global promotion in production) must run \
+             exactly once, by the winner only -- a loser running it too would leak one JNI \
+             global reference per losing call, for the life of the process"
+        );
+        assert_eq!(
+            stored_calls.load(Ordering::SeqCst),
+            1,
+            "store must run exactly once, with the one value make_context_ptr produced"
+        );
     }
 }
