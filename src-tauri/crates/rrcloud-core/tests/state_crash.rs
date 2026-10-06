@@ -589,8 +589,12 @@ mod linux {
             // the pending-bytes key still holds a DIFFERENT seq's bytes
             // (the torn state two separate commits can leave) is exactly
             // the round-3 review hazard this probe exists to catch.
-            let meta_head = db.synced_meta_head(ALBUMS_META_KEY).expect("synced_meta_head");
-            let meta_bytes_on_disk = db.pending_meta_bytes(ALBUMS_META_KEY).expect("pending_meta_bytes");
+            let meta_head = db
+                .synced_meta_head(ALBUMS_META_KEY)
+                .expect("synced_meta_head");
+            let meta_bytes_on_disk = db
+                .pending_meta_bytes(ALBUMS_META_KEY)
+                .expect("pending_meta_bytes");
             assert_eq!(
                 meta_head.is_some(),
                 meta_bytes_on_disk.is_some(),

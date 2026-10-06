@@ -414,9 +414,8 @@ fn merge_album_out_of_root(
                     .or_insert_with(|| Value::Array(Vec::new()));
                 if let Value::Array(images) = images {
                     for path in extra {
-                        let already_present = images
-                            .iter()
-                            .any(|v| v.as_str() == Some(path.as_str()));
+                        let already_present =
+                            images.iter().any(|v| v.as_str() == Some(path.as_str()));
                         if !already_present {
                             images.push(Value::String(path.clone()));
                         }

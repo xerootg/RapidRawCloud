@@ -22,9 +22,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+      # This crate lives under src-tauri/, whose rust-toolchain.toml pins the
+      # channel to 1.98. That pin is resolved by walking up from the working
+      # directory, so it applies to this standalone crate too and overrides
+      # whatever toolchain is installed — rustfmt/clippy must therefore be
+      # installed FOR 1.98, not for `stable`. The old `@stable` install left
+      # cargo-fmt/clippy absent on the 1.98 toolchain cargo actually selects
+      # here, which failed `cargo fmt --check` on every CI run.
+      - name: Install Rust (1.98, matching the project pin)
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: "1.98"
           components: rustfmt,clippy
 
       - uses: Swatinem/rust-cache@v2
