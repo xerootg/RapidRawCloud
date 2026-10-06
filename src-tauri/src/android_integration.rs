@@ -58,6 +58,50 @@ pub fn initialize_android(window: &tauri::WebviewWindow) {
                     // unchanged. It only runs at all if this call wins the
                     // shared race.
                     rrcloud_core::android::ensure_ndk_context_initialized(vm_ptr, || context_ptr);
+
+                    // Caches the app's `ClassLoader` so later
+                    // `#[tauri::command]` handlers (which run on a Tokio
+                    // thread, never one the JVM created) can resolve
+                    // `com.plugin.rrcloud.RrcloudBridge` correctly — see
+                    // `rrcloud_core::android::platform_init`'s module doc
+                    // ("The `ClassNotFoundException` this module also
+                    // fixes") for the on-device crash this prevents. Must
+                    // run on this closure's thread (the WebView's own,
+                    // genuinely Java-originated) while `env`/`context` are
+                    // still live and attached correctly.
+                    rrcloud_core::android::ensure_class_loader_initialized(|| {
+                        match env
+                            .call_method(context, "getClass", "()Ljava/lang/Class;", &[])
+                            .and_then(|v| v.l())
+                            .and_then(|class_obj| {
+                                env.call_method(
+                                    &class_obj,
+                                    "getClassLoader",
+                                    "()Ljava/lang/ClassLoader;",
+                                    &[],
+                                )
+                            })
+                            .and_then(|v| v.l())
+                            .and_then(|loader_obj| env.new_global_ref(&loader_obj))
+                        {
+                            Ok(global_loader) => {
+                                let ptr =
+                                    global_loader.as_obj().as_raw() as *mut std::ffi::c_void;
+                                // Intentionally leaked -- same rationale as
+                                // `context_ptr` above: this cache must
+                                // outlive this one call, for the rest of
+                                // the process's life.
+                                std::mem::forget(global_loader);
+                                ptr
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "rrcloud: failed to cache app ClassLoader at startup: {e:?}"
+                                );
+                                std::ptr::null_mut()
+                            }
+                        }
+                    });
                 }
                 #[cfg(not(feature = "sync"))]
                 {
@@ -646,6 +690,59 @@ pub fn save_file_bytes_to_android_downloads(
 #[cfg(target_os = "android")]
 const RRCLOUD_BRIDGE_CLASS: &str = "com/plugin/rrcloud/RrcloudBridge";
 
+/// Resolves [`RRCLOUD_BRIDGE_CLASS`] for a `call_static_method` call below.
+///
+/// Every caller here is a `#[tauri::command]` handler, running on a
+/// thread Tauri's own async runtime attached to the JVM — never one the
+/// JVM itself created — so a plain `env.find_class(RRCLOUD_BRIDGE_CLASS)`
+/// (what passing the bare string straight to `call_static_method` does
+/// internally) resolves against the *system* classloader and never finds
+/// this app-defined class. See
+/// `rrcloud_core::android::platform_init`'s module doc ("The
+/// `ClassNotFoundException` this module also fixes") for the on-device
+/// crash this prevents, and why `ClassLoader.loadClass` — not
+/// `FindClass` — is the correct fix here.
+///
+/// Falls back to plain `find_class` only if the cache has not been
+/// populated yet (should not happen in production — see that same doc
+/// for why `initialize_android` always runs first — but still correct on
+/// a thread that happens to BE Java-originated, where `find_class` works
+/// regardless).
+#[cfg(target_os = "android")]
+fn resolve_rrcloud_bridge_class<'local>(
+    env: &mut JNIEnv<'local>,
+) -> Result<jni::objects::JClass<'local>, String> {
+    let cached = rrcloud_core::android::cached_class_loader_global_ref();
+    if cached.is_null() {
+        return env
+            .find_class(RRCLOUD_BRIDGE_CLASS)
+            .map_err(|e| map_android_jni_error(env, e));
+    }
+
+    // SAFETY: `cached` is either null (handled above) or a JNI global
+    // reference this process cached once in `initialize_android` and
+    // deliberately leaked (`std::mem::forget`) to live for the rest of
+    // the process's life — valid to wrap here no matter which thread
+    // calls in.
+    let class_loader = unsafe { JObject::from_raw(cached as jni::sys::jobject) };
+    let binary_name = RRCLOUD_BRIDGE_CLASS.replace('/', ".");
+    let name_jstring = env
+        .new_string(&binary_name)
+        .map_err(|e| map_android_jni_error(env, e))?;
+
+    let class_obj = env
+        .call_method(
+            &class_loader,
+            "loadClass",
+            "(Ljava/lang/String;)Ljava/lang/Class;",
+            &[(&name_jstring).into()],
+        )
+        .and_then(|v| v.l())
+        .map_err(|e| map_android_jni_error(env, e))?;
+
+    Ok(jni::objects::JClass::from(class_obj))
+}
+
 /// ARCHITECTURE.md §5.1 app-process half of the Keystore `CredentialStore`
 /// JNI contract: calls the `@JvmStatic fun loadCredentialsJson(Context):
 /// String?` Kotlin method backing `sync::credentials::
@@ -663,9 +760,10 @@ pub fn android_credential_store_load() -> Result<Option<String>, String> {
         .new_local_ref(unsafe { JObject::from_raw(android_context().context().cast()) })
         .map_err(|e| map_android_jni_error(&mut env, e))?;
 
+    let bridge_class = resolve_rrcloud_bridge_class(&mut env)?;
     let result = env
         .call_static_method(
-            RRCLOUD_BRIDGE_CLASS,
+            &bridge_class,
             "loadCredentialsJson",
             "(Landroid/content/Context;)Ljava/lang/String;",
             &[(&context).into()],
@@ -702,9 +800,10 @@ pub fn android_credential_store_save(json: &str) -> Result<(), String> {
         .new_string(json)
         .map_err(|e| map_android_jni_error(&mut env, e))?;
 
+    let bridge_class = resolve_rrcloud_bridge_class(&mut env)?;
     let ok = env
         .call_static_method(
-            RRCLOUD_BRIDGE_CLASS,
+            &bridge_class,
             "storeCredentialsJson",
             "(Landroid/content/Context;Ljava/lang/String;)Z",
             &[(&context).into(), (&json_java).into()],
@@ -732,9 +831,10 @@ pub fn android_credential_store_clear() -> Result<(), String> {
         .new_local_ref(unsafe { JObject::from_raw(android_context().context().cast()) })
         .map_err(|e| map_android_jni_error(&mut env, e))?;
 
+    let bridge_class = resolve_rrcloud_bridge_class(&mut env)?;
     let ok = env
         .call_static_method(
-            RRCLOUD_BRIDGE_CLASS,
+            &bridge_class,
             "clearCredentials",
             "(Landroid/content/Context;)Z",
             &[(&context).into()],
@@ -767,8 +867,9 @@ pub fn android_enqueue_expedited_sync() -> Result<(), String> {
         .new_local_ref(unsafe { JObject::from_raw(android_context().context().cast()) })
         .map_err(|e| map_android_jni_error(&mut env, e))?;
 
+    let bridge_class = resolve_rrcloud_bridge_class(&mut env)?;
     env.call_static_method(
-        RRCLOUD_BRIDGE_CLASS,
+        &bridge_class,
         "enqueueExpeditedSync",
         "(Landroid/content/Context;)V",
         &[(&context).into()],

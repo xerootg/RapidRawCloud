@@ -603,6 +603,18 @@ mod imp {
                 return null;
             }
         };
+        // `DcimScanWorker` can run before `SyncCycleWorker` ever has in this
+        // process/device's lifetime (independent periodic schedules, no
+        // ordering guarantee) — confirmed on-device: a fresh install's
+        // first-ever scan hit `open_state_db` before `<filesDir>/rrcloud`
+        // existed at all, since only `runSyncCycle` created it. Every
+        // bridge entry point that touches the state db must ensure this
+        // directory exists itself, not assume another entry point already
+        // ran first.
+        if let Err(e) = std::fs::create_dir_all(&state_dir) {
+            eprintln!("rrcloud bridge: dcimScanDecisions: create state dir: {e}");
+            return null;
+        }
         let db = match open_state_db(&state_dir) {
             OpenOutcome::Opened(db) => db,
             OpenOutcome::Locked => {
@@ -726,6 +738,12 @@ mod imp {
                 return BridgeResult::FailurePermanent.to_code();
             }
         };
+        // See the matching comment in `dcimScanDecisions`: this entry point
+        // can likewise run before `runSyncCycle` ever has.
+        if let Err(e) = std::fs::create_dir_all(&state_dir) {
+            eprintln!("rrcloud bridge: dcimRecordImport: create state dir: {e}");
+            return BridgeResult::FailurePermanent.to_code();
+        }
         let root = match sync_root_dir(&mut env, &ctx) {
             Ok(p) => p,
             Err(e) => {
@@ -822,6 +840,12 @@ mod imp {
                 return -1;
             }
         };
+        // See the matching comment in `dcimScanDecisions`: this entry point
+        // can likewise run before `runSyncCycle` ever has.
+        if let Err(e) = std::fs::create_dir_all(&state_dir) {
+            eprintln!("rrcloud bridge: dirtyUnbackedCount: create state dir: {e}");
+            return -1;
+        }
         let db = match open_state_db(&state_dir) {
             OpenOutcome::Opened(db) => db,
             OpenOutcome::Locked => return -1,

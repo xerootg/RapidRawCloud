@@ -151,7 +151,68 @@
 //! reference fix above depends on ([`init_context_exactly_once`] is the
 //! same kind of `target_os`-ungated, host-testable core as
 //! [`run_exactly_once`], for the same reason).
+//!
+//! ## The `ClassNotFoundException` this module also fixes
+//!
+//! Confirmed on a real device: tapping "Save & reconfigure" in the Cloud
+//! Sync settings panel (`android_integration.rs`'s
+//! `android_credential_store_save`/`_load`/`_clear` and
+//! `android_enqueue_expedited_sync`) crashed the call with an Android JNI
+//! exception — logcat showed
+//! `java.lang.ClassNotFoundException: Didn't find class
+//! "com.plugin.rrcloud.RrcloudBridge" on path: DexPathList[[directory
+//! "."],...]` — even though the class demonstrably exists in the
+//! installed APK (`unzip`+`strings` on `classes11.dex` lists it, along
+//! with `AndroidCredentialStore`, `RrcloudPlugin`, and every other
+//! `tauri-plugin-rrcloud` Kotlin class).
+//!
+//! The `DexPathList[[directory "."],...]` in that message is the tell:
+//! that is the **bootstrap/system** classloader's (empty) path list, not
+//! this app's real `PathClassLoader` (which has eleven dex files on it).
+//! `JNIEnv::find_class`/`call_static_method(name: &str, ...)` resolve a
+//! class by name using the *calling thread's* classloader context — and
+//! per the Android NDK's own documented gotcha, a thread this process
+//! attaches to the JVM via `AttachCurrentThread` (rather than one the JVM
+//! itself created and called native code on) gets the system classloader
+//! by default, which has never heard of any class this app defines. Every
+//! `#[tauri::command]` handler runs on a thread from Tauri's own async
+//! runtime pool — never one the JVM created — so every
+//! `android_integration.rs` call site that did
+//! `env.call_static_method("com/plugin/rrcloud/RrcloudBridge", ...)`
+//! (a bare class-name string, which internally means "`FindClass` on my
+//! own thread's classloader") hit exactly this bug the moment Cloud Sync
+//! shipped a UI path that calls one of them.
+//!
+//! [`super::bridge`]'s own JNI entry points (`Java_..._RrcloudBridge_*`)
+//! are NOT affected: the JVM calls *those* directly (WorkManager invoking
+//! a `Worker.doWork()` override, which the JVM itself scheduled onto one
+//! of its own threads), so the call stack genuinely descends from Java
+//! there and the default classloader context is correct. This bug is
+//! specific to the *opposite* direction — Rust-initiated calls into
+//! Kotlin, from a thread Rust/Tokio created, not the JVM.
+//!
+//! The fix: resolve the class through the app's actual `ClassLoader`
+//! object (`ClassLoader.loadClass(String): Class`) instead of by-name
+//! `FindClass`. `loadClass` is an ordinary virtual method call on an
+//! already-resolved object — it works correctly from any thread,
+//! attached or not, because nothing about it depends on the calling
+//! thread's own classloader context. [`ensure_class_loader_initialized`]
+//! caches that `ClassLoader` as a process-wide JNI global reference,
+//! once, the first time `android_integration.rs`'s `initialize_android`
+//! runs on the WebView's own (genuinely Java-originated) thread — the
+//! same shared-`Once` shape [`ensure_ndk_context_initialized`] already
+//! uses, for the same "whichever call wins must promote its local
+//! reference to a global one" reason (see this module's section above).
+//! Only `android_integration.rs`'s call site populates this cache:
+//! [`super::bridge`]'s entry points never need it (they resolve fine
+//! as-is, per the previous paragraph), and every caller of the four
+//! credential/enqueue functions this fixes is a `#[tauri::command]`,
+//! which cannot run before `initialize_android` has already executed on
+//! the one WebView the command's JS came from — so the cache is always
+//! populated by the time anything needs to read it.
 
+#[cfg(target_os = "android")]
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::Once;
 
 /// Runs `init` exactly once across any number of callers racing on the
@@ -182,6 +243,17 @@ static NDK_CONTEXT_INIT: Once = Once::new();
 /// not strictly need it).
 #[cfg(target_os = "android")]
 static RUSTLS_PLATFORM_VERIFIER_INIT: Once = Once::new();
+
+/// The single process-wide guard for caching the app's `ClassLoader` — see
+/// this module's doc for the `ClassNotFoundException` it fixes.
+#[cfg(target_os = "android")]
+static CLASS_LOADER_INIT: Once = Once::new();
+
+/// The cached app `ClassLoader`'s raw global-reference `jobject` pointer,
+/// null until [`ensure_class_loader_initialized`] runs (or if its one
+/// attempt failed to produce a reference).
+#[cfg(target_os = "android")]
+static CLASS_LOADER_GLOBAL_REF: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(std::ptr::null_mut());
 
 /// Host-testable core of [`ensure_ndk_context_initialized`]: runs
 /// `make_context_ptr` and hands its result to `store`, guarded by `once`
@@ -302,6 +374,47 @@ pub fn ensure_rustls_platform_verifier_initialized(
             }
         }
     });
+}
+
+/// Caches the app's `ClassLoader` object as a process-wide JNI global
+/// reference, exactly once — see this module's doc ("The
+/// `ClassNotFoundException` this module also fixes") for why this exists.
+/// `make_class_loader_global_ref` is called at most once per process (by
+/// whichever caller wins the shared `Once`, exactly like
+/// [`ensure_ndk_context_initialized`]'s `make_context_ptr`), and must
+/// already be a JNI *global* reference — a local reference handed to a
+/// native-method call becomes invalid once that call returns, and this
+/// cache must outlive it. Returning null means the attempt failed
+/// (e.g. the `new_global_ref` promotion itself errored); later readers
+/// see a null cache in that case, same as an un-run `Once`.
+#[cfg(target_os = "android")]
+pub fn ensure_class_loader_initialized(
+    make_class_loader_global_ref: impl FnOnce() -> *mut std::ffi::c_void,
+) {
+    run_exactly_once(&CLASS_LOADER_INIT, || {
+        let ptr = make_class_loader_global_ref();
+        if ptr.is_null() {
+            eprintln!(
+                "rrcloud: class loader cache init skipped -- make_class_loader_global_ref \
+                 returned null (shared guard already consumed the one init attempt for this \
+                 process)."
+            );
+            return;
+        }
+        CLASS_LOADER_GLOBAL_REF.store(ptr, Ordering::SeqCst);
+        eprintln!("rrcloud: app ClassLoader cached for this process (shared guard).");
+    });
+}
+
+/// Returns the cached app `ClassLoader`'s raw global-reference `jobject`
+/// pointer, or null if [`ensure_class_loader_initialized`] has not run
+/// yet, or its one attempt failed. A caller resolving an app class from a
+/// thread that might not be Java-originated (see this module's doc) must
+/// use this cache rather than `env.find_class` by name whenever it is
+/// non-null.
+#[cfg(target_os = "android")]
+pub fn cached_class_loader_global_ref() -> *mut std::ffi::c_void {
+    CLASS_LOADER_GLOBAL_REF.load(Ordering::SeqCst)
 }
 
 #[cfg(test)]
@@ -443,8 +556,7 @@ mod tests {
         }
 
         for h in handles {
-            h.join()
-                .expect("no caller should panic, winner or loser");
+            h.join().expect("no caller should panic, winner or loser");
         }
 
         assert_eq!(

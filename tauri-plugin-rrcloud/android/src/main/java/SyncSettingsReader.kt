@@ -9,9 +9,20 @@ import java.io.File
  * Reads the `sync` block out of the app's `settings.json`
  * (ARCHITECTURE.md §5.1): the same file `app_settings::get_settings_path`/
  * `save_settings` reads and writes on the Rust side, at
- * `context.filesDir/settings.json` — Tauri's Android `app_data_dir`
- * resolves to `context.filesDir` directly, so this is the exact path the
- * app process itself uses.
+ * `context.dataDir/settings.json` — Tauri's Android `app_data_dir`
+ * resolves to `context.dataDir` (the app's root private data directory,
+ * e.g. `/data/user/0/<pkg>/settings.json`), **not** `context.filesDir`
+ * (`/data/user/0/<pkg>/files/`, a subdirectory of it) — confirmed
+ * on-device: an earlier version of this reader looked in `filesDir` and
+ * silently found nothing there ever, every single time, for every
+ * `settings.json`-backed `WorkConstraintSettings` read. Because a missing
+ * file reads identically to "not configured yet" (this function's own
+ * contract, see below), that bug was invisible from any log: it always
+ * returned a clean default `WorkConstraintSettings()` (`enabled = false`,
+ * `autoWatchDcim = false`, ...) instead of ever throwing or warning, so
+ * `DcimScanWorker`/`SyncCycleWorker` always took their "disabled, nothing
+ * to do, `Result.success()`" early-return path, no matter what the user
+ * actually configured in the Cloud Sync settings UI.
  *
  * Returns just the `sync` sub-object as a JSON string (matching
  * `rrcloud_core::android::bridge`'s minimal `AndroidSyncSettings` shape:
@@ -23,7 +34,7 @@ object RrcloudSyncSettingsReader {
     private const val TAG = "RrcloudSettingsReader"
 
     private fun readSyncObject(context: Context): JSONObject? {
-        val file = File(context.filesDir, "settings.json")
+        val file = File(context.dataDir, "settings.json")
         if (!file.exists()) {
             return null
         }

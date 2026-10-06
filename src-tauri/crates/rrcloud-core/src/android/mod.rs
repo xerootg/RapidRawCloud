@@ -42,4 +42,7 @@ pub mod result_code;
 pub mod scan_window;
 
 #[cfg(target_os = "android")]
-pub use platform_init::{ensure_ndk_context_initialized, ensure_rustls_platform_verifier_initialized};
+pub use platform_init::{
+    cached_class_loader_global_ref, ensure_class_loader_initialized,
+    ensure_ndk_context_initialized, ensure_rustls_platform_verifier_initialized,
+};
