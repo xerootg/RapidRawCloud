@@ -188,28 +188,43 @@ the maintainer, or mint your own with the commands above.
 
 ---
 
-## 6. Optional: low-effort pairing
+## 6. Optional: low-effort pairing (self-hosters)
 
 Typing an endpoint, bucket, region, a `GK…` access key, and a 64-char
 secret into a phone is the one genuinely tedious part of setup. For
-self-hosters who already run an identity provider, RapidRawCloud is
-growing an **optional** pairing flow so a new device can be configured by
-logging in once instead of typing anything:
+self-hosters who already run [Authentik](https://goauthentik.io/), the
+**pairing service** (`pairing/` in this repo,
+`ghcr.io/<owner>/rrcloud-pairing`) removes it. The guiding idea is still
+**"S3 is the config store"** — the service adds no new source of truth:
 
-- A small discovery endpoint (e.g. `https://rrc.themissing.xyz`) sits
-  behind [Authentik](https://goauthentik.io/) single-sign-on (Traefik
-  forward-auth for the browser, OIDC/PKCE for the native app — the same
-  patterns other apps in `argo-things` already use).
-- You log in once; the service mints a bucket + scoped key for you and
-  hands the app its whole config over a deep link / claim code.
-- Your "knobs and dials" live as a settings document **in your S3
-  bucket**, so they can be managed from the web and synced down — the
-  bucket stays the single source of truth, consistent with how albums
-  and presets already sync.
+- One small **admin** bucket (e.g. `rapidraw-admin`) holds one config
+  document per user at `users/<username>/config.json`:
+  `{ sync: {…SyncSettings…}, credentials: { accessKeyId, secretAccessKey } }`.
+- The service sits at a discovery URL (e.g. `https://rrc.themissing.xyz`):
+  - **Browser** routes behind Authentik forward-auth. The first time you
+    sign in, you paste *your own* library bucket's S3 coordinates once (in
+    a browser, not on the phone); the service writes your `config.json`.
+    Return visits show a "paired" page and let you edit the settings — your
+    "knobs and dials" are managed here, in the cloud.
+  - **App** route `/api/config` validates an OIDC/PKCE bearer token
+    (Authentik) and returns your stored config so the app configures
+    itself — zero typing on the device.
+- **Bring your own bucket.** The service never creates buckets or mints
+  credentials; it just remembers the ones you give it, so every device
+  you pair *and* the headless worker can use them.
 
-This is purely a convenience layer. It is **not required** and the app is
-fully functional with manual configuration (§2). Status and deployment
-manifests will be documented here as the flow lands.
+Deployment (this repo's reference homelab): the service runs in Kubernetes
+via `argo-things` (`configs/rapidraw-pairing`, `apps/93-rapidraw-pairing`)
+behind Traefik at `rrc.themissing.xyz`, with two Authentik applications —
+an OAuth2/OIDC provider (public/PKCE, redirect `rapidraw://auth-callback`)
+for the app and a forward-auth Proxy provider for the browser page. The
+admin-bucket service key is supplied via a Kubernetes secret (see
+`configs/rapidraw-pairing/secret.example.yaml`). The container image must
+be public on GHCR (it is pulled without registry credentials).
+
+This is purely a convenience layer. It is **not required** — the app is
+fully functional with manual configuration (§2), and the admin bucket is
+just another plain S3 bucket.
 
 ---
 
@@ -283,6 +298,22 @@ It is **optional** — the phone and desktop clients are fully capable on
 their own. The image is published to `ghcr.io/xerootg/rrcloud-worker`
 (public, so a free-tier box can pull without credentials); GitOps
 manifests for running it on Kubernetes live in `argo-things`.
+
+Modes: `--once` (one cycle, default), `--daemon --interval <dur>`, or
+`--report` (stateless read-only). A single worker is configured for one
+library via `RRCLOUD_ENDPOINT` / `RRCLOUD_BUCKET` / `RRCLOUD_REGION` /
+`RRCLOUD_ACCESS_KEY` / `RRCLOUD_SECRET_KEY` and `RRCLOUD_STATE_DIR`.
+
+**Fleet mode (`--fleet`)** pairs with the pairing service (§6): instead of
+one library from env, it reads the **admin** bucket and runs one cycle per
+paired user, against each user's own library with each user's own
+credentials (a per-user sub-directory under `RRCLOUD_STATE_DIR`). Point it
+at the admin bucket with a **read-only** admin key via
+`RRCLOUD_ADMIN_BUCKET` / `RRCLOUD_ADMIN_ENDPOINT` / `RRCLOUD_ADMIN_REGION`
+/ `RRCLOUD_ADMIN_ACCESS_KEY` / `RRCLOUD_ADMIN_SECRET_KEY`, e.g.
+`rrcloud-worker --fleet --daemon --interval 1h`. Users who set
+`workerBackfill: false` are skipped; one user's failure never aborts the
+others.
 
 ---
 
