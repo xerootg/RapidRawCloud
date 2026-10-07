@@ -50,6 +50,7 @@ pub mod android;
 pub mod clock;
 pub mod compact;
 pub mod engine;
+pub mod fleet;
 pub mod journal;
 pub mod keys;
 pub mod manifest;

@@ -14,11 +14,13 @@
 use std::process::ExitCode;
 use std::time::Duration;
 
+use rrcloud_core::fleet::{self, FleetConfig};
 use rrcloud_core::worker::{
     self, CycleOptions, RunMode, Worker, WorkerConfig, DEFAULT_DAEMON_INTERVAL,
 };
 
-const USAGE: &str = "usage: rrcloud-worker [--once | --daemon --interval <dur> | --report]";
+const USAGE: &str =
+    "usage: rrcloud-worker [--once | --daemon --interval <dur> | --report | --fleet [--once | --daemon --interval <dur>]]";
 
 /// What the CLI resolves argv into.
 enum Invocation {
@@ -28,6 +30,9 @@ enum Invocation {
     Report,
     /// The journaling role ([`Worker::open`]) driven by `mode`.
     Run(RunMode),
+    /// Multi-user fleet backfill (optional pairing deployment): read the
+    /// admin bucket and run one cycle per paired user, driven by `mode`.
+    Fleet(RunMode),
 }
 
 #[tokio::main]
@@ -67,6 +72,47 @@ async fn real_main(inv: Invocation) -> Result<(), worker::WorkerError> {
             let worker = Worker::open(&cfg)?;
             worker::run(&worker, mode, &CycleOptions::default()).await
         }
+        Invocation::Fleet(mode) => run_fleet(mode).await,
+    }
+}
+
+/// Fleet mode: resolve the admin-bucket config from the environment, then run
+/// one backfill cycle per paired user (once) or on an interval (daemon). A
+/// single user's failure is logged, never fatal; the whole-cycle `Err`
+/// (admin bucket unreachable) propagates so the caller/daemon can retry.
+async fn run_fleet(mode: RunMode) -> Result<(), worker::WorkerError> {
+    let fleet_cfg = FleetConfig::from_env()?;
+    let opts = CycleOptions::default();
+    match mode {
+        RunMode::Once => {
+            let report = fleet::run_fleet_cycle(&fleet_cfg, &opts).await?;
+            log_fleet_report(&report);
+            Ok(())
+        }
+        RunMode::Daemon { interval } => loop {
+            match fleet::run_fleet_cycle(&fleet_cfg, &opts).await {
+                Ok(report) => log_fleet_report(&report),
+                // A whole-cycle failure (admin bucket unreachable) is logged,
+                // not fatal: the daemon sleeps and retries next interval
+                // rather than exiting, matching `worker::run`'s daemon loop.
+                Err(e) => eprintln!("rrcloud-worker fleet: cycle failed, will retry: {e}"),
+            }
+            tokio::time::sleep(interval).await;
+        },
+    }
+}
+
+fn log_fleet_report(report: &fleet::FleetReport) {
+    println!(
+        "rrcloud-worker fleet: {} users ({} ran, {} failed)",
+        report.users.len(),
+        report.ran(),
+        report.failed()
+    );
+    for (user, outcome) in &report.users {
+        if let fleet::UserOutcome::Failed(why) = outcome {
+            eprintln!("rrcloud-worker fleet: user {user}: {why}");
+        }
     }
 }
 
@@ -78,6 +124,7 @@ fn parse_invocation() -> Option<Invocation> {
     let mut once = false;
     let mut daemon = false;
     let mut report = false;
+    let mut fleet = false;
     let mut interval = DEFAULT_DAEMON_INTERVAL;
     let mut i = 0;
     while i < args.len() {
@@ -85,6 +132,7 @@ fn parse_invocation() -> Option<Invocation> {
             "--once" => once = true,
             "--daemon" => daemon = true,
             "--report" => report = true,
+            "--fleet" => fleet = true,
             "--interval" => {
                 i += 1;
                 interval = parse_duration(args.get(i)?)?;
@@ -94,20 +142,26 @@ fn parse_invocation() -> Option<Invocation> {
         i += 1;
     }
     // --report is the stateless reporting mode; it cannot combine with the
-    // journaling modes.
-    if report && (daemon || once) {
+    // journaling modes (including --fleet).
+    if report && (daemon || once || fleet) {
         return None;
     }
     if report {
         return Some(Invocation::Report);
     }
+    // --once and --daemon are mutually exclusive, with or without --fleet.
     if once && daemon {
         return None;
     }
-    if daemon {
-        Some(Invocation::Run(RunMode::Daemon { interval }))
+    let mode = if daemon {
+        RunMode::Daemon { interval }
     } else {
-        Some(Invocation::Run(RunMode::Once))
+        RunMode::Once
+    };
+    if fleet {
+        Some(Invocation::Fleet(mode))
+    } else {
+        Some(Invocation::Run(mode))
     }
 }
 
