@@ -1,0 +1,43 @@
+name: 'Release: Android only'
+
+# Rebuilds just the Android APK/AAB and uploads them to an EXISTING release.
+# Exists because a failed android leg of the full release matrix cannot simply
+# be "re-run" after a workflow fix (re-runs use the original workflow
+# snapshot), and recreating the release would throw away the desktop assets.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to upload the APK/AAB to (e.g. v1.6.4-cloud.1)'
+        required: true
+        type: string
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.find.outputs.release_id }}
+    steps:
+      - name: Resolve release id from tag
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh api "repos/${{ github.repository }}/releases/tags/${{ inputs.release_tag }}" --jq '.id')
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+          echo "release ${{ inputs.release_tag }} -> id $id"
+
+  android:
+    needs: lookup
+    uses: ./.github/workflows/build.yml
+    with:
+      release-id: ${{ needs.lookup.outputs.release_id }}
+      platform: 'ubuntu-latest'
+      target: 'aarch64-linux-android'
+      build-args: '--target aarch64'
+      asset-name-pattern: '[name]_v[version]_[platform]_[arch][ext]'
+      asset-prefix: '04'
+      mobile: 'android'
+    secrets: inherit
+    permissions:
+      contents: write

@@ -91,6 +91,23 @@ jobs:
           brew install libgphoto2 pkg-config
 
       # ------------- Android Setup -------------
+      # The Android release build does not fit the hosted runner's free disk
+      # (~14 GB): the universal APK bundles the ONNX models (~1 GB output)
+      # on top of the aarch64 rust target dir, gradle caches, SDK and NDK —
+      # the v1.6.4-cloud.1 run died 25 minutes in with "No space left on
+      # device". Reclaim the big preinstalled toolchains we never use
+      # (.NET, GHC/Haskell, Swift, CodeQL, docker images) — NOT
+      # /usr/local/lib/android, which is the SDK this job needs.
+      - name: Free runner disk space (Android)
+        if: inputs.mobile == 'android' && runner.os == 'Linux'
+        run: |
+          echo "before:"; df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /usr/share/swift /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/local/julia* || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          echo "after:"; df -h / | tail -1
+
       - name: Set up JDK
         if: inputs.mobile == 'android'
         uses: actions/setup-java@v4
