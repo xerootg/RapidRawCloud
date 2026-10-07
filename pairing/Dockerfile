@@ -5,7 +5,10 @@
 # HTML form. Build context is this directory:
 #   docker build -f pairing/Dockerfile pairing
 # (CI passes that context; see .github/workflows/pairing-image.yml).
-FROM rust:1.83-bookworm AS builder
+# Latest stable Rust: some transitive deps (e.g. rand_pcg 0.10.x) ship a
+# Cargo.toml needing a recent cargo to parse; an old pin fails at manifest
+# parse time.
+FROM rust:1-bookworm AS builder
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
