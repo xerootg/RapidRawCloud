@@ -1,0 +1,51 @@
+name: pairing-image
+
+# Builds the RapidRawCloud pairing/discovery service image and publishes it to
+# GHCR. Public image so the homelab deployment can pull without credentials.
+on:
+  push:
+    branches: [main, cloud, ccr-70e6b1a3-bux8cz]
+    paths:
+      - 'pairing/**'
+      - '.github/workflows/pairing-image.yml'
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/rrcloud-pairing
+          tags: |
+            type=sha,format=long
+            type=ref,event=tag
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: pairing
+          file: pairing/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
