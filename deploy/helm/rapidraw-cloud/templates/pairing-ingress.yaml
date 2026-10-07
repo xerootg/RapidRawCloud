@@ -1,0 +1,49 @@
+{{- if and .Values.pairing.enabled .Values.pairing.ingressRoute.enabled }}
+{{- $ir := .Values.pairing.ingressRoute }}
+{{- if $ir.forwardAuth.enabled }}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: {{ $ir.forwardAuth.middlewareName }}
+spec:
+  forwardAuth:
+    address: {{ $ir.forwardAuth.address | quote }}
+    trustForwardHeader: true
+    authResponseHeaders:
+      - X-Authentik-Username
+      - X-Authentik-Groups
+      - X-Authentik-Email
+      - X-Authentik-Name
+      - X-Authentik-Uid
+      - X-Authentik-Jwt
+---
+{{- end }}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: rapidraw-pairing
+spec:
+  entryPoints: [websecure]
+  routes:
+    # App config API validates its own OIDC bearer token — no forward-auth.
+    - match: Host(`{{ $ir.host }}`) && PathPrefix(`/api`)
+      kind: Rule
+      priority: 20
+      services:
+        - { name: rapidraw-pairing, port: 8080 }
+    # Browser pairing page (optionally behind Authentik forward-auth).
+    - match: Host(`{{ $ir.host }}`)
+      kind: Rule
+      priority: 10
+      services:
+        - { name: rapidraw-pairing, port: 8080 }
+      {{- if $ir.forwardAuth.enabled }}
+      middlewares:
+        - { name: {{ $ir.forwardAuth.middlewareName }} }
+      {{- end }}
+  tls:
+    certResolver: {{ $ir.certResolver }}
+    domains:
+      - main: {{ $ir.tlsDomainMain }}
+        sans: ["*.{{ $ir.tlsDomainMain }}"]
+{{- end }}

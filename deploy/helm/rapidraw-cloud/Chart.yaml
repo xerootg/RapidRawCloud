@@ -1,0 +1,9 @@
+apiVersion: v2
+name: rapidraw-cloud
+description: RapidRawCloud server side — the pairing service and the fleet worker, backed by an S3/Garage admin bucket.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/xerootg/RapidRawCloud
+sources:
+  - https://github.com/xerootg/RapidRawCloud

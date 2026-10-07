@@ -1,0 +1,66 @@
+{{- if .Values.worker.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rapidraw-worker-state
+  labels:
+    app.kubernetes.io/name: rapidraw-worker
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: {{ .Values.worker.state.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.worker.state.size }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rapidraw-worker
+  labels:
+    app.kubernetes.io/name: rapidraw-worker
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  replicas: 1
+  # Per-user sync state is RWO and must never be processed by two workers at
+  # once — never scale above 1, never surge on update.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rapidraw-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rapidraw-worker
+    spec:
+      securityContext:
+        fsGroup: 65532
+      containers:
+        - name: rapidraw-worker
+          image: {{ .Values.worker.image | quote }}
+          imagePullPolicy: {{ .Values.worker.imagePullPolicy }}
+          args: ["--fleet", "--daemon", "--interval", {{ .Values.worker.interval | quote }}]
+          env:
+            - { name: RRCLOUD_ADMIN_BUCKET, value: {{ .Values.admin.bucket | quote }} }
+            - { name: RRCLOUD_ADMIN_ENDPOINT, value: {{ .Values.admin.endpoint | quote }} }
+            - { name: RRCLOUD_ADMIN_REGION, value: {{ .Values.admin.region | quote }} }
+            - name: RRCLOUD_ADMIN_ACCESS_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.worker.existingSecret }}, key: admin-s3-access-key } }
+            - name: RRCLOUD_ADMIN_SECRET_KEY
+              valueFrom: { secretKeyRef: { name: {{ .Values.worker.existingSecret }}, key: admin-s3-secret-key } }
+            - { name: RRCLOUD_STATE_DIR, value: "/state" }
+            - { name: RUST_LOG, value: "info" }
+          volumeMounts:
+            - { name: state, mountPath: /state }
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65532
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources: {{ toYaml .Values.worker.resources | nindent 12 }}
+      volumes:
+        - name: state
+          persistentVolumeClaim:
+            claimName: rapidraw-worker-state
+{{- end }}

@@ -1,0 +1,56 @@
+# RapidRawCloud server-side chart. Both components read the admin bucket
+# (users/<username>/config.json) over S3; per-user library credentials live
+# inside those config docs, not here. Create the referenced Secrets yourself
+# (see README); they are never templated from values.
+
+# Shared admin bucket + S3 endpoint the server components use.
+admin:
+  bucket: rapidraw-admin
+  # In-cluster endpoint (plain HTTP). The config docs point *apps* at the
+  # public endpoint (pairing.defaultLibrary.endpoint).
+  endpoint: http://garage-external.garage.svc.cluster.local:3900
+  region: garage
+
+pairing:
+  enabled: true
+  image: ghcr.io/xerootg/rrcloud-pairing:latest
+  imagePullPolicy: Always
+  replicas: 1
+  # Secret with keys: admin-s3-access-key, admin-s3-secret-key (read+write).
+  existingSecret: rapidraw-pairing-secret
+  oidc:
+    userinfoUrl: https://authentik.themissing.xyz/application/o/userinfo/
+    issuerUrl: https://authentik.themissing.xyz/application/o/rapidraw-cloud/
+    clientId: X1EdWXMGIBeLqx0ZA8VSguMFiIqaqM8drSueng17 # public client id, not a secret
+  # Prefilled in the browser creds form — the PUBLIC S3 URL apps use.
+  defaultLibrary:
+    endpoint: https://garage.themissing.xyz
+    region: garage
+  # Traefik IngressRoute + optional Authentik forward-auth (themissing.xyz
+  # fleet specifics; off by default so the chart is portable).
+  ingressRoute:
+    enabled: false
+    host: rrc.themissing.xyz
+    certResolver: cloudflare
+    tlsDomainMain: themissing.xyz
+    forwardAuth:
+      enabled: false
+      middlewareName: authentik-forwardauth
+      address: http://authentik-server.authentik.svc.cluster.local/outpost.goauthentik.io/auth/traefik
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits: { cpu: 200m, memory: 128Mi }
+
+worker:
+  enabled: true
+  image: ghcr.io/xerootg/rrcloud-worker:latest
+  imagePullPolicy: Always
+  interval: 1h
+  # Secret with keys: admin-s3-access-key, admin-s3-secret-key (READ-ONLY).
+  existingSecret: rapidraw-worker-secret
+  state:
+    size: 5Gi
+    storageClass: longhorn
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { cpu: "2", memory: 2Gi }

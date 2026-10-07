@@ -1,0 +1,11 @@
+RapidRawCloud server side installed in namespace {{ .Release.Namespace }}.
+
+{{- if .Values.pairing.enabled }}
+- pairing service: Deployment/rapidraw-pairing (port 8080){{ if .Values.pairing.ingressRoute.enabled }} at https://{{ .Values.pairing.ingressRoute.host }}{{ end }}
+{{- end }}
+{{- if .Values.worker.enabled }}
+- fleet worker:   Deployment/rapidraw-worker (interval {{ .Values.worker.interval }})
+{{- end }}
+
+Reminder: the Secrets {{ .Values.pairing.existingSecret }} / {{ .Values.worker.existingSecret }}
+must exist (admin-s3-access-key, admin-s3-secret-key). See the chart README.
