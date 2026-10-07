@@ -5,7 +5,24 @@ on:
     types: [created]
 
 jobs:
+  # Obtainium (and Android's package manager) only picks up an update when the
+  # app version actually changes, so a release tag whose x.y.z prefix doesn't
+  # match tauri.conf.json would ship an APK that installed users never receive.
+  # Fail fast instead of building 20+ assets with a stale version.
+  version-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag version must match tauri.conf.json
+        run: |
+          tag='${{ github.event.release.tag_name }}'
+          tag_ver=$(echo "$tag" | sed -E 's/^v//; s/[-+].*$//')
+          conf_ver=$(jq -r .version src-tauri/tauri.conf.json)
+          echo "tag=$tag tag_ver=$tag_ver conf_ver=$conf_ver"
+          [ "$tag_ver" = "$conf_ver" ] || { echo "::error::release tag $tag does not match tauri.conf.json version $conf_ver — bump the app version so Obtainium sees the update"; exit 1; }
+
   release:
+    needs: version-guard
     strategy:
       fail-fast: false
       matrix:
