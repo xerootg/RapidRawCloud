@@ -220,8 +220,11 @@ jobs:
         run: |
           set -euo pipefail
 
-          tag_ref="${{ inputs.ref }}"
-          tag_name="${tag_ref#refs/tags/}"
+          # Resolve the tag from the release id instead of inputs.ref: the
+          # release-event caller passes the tag ref, but the android-only
+          # workflow_dispatch caller (android-release.yml) has no tag ref —
+          # deriving from the id works identically for both.
+          tag_name="$(gh api "repos/${GITHUB_REPOSITORY}/releases/${{ inputs.release-id }}" --jq .tag_name)"
           gh release upload "$tag_name" "$RUNNER_TEMP"/android-release-assets/* --clobber
 
       - name: Upload Android Artifacts
