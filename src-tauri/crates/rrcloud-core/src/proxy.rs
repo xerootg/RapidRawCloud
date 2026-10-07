@@ -15,12 +15,6 @@
 //! importing client (via the app) and the headless worker (P4) call it. It
 //! is built directly against the pinned rawler
 //! (`CyberTimon/RapidRAW-DngLab` @ `934af4b`) — no rawler fork or port.
-//!
-//! # RED scaffold
-//! Every public entry point is `todo!()` until the P3 green pass. The API
-//! surface, the documented constants, and the decode seam used by the
-//! matrix round-trip test are fixed here so the failing suite can be
-//! authored against them.
 
 use std::collections::HashMap;
 use std::fmt;
