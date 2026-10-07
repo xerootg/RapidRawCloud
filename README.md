@@ -19,6 +19,8 @@
 
 # RapidRAW
 
+> **RapidRawCloud fork:** this fork adds offline-first photo-library sync over any plain S3 bucket (no server, no account). See **[docs/CLOUD_SETUP.md](docs/CLOUD_SETUP.md)** to set it up.
+
 > A beautiful, non-destructive, and GPU-accelerated RAW image editor built with performance in mind.
 
 RapidRAW is a modern, high-performance alternative to Adobe Lightroom®. It delivers a simple, beautiful editing experience in a lightweight package (under 20MB) for Windows, macOS, Linux, and Android.
