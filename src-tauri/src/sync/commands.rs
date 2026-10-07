@@ -218,6 +218,21 @@ pub async fn sync_configure(
     configure_core(&state.sync_manager, &*store, settings, sync_root, state_dir)
 }
 
+/// The device's camera-roll folder names (MediaStore image buckets) for
+/// the per-device "Add folder" DCIM-watch picker. Android-only data;
+/// desktop returns an empty list (the DCIM watch is an Android feature).
+#[tauri::command]
+pub fn sync_list_media_buckets() -> Result<Vec<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        crate::android_integration::android_list_media_buckets()
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        Ok(Vec::new())
+    }
+}
+
 /// Writes credentials to the Rust-only store (§3.6). Returns `()`, never an
 /// echo of the secret material.
 #[tauri::command]

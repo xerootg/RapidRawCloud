@@ -42,6 +42,9 @@ export default function SyncSettingsSection() {
   const [secretKey, setSecretKey] = useState('');
   const [savingCreds, setSavingCreds] = useState(false);
   const [pairUrl, setPairUrl] = useState('');
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [pickerBuckets, setPickerBuckets] = useState<string[] | null>(null);
+  const [pickerManual, setPickerManual] = useState('');
   const [pairState, setPairState] = useState<'idle' | 'waiting' | 'applying' | 'done' | 'error'>(
     'idle',
   );
@@ -118,6 +121,39 @@ export default function SyncSettingsSection() {
     }
   };
 
+  // Per-device DCIM watch list (user decision 2026-10-07: device-local,
+  // folder picker — never a synced comma string). "Add folder" lists the
+  // device's actual MediaStore buckets via sync_list_media_buckets.
+  const openPicker = async () => {
+    setPickerOpen(true);
+    setPickerBuckets(null);
+    try {
+      const buckets = await invoke<string[]>(Invokes.SyncListMediaBuckets);
+      setPickerBuckets(buckets);
+    } catch {
+      setPickerBuckets([]);
+    }
+  };
+
+  const addWatched = (name: string) => {
+    const n = name.trim();
+    if (!n) return;
+    setForm((f) =>
+      f.watchedMediaBuckets.includes(n)
+        ? f
+        : { ...f, watchedMediaBuckets: [...f.watchedMediaBuckets, n] },
+    );
+    setPickerOpen(false);
+    setPickerManual('');
+  };
+
+  const removeWatched = (name: string) => {
+    setForm((f) => ({
+      ...f,
+      watchedMediaBuckets: f.watchedMediaBuckets.filter((b) => b !== name),
+    }));
+  };
+
   const credsConfigured = status?.credentialsConfigured ?? false;
 
   return (
@@ -179,11 +215,77 @@ export default function SyncSettingsSection() {
             onChange={(e) => patch({ autoWatchDcim: e.target.checked })}
           />
         </label>
-        <Field
-          label="Watched buckets (comma-separated)"
-          value={form.watchedMediaBuckets.join(', ')}
-          onChange={(v) => patch({ watchedMediaBuckets: v.split(',').map((s) => s.trim()).filter(Boolean) })}
-        />
+        <div className="flex flex-col gap-1">
+          <span className="text-text-secondary text-sm">Watched camera-roll folders (this device)</span>
+          {form.watchedMediaBuckets.length === 0 && (
+            <p className="text-text-secondary text-xs">None — new photos are not auto-imported.</p>
+          )}
+          {form.watchedMediaBuckets.map((b) => (
+            <div key={b} className="flex items-center justify-between px-2 py-1 rounded-md bg-bg-primary border border-border-color/40">
+              <span className="text-text-primary text-sm">{b}</span>
+              <button
+                className="text-text-secondary hover:text-red-400 px-2"
+                onClick={() => removeWatched(b)}
+                aria-label={`Stop watching ${b}`}
+              >
+                ✕
+              </button>
+            </div>
+          ))}
+          <button
+            className="self-start px-3 py-1 rounded-md bg-surface border border-border-color/40 text-text-primary text-sm"
+            onClick={() => void openPicker()}
+          >
+            Add folder…
+          </button>
+          {pickerOpen && (
+            <div className="flex flex-col gap-1 mt-1 p-2 rounded-md bg-bg-primary border border-border-color/40">
+              <span className="text-text-secondary text-xs">
+                {pickerBuckets === null ? 'Loading folders…' : 'Folders with photos on this device:'}
+              </span>
+              {(pickerBuckets ?? [])
+                .filter((b) => !form.watchedMediaBuckets.includes(b))
+                .map((b) => (
+                  <button
+                    key={b}
+                    className="text-left px-2 py-1 rounded hover:bg-surface text-text-primary text-sm"
+                    onClick={() => addWatched(b)}
+                  >
+                    {b}
+                  </button>
+                ))}
+              {pickerBuckets !== null &&
+                pickerBuckets.filter((b) => !form.watchedMediaBuckets.includes(b)).length === 0 && (
+                  <p className="text-text-secondary text-xs">No other folders found.</p>
+                )}
+              <div className="flex gap-2 items-center mt-1">
+                <input
+                  type="text"
+                  value={pickerManual}
+                  placeholder="Folder name…"
+                  onChange={(e) => setPickerManual(e.target.value)}
+                  className="flex-1 px-2 py-1 rounded-md bg-surface border border-border-color/40 text-text-primary text-sm"
+                />
+                <button
+                  className="px-2 py-1 rounded-md bg-accent text-button-text text-sm disabled:opacity-50"
+                  disabled={!pickerManual.trim()}
+                  onClick={() => addWatched(pickerManual)}
+                >
+                  Add
+                </button>
+                <button
+                  className="px-2 py-1 rounded-md bg-surface border border-border-color/40 text-text-secondary text-sm"
+                  onClick={() => {
+                    setPickerOpen(false);
+                    setPickerManual('');
+                  }}
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
         <label className="flex items-center justify-between">
           <span className="text-text-secondary">Worker backfill (this device)</span>
           <input

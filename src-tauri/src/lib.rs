@@ -2435,6 +2435,8 @@ pub fn run() {
             #[cfg(feature = "sync")]
             sync::commands::sync_set_credentials,
             #[cfg(feature = "sync")]
+            sync::commands::sync_list_media_buckets,
+            #[cfg(feature = "sync")]
             sync::pairing::sync_pair_begin,
             #[cfg(feature = "sync")]
             sync::pairing::sync_pair_complete,

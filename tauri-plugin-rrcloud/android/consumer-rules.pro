@@ -27,6 +27,7 @@
     boolean clearCredentials(android.content.Context);
     java.lang.String loadSyncSettingsJson(android.content.Context);
     void enqueueExpeditedSync(android.content.Context);
+    java.lang.String listMediaBuckets(android.content.Context);
 }
 
 # androidx.security:security-crypto pulls in Google Tink, which references

@@ -151,6 +151,20 @@ pub fn parse_callback(callback_url: &str) -> Result<(String, String), String> {
     }
 }
 
+/// Merges a cloud config doc's sync settings onto this device's current
+/// ones, preserving the DEVICE-LOCAL fields. A camera-roll watch list
+/// describes one physical device's storage — `autoWatchDcim` and
+/// `watchedMediaBuckets` must never be stomped by pairing (user decision,
+/// 2026-10-07: "not persisted for all devices, be a per-device setting").
+/// Everything else (endpoint/bucket/region/budgets/...) comes from the
+/// cloud doc.
+pub fn merge_cloud_sync(local: &SyncSettings, cloud: &SyncSettings) -> SyncSettings {
+    let mut merged = cloud.clone();
+    merged.auto_watch_dcim = local.auto_watch_dcim;
+    merged.watched_media_buckets = local.watched_media_buckets.clone();
+    merged
+}
+
 // ---------------------------------------------------------------------------
 // Wire types
 // ---------------------------------------------------------------------------
@@ -368,7 +382,9 @@ pub async fn sync_pair_complete(
     )?;
 
     let mut app_settings = crate::app_settings::load_settings(app.clone())?;
-    app_settings.sync = doc.sync.clone();
+    // Device-local fields survive pairing (see merge_cloud_sync's doc).
+    let applied_sync = merge_cloud_sync(&app_settings.sync, &doc.sync);
+    app_settings.sync = applied_sync.clone();
     crate::app_settings::save_settings(app_settings.clone(), app.clone())?;
 
     // Reconfigure now if a library is open; otherwise the saved settings +
@@ -388,7 +404,7 @@ pub async fn sync_pair_complete(
         if let Err(e) = configure_core(
             &state.sync_manager,
             &*store,
-            doc.sync.clone(),
+            applied_sync.clone(),
             sync_root,
             state_dir,
         ) {
@@ -412,7 +428,7 @@ pub async fn sync_pair_complete(
         }
     }
 
-    Ok(doc.sync)
+    Ok(applied_sync)
 }
 
 #[cfg(test)]
@@ -497,6 +513,48 @@ mod tests {
         assert!(err.contains("access_denied"), "{err}");
         assert!(parse_callback("rapidraw://auth-callback").is_err());
         assert!(parse_callback("not a url").is_err());
+    }
+
+    #[test]
+    fn merge_cloud_sync_preserves_device_local_dcim_fields() {
+        // User decision (2026-10-07): a camera-roll watch list is a
+        // per-device fact; pairing must never push one device's folders
+        // onto another. Cloud wins for coordinates; device wins for DCIM.
+        let mut local = SyncSettings::default();
+        local.auto_watch_dcim = true;
+        local.watched_media_buckets = vec!["Camera".into(), "158ND750".into()];
+        local.endpoint = "http://old.local".into();
+
+        let mut cloud = SyncSettings::default();
+        cloud.enabled = true;
+        cloud.endpoint = "https://garage.example".into();
+        cloud.bucket = "my-photos".into();
+        cloud.region = "garage".into();
+        // The doc may carry ANY values here (older docs, other devices'
+        // choices) — they must not matter.
+        cloud.auto_watch_dcim = false;
+        cloud.watched_media_buckets = vec!["SomeoneElsesFolder".into()];
+
+        let merged = merge_cloud_sync(&local, &cloud);
+        assert!(merged.enabled);
+        assert_eq!(merged.endpoint, "https://garage.example");
+        assert_eq!(merged.bucket, "my-photos");
+        // Device-local fields preserved verbatim:
+        assert!(merged.auto_watch_dcim);
+        assert_eq!(merged.watched_media_buckets, vec!["Camera", "158ND750"]);
+    }
+
+    #[test]
+    fn merge_cloud_sync_fresh_device_keeps_defaults_off() {
+        // First pair on a fresh install: DCIM watch stays OFF regardless of
+        // what the cloud doc says — enabling it is an on-device choice.
+        let local = SyncSettings::default();
+        let mut cloud = SyncSettings::default();
+        cloud.auto_watch_dcim = true;
+        cloud.watched_media_buckets = vec!["Camera".into()];
+        let merged = merge_cloud_sync(&local, &cloud);
+        assert!(!merged.auto_watch_dcim);
+        assert!(merged.watched_media_buckets.is_empty());
     }
 
     #[test]

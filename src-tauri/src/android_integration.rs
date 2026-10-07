@@ -85,8 +85,7 @@ pub fn initialize_android(window: &tauri::WebviewWindow) {
                             .and_then(|loader_obj| env.new_global_ref(&loader_obj))
                         {
                             Ok(global_loader) => {
-                                let ptr =
-                                    global_loader.as_obj().as_raw() as *mut std::ffi::c_void;
+                                let ptr = global_loader.as_obj().as_raw() as *mut std::ffi::c_void;
                                 // Intentionally leaked -- same rationale as
                                 // `context_ptr` above: this cache must
                                 // outlive this one call, for the rest of
@@ -876,6 +875,42 @@ pub fn android_enqueue_expedited_sync() -> Result<(), String> {
     )
     .map_err(|e| map_android_jni_error(&mut env, e))?;
     Ok(())
+}
+
+/// Per-device DCIM picker backing: the distinct camera-roll folder names
+/// MediaStore knows about, via `RrcloudBridge.listMediaBuckets(Context)`
+/// (JSON array string, Kotlin side). Same reflection path (and the same
+/// ClassLoader resolution requirement) as the credential callbacks above;
+/// the method has a matching consumer-rules.pro keep entry.
+#[cfg(target_os = "android")]
+pub fn android_list_media_buckets() -> Result<Vec<String>, String> {
+    let vm = unsafe { JavaVM::from_raw(android_context().vm().cast()) }
+        .map_err(|e| format!("Failed to access Android JVM: {}", e))?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|e| format!("Failed to attach current thread to Android JVM: {}", e))?;
+    let context = env
+        .new_local_ref(unsafe { JObject::from_raw(android_context().context().cast()) })
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+
+    let bridge_class = resolve_rrcloud_bridge_class(&mut env)?;
+    let result = env
+        .call_static_method(
+            &bridge_class,
+            "listMediaBuckets",
+            "(Landroid/content/Context;)Ljava/lang/String;",
+            &[(&context).into()],
+        )
+        .and_then(|v| v.l())
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+    if result.is_null() {
+        return Ok(Vec::new());
+    }
+    let json: String = env
+        .get_string(&JString::from(result))
+        .map_err(|e| map_android_jni_error(&mut env, e))?
+        .into();
+    serde_json::from_str(&json).map_err(|e| format!("bad bucket list JSON: {e}"))
 }
 
 #[cfg(target_os = "android")]

@@ -124,6 +124,7 @@ export enum Invokes {
   SyncSetCredentials = 'sync_set_credentials',
   SyncPairBegin = 'sync_pair_begin',
   SyncPairComplete = 'sync_pair_complete',
+  SyncListMediaBuckets = 'sync_list_media_buckets',
   SyncPinPaths = 'sync_pin_paths',
   SyncUnpinPaths = 'sync_unpin_paths',
   SyncFreeSpace = 'sync_free_space',

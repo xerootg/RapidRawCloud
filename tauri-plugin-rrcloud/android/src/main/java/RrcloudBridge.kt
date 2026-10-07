@@ -123,6 +123,43 @@ object RrcloudBridge {
         RrcloudWorkScheduler.enqueueExpeditedSyncCycle(context)
     }
 
+    /**
+     * Distinct camera-roll folder names (MediaStore image bucket display
+     * names), as a JSON array string — the choices behind the Sync
+     * settings' "Add folder" picker for the per-device DCIM watch list.
+     * Reflection-invoked from the app's `sync_list_media_buckets` command
+     * (see android_integration.rs); keep rule in consumer-rules.pro.
+     * Returns "[]" when nothing is indexed or the query fails (e.g. the
+     * media permission is not granted yet) — a picker with no entries,
+     * never a crash.
+     */
+    @JvmStatic
+    fun listMediaBuckets(context: Context): String {
+        return try {
+            val names = sortedSetOf<String>()
+            context.contentResolver.query(
+                android.provider.MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                arrayOf(android.provider.MediaStore.MediaColumns.BUCKET_DISPLAY_NAME),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                val col = cursor.getColumnIndexOrThrow(
+                    android.provider.MediaStore.MediaColumns.BUCKET_DISPLAY_NAME
+                )
+                while (cursor.moveToNext()) {
+                    cursor.getString(col)?.takeIf { it.isNotEmpty() }?.let { names.add(it) }
+                }
+            }
+            val arr = org.json.JSONArray()
+            names.forEach { arr.put(it) }
+            arr.toString()
+        } catch (e: Exception) {
+            android.util.Log.w("RrcloudBridge", "listMediaBuckets failed", e)
+            "[]"
+        }
+    }
+
     // ---- §5.1 foreground/background handoff (P5 review round-1 major) -----
     // The opposite direction from everything else below [runSyncCycle]:
     // these two are plain (non-`@JvmStatic`) `external fun`s declared

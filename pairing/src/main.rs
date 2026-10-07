@@ -321,15 +321,11 @@ struct SaveForm {
     #[serde(default)]
     force_path_style: Option<String>,
     #[serde(default)]
-    auto_watch_dcim: Option<String>,
-    #[serde(default)]
     worker_backfill: Option<String>,
     #[serde(default)]
     cache_size_gb: Option<u32>,
     #[serde(default)]
     preview_budget_gb: Option<u32>,
-    #[serde(default)]
-    watched_media_buckets: Option<String>,
 }
 
 async fn save(
@@ -366,14 +362,6 @@ async fn save(
         .into_response();
     }
 
-    let watched = form
-        .watched_media_buckets
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>();
-
     let doc = ConfigDoc {
         version: 1,
         updated_at: now_iso8601(),
@@ -386,8 +374,13 @@ async fn save(
             cache_size_gb: form.cache_size_gb.unwrap_or_else(default_cache_gb),
             preview_budget_gb: form.preview_budget_gb.unwrap_or_else(default_preview_gb),
             preview_prefetch_months: default_prefetch_months(),
-            auto_watch_dcim: form.auto_watch_dcim.is_some(),
-            watched_media_buckets: watched,
+            // DEVICE-LOCAL fields — deliberately NOT collected here and
+            // written as inert defaults: a camera-roll watch list belongs
+            // to one physical device, and the app ignores these two doc
+            // fields when applying a pair (merge_cloud_sync in the app's
+            // sync::pairing preserves the device's own values).
+            auto_watch_dcim: false,
+            watched_media_buckets: Vec::new(),
             worker_backfill: form.worker_backfill.is_some(),
         },
         credentials: Creds {
@@ -489,18 +482,16 @@ fn render_page(
         .map(|e| format!("<p class=\"err\">{}</p>", esc(e)))
         .unwrap_or_default();
 
-    let (ep, bucket, region, akid, fps, awd, wbf, cache, prev, watched) = match existing {
+    let (ep, bucket, region, akid, fps, wbf, cache, prev) = match existing {
         Some(d) => (
             esc(&d.sync.endpoint),
             esc(&d.sync.bucket),
             esc(&d.sync.region),
             esc(&d.credentials.access_key_id),
             d.sync.force_path_style,
-            d.sync.auto_watch_dcim,
             d.sync.worker_backfill,
             d.sync.cache_size_gb,
             d.sync.preview_budget_gb,
-            esc(&d.sync.watched_media_buckets.join(", ")),
         ),
         None => (
             esc(&cfg.default_library_endpoint),
@@ -508,11 +499,9 @@ fn render_page(
             esc(&cfg.default_library_region),
             String::new(),
             true,
-            false,
             true,
             default_cache_gb(),
             default_preview_gb(),
-            String::new(),
         ),
     };
     let ck = |b: bool| if b { "checked" } else { "" };
@@ -536,14 +525,12 @@ fn render_page(
   <input type="password" name="secret_access_key" autocomplete="off" required placeholder="{secret_ph}">
   <p class="note">Stored in the admin config bucket so your devices and the worker can use it. Use a key scoped to this one bucket. The secret is write-only here — re-enter it on every save.</p>
   <label class="check"><input type="checkbox" name="force_path_style" {fps}> Path-style addressing (Garage / MinIO / B2 / R2)</label>
-  <label class="check"><input type="checkbox" name="auto_watch_dcim" {awd}> Auto-watch DCIM (phones back up new camera RAWs)</label>
   <label class="check"><input type="checkbox" name="worker_backfill" {wbf}> Let the worker generate previews for this library</label>
+  <p class="note">Camera-roll auto-import (which folders each phone watches) is a per-device choice — set it on the device, in Settings → Sync.</p>
   <div class="row">
     <div><label>Cache budget (GB)</label><input type="number" name="cache_size_gb" value="{cache}" min="1"></div>
     <div><label>Preview budget (GB)</label><input type="number" name="preview_budget_gb" value="{prev}" min="1"></div>
   </div>
-  <label>Watched camera-roll folders (comma-separated, optional)</label>
-  <input type="text" name="watched_media_buckets" value="{watched}" placeholder="Camera">
   <button type="submit">Save</button>
 </form>"#,
         ep = ep,
@@ -552,11 +539,9 @@ fn render_page(
         akid = akid,
         secret_ph = secret_ph,
         fps = ck(fps),
-        awd = ck(awd),
         wbf = ck(wbf),
         cache = cache,
         prev = prev,
-        watched = watched,
     );
 
     let header = if existing.is_some() {
