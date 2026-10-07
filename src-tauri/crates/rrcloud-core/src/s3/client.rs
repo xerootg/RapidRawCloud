@@ -351,7 +351,12 @@ impl S3Client {
         // replay the original Authorization against a different host/path
         // and fail with a baffling signature error, so 3xx responses are
         // surfaced as typed API errors instead.
-        let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+        // Android: webpki-roots TLS instead of the platform verifier —
+        // see `crate::tls` for the release-build OCSP/Let's Encrypt
+        // failure this avoids. No-op elsewhere.
+        let mut builder = crate::tls::apply_platform_tls(
+            reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()),
+        );
         if let Some(timeout) = config.connect_timeout {
             builder = builder.connect_timeout(timeout);
         }

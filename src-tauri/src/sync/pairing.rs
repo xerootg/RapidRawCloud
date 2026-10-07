@@ -205,10 +205,13 @@ struct ConfigDoc {
 #[tauri::command]
 pub async fn sync_pair_begin(discovery_url: String, app: AppHandle) -> Result<String, String> {
     let base = normalize_discovery_url(&discovery_url)?;
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
+    // Android: webpki-roots TLS (see rrcloud_core::tls — the platform
+    // verifier hard-fails OCSP-less Let's Encrypt certs on release builds).
+    let http = rrcloud_core::tls::apply_platform_tls(
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
+    )
+    .build()
+    .map_err(|e| e.to_string())?;
 
     let info: PairingInfo = http
         .get(format!("{base}/api/pairing-info"))
@@ -298,10 +301,12 @@ pub async fn sync_pair_complete(
         return Err("state mismatch — stale or forged callback; start pairing again".into());
     }
 
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| e.to_string())?;
+    // Same Android TLS override as `sync_pair_begin` (rrcloud_core::tls).
+    let http = rrcloud_core::tls::apply_platform_tls(
+        reqwest::Client::builder().timeout(std::time::Duration::from_secs(15)),
+    )
+    .build()
+    .map_err(|e| e.to_string())?;
 
     // Code → token (public client: client_id + PKCE verifier, no secret).
     // Form body built by hand via Url's pair encoder: the app's reqwest is

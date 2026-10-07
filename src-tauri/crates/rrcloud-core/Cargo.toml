@@ -182,6 +182,19 @@ ndk-context = "0.1"
 # alias below (identical shim `android_integration.rs` already uses).
 rustls-platform-verifier = "0.7"
 jni22 = { package = "jni", version = "0.22" }
+# Android-only TLS trust for this crate's own HTTP clients (S3, pairing —
+# see `crate::tls`): reqwest 0.13's `rustls` feature hard-wires
+# rustls-platform-verifier, whose Android path requires OCSP revocation
+# data that Let's Encrypt certificates no longer carry (LE dropped OCSP in
+# 2025) — a NON-debuggable (release) build hard-fails every such
+# connection with "invalid peer certificate: Revoked" (the debug escape in
+# the verifier's Kotlin is debug/test-only; upstream has no release fix,
+# see rustls/rustls-platform-verifier#179). On Android we therefore build
+# the connectors on the bundled webpki (Mozilla) root store instead. Same
+# rustls 0.23 reqwest resolves, so `use_preconfigured_tls`'s `Any`
+# downcast matches.
+rustls = { version = "0.23", default-features = false, features = ["std", "aws-lc-rs"] }
+webpki-roots = "1"
 
 # Crash-injection + lock-exclusivity suite for the redb state store (§2.1.5,
 # §5.1). harness = false: the binary re-execs itself as a writer/locker child

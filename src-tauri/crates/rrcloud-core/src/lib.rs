@@ -61,6 +61,7 @@ pub mod reader;
 pub mod s3;
 pub mod semhash;
 pub mod state;
+pub mod tls;
 pub mod transfer;
 pub mod worker;
 
