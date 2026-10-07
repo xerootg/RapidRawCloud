@@ -28,3 +28,14 @@
     java.lang.String loadSyncSettingsJson(android.content.Context);
     void enqueueExpeditedSync(android.content.Context);
 }
+
+# androidx.security:security-crypto pulls in Google Tink, which references
+# the compile-only JSR-305/concurrency annotations. They are absent from
+# the runtime classpath by design, but R8 treats a missing referenced
+# class as fatal in a minified release build:
+#   Missing class javax.annotation.concurrent.GuardedBy
+#       (referenced from: com.google.crypto.tink.KeysetManager ...)
+# killed `:app:minifyUniversalReleaseWithR8` on the v1.6.4-cloud.1 release
+# pipeline. Tink's own README prescribes exactly these -dontwarn rules.
+-dontwarn javax.annotation.Nullable
+-dontwarn javax.annotation.concurrent.GuardedBy
