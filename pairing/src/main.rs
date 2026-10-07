@@ -52,6 +52,13 @@ struct Config {
     admin_s3_secret_key: String,
     /// Authentik userinfo endpoint, used to validate app bearer tokens.
     oidc_userinfo_url: String,
+    /// OIDC issuer URL for the APP's provider (public/PKCE), advertised via
+    /// `GET /api/pairing-info` so a device needs only this service's URL to
+    /// discover everything else (authorize/token endpoints come from the
+    /// issuer's own `.well-known/openid-configuration`).
+    oidc_issuer_url: String,
+    /// OIDC client id of the APP's provider (public client, no secret).
+    oidc_client_id: String,
     /// Default library endpoint pre-filled in the creds form (the public S3
     /// URL the *app* will use — e.g. https://garage.themissing.xyz).
     default_library_endpoint: String,
@@ -68,6 +75,8 @@ impl Config {
             admin_s3_access_key: get("ADMIN_S3_ACCESS_KEY")?,
             admin_s3_secret_key: get("ADMIN_S3_SECRET_KEY")?,
             oidc_userinfo_url: get("OIDC_USERINFO_URL")?,
+            oidc_issuer_url: get("OIDC_ISSUER_URL")?,
+            oidc_client_id: get("OIDC_CLIENT_ID")?,
             default_library_endpoint: std::env::var("DEFAULT_LIBRARY_ENDPOINT").unwrap_or_default(),
             default_library_region: std::env::var("DEFAULT_LIBRARY_REGION")
                 .unwrap_or_else(|_| "garage".into()),
@@ -396,6 +405,21 @@ async fn save(
     }
 }
 
+/// Public pairing discovery: everything a device needs to start the OIDC/
+/// PKCE flow, keyed only by this service's URL. Deliberately unauthenticated
+/// (none of this is secret — the client id is a public client, and the
+/// issuer's own `.well-known/openid-configuration` is public too).
+async fn api_pairing_info(State(state): State<Arc<AppState>>) -> Response {
+    Json(serde_json::json!({
+        "version": 1,
+        "issuer": state.config.oidc_issuer_url,
+        "clientId": state.config.oidc_client_id,
+        "configEndpoint": "/api/config",
+        "redirectUri": "rapidraw://auth-callback",
+    }))
+    .into_response()
+}
+
 /// App config endpoint. `Authorization: Bearer <oidc access token>`.
 async fn api_config(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
     let Some(bearer) = headers
@@ -633,6 +657,7 @@ async fn main() {
         .route("/", get(index))
         .route("/save", post(save))
         .route("/api/config", get(api_config))
+        .route("/api/pairing-info", get(api_pairing_info))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
