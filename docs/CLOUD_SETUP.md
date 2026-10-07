@@ -68,7 +68,7 @@ Fill in, in this order:
 3. **Region** — your provider's region string (`us-west-002`,
    `auto` for R2, `garage` for Garage, etc.).
 4. Optionally adjust **Cache budget (GB)**, **Preview budget (GB)**,
-   **Auto-watch DCIM**, **Watched buckets**, **Worker backfill** (see
+   **Auto-watch DCIM**, **Watched camera-roll folders**, **Worker backfill** (see
    [§4](#4-what-the-knobs-do)).
 5. Tap **Save & reconfigure**.
 
@@ -126,8 +126,8 @@ already-deleted files or loses an edit it hadn't uploaded yet.
 | **Endpoint / Bucket / Region** | S3 coordinates. |
 | **Cache budget (GB)** | Max disk the device spends caching full-resolution **originals** pulled on demand. LRU-evicted; pinned items are never evicted. |
 | **Preview budget (GB)** | Max disk for cached **smart previews** (always kept; see below). |
-| **Auto-watch DCIM** | (Android) Watch the camera roll and auto-import new RAW shots into the library for backup. |
-| **Watched buckets** | (Android) Comma-separated camera-roll *folder* names to watch (default: `Camera`). This is the on-device MediaStore album filter, unrelated to the S3 bucket. |
+| **Auto-watch DCIM** | (Android) Watch the camera roll and auto-import new RAW shots into the library for backup. Device-local: pairing never changes it. |
+| **Watched camera-roll folders** | (Android) Per-device list of camera-roll *folder* names to watch (default: `Camera`). "Add folder…" lists the folders that actually contain photos on the device; each entry has a remove button. This is the on-device MediaStore album filter, unrelated to the S3 bucket — and it is a device-local setting: pairing never changes it, and it is not shared between devices. |
 | **Worker backfill (this device)** | Let this device generate and upload missing smart previews for items it has locally (the same backfill the headless worker does). |
 
 ### Smart previews
