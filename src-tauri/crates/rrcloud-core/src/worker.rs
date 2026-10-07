@@ -69,7 +69,7 @@ use crate::engine::{reconcile_wholeness, EngineConsumer, EngineError};
 use crate::journal::{JournalEntry, JournalError, Kind, Op, JOURNAL_VERSION};
 use crate::keys::{
     classify_key, library_key, preview_key, thumb_key, KeyClass, KeyError, RelKey, ThumbSize,
-    LIBRARY_PREFIX,
+    CONTROL_PREFIX, LIBRARY_PREFIX,
 };
 use crate::manifest::{get_manifest, merge as merge_manifests, Manifest, ManifestError};
 use crate::proxy::{generate_proxy_with, ProxyError, ProxyParams};
@@ -378,6 +378,12 @@ pub struct CycleReport {
     /// original, or the converse), by item relkey — the GC worker's
     /// unconditional whole-item backstop.
     pub resurrected: Vec<RelKey>,
+    /// §4.3's second generation duty: journal-known originals (uploaded and
+    /// journaled by a client that skipped preview generation) whose smart
+    /// preview + thumbs this cycle generated and PUT, by item relkey. No
+    /// original version is published for these — only preview/thumb put
+    /// entries — so the uploading client's head is never contended.
+    pub previews_backfilled: Vec<RelKey>,
     /// Smart previews generated via [`crate::proxy::generate_proxy_with`].
     pub proxies_generated: usize,
     /// Preview objects PUT under `previews/<content_id>`.
@@ -650,6 +656,11 @@ pub async fn run_cycle(worker: &Worker, opts: &CycleOptions) -> Result<CycleRepo
     // state (staging only — per-item isolated, so one undecodable object
     // never aborts the cycle).
     adopt_foreign_originals(worker, opts, &clock, &mut report).await?;
+
+    // (1c′) §4.3's second generation duty: backfill previews for
+    // journal-known originals whose uploading client skipped generation
+    // (staging only, same single publish point as adoption).
+    backfill_known_previews(worker, opts, &clock, &mut report).await?;
 
     // (1d) Publish everything staged this cycle (adoptions + resurrections)
     // under our own prefix in one drain — a single publish point, so a poison
@@ -1068,6 +1079,219 @@ async fn adopt_foreign_originals(
     }
 
     Ok(())
+}
+
+/// §4.3's second generation duty: for every journal-known live original
+/// whose `content_id` has no preview object in the bucket (the uploading
+/// client skipped generation — today's app journals the original put but
+/// never uploads preview/thumbs), GET the original, generate the smart
+/// preview + thumbs, PUT them under the content-addressed keys, and stage
+/// matching put entries (published by the caller's single publish point).
+///
+/// Deliberately does NOT publish any original version: the preview/thumb
+/// lane is content-addressed and versionless, so the uploading device's
+/// head is never contended (unlike adoption, which versions a previously
+/// unknown key). Idempotence is structural: the next cycle's preview
+/// listing contains the content id, so the item is skipped — no per-item
+/// marker state, safe with a second concurrent backfiller (byte-identical
+/// content-addressed overwrites).
+///
+/// Per-item isolation, same contract as adoption: a failed GET, a
+/// blake3-vs-record mismatch (a stale or replaced object), or an
+/// undecodable original logs and skips that one item without aborting the
+/// cycle; a transient failure retries next cycle.
+async fn backfill_known_previews(
+    worker: &Worker,
+    opts: &CycleOptions,
+    clock: &ServerClock,
+    report: &mut CycleReport,
+) -> Result<(), WorkerError> {
+    let db = &worker.db;
+    let s3 = &worker.s3;
+    let bucket = worker.bucket.as_str();
+    let device = db.device_id().clone();
+    let now_ts = clock.now_server();
+    let cap = opts
+        .max_adopt_original_bytes
+        .unwrap_or(MAX_ADOPT_ORIGINAL_BYTES);
+
+    let have = list_preview_content_ids(s3, bucket).await?;
+
+    for (relkey, record) in db.iter_items()? {
+        if record.deleted || record.kind != Kind::Original {
+            continue;
+        }
+        let Some(content_id) = record.content_id.clone() else {
+            continue;
+        };
+        if have.contains(&content_id) {
+            continue;
+        }
+
+        let key = library_key(&relkey);
+        let bytes = match fetch_foreign_original(s3, bucket, &key, cap).await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!(
+                    "rrcloud-worker: skipping preview backfill of {key} this cycle (fetch \
+                     failed, not aborting the cycle): {e}"
+                );
+                continue;
+            }
+        };
+        // The journal head names the bytes this preview must render. A
+        // mismatch means the object was replaced/corrupted relative to the
+        // merged head — backfilling from it would journal a preview for
+        // content the head does not describe.
+        let fetched_blake3 = Blake3Hex::from_bytes(&bytes);
+        if record.blake3.as_ref() != Some(&fetched_blake3) {
+            eprintln!(
+                "rrcloud-worker: skipping preview backfill of {key} (object blake3 does not \
+                 match the journal-known head)"
+            );
+            continue;
+        }
+
+        let proxy = match generate_proxy_with(&bytes, &opts.proxy) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "rrcloud-worker: skipping preview backfill of {key} (preview generation \
+                     failed): {e}"
+                );
+                continue;
+            }
+        };
+        report.proxies_generated += 1;
+        let orig_w = proxy.orig_width;
+        let orig_h = proxy.orig_height;
+        let preview_hash = Blake3Hex::from_bytes(&proxy.dng);
+        let preview_len = proxy.dng.len() as u64;
+        let small_hash = Blake3Hex::from_bytes(&proxy.small_jpeg);
+        let small_len = proxy.small_jpeg.len() as u64;
+        let medium_hash = Blake3Hex::from_bytes(&proxy.medium_jpeg);
+        let medium_len = proxy.medium_jpeg.len() as u64;
+
+        s3.put_object(
+            bucket,
+            &preview_key(&content_id),
+            Bytes::from(proxy.dng),
+            &PutObjectOptions::default(),
+        )
+        .await?;
+        report.previews_put += 1;
+        s3.put_object(
+            bucket,
+            &thumb_key(&content_id, ThumbSize::Small),
+            Bytes::from(proxy.small_jpeg),
+            &PutObjectOptions::default(),
+        )
+        .await?;
+        s3.put_object(
+            bucket,
+            &thumb_key(&content_id, ThumbSize::Medium),
+            Bytes::from(proxy.medium_jpeg),
+            &PutObjectOptions::default(),
+        )
+        .await?;
+        report.thumbs_put += 2;
+
+        // Journal the preview/thumb puts under the head's version vector
+        // (the vector names which original version these renditions render;
+        // the worker is not authoring a new original version).
+        let tmpl = JournalEntry {
+            v: JOURNAL_VERSION,
+            seq: 0,
+            ts: now_ts,
+            device: device.clone(),
+            op: Op::Put,
+            kind: Kind::Preview,
+            key: String::new(),
+            vv: record.vv.clone(),
+            size: None,
+            blake3: None,
+            sem_hash: None,
+            rating: None,
+            color_label: None,
+            content_id: Some(content_id.clone()),
+            w: None,
+            h: None,
+            mtime: None,
+            from_key: None,
+        };
+        let mut put_preview = tmpl.clone();
+        put_preview.key = preview_key(&content_id);
+        put_preview.blake3 = Some(preview_hash);
+        put_preview.size = Some(preview_len);
+        let mut put_thumb_small = tmpl.clone();
+        put_thumb_small.kind = Kind::Thumb;
+        put_thumb_small.key = thumb_key(&content_id, ThumbSize::Small);
+        put_thumb_small.blake3 = Some(small_hash);
+        put_thumb_small.size = Some(small_len);
+        let mut put_thumb_medium = tmpl.clone();
+        put_thumb_medium.kind = Kind::Thumb;
+        put_thumb_medium.key = thumb_key(&content_id, ThumbSize::Medium);
+        put_thumb_medium.blake3 = Some(medium_hash);
+        put_thumb_medium.size = Some(medium_len);
+
+        // Stage the entries and record the measured dims on our own copy of
+        // the item in ONE transaction (same crash-safety shape as adoption:
+        // either the entries are staged and the dims recorded, or neither).
+        let mut updated = record.clone();
+        if updated.w.is_none() {
+            updated.w = Some(orig_w);
+        }
+        if updated.h.is_none() {
+            updated.h = Some(orig_h);
+        }
+        db.with_txn_err::<(), WorkerError>(|t| {
+            enqueue_entry_in(t, &device, &put_preview)?;
+            enqueue_entry_in(t, &device, &put_thumb_small)?;
+            enqueue_entry_in(t, &device, &put_thumb_medium)?;
+            t.replay_put_item(&relkey, &updated)?;
+            Ok(())
+        })?;
+        report.previews_backfilled.push(relkey);
+    }
+
+    Ok(())
+}
+
+/// The set of `content_id`s that already have a preview object under
+/// `.rrcloud/v1/previews/` — one paginated LIST per cycle, the structural
+/// idempotence guard for [`backfill_known_previews`]. Unparseable keys
+/// under the prefix are ignored (future formats are not this cycle's
+/// concern).
+async fn list_preview_content_ids(
+    s3: &S3Client,
+    bucket: &str,
+) -> Result<std::collections::HashSet<ContentId>, WorkerError> {
+    let mut have = std::collections::HashSet::new();
+    let mut continuation_token: Option<String> = None;
+    loop {
+        let page = s3
+            .list_objects_v2(
+                bucket,
+                &ListObjectsV2Request {
+                    prefix: Some(format!("{CONTROL_PREFIX}previews/")),
+                    continuation_token: continuation_token.take(),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        for o in page.objects {
+            if let KeyClass::Preview { content_id } = classify_key(&o.key) {
+                have.insert(content_id);
+            }
+        }
+        if !page.is_truncated {
+            return Ok(have);
+        }
+        match page.next_continuation_token {
+            Some(token) => continuation_token = Some(token),
+            None => return Ok(have),
+        }
+    }
 }
 
 /// GET a foreign original with per-item isolation (§6 forward progress): the

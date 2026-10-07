@@ -1361,3 +1361,115 @@ async fn open_journaling_does_not_delete_its_persistent_state_dir_on_drop() {
 // A `CompactConfig` field is referenced so the import is load-bearing even
 // while every §2.10 default is exercised through `CycleOptions::default`.
 const _: fn() -> CompactConfig = CompactConfig::default;
+
+// ---------------------------------------------------------------------------
+// §4.3 PREVIEW BACKFILL for journal-known originals (second worker duty)
+// ---------------------------------------------------------------------------
+
+/// §4.3 names two worker generation duties: foreign ingests AND "clients
+/// that skipped generation". A phone that uploads an original and journals
+/// the put (content_id present) but never publishes preview/thumb objects —
+/// today's app behavior — must get its smart preview backfilled by the
+/// worker: `.pxy.dng` + `_small`/`_medium` thumbs PUT under `content_id`
+/// keys and journaled as put entries, WITHOUT re-adopting the original (no
+/// new original version, no spurious conflict with the phone's head). A
+/// second cycle backfills nothing again (the preview listing now contains
+/// the content id).
+#[tokio::test]
+async fn backfills_previews_for_journal_known_originals_without_them() {
+    let (filename, raw) = skip_without_corpus!("preview_backfill");
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-backfill");
+    let client = g.client();
+
+    // "Phone" P: uploads the original and journals the put with a
+    // content_id but no w/h and no preview/thumb entries — exactly the
+    // segment shape the real app publishes today.
+    let item = ingest_relkey(&filename);
+    put_raw(&client, &bucket, &library_key(&item), &raw).await;
+    let p = dev(DEV_A);
+    let (_pdir, _ppath, p_db) = open_db(&p);
+    let cid = ContentId::from_bytes(&raw);
+    p_db.replay_put_item(&item, &peer_original_record(&p, &raw))
+        .expect("phone record");
+    let mut orig_put = journal_entry(&p, Op::Put, Kind::Original, library_key(&item));
+    orig_put.vv = vv(&[(&p, 1)]);
+    orig_put.content_id = Some(cid.clone());
+    orig_put.blake3 = Some(Blake3Hex::from_bytes(&raw));
+    orig_put.size = Some(raw.len() as u64);
+    enqueue_entry(&p_db, &orig_put).expect("enqueue orig");
+    publish_pending(&p_db, &client, &bucket)
+        .await
+        .expect("publish phone segment");
+
+    // The worker runs a cycle.
+    let state = tempfile::tempdir().expect("state dir");
+    let cfg = worker_cfg(g, &bucket, Some(state.path().to_path_buf()));
+    let worker = Worker::open(&cfg).expect("open worker");
+    let report = worker::run_cycle(&worker, &CycleOptions::default())
+        .await
+        .expect("cycle 1");
+
+    // Not adopted (journal-known), but backfilled.
+    assert!(
+        report.adopted.is_empty(),
+        "a journal-known original must not be re-adopted (adopted={:?})",
+        report.adopted
+    );
+    assert_eq!(
+        report.previews_backfilled,
+        vec![item.clone()],
+        "exactly the phone's original is preview-backfilled"
+    );
+    assert!(report.proxies_generated >= 1, "a proxy was generated");
+    assert!(report.previews_put >= 1, "the preview object was PUT");
+    assert!(report.thumbs_put >= 2, "both thumbs were PUT");
+    assert!(
+        exists(&client, &bucket, &preview_key(&cid)).await,
+        "preview object exists under the content_id key"
+    );
+    assert!(
+        exists(&client, &bucket, &thumb_key(&cid, ThumbSize::Small)).await,
+        "_small thumb exists"
+    );
+    assert!(
+        exists(&client, &bucket, &thumb_key(&cid, ThumbSize::Medium)).await,
+        "_medium thumb exists"
+    );
+
+    // The worker journaled the preview + thumb puts (so peers/manifests/GC
+    // learn them) — and did NOT publish any new original version.
+    let w_entries = eh::journal_entries_of(&client, &bucket, worker.device_id()).await;
+    assert!(
+        w_entries
+            .iter()
+            .any(|e| e.op == Op::Put && e.kind == Kind::Preview),
+        "a put-preview entry was published"
+    );
+    assert!(
+        w_entries
+            .iter()
+            .any(|e| e.op == Op::Put && e.kind == Kind::Thumb),
+        "a put-thumb entry was published"
+    );
+    assert!(
+        !w_entries
+            .iter()
+            .any(|e| e.op == Op::Put && e.kind == Kind::Original),
+        "no re-advertised original version (the phone's head stays sole)"
+    );
+
+    // Idempotence: a second worker instance over the same bucket backfills
+    // nothing new.
+    let state2 = tempfile::tempdir().expect("state dir 2");
+    let cfg2 = worker_cfg(g, &bucket, Some(state2.path().to_path_buf()));
+    let worker2 = Worker::open(&cfg2).expect("open worker 2");
+    let second = worker::run_cycle(&worker2, &CycleOptions::default())
+        .await
+        .expect("cycle 2");
+    assert!(
+        second.previews_backfilled.is_empty(),
+        "cycle 2 backfills nothing (preview already present)"
+    );
+    assert_eq!(second.previews_put, 0, "no duplicate preview PUT");
+}
