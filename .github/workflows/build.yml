@@ -249,6 +249,10 @@ jobs:
           pin tauri-plugin-http   2.7.0
           pin tauri-plugin-fs     2.5.2
           pin tauri-plugin-store  2.4.0
+          # The fork's OIDC-pairing deep-link plugin: 2.6.x requires tauri
+          # ^2.12, so it must come down to a 2.11-compatible release before
+          # tauri itself can be pinned back for the Android leg.
+          pin tauri-plugin-deep-link 2.4.10
           pin tauri               2.11.5
           pin tauri-runtime-wry   2.11.4
           pin tauri-runtime       2.11.3
