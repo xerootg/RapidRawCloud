@@ -380,13 +380,31 @@ pub async fn sync_pair_complete(
             .app_data_dir()
             .map_err(|e| e.to_string())?
             .join("rrcloud");
-        configure_core(
+        if let Err(e) = configure_core(
             &state.sync_manager,
             &*store,
             doc.sync.clone(),
             sync_root,
             state_dir,
-        )?;
+        ) {
+            // The redb state store is single-writer: a WorkManager sync/scan
+            // cycle holding it at this exact moment is routine, not a
+            // pairing failure — credentials and settings are already fully
+            // applied above, and the engine picks them up on its next
+            // cycle/foreground reconfigure. Seen live on-device: a re-pair
+            // raced the half-hourly SyncCycleWorker and the UI showed a
+            // scary "state db is already open in another process" even
+            // though the pair had succeeded. Any OTHER configure failure
+            // (bad endpoint, unwritable state dir, ...) still surfaces.
+            if e.contains("already open in another process") {
+                log::warn!(
+                    "pair: configure deferred (state db busy — a background \
+                     sync cycle holds it); settings + credentials applied: {e}"
+                );
+            } else {
+                return Err(e);
+            }
+        }
     }
 
     Ok(doc.sync)
