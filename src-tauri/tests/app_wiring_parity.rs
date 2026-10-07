@@ -18,6 +18,7 @@ fn meta() -> ImageMetadata {
         adjustments: serde_json::json!({ "exposure": 0.25, "contrast": 10 }),
         tags: Some(vec!["user:keep".to_string()]),
         exif: None,
+        flag: None,
     }
 }
 

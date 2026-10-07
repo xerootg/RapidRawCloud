@@ -220,32 +220,43 @@ pub fn generate_tags_with_clip(
     }
 
     scored_tags.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-    let initial_tags: Vec<String> = scored_tags
-        .into_iter()
-        .take(max_tags)
-        .map(|(tag, _)| tag)
-        .collect();
+    let ranked_tags: Vec<String> = scored_tags.into_iter().map(|(tag, _)| tag).collect();
 
-    let mut final_tags_set: HashSet<String> = initial_tags.iter().cloned().collect();
+    let color_tags = if is_custom {
+        Vec::new()
+    } else {
+        extract_color_tags(image)
+    };
 
-    if !is_custom {
-        let color_tags = extract_color_tags(image);
-        for color_tag in color_tags {
-            final_tags_set.insert(color_tag);
+    Ok(limit_tags(&ranked_tags, !is_custom, color_tags, max_tags))
+}
+
+fn limit_tags(
+    ranked_tags: &[String],
+    add_parents: bool,
+    color_tags: Vec<String>,
+    max_tags: usize,
+) -> Vec<String> {
+    let mut final_tags: Vec<String> = Vec::new();
+    let mut add_tag = |tag: &str| {
+        if final_tags.len() < max_tags && !final_tags.iter().any(|t| t == tag) {
+            final_tags.push(tag.to_string());
         }
+    };
 
-        for tag in &initial_tags {
-            if let Some(parents) = TAG_HIERARCHY.get(tag.as_str()) {
-                for &parent in parents {
-                    final_tags_set.insert(parent.to_string());
-                }
+    for tag in ranked_tags {
+        add_tag(tag);
+        if add_parents && let Some(parents) = TAG_HIERARCHY.get(tag.as_str()) {
+            for parent in parents {
+                add_tag(parent);
             }
         }
     }
+    for color_tag in &color_tags {
+        add_tag(color_tag);
+    }
 
-    let final_tags = final_tags_set.into_iter().collect();
-
-    Ok(final_tags)
+    final_tags
 }
 
 #[tauri::command]
@@ -685,8 +696,7 @@ mod tests {
         let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
 
         let clear_path = sidecar.clone();
-        let handle =
-            std::thread::spawn(move || clear_tags_in_sidecar(&clear_path, keep_non_ai));
+        let handle = std::thread::spawn(move || clear_tags_in_sidecar(&clear_path, keep_non_ai));
 
         // Let the clear thread reach its lock-wait (and, for the old
         // load-outside-the-lock pattern, perform its external read of the
@@ -749,7 +759,9 @@ mod tests {
         );
         let before = std::fs::read(&retained).unwrap();
         assert!(
-            clear_tags_in_sidecar(&retained, keep_non_ai).unwrap().is_none(),
+            clear_tags_in_sidecar(&retained, keep_non_ai)
+                .unwrap()
+                .is_none(),
             "a sidecar whose tags all survive must report no change"
         );
         assert_eq!(
@@ -768,7 +780,9 @@ mod tests {
             },
         );
         assert!(
-            clear_tags_in_sidecar(&untagged, keep_non_ai).unwrap().is_none(),
+            clear_tags_in_sidecar(&untagged, keep_non_ai)
+                .unwrap()
+                .is_none(),
             "a sidecar with no tags must report no change"
         );
     }

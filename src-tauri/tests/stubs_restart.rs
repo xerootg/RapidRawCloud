@@ -65,13 +65,8 @@ fn stub_set_is_rehydrated_from_redb_after_restart() {
     // --- First process: configure, create the stub, confirm it registers.
     {
         let mgr = SyncManager::new_inert();
-        mgr.configure(
-            settings(),
-            creds(),
-            root.clone(),
-            state.clone(),
-        )
-        .expect("configure (first process)");
+        mgr.configure(settings(), creds(), root.clone(), state.clone())
+            .expect("configure (first process)");
         sync::install_global_manager(mgr.clone());
 
         mgr.create_stub(&stub_path, &blake3_hex, remote_size, remote_mtime)

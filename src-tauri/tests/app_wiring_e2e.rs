@@ -19,12 +19,12 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use common::garage;
-use tokio::sync::{Mutex, MutexGuard};
 use rapidraw_lib::rrcloud_core::keys::{CONTROL_PREFIX, LIBRARY_PREFIX};
 use rapidraw_lib::rrcloud_core::s3::{ListObjectsV2Request, S3Client};
 use rapidraw_lib::sync::{
     self, Credentials, ImageMetadata, SyncManager, SyncSettings, WriteOrigin, save_sidecar,
 };
+use tokio::sync::{Mutex, MutexGuard};
 
 /// Serializes the tests that install the process-global [`SyncManager`]
 /// (`sync::install_global_manager`). libtest runs both `#[tokio::test]`s in
@@ -72,6 +72,7 @@ fn edit(rating: u8, exposure: f64) -> ImageMetadata {
         adjustments: serde_json::json!({ "exposure": exposure, "contrast": 0 }),
         tags: Some(vec![]),
         exif: None,
+        flag: None,
     }
 }
 

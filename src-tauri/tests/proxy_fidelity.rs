@@ -280,7 +280,12 @@ fn fidelity_core_delta_e_within_budget() {
 
         let mut unclipped = Vec::new();
         let mut clipped = Vec::new();
-        for (pa, pb) in a_ds.as_chunks::<3>().0.iter().zip(b.as_chunks::<3>().0.iter()) {
+        for (pa, pb) in a_ds
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(b.as_chunks::<3>().0.iter())
+        {
             let (la, aa, ba) = lin_rgb_to_lab(pa[0], pa[1], pa[2]);
             let (lb, ab, bb) = lin_rgb_to_lab(pb[0], pb[1], pb[2]);
             let de = ciede2000(la, aa, ba, lb, ab, bb);
@@ -635,7 +640,12 @@ fn fidelity_gpu_confirmation_under_aggressive_settings() {
 
     let mut unclipped = Vec::new();
     let mut clipped = Vec::new();
-    for (pa, pb) in o_ds.as_chunks::<3>().0.iter().zip(p_rgb.as_chunks::<3>().0.iter()) {
+    for (pa, pb) in o_ds
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(p_rgb.as_chunks::<3>().0.iter())
+    {
         let (la, aa, ba) = lin_rgb_to_lab(pa[0], pa[1], pa[2]);
         let (lb, ab, bb) = lin_rgb_to_lab(pb[0], pb[1], pb[2]);
         let de = ciede2000(la, aa, ba, lb, ab, bb);

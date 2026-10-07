@@ -36,9 +36,12 @@ fn prepare_source_image(
     // §4.4: `get_original_image` returns the loaded base, which is the proxy in
     // proxy edit mode; scale the OTHER patches' original-space geometry/bitmaps
     // into that base's space (1.0 no-op when the loaded base is the original).
-    let composited =
-        composite_patches_on_image(&base_image, &source_image_adjustments, crate::current_proxy_scale(state))
-            .map_err(|e| format!("Failed to prepare source image: {}", e))?;
+    let composited = composite_patches_on_image(
+        &base_image,
+        &source_image_adjustments,
+        crate::current_proxy_scale(state),
+    )
+    .map_err(|e| format!("Failed to prepare source image: {}", e))?;
 
     let source_image = if is_raw {
         apply_linear_to_srgb(composited)
@@ -539,7 +542,7 @@ pub async fn invoke_generative_replace_with_mask_def(
             dst_chunk[3] = 255;
         }
 
-        let base_url = "http://127.0.0.1:5000";
+        let base_url = "https://www.getrapidraw.com/api";
 
         let dyn_src_crop = DynamicImage::ImageRgba8(final_src_crop);
         let dyn_rgba_mask = DynamicImage::ImageRgba8(rgba_mask);

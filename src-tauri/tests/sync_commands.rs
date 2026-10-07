@@ -72,6 +72,7 @@ fn edit(rating: u8, exposure: f64) -> ImageMetadata {
         adjustments: serde_json::json!({ "exposure": exposure, "contrast": 0 }),
         tags: Some(vec![]),
         exif: None,
+        flag: None,
     }
 }
 

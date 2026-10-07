@@ -7,7 +7,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, GenericImageView, GrayImage, ImageBuffer, ImageFormat, Luma, imageops};
+use image::codecs::png::PngEncoder;
+use image::{
+    DynamicImage, GenericImageView, GrayImage, ImageBuffer, ImageEncoder, ImageFormat, Luma,
+    imageops,
+};
 use jxl_encoder::{
     LosslessConfig, LossyConfig, PixelLayout,
     api::{calibrated_jxl_quality, quality_to_distance},
@@ -34,12 +38,13 @@ use crate::image_processing::{
 use crate::lut_processing::{
     convert_image_to_cube_lut, generate_identity_lut_image, get_or_load_lut,
 };
-use crate::mask_generation::{MaskDefinition, generate_mask_bitmap};
+use crate::mask_generation::{MaskDefinition, build_warped_image_for_masks, generate_mask_bitmap};
 
 use crate::cache_utils::{calculate_full_job_hash, calculate_transform_hash};
+use crate::white_balance::as_shot_white_balance;
 use crate::{
     apply_all_transformations, generate_transformed_preview, get_cached_or_generate_mask,
-    hydrate_adjustments, load_settings, resolve_warped_image_for_masks,
+    hydrate_adjustments, load_settings,
 };
 
 /// Which base image a *current-edit* export (the `is_current_edit` branch of
@@ -1003,7 +1008,8 @@ fn process_image_for_export_pipeline(
         .and_then(|m| serde_json::from_value(m.clone()).ok())
         .unwrap_or_default();
 
-    let warped_image = resolve_warped_image_for_masks(state, js_adjustments, &mask_definitions);
+    let warped_image =
+        build_warped_image_for_masks(base_image, is_raw, js_adjustments, &mask_definitions);
     let mask_bitmaps: Vec<ImageBuffer<Luma<u8>, Vec<u8>>> = mask_definitions
         .iter()
         .filter_map(|def| {
@@ -1019,7 +1025,12 @@ fn process_image_for_export_pipeline(
         .collect();
 
     let tm_override = resolve_tonemapper_override_from_handle(app_handle, is_raw);
-    let mut all_adjustments = get_all_adjustments_from_json(js_adjustments, is_raw, tm_override);
+    let mut all_adjustments = get_all_adjustments_from_json(
+        js_adjustments,
+        is_raw,
+        as_shot_white_balance(path),
+        tm_override,
+    );
     all_adjustments.global.show_clipping = 0;
 
     let lut_path = js_adjustments["lutPath"].as_str();
@@ -1189,6 +1200,9 @@ fn encode_grayscale_to_png(bitmap: &GrayImage) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
+/// Exports are sRGB-encoded; tagging them lets color-managed apps read them correctly.
+const SRGB_ICC_PROFILE: &[u8] = include_bytes!("../icc/sRGB-v2-magic.icc");
+
 fn encode_image_to_bytes(
     image: &DynamicImage,
     output_format: &str,
@@ -1242,7 +1256,10 @@ fn encode_image_to_bytes(
         }
         "jpg" | "jpeg" => {
             let rgb_image = image.to_rgb8();
-            let encoder = JpegEncoder::new_with_quality(&mut cursor, jpeg_quality);
+            let mut encoder = JpegEncoder::new_with_quality(&mut cursor, jpeg_quality);
+            encoder
+                .set_icc_profile(SRGB_ICC_PROFILE.to_vec())
+                .map_err(|e| e.to_string())?;
             rgb_image
                 .write_with_encoder(encoder)
                 .map_err(|e| e.to_string())?;
@@ -1254,8 +1271,12 @@ fn encode_image_to_bytes(
                 image.clone()
             };
 
+            let mut encoder = PngEncoder::new(&mut cursor);
+            encoder
+                .set_icc_profile(SRGB_ICC_PROFILE.to_vec())
+                .map_err(|e| e.to_string())?;
             image_to_encode
-                .write_to(&mut cursor, image::ImageFormat::Png)
+                .write_with_encoder(encoder)
                 .map_err(|e| e.to_string())?;
         }
         "tif" | "tiff" => {
@@ -1300,7 +1321,8 @@ fn export_masks_for_image(
         .and_then(|m| serde_json::from_value(m.clone()).ok())
         .unwrap_or_default();
 
-    let warped_image = resolve_warped_image_for_masks(state, js_adjustments, &mask_definitions);
+    let warped_image =
+        build_warped_image_for_masks(base_image, is_raw, js_adjustments, &mask_definitions);
     let mut mask_bitmaps = Vec::with_capacity(mask_definitions.len());
     for definition in &mask_definitions {
         ensure_export_not_cancelled(cancellation_token)?;
@@ -1319,7 +1341,12 @@ fn export_masks_for_image(
 
     if !mask_bitmaps.is_empty() {
         let tm_override = resolve_tonemapper_override_from_handle(app_handle, is_raw);
-        let all_adjustments = get_all_adjustments_from_json(js_adjustments, is_raw, tm_override);
+        let all_adjustments = get_all_adjustments_from_json(
+            js_adjustments,
+            is_raw,
+            as_shot_white_balance(source_path_str),
+            tm_override,
+        );
         let lut_path = js_adjustments["lutPath"].as_str();
         let lut = lut_path.and_then(|p| get_or_load_lut(state, p).ok());
         let unique_hash = calculate_full_job_hash(source_path_str, js_adjustments);
@@ -1424,7 +1451,12 @@ fn export_adjustments_as_lut(
     let identity_image = generate_identity_lut_image(lut_size);
 
     let tm_override = resolve_tonemapper_override_from_handle(app_handle, false);
-    let mut all_adjustments = get_all_adjustments_from_json(js_adjustments, false, tm_override);
+    let mut all_adjustments = get_all_adjustments_from_json(
+        js_adjustments,
+        false,
+        as_shot_white_balance(source_path_str),
+        tm_override,
+    );
 
     all_adjustments.global.show_clipping = 0;
     all_adjustments.global.vignette_amount = 0.0;
@@ -2018,7 +2050,7 @@ pub async fn run_headless_export(
     session: crate::launch_request::HeadlessExportSession,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    println!("Starting headless export...");
+    cli_println!("Starting headless export...");
     let state = app_handle.state::<crate::AppState>();
 
     let source_path = std::path::Path::new(&session.source);
@@ -2055,7 +2087,7 @@ pub async fn run_headless_export(
             .map_err(|e| format!("Failed to create output directory: {}", e))?;
     }
 
-    println!("Found {} images to export. Processing...", paths.len());
+    cli_println!("Found {} images to export. Processing...", paths.len());
 
     let export_settings = ExportSettings {
         jpeg_quality: session.quality,
@@ -2081,7 +2113,7 @@ pub async fn run_headless_export(
         let json: serde_json::Value = serde_json::from_str(&content)
             .map_err(|e| format!("Failed to parse adjustments JSON: {}", e))?;
         custom_adjustments = Some(json);
-        println!(
+        cli_println!(
             "Loaded custom adjustments to override sidecars from: {}",
             adj_path
         );
@@ -2223,6 +2255,7 @@ pub async fn estimate_export_sizes(
             .filter_map(|def| {
                 get_cached_or_generate_mask(
                     &state,
+                    &loaded_image.path,
                     def,
                     img_w,
                     img_h,
@@ -2234,8 +2267,12 @@ pub async fn estimate_export_sizes(
             .collect();
 
         let tm_override = resolve_tonemapper_override_from_handle(&app_handle, is_raw);
-        let mut all_adjustments =
-            get_all_adjustments_from_json(&adjustments_clone, is_raw, tm_override);
+        let mut all_adjustments = get_all_adjustments_from_json(
+            &adjustments_clone,
+            is_raw,
+            loaded_image.as_shot_white_balance,
+            tm_override,
+        );
         all_adjustments.global.show_clipping = 0;
 
         let lut = adjustments_clone["lutPath"]
@@ -2360,6 +2397,7 @@ pub async fn estimate_export_sizes(
             .filter_map(|def| {
                 get_cached_or_generate_mask(
                     &state,
+                    &source_path_str,
                     def,
                     preview_w,
                     preview_h,
@@ -2371,8 +2409,12 @@ pub async fn estimate_export_sizes(
             .collect();
 
         let tm_override = resolve_tonemapper_override_from_handle(&app_handle, is_raw);
-        let mut all_adjustments =
-            get_all_adjustments_from_json(&js_adjustments, is_raw, tm_override);
+        let mut all_adjustments = get_all_adjustments_from_json(
+            &js_adjustments,
+            is_raw,
+            as_shot_white_balance(&source_path_str),
+            tm_override,
+        );
         all_adjustments.global.show_clipping = 0;
 
         let lut = js_adjustments["lutPath"]

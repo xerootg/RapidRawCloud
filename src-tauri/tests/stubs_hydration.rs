@@ -411,7 +411,13 @@ async fn concurrent_ensure_local_waits_for_the_in_flight_hydration() {
     sync::install_global_manager(mgr_a.clone());
 
     let rel = "race/BIG_0001.NEF";
-    let remote = upload_original(&mgr_a, root_a.path(), rel, &original_bytes(29, 20 * 1024 * 1024)).await;
+    let remote = upload_original(
+        &mgr_a,
+        root_a.path(),
+        rel,
+        &original_bytes(29, 20 * 1024 * 1024),
+    )
+    .await;
 
     // Device B makes a stub.
     let root_b = tempfile::tempdir().expect("root b");

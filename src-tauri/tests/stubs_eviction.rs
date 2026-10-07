@@ -366,10 +366,20 @@ async fn evictor_error_keeps_the_stub_mirror_consistent_with_redb() {
 
     let rel_old = "lib/OLD_01.NEF";
     let rel_new = "lib/NEW_01.NEF";
-    let r_old =
-        upload_original(&mgr_a, root_a.path(), rel_old, &original_bytes(1, 80 * 1024)).await;
-    let r_new =
-        upload_original(&mgr_a, root_a.path(), rel_new, &original_bytes(2, 80 * 1024)).await;
+    let r_old = upload_original(
+        &mgr_a,
+        root_a.path(),
+        rel_old,
+        &original_bytes(1, 80 * 1024),
+    )
+    .await;
+    let r_new = upload_original(
+        &mgr_a,
+        root_a.path(),
+        rel_new,
+        &original_bytes(2, 80 * 1024),
+    )
+    .await;
 
     // Device B stubs both, hydrates OLD first (LRU victim) then NEW.
     let root_b = tempfile::tempdir().expect("root b");
