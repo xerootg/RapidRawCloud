@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useSettingsStore } from '../../../store/useSettingsStore';
 import { useSyncStore } from '../../../store/useSyncStore';
 import { useSyncActions } from '../../../hooks/useSyncActions';
-import { SyncSettings } from '../../ui/AppProperties';
+import { Invokes, SyncSettings } from '../../ui/AppProperties';
 import DeviceManagementPanel from './DeviceManagementPanel';
 import RecentlyDeletedView from './RecentlyDeletedView';
 
@@ -39,10 +41,56 @@ export default function SyncSettingsSection() {
   const [accessKey, setAccessKey] = useState('');
   const [secretKey, setSecretKey] = useState('');
   const [savingCreds, setSavingCreds] = useState(false);
+  const [pairUrl, setPairUrl] = useState('');
+  const [pairState, setPairState] = useState<'idle' | 'waiting' | 'applying' | 'done' | 'error'>(
+    'idle',
+  );
+  const [pairMessage, setPairMessage] = useState('');
 
   useEffect(() => {
     void refreshStatus();
   }, [refreshStatus]);
+
+  // "Pair with cloud" (docs/CLOUD_SETUP.md §6): the Rust side forwards the
+  // rapidraw://auth-callback deep link as this event; completing it fetches
+  // and applies the whole sync config + credentials.
+  useEffect(() => {
+    const un = listen<string>('rrcloud-pair-callback', async (event) => {
+      setPairState('applying');
+      setPairMessage('Finishing sign-in…');
+      try {
+        const applied = await invoke<SyncSettings>(Invokes.SyncPairComplete, {
+          callbackUrl: event.payload,
+        });
+        setForm(applied);
+        if (appSettings) {
+          await handleSettingsChange({ ...appSettings, sync: applied });
+        }
+        setPairState('done');
+        setPairMessage('Paired! Cloud sync is configured.');
+        await refreshStatus();
+      } catch (err) {
+        setPairState('error');
+        setPairMessage(String(err));
+      }
+    });
+    return () => {
+      void un.then((f) => f());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [appSettings, handleSettingsChange, refreshStatus]);
+
+  const beginPair = async () => {
+    setPairState('waiting');
+    setPairMessage('Opening your browser to sign in…');
+    try {
+      await invoke<string>(Invokes.SyncPairBegin, { discoveryUrl: pairUrl });
+      setPairMessage('Finish signing in — this screen updates automatically.');
+    } catch (err) {
+      setPairState('error');
+      setPairMessage(String(err));
+    }
+  };
 
   useEffect(() => {
     if (appSettings?.sync) setForm(appSettings.sync);
@@ -74,6 +122,40 @@ export default function SyncSettingsSection() {
 
   return (
     <div className="flex flex-col gap-6">
+      <section className="flex flex-col gap-3">
+        <h3 className="text-text-primary font-medium">Pair with cloud</h3>
+        <p className="text-text-secondary text-sm">
+          Have a pairing service? Enter its URL and sign in — endpoint, bucket, and
+          credentials are configured for you.
+        </p>
+        <Field
+          label="Pairing service URL"
+          value={pairUrl}
+          onChange={setPairUrl}
+          placeholder="rrc.example.com"
+        />
+        <button
+          className="self-start px-3 py-1.5 rounded-md bg-accent text-button-text disabled:opacity-50"
+          disabled={!pairUrl || pairState === 'waiting' || pairState === 'applying'}
+          onClick={() => void beginPair()}
+        >
+          Pair with cloud
+        </button>
+        {pairMessage && (
+          <p
+            className={`text-sm ${
+              pairState === 'error'
+                ? 'text-red-400'
+                : pairState === 'done'
+                  ? 'text-green-400'
+                  : 'text-text-secondary'
+            }`}
+          >
+            {pairMessage}
+          </p>
+        )}
+      </section>
+
       <section className="flex flex-col gap-3">
         <h3 className="text-text-primary font-medium">Cloud Sync</h3>
         <label className="flex items-center justify-between">

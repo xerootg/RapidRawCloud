@@ -33,6 +33,8 @@ pub mod credentials;
 pub mod events;
 pub mod hooks;
 pub mod manager;
+#[cfg(feature = "sync")]
+pub mod pairing;
 
 pub use credentials::{CredentialStore, Credentials, FileCredentialStore};
 

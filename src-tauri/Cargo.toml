@@ -20,7 +20,7 @@ tethering = ["dep:gphoto2"]
 # registration); it is a plain dependency of every platform's build (like
 # any other Tauri plugin crate) but is only ever *used* — `init()` called,
 # its android/ Kotlin project linked — under `sync`, mirroring rrcloud-core.
-sync = ["dep:rrcloud-core", "dep:tauri-plugin-rrcloud"]
+sync = ["dep:rrcloud-core", "dep:tauri-plugin-rrcloud", "dep:tauri-plugin-deep-link"]
 
 [dependencies]
 tauri = { version = "2.11", features = [ "macos-private-api", "rustls-tls", "protocol-asset" ] }
@@ -87,6 +87,9 @@ rrcloud-core = { path = "crates/rrcloud-core", optional = true }
 # `worker/`) rather than under `crates/`, matching where `tauri plugin new`
 # puts a plugin by convention. Optional + gated by `sync` above.
 tauri-plugin-rrcloud = { path = "../tauri-plugin-rrcloud", optional = true }
+# "Pair with cloud" (docs/CLOUD_SETUP.md §6): receives the OIDC/PKCE
+# rapidraw://auth-callback redirect. sync-only, like rrcloud-core.
+tauri-plugin-deep-link = { version = "2", optional = true }
 # Per-path sidecar lock map (§3.4 step 1).
 dashmap = "6"
 

@@ -1887,6 +1887,12 @@ pub fn run() {
         // (`crate::sync::manager::start_in_setup`, below) — a
         // `--no-default-features` build links neither.
         builder = builder.plugin(tauri_plugin_rrcloud::init());
+        // "Pair with cloud" (docs/CLOUD_SETUP.md §6): receives the
+        // rapidraw://auth-callback OIDC redirect. The Android intent-filter
+        // lives on MainActivity (gen/android manifest); this plugin surfaces
+        // the intent to Rust, and the setup hook below forwards it to the
+        // webview, which calls `sync_pair_complete`.
+        builder = builder.plugin(tauri_plugin_deep_link::init());
     }
 
     builder
@@ -1908,6 +1914,27 @@ pub fn run() {
                     }
         })
         .setup(move |app| {
+            // "Pair with cloud" deep-link return (docs/CLOUD_SETUP.md §6):
+            // the OIDC redirect rapidraw://auth-callback lands here (plugin
+            // callback runs on both the cold-start intent and onNewIntent).
+            // Forward the URL to the webview; the Sync settings screen calls
+            // `sync_pair_complete` with it. Forward-only — no OAuth logic on
+            // this side of the boundary.
+            #[cfg(feature = "sync")]
+            {
+                use tauri::Emitter;
+                use tauri_plugin_deep_link::DeepLinkExt;
+                let handle = app.handle().clone();
+                app.deep_link().on_open_url(move |event| {
+                    for url in event.urls() {
+                        let url = url.to_string();
+                        if url.starts_with(crate::sync::pairing::REDIRECT_URI) {
+                            let _ = handle.emit("rrcloud-pair-callback", url);
+                        }
+                    }
+                });
+            }
+
             #[cfg(feature = "tethering")]
             {
                 std::thread::spawn(|| {
@@ -2407,6 +2434,10 @@ pub fn run() {
             sync::commands::sync_configure,
             #[cfg(feature = "sync")]
             sync::commands::sync_set_credentials,
+            #[cfg(feature = "sync")]
+            sync::pairing::sync_pair_begin,
+            #[cfg(feature = "sync")]
+            sync::pairing::sync_pair_complete,
             #[cfg(feature = "sync")]
             sync::commands::sync_pin_paths,
             #[cfg(feature = "sync")]

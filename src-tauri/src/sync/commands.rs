@@ -158,7 +158,7 @@ pub fn hydrate_core(manager: &SyncManager, path: PathBuf) -> Result<(), String> 
 /// Kotlin-side Keystore store via the same JNI methods (see
 /// `android_integration::android_credential_store_load` and
 /// `rrcloud_core::android::bridge`'s doc).
-fn credential_store(app: &AppHandle) -> Result<Box<dyn CredentialStore>, String> {
+pub(crate) fn credential_store(app: &AppHandle) -> Result<Box<dyn CredentialStore>, String> {
     #[cfg(target_os = "android")]
     {
         let _ = app;

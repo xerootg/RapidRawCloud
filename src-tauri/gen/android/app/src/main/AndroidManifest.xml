@@ -22,6 +22,16 @@
                 <!-- AndroidTV support -->
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
+            <!-- RapidRawCloud pairing (docs/CLOUD_SETUP.md §6): the OIDC/PKCE
+                 redirect rapidraw://auth-callback returns here from the
+                 browser; tauri-plugin-deep-link picks it up (the activity is
+                 singleTask, so the running instance gets onNewIntent). -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="rapidraw" android:host="auth-callback" />
+            </intent-filter>
         </activity>
 
         <provider
