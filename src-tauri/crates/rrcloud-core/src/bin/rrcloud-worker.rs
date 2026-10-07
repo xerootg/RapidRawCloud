@@ -53,13 +53,18 @@ async fn main() -> ExitCode {
 }
 
 async fn real_main(inv: Invocation) -> Result<(), worker::WorkerError> {
-    let cfg = WorkerConfig::from_env()?;
+    // Resolve the single-user WorkerConfig only on the paths that use it.
+    // Fleet mode gets its per-user configs from the admin bucket's config
+    // docs (FleetConfig::from_env), so requiring RRCLOUD_ENDPOINT here made
+    // every real fleet deployment crash-loop on startup with
+    // "missing required configuration: RRCLOUD_ENDPOINT".
     match inv {
         // Stateless read-only reporting: open_readonly never requires (nor
         // uses) a persistent state dir and never journals, so `--report`
         // works with RRCLOUD_STATE_DIR unset — the one CLI path to §6's
         // "a stateless invocation may at most do read-only reporting".
         Invocation::Report => {
+            let cfg = WorkerConfig::from_env()?;
             let worker = Worker::open_readonly(&cfg)?;
             let report = worker::run_cycle(&worker, &CycleOptions::default()).await?;
             println!(
@@ -69,6 +74,7 @@ async fn real_main(inv: Invocation) -> Result<(), worker::WorkerError> {
             Ok(())
         }
         Invocation::Run(mode) => {
+            let cfg = WorkerConfig::from_env()?;
             let worker = Worker::open(&cfg)?;
             worker::run(&worker, mode, &CycleOptions::default()).await
         }
