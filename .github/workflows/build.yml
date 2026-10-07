@@ -56,7 +56,15 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
-          key: ${{ inputs.mobile == '' && inputs.platform || format('{0}-{1}', inputs.platform, inputs.mobile) }}-${{ contains(inputs.build-args, 'tethering') && 'tethering' || 'standard' }}
+          # Save the cache even when the build fails: the android leg
+          # compiles ~900 crates for aarch64-linux-android in 25-45 min,
+          # and with the default (cache-on-failure: false) three failed
+          # release runs in a row each recompiled everything from zero.
+          cache-on-failure: true
+          # inputs.target is part of the key so cross-target legs on the
+          # same image (e.g. android aarch64 vs desktop x86_64, both on
+          # ubuntu) don't thrash each other's caches.
+          key: ${{ inputs.mobile == '' && inputs.platform || format('{0}-{1}', inputs.platform, inputs.mobile) }}-${{ inputs.target || 'host' }}-${{ contains(inputs.build-args, 'tethering') && 'tethering' || 'standard' }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -116,6 +124,20 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      # Caches the gradle distribution and dependency caches (~/.gradle).
+      # Without it every android run logged "Build cache is disabled" /
+      # "No history is available", re-downloaded the gradle distribution +
+      # all maven deps and re-ran all ~255 tasks. setup-gradle saves its
+      # caches in the post step even when the build fails.
+      - name: Setup Gradle
+        if: inputs.mobile == 'android'
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          # Release runs execute on tag refs; setup-gradle's default is
+          # cache-read-only for anything but the default branch, which
+          # would mean release runs never save a cache.
+          cache-read-only: false
+
       - name: Setup Android SDK
         if: inputs.mobile == 'android'
         uses: android-actions/setup-android@v3
@@ -132,6 +154,29 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm install
+
+      # src-tauri/build.rs downloads the ONNX Runtime library
+      # (~100-400 MB per platform, from huggingface) into
+      # src-tauri/libs/arm64-v8a (android) or src-tauri/resources
+      # (desktop) on every uncached run. Restore it from cache before the
+      # build steps; build.rs sha256-verifies whatever is on disk and
+      # re-downloads if missing or corrupt, so a cold or stale cache
+      # cannot break the build. Only the downloaded lib files are cached —
+      # src-tauri/resources also holds checked-in assets (film_luts,
+      # licenses) that must come from the checkout, not a cache.
+      # Keep the version in the key in sync with the onnxruntimes-vX.Y.Z
+      # URL in src-tauri/build.rs. runner.arch is needed because e.g. the
+      # ubuntu x86_64 and ubuntu arm legs both have inputs.target == ''.
+      - name: Restore ONNX Runtime cache
+        id: onnx-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            src-tauri/libs
+            src-tauri/resources/libonnxruntime.so
+            src-tauri/resources/libonnxruntime.dylib
+            src-tauri/resources/onnxruntime.dll
+          key: onnxruntime-v1.22.0-${{ runner.os }}-${{ runner.arch }}-${{ inputs.target || 'host' }}
 
       - name: Setup Android signing
         if: inputs.mobile == 'android' && github.event_name != 'pull_request'
@@ -187,6 +232,21 @@ jobs:
           ORT_STRATEGY: manual
         run: |
           npx tauri android build --verbose ${{ inputs.build-args }}
+
+      # Explicit save (instead of actions/cache's automatic post step) so
+      # the ONNX download is kept even when the build itself fails —
+      # failed android runs were exactly the case that kept re-downloading
+      # it. Skipped on a cache hit: the key is exact and immutable.
+      - name: Save ONNX Runtime cache
+        if: always() && steps.onnx-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            src-tauri/libs
+            src-tauri/resources/libonnxruntime.so
+            src-tauri/resources/libonnxruntime.dylib
+            src-tauri/resources/onnxruntime.dll
+          key: ${{ steps.onnx-cache.outputs.cache-primary-key }}
 
       - name: Prepare Android Release Assets
         if: ${{ inputs.mobile == 'android' && inputs.release-id != '' }}
