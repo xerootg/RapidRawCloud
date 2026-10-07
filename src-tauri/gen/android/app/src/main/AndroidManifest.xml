@@ -32,6 +32,21 @@
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="rapidraw" android:host="auth-callback" />
             </intent-filter>
+            <!-- DEEP LINK PLUGIN. AUTO-GENERATED. DO NOT REMOVE. -->
+            <intent-filter >
+                <action android:name="android.intent.action.VIEW" />
+                <!-- ChromeOS ARC++ uses a different action for deep links -->
+                <action android:name="org.chromium.arc.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="rapidraw" />
+                <data android:host="auth-callback" />
+                
+                
+                
+                
+            </intent-filter>
+            <!-- DEEP LINK PLUGIN. AUTO-GENERATED. DO NOT REMOVE. -->
             <!-- tauri-file-associations. AUTO-GENERATED. DO NOT REMOVE. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
@@ -203,7 +218,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:mimeType="image/png" />
+                <data android:mimeType="image/bmp" />
                 <data android:pathPattern=".*\\.pro" />
                 <data android:pathPattern=".*\\.ari" />
                 <data android:pathPattern=".*\\.bay" />
@@ -255,7 +270,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:mimeType="image/tiff" />
+                <data android:mimeType="image/png" />
                 <data android:pathPattern=".*\\.pro" />
                 <data android:pathPattern=".*\\.ari" />
                 <data android:pathPattern=".*\\.bay" />
@@ -281,7 +296,7 @@
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
-                <data android:mimeType="image/bmp" />
+                <data android:mimeType="image/tiff" />
                 <data android:pathPattern=".*\\.pro" />
                 <data android:pathPattern=".*\\.ari" />
                 <data android:pathPattern=".*\\.bay" />
