@@ -78,7 +78,8 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
-            pkg-config
+            pkg-config \
+            xdg-utils
 
       - name: Install libgphoto2 for Tethering (Linux)
         if: runner.os == 'Linux' && contains(inputs.build-args, 'tethering')
