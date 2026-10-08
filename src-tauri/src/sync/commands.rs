@@ -132,6 +132,60 @@ pub fn configure_core(
         .map_err(|e| e.to_string())
 }
 
+/// Startup auto-configure (§3.3). On launch, re-point the in-process
+/// [`SyncManager`] at the saved sync settings + stored credentials so the
+/// app-crate engine is actually LIVE for the session — the status badge then
+/// reflects the real state db, imports get tracked (`notify_new_original`), and
+/// the foreground cycle ([`SyncManager::spawn_foreground_cycle`]) can run and
+/// emit live events. Without this the manager stays inert until the user opens
+/// Settings → Sync and taps Save, so a normal launch's imports never sync and
+/// the badge is only coincidentally right. A no-op when sync is disabled or no
+/// library is open. A state-db lock contention (the Android background worker
+/// momentarily holds it) is logged, not fatal — the §5.1 foreground reacquire /
+/// the next cycle recovers.
+pub fn auto_configure_on_startup(
+    app: &AppHandle,
+    manager: &SyncManager,
+    settings: &crate::app_settings::AppSettings,
+) {
+    if !settings.sync.enabled {
+        return;
+    }
+    let Some(sync_root) = settings
+        .root_folders
+        .first()
+        .cloned()
+        .or_else(|| settings.last_root_path.clone())
+        .map(PathBuf::from)
+    else {
+        return; // no library open yet; nothing to key the engine against
+    };
+    let state_dir = match app.path().app_data_dir() {
+        Ok(dir) => dir.join("rrcloud"),
+        Err(e) => {
+            log::warn!("sync auto-configure: no app_data_dir: {e}");
+            return;
+        }
+    };
+    let store = match credential_store(app) {
+        Ok(store) => store,
+        Err(e) => {
+            log::warn!("sync auto-configure: credential store unavailable: {e}");
+            return;
+        }
+    };
+    match configure_core(
+        manager,
+        &*store,
+        settings.sync.clone(),
+        sync_root,
+        state_dir,
+    ) {
+        Ok(()) => log::info!("sync: auto-configured the in-process engine from saved settings"),
+        Err(e) => log::warn!("sync auto-configure failed (will retry on a later cycle): {e}"),
+    }
+}
+
 /// "Make available offline" (§3.5): hydrate the stub at `path` to its original
 /// bytes, returning when done. Wraps [`SyncManager::ensure_local`] on a
 /// blocking worker so the async command never stalls the runtime.
