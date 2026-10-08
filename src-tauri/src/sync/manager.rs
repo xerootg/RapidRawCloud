@@ -206,6 +206,15 @@ pub struct SyncManager {
     /// under the `sync` feature. Empty ⇒ every `is_stub` query is `false`,
     /// which is exactly upstream behavior.
     stub_set: Mutex<HashSet<PathBuf>>,
+    /// The app handle to emit `sync-*` live-status events through (§3.8), set
+    /// once in [`start_in_setup`]. `None` in tests / headless and before
+    /// setup, in which case [`Self::publish_sync_events`] is a silent no-op.
+    app: std::sync::Mutex<Option<tauri::AppHandle>>,
+    /// The last `path -> ui-state` map emitted, so each
+    /// [`Self::publish_sync_events`] call emits only the items that actually
+    /// changed since the previous one (§3.8 batched item-state updates).
+    #[cfg(feature = "sync")]
+    last_item_states: std::sync::Mutex<std::collections::HashMap<String, String>>,
     #[cfg(feature = "sync")]
     inner: std::sync::Mutex<Option<Arc<imp::Configured>>>,
     /// The parameters of the last successful [`Self::configure`] call
@@ -225,6 +234,9 @@ impl SyncManager {
         Arc::new(SyncManager {
             configured: AtomicBool::new(false),
             stub_set: Mutex::new(HashSet::new()),
+            app: std::sync::Mutex::new(None),
+            #[cfg(feature = "sync")]
+            last_item_states: std::sync::Mutex::new(std::collections::HashMap::new()),
             #[cfg(feature = "sync")]
             inner: std::sync::Mutex::new(None),
             #[cfg(feature = "sync")]
@@ -434,7 +446,11 @@ impl SyncManager {
         #[cfg(feature = "sync")]
         {
             let cfg = self.configured()?;
-            cfg.run_cycle().await
+            let status = cfg.run_cycle().await?;
+            // §3.8: push the post-cycle status + per-item deltas to the webview
+            // so the badge and grid icons settle without a poll.
+            self.publish_sync_events();
+            Ok(status)
         }
         #[cfg(not(feature = "sync"))]
         {
@@ -454,6 +470,60 @@ impl SyncManager {
         #[cfg(not(feature = "sync"))]
         {
             SyncStatus::default()
+        }
+    }
+
+    /// Emits the §3.8 live-status events — `sync-status` (always) plus the
+    /// batched `sync-item-state` deltas since the previous call — through the
+    /// app handle set in [`start_in_setup`]. A silent no-op when no app handle
+    /// is set (tests / headless) or sync is off / unconfigured. Called at the
+    /// end of each cycle, right after a local change marks an item dirty, and
+    /// after a hydration, so the header badge and the per-photo grid icons
+    /// track state live without the webview polling `sync_status`.
+    pub fn publish_sync_events(&self) {
+        let app = match self.app.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            Some(app) => app,
+            None => return,
+        };
+        #[cfg(feature = "sync")]
+        {
+            let Ok(cfg) = self.configured() else {
+                return;
+            };
+            let status = cfg.status_snapshot(0, 0);
+            let state = match status.state {
+                SyncState::Idle => "idle",
+                SyncState::Syncing => "syncing",
+                SyncState::Offline => "offline",
+                SyncState::Error => "error",
+            };
+            crate::sync::events::emit_status(
+                &app,
+                &crate::sync::events::SyncStatusEvent {
+                    state: state.to_string(),
+                    pending_up: status.pending_up,
+                    pending_down: status.pending_down,
+                    // Byte accounting is not tracked yet (object counts only).
+                    bytes_up: 0,
+                    bytes_down: 0,
+                    dirty_unbacked: status.dirty_unbacked,
+                },
+            );
+
+            let now = cfg.item_state_map();
+            let mut last = self
+                .last_item_states
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let changed = crate::sync::events::diff_item_states(&last, &now);
+            if !changed.is_empty() {
+                crate::sync::events::emit_item_states(&app, &changed);
+                *last = now;
+            }
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = app;
         }
     }
 
@@ -483,6 +553,9 @@ impl SyncManager {
         {
             if let Ok(cfg) = self.configured() {
                 cfg.note_local_sidecar(sidecar_path, origin);
+                // §3.8: a user edit just marked this item dirty — flip its grid
+                // icon to the upload indicator now, not at the next cycle.
+                self.publish_sync_events();
             }
         }
         #[cfg(not(feature = "sync"))]
@@ -514,6 +587,9 @@ impl SyncManager {
         {
             if let Ok(cfg) = self.configured() {
                 cfg.note_new_original(path);
+                // §3.8: a freshly imported/derived original is now pending
+                // upload — surface its grid icon immediately.
+                self.publish_sync_events();
             }
         }
         #[cfg(not(feature = "sync"))]
@@ -711,6 +787,17 @@ impl SyncManager {
             let cfg = self.configured()?;
             let hydrated = cfg.hydrate(path, reason)?;
             self.mark_stub(path, false);
+            // §3.8: the stub is now the real original — emit `sync-hydrated`
+            // and refresh the grid icon (stub → synced) for this path.
+            if let Some(app) = self.app.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                crate::sync::events::emit_hydrated(
+                    &app,
+                    &crate::sync::events::SyncHydratedEvent {
+                        path: path.to_string_lossy().into_owned(),
+                    },
+                );
+            }
+            self.publish_sync_events();
             Ok(hydrated)
         }
         #[cfg(not(feature = "sync"))]
@@ -1007,7 +1094,9 @@ impl SyncManager {
 /// task and the credential/settings load are part of that P2 work (command
 /// registration / `configure`, per UPSTREAM_TOUCHES.md), not this unit.
 pub fn start_in_setup(app: &tauri::AppHandle, manager: &Arc<SyncManager>) {
-    let _ = app;
+    // Retain the app handle so the engine can emit `sync-*` live-status events
+    // (§3.8) from its cycle / local-change / hydrate paths.
+    *manager.app.lock().unwrap_or_else(|e| e.into_inner()) = Some(app.clone());
     crate::sync::install_global_manager(manager.clone());
 }
 
@@ -1095,6 +1184,28 @@ mod imp {
     /// Maps any displayable engine error into a [`SyncError`].
     fn se<E: std::fmt::Display>(e: E) -> SyncError {
         SyncError::Message(e.to_string())
+    }
+
+    /// Collapses the fine-grained per-item [`ItemState`] into the coarse UI
+    /// vocabulary the library badge (`SyncItemBadge.tsx`) and the P2 listing's
+    /// `ImageFile.sync_state` understand (§3.8). The four upload-lane states
+    /// all read as `pending_up` (one up-arrow); the two download-lane states
+    /// as `pending_down`. Keeping this the single source of the vocabulary is
+    /// what makes the static listing badge and the live `sync-item-state`
+    /// event agree — before this the raw `dirty`/`queued`/`uploading` strings
+    /// matched no badge case, so uploading items showed no icon at all.
+    pub(super) fn item_state_ui(state: ItemState) -> &'static str {
+        match state {
+            ItemState::Dirty | ItemState::Queued | ItemState::Uploading | ItemState::Verifying => {
+                "pending_up"
+            }
+            ItemState::PendingDown | ItemState::Downloading => "pending_down",
+            ItemState::Stub => "stub",
+            ItemState::CorruptRemote => "corrupt_remote",
+            ItemState::Conflict => "conflict",
+            ItemState::Synced => "synced",
+            ItemState::Hydrated => "hydrated",
+        }
     }
 
     /// The file's mtime in unix nanoseconds, or 0 when unavailable.
@@ -3005,9 +3116,38 @@ mod imp {
         pub fn item_sync_state(&self, image_path: &Path) -> Option<String> {
             let rk = relkey(image_path, &self.sync_root).ok()?;
             let record = self.db.get_item(&rk).ok().flatten()?;
-            serde_json::to_value(record.state)
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_string))
+            if record.deleted {
+                return None;
+            }
+            Some(item_state_ui(record.state).to_string())
+        }
+
+        /// The full `absolute-path -> ui-state` map for every live (non-deleted)
+        /// item this device knows about — the snapshot the §3.8 live
+        /// `sync-item-state` batch is diffed from (see
+        /// [`super::SyncManager::publish_sync_events`]). Keyed by absolute path
+        /// (what the grid's per-item badge looks up), valued in the same UI
+        /// vocabulary as [`item_state_ui`] / [`Self::item_sync_state`].
+        pub fn item_state_map(&self) -> std::collections::HashMap<String, String> {
+            let mut out = std::collections::HashMap::new();
+            let items = match self.db.iter_items() {
+                Ok(items) => items,
+                Err(e) => {
+                    log::warn!("sync: iter_items for item_state_map: {e}");
+                    return out;
+                }
+            };
+            for (rk, record) in items {
+                if record.deleted {
+                    continue;
+                }
+                let path = item_local_path(&self.sync_root, &rk);
+                out.insert(
+                    path.to_string_lossy().into_owned(),
+                    item_state_ui(record.state).to_string(),
+                );
+            }
+            out
         }
 
         // ---- §3.8 control-surface helpers (U8 command layer) ------------
@@ -3472,6 +3612,38 @@ mod imp {
                 downloaded,
                 dirty_unbacked: pending_up,
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{ItemState, item_state_ui};
+
+        #[test]
+        fn item_state_ui_collapses_lanes_to_the_badge_vocabulary() {
+            // The four upload-lane states all read as one up-arrow.
+            for s in [
+                ItemState::Dirty,
+                ItemState::Queued,
+                ItemState::Uploading,
+                ItemState::Verifying,
+            ] {
+                assert_eq!(
+                    item_state_ui(s),
+                    "pending_up",
+                    "{s:?} is an upload-lane state"
+                );
+            }
+            // Both download-lane states read as one down-arrow.
+            assert_eq!(item_state_ui(ItemState::PendingDown), "pending_down");
+            assert_eq!(item_state_ui(ItemState::Downloading), "pending_down");
+            // The rest map one-to-one onto the vocabulary the frontend badge
+            // (SyncItemBadge.tsx) switches on.
+            assert_eq!(item_state_ui(ItemState::Stub), "stub");
+            assert_eq!(item_state_ui(ItemState::CorruptRemote), "corrupt_remote");
+            assert_eq!(item_state_ui(ItemState::Conflict), "conflict");
+            assert_eq!(item_state_ui(ItemState::Synced), "synced");
+            assert_eq!(item_state_ui(ItemState::Hydrated), "hydrated");
         }
     }
 }

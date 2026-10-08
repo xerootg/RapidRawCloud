@@ -449,15 +449,18 @@ async fn concurrent_ensure_local_waits_for_the_in_flight_hydration() {
     let stub_thread = stub_path.clone();
     let handle = std::thread::spawn(move || mgr_thread.ensure_local(&stub_thread, "thread-a"));
 
-    // Observe the in-flight `downloading` window, then race a second
-    // ensure_local into it. download_item refuses an item already Downloading
-    // with a typed StaleState (the single-driver contract); the manager must
-    // treat that as "already in flight" and WAIT, not surface a hard failure.
+    // Observe the in-flight download window, then race a second ensure_local
+    // into it. download_item refuses an item already Downloading with a typed
+    // StaleState (the single-driver contract); the manager must treat that as
+    // "already in flight" and WAIT, not surface a hard failure. `item_sync_state`
+    // reports the badge vocabulary (§3.8), so the active-download state surfaces
+    // as `pending_down` — and a stub hydrated directly via ensure_local goes
+    // Stub → Downloading without resting at PendingDown, so this IS that window.
     let mut observed_downloading = false;
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(60) {
         match mgr_b.item_sync_state(&stub_path).as_deref() {
-            Some("downloading") => {
+            Some("pending_down") => {
                 observed_downloading = true;
                 break;
             }
