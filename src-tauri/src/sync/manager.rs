@@ -215,6 +215,10 @@ pub struct SyncManager {
     /// changed since the previous one (§3.8 batched item-state updates).
     #[cfg(feature = "sync")]
     last_item_states: std::sync::Mutex<std::collections::HashMap<String, String>>,
+    /// Guards [`Self::spawn_foreground_cycle`] so the webview's resume /
+    /// interval / post-import pokes never stack up more than one in-process
+    /// cycle at a time.
+    fg_cycle_running: AtomicBool,
     #[cfg(feature = "sync")]
     inner: std::sync::Mutex<Option<Arc<imp::Configured>>>,
     /// The parameters of the last successful [`Self::configure`] call
@@ -237,6 +241,7 @@ impl SyncManager {
             app: std::sync::Mutex::new(None),
             #[cfg(feature = "sync")]
             last_item_states: std::sync::Mutex::new(std::collections::HashMap::new()),
+            fg_cycle_running: AtomicBool::new(false),
             #[cfg(feature = "sync")]
             inner: std::sync::Mutex::new(None),
             #[cfg(feature = "sync")]
@@ -455,6 +460,45 @@ impl SyncManager {
         #[cfg(not(feature = "sync"))]
         {
             Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    /// Kicks one in-process sync cycle on a dedicated thread and returns
+    /// immediately (§3.3 foreground driver, backing the `sync_run_cycle`
+    /// command). The cycle runs through [`Self::run_once`], which emits the
+    /// live §3.8 `sync-status` / `sync-item-state` events as it progresses — so
+    /// the webview badges animate through pending → synced while the user
+    /// watches, and the inbound poll bootstraps the bucket's photos into the
+    /// library. A no-op when sync is off / unconfigured, or when a foreground
+    /// cycle is already running (the `fg_cycle_running` guard). The cycle's
+    /// future is `!Send` (the transfer lanes), so it is created and polled
+    /// entirely on the spawned thread's own current-thread runtime; only the
+    /// `Send` `Arc<Self>` crosses the thread boundary.
+    pub fn spawn_foreground_cycle(self: &Arc<Self>) {
+        #[cfg(feature = "sync")]
+        {
+            if !self.is_configured() {
+                return;
+            }
+            if self.fg_cycle_running.swap(true, Ordering::SeqCst) {
+                return; // a foreground cycle is already in flight
+            }
+            let me = Arc::clone(self);
+            std::thread::spawn(move || {
+                let outcome = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| SyncError::msg(format!("foreground cycle runtime: {e}")))
+                    .and_then(|rt| rt.block_on(me.run_once()).map(|_| ()));
+                if let Err(e) = outcome {
+                    log::warn!("foreground sync cycle failed: {e}");
+                }
+                me.fg_cycle_running.store(false, Ordering::SeqCst);
+            });
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = self;
         }
     }
 

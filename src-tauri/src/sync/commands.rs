@@ -185,6 +185,27 @@ pub fn sync_status(state: State<'_, AppState>, app: AppHandle) -> Result<SyncSta
     Ok(status_core(&state.sync_manager, creds))
 }
 
+/// §3.3 foreground sync cycle. Runs one full cycle IN-PROCESS through the
+/// app-crate [`SyncManager`] (upload lane → inbound poll + apply → download
+/// lane) and returns the resulting status. Unlike the Android background
+/// WorkManager cycle (which runs a parallel implementation in `rrcloud-core`
+/// and never touches this manager), this path emits the live `sync-status` /
+/// `sync-item-state` events the webview badges consume — so the frontend calls
+/// it on resume / right after an import / on a light foreground interval to make
+/// sync visibly progress and to bootstrap the bucket's photos into the library
+/// grid. A no-op (returns the current status) when sync is not configured.
+#[tauri::command]
+pub fn sync_run_cycle(state: State<'_, AppState>, app: AppHandle) -> Result<SyncStatusDto, String> {
+    // Kick the cycle on its own thread and return the current status at once;
+    // the cycle emits live `sync-*` events as it progresses, so the webview
+    // updates without this call blocking on uploads/downloads. The guard inside
+    // `spawn_foreground_cycle` coalesces overlapping pokes into one cycle.
+    state.sync_manager.spawn_foreground_cycle();
+    let store = credential_store(&app)?;
+    let creds = credentials_configured_core(&*store);
+    Ok(status_core(&state.sync_manager, creds))
+}
+
 /// Persists `settings` (via the settings path) and reconfigures the manager.
 #[tauri::command]
 pub async fn sync_configure(

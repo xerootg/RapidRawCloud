@@ -2617,6 +2617,8 @@ pub fn run() {
             #[cfg(feature = "sync")]
             sync::commands::sync_status,
             #[cfg(feature = "sync")]
+            sync::commands::sync_run_cycle,
+            #[cfg(feature = "sync")]
             sync::commands::sync_configure,
             #[cfg(feature = "sync")]
             sync::commands::sync_set_credentials,

@@ -123,6 +123,7 @@ export enum Invokes {
   // Cloud sync (ARCHITECTURE.md §3.3/§3.5/§3.6/§3.8, U8). Absent on an
   // upstream `--no-default-features` build; callers guard via useSyncActions.
   SyncStatus = 'sync_status',
+  SyncRunCycle = 'sync_run_cycle',
   SyncConfigure = 'sync_configure',
   SyncSetCredentials = 'sync_set_credentials',
   SyncPairBegin = 'sync_pair_begin',

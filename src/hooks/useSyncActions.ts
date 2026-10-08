@@ -38,6 +38,22 @@ export function useSyncActions() {
     await invoke(Invokes.SyncConfigure, { settings });
   }, []);
 
+  // §3.3 foreground cycle: kicks an in-process sync pass (upload → poll+apply →
+  // download) that emits the live sync-* events and bootstraps remote photos
+  // into the library. Returns immediately (the cycle runs on its own thread);
+  // the returned status is the pre-cycle snapshot, with live events following.
+  const runCycle = useCallback(async (): Promise<SyncStatusDto | null> => {
+    try {
+      const status = await invoke<SyncStatusDto>(Invokes.SyncRunCycle);
+      setAvailable(true);
+      setStatus(status);
+      return status;
+    } catch (_err) {
+      setAvailable(false);
+      return null;
+    }
+  }, [setAvailable, setStatus]);
+
   const setCredentials = useCallback(async (accessKey: string, secretKey: string): Promise<void> => {
     // Intentionally returns void: the secret never comes back (§3.6).
     await invoke(Invokes.SyncSetCredentials, { accessKey, secretKey });
@@ -91,6 +107,7 @@ export function useSyncActions() {
 
   return {
     refreshStatus,
+    runCycle,
     configure,
     setCredentials,
     pinPaths,

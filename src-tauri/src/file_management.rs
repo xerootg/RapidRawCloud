@@ -3892,6 +3892,7 @@ pub async fn import_files(
     let _ = app_handle.emit("import-start", serde_json::json!({ "total": total_files }));
 
     tauri::async_runtime::spawn_blocking(move || {
+        let mut imported = 0usize;
         for (i, source_path_str) in source_paths.iter().enumerate() {
             let _ = app_handle.emit(
                 "import-progress",
@@ -3945,6 +3946,12 @@ pub async fn import_files(
                     }
 
                     fs::write(&dest_file_path, source_bytes).map_err(|e| e.to_string())?;
+
+                    // §2.5: tell the sync engine a new original landed in the
+                    // library so it is tracked + uploaded. Without this the
+                    // imported file sits in the sync_root untracked forever (no
+                    // cycle rescans the tree for untracked files).
+                    crate::sync::hooks::notify_new_original(&dest_file_path);
 
                     if settings.delete_after_import {
                         log::info!(
@@ -4017,6 +4024,12 @@ pub async fn import_files(
                     let _ = fs::copy(&source_rrexif, &dest_rrexif);
                 }
 
+                // §2.5: register the newly-imported original with the sync
+                // engine (marks it dirty for upload). Copied sidecars ride
+                // along with the original's item; only the original is
+                // announced here.
+                crate::sync::hooks::notify_new_original(&dest_file_path);
+
                 if settings.delete_after_import {
                     #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
                     {
@@ -4064,7 +4077,22 @@ pub async fn import_files(
                 let _ = app_handle.emit("import-error", e);
                 continue;
             }
+            imported += 1;
         }
+
+        // §3.3: kick a prompt sync cycle so the just-imported originals upload
+        // soon, instead of waiting for the periodic ~1h background worker. The
+        // in-process `notify_new_original` above already marked them dirty and
+        // emitted the live pending-upload badge; this enqueues the WorkManager
+        // cycle that actually pushes the bytes. Android-only (desktop has no
+        // WorkManager; its cycle is driven foreground via `sync_run_cycle`).
+        #[cfg(target_os = "android")]
+        if imported > 0 {
+            if let Err(e) = crate::android_integration::android_enqueue_expedited_sync() {
+                log::warn!("import: failed to enqueue expedited sync: {e}");
+            }
+        }
+        let _ = imported;
 
         let _ = app_handle.emit(
             "import-progress",
