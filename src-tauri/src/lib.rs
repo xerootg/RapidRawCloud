@@ -2240,16 +2240,11 @@ pub fn run() {
                 use tauri::Manager;
                 let state = app.state::<AppState>();
                 crate::sync::manager::start_in_setup(&app_handle, &state.sync_manager);
-                // Make the in-process engine live for the session from saved
-                // settings, so imports are tracked and the foreground cycle
-                // (and its live events) work on a normal launch — not only
-                // right after the user saves sync settings.
-                #[cfg(feature = "sync")]
-                crate::sync::commands::auto_configure_on_startup(
-                    &app_handle,
-                    &state.sync_manager,
-                    &settings,
-                );
+                // NOTE: the in-process engine is made live for the session from
+                // saved settings via the `sync_ensure_configured` command, which
+                // the webview calls on startup (`useSyncDriver`). It cannot run
+                // here: on Android the credential-store JNI needs the ndk
+                // context, which is not initialized this early in `setup()`.
             }
             jxl_oxide::integration::register_image_decoding_hook();
 
@@ -2626,6 +2621,8 @@ pub fn run() {
             // the webview call-guards on their absence.
             #[cfg(feature = "sync")]
             sync::commands::sync_status,
+            #[cfg(feature = "sync")]
+            sync::commands::sync_ensure_configured,
             #[cfg(feature = "sync")]
             sync::commands::sync_run_cycle,
             #[cfg(feature = "sync")]

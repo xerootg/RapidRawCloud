@@ -1,5 +1,7 @@
 import { useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { Invokes } from '../components/ui/AppProperties';
 import { useSyncActions } from './useSyncActions';
 import { useSyncStore } from '../store/useSyncStore';
 
@@ -25,7 +27,12 @@ export function useSyncDriver() {
     // Known non-sync build: stay inert.
     if (available === false) return;
 
-    void runCycle();
+    // Make the in-process engine live for the session (the app-crate manager is
+    // otherwise only configured after the user saves sync settings), THEN kick
+    // the first cycle. Both are no-ops on a non-sync build / when sync is off.
+    void invoke(Invokes.SyncEnsureConfigured)
+      .catch(() => {})
+      .finally(() => void runCycle());
 
     const onFocus = () => void runCycle();
     window.addEventListener('focus', onFocus);
