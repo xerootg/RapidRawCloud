@@ -181,6 +181,107 @@ async fn two_sync_managers_converge_through_a_real_bucket() {
     );
 }
 
+/// §3.5 cloud-stub model (the per-user "single library of all S3 images"):
+/// an ORIGINAL uploaded by another device is received here as a browsable
+/// 0-byte STUB — NOT eagerly downloaded — and `ensure_local` hydrates it to
+/// the real bytes on demand. Proves `stub_pending_originals` (the app-layer
+/// download policy) + the hydrate path end to end against a real bucket.
+#[tokio::test]
+async fn remote_original_is_received_as_a_hydrate_on_demand_stub() {
+    let _global = global_guard().await;
+    let Some(garage) = garage::shared() else {
+        eprintln!("SKIP: no Garage binary; set GARAGE_BIN to run the e2e test");
+        return;
+    };
+    let bucket = garage.create_unique_bucket("app-stub");
+    let settings = settings_for(garage, &bucket);
+    let creds = creds_for(garage);
+
+    // ---- device A: import a real original, sync it up ----
+    let root_a = tempfile::tempdir().expect("root a");
+    let state_a = tempfile::tempdir().expect("state a");
+    let mgr_a = SyncManager::new_inert();
+    mgr_a
+        .configure(
+            settings.clone(),
+            creds.clone(),
+            root_a.path().to_path_buf(),
+            state_a.path().to_path_buf(),
+        )
+        .expect("configure a");
+    sync::install_global_manager(mgr_a.clone());
+
+    // Opaque bytes: the sync engine is content-agnostic (blake3 + size), so a
+    // non-RAW stand-in exercises the original upload/stub/hydrate path fine.
+    let rel = Path::new("trip/DSC_2000.NEF");
+    let original_a = root_a.path().join(rel);
+    std::fs::create_dir_all(original_a.parent().unwrap()).expect("mkdir a");
+    let bytes = vec![0x42u8; 4096];
+    std::fs::write(&original_a, &bytes).expect("write original a");
+    mgr_a.note_new_original(&original_a);
+    mgr_a.run_once().await.expect("device A sync cycle");
+
+    let client = garage.client();
+    let lib_keys = keys_under(&client, &bucket, LIBRARY_PREFIX).await;
+    assert!(
+        lib_keys.iter().any(|k| k.ends_with("DSC_2000.NEF")),
+        "device A must upload the original, got {lib_keys:?}"
+    );
+
+    // ---- device B: distinct device + root, same bucket ----
+    let root_b = tempfile::tempdir().expect("root b");
+    let state_b = tempfile::tempdir().expect("state b");
+    let mgr_b = SyncManager::new_inert();
+    mgr_b
+        .configure(
+            settings.clone(),
+            creds.clone(),
+            root_b.path().to_path_buf(),
+            state_b.path().to_path_buf(),
+        )
+        .expect("configure b");
+    sync::install_global_manager(mgr_b.clone());
+
+    mgr_b.run_once().await.expect("device B sync cycle");
+
+    // B received the original as a browsable 0-byte STUB — not a full download.
+    let original_b = root_b.path().join(rel);
+    assert!(
+        original_b.exists(),
+        "device B must have a placeholder file at {}",
+        original_b.display()
+    );
+    assert_eq!(
+        std::fs::metadata(&original_b).expect("stat b").len(),
+        0,
+        "the received original must be a 0-byte stub, not a full download"
+    );
+    assert!(
+        mgr_b.is_stub(&original_b),
+        "device B must track the received original as a stub"
+    );
+    assert_eq!(
+        mgr_b.item_sync_state(&original_b).as_deref(),
+        Some("stub"),
+        "the badge state must be stub"
+    );
+
+    // ---- editing it hydrates on demand ----
+    let hydrated = mgr_b
+        .ensure_local(&original_b, "test-open")
+        .expect("hydrate on demand");
+    assert_eq!(hydrated, original_b);
+    assert_eq!(
+        std::fs::read(&original_b).expect("read hydrated b"),
+        bytes,
+        "ensure_local must download the real original bytes"
+    );
+    assert!(
+        !mgr_b.is_stub(&original_b),
+        "after hydration the item is no longer a stub"
+    );
+}
+
 #[tokio::test]
 async fn bounded_exit_flush_drains_or_times_out_without_hanging() {
     // Serialize installers of the one process-global manager (see

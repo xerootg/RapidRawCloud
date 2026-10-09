@@ -1213,7 +1213,13 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             if row.is_some() {
                 txn.remove_deleted(item)?;
             }
-            // xmp download policy is P2: metadata recording only.
+            // xmp download policy is P2: metadata recording only. Note: ORIGINALS
+            // are enqueued here too, but the app-layer cycle's stub policy
+            // (`sync::manager::Configured::stub_pending_originals`, §3.5) turns
+            // unpinned PendingDown originals into cloud stubs and dequeues them
+            // before `pump_downloads` runs, so they hydrate on demand rather than
+            // downloading eagerly. The engine itself stays download-everything;
+            // the stub-vs-download *policy* lives in the app.
             if kind != Kind::Xmp {
                 txn.queue_push(Queue::Down, item, transfer_class(kind))?;
             }

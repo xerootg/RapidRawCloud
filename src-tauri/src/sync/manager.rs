@@ -452,6 +452,17 @@ impl SyncManager {
         {
             let cfg = self.configured()?;
             let status = cfg.run_cycle().await?;
+            // §3.5: reseed the in-memory stub mirror from the durable records so
+            // the cloud stubs this cycle just materialized read as stubs (the
+            // guard sites hydrate them on open/edit; the grid shows placeholders).
+            // Authoritative: stub_paths is exactly the Stub-state items, so an
+            // item hydrated this cycle correctly drops out.
+            if let Ok(stubs) = cfg.stub_paths()
+                && let Ok(mut set) = self.stub_set.lock()
+            {
+                set.clear();
+                set.extend(stubs);
+            }
             // §3.8: push the post-cycle status + per-item deltas to the webview
             // so the badge and grid icons settle without a poll.
             self.publish_sync_events();
@@ -1165,7 +1176,7 @@ mod imp {
     use rrcloud_core::reader::poll;
     use rrcloud_core::s3::{PutObjectOptions, S3Client, S3Config};
     use rrcloud_core::semhash::{Blake3Hex, ContentId};
-    use rrcloud_core::state::{ItemRecord, ItemState, StateError, SyncDb};
+    use rrcloud_core::state::{ItemRecord, ItemState, Queue, StateError, SyncDb};
     use rrcloud_core::transfer::{
         BackendProfile, CancelFlag, ExpectedDownload, TransferConfig, TransferError,
         bucket_key_for, download_item, local_target_path, probe_backend, pump_downloads,
@@ -2707,15 +2718,26 @@ mod imp {
                 // `block_on`. An `InFlight` outcome means another driver owns
                 // the live transfer.
                 let db = self.db.clone();
-                let s3 = self.s3.clone();
+                // Build the S3 client INSIDE the dedicated-thread runtime rather
+                // than sharing `self.s3`: a reqwest client reuses pooled
+                // connections whose background driver task lives on the runtime
+                // that first opened them (the cycle's runtime). Driving such a
+                // pooled connection from this separate current-thread runtime
+                // deadlocks — the GET future never resolves because its
+                // connection is never polled. A fresh client opens its own
+                // connections on THIS runtime, so the ranged hydrate GET makes
+                // progress. (The stub tests use a mock S3, so this only bit once
+                // real hydration against a live bucket was exercised.)
+                let s3_config = self.s3.config().clone();
                 let bucket = self.bucket.clone();
                 let root = self.sync_root.clone();
                 let rk_dl = rk.clone();
                 let expected_dl = expected.clone();
                 let outcome = run_blocking(async move {
-                    let backend = resolve_backend(&db, s3.as_ref(), &bucket).await?;
+                    let s3 = S3Client::new(s3_config).map_err(se)?;
+                    let backend = resolve_backend(&db, &s3, &bucket).await?;
                     let cfg = TransferConfig::new(bucket, root.clone(), backend);
-                    match download_item(&db, s3.as_ref(), &cfg, &rk_dl, &root, &expected_dl).await {
+                    match download_item(&db, &s3, &cfg, &rk_dl, &root, &expected_dl).await {
                         Ok(o) => Ok::<HydrateOutcome, SyncError>(HydrateOutcome::Installed(o.path)),
                         Err(TransferError::State(StateError::StaleState {
                             found: Some(ItemState::Downloading),
@@ -3154,6 +3176,79 @@ mod imp {
             Ok(out)
         }
 
+        /// The §3.5 app-layer download POLICY: turn every unpinned
+        /// `PendingDown` ORIGINAL the poll just learned about into a cloud STUB
+        /// — a browsable 0-byte placeholder that hydrates on demand
+        /// (`ensure_local` at the open/edit/export guard sites) — instead of
+        /// letting `pump_downloads` fetch its full bytes. This is the per-user
+        /// "single library of all S3 images" model: a photo another device
+        /// uploaded shows up here as a placeholder, and its bytes land only when
+        /// the user opens it. Runs AFTER poll and BEFORE `pump_downloads` in the
+        /// cycle. Sidecars (small, §3.5 "never stubbed"), xmp, and *pinned*
+        /// originals are left in the download queue and fetched eagerly.
+        ///
+        /// For each candidate it writes the 0-byte file (mtime replayed from the
+        /// record so the thumbnail cache key is stable), flips the record
+        /// `PendingDown → Stub`, and `queue_remove`s it from the Down queue so
+        /// the pump skips it. Per-item isolated + best-effort (one failure logs
+        /// and continues); a path that somehow already holds real bytes is never
+        /// truncated. `ensure_local`'s hydrate uses `download_item` directly
+        /// (not this queue), so on-demand download is unaffected.
+        pub fn stub_pending_originals(&self) {
+            let items = match self.db.iter_items() {
+                Ok(items) => items,
+                Err(e) => {
+                    log::warn!("stub_pending_originals: iter_items: {e}");
+                    return;
+                }
+            };
+            for (rk, record) in items {
+                if record.deleted
+                    || record.kind != Kind::Original
+                    || record.state != ItemState::PendingDown
+                    || record.pinned
+                {
+                    continue;
+                }
+                let path = local_target_path(&self.sync_root, &rk, record.kind);
+                // A PendingDown item has no file yet; never truncate real bytes.
+                if std::fs::metadata(&path)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                if let Some(parent) = path.parent()
+                    && let Err(e) = std::fs::create_dir_all(parent)
+                {
+                    log::warn!("stub_pending_originals: mkdir {}: {e}", parent.display());
+                    continue;
+                }
+                if let Err(e) = std::fs::File::create(&path) {
+                    log::warn!("stub_pending_originals: create {}: {e}", path.display());
+                    continue;
+                }
+                let mtime = record.mtime_unix_ns / 1_000_000_000;
+                let _ =
+                    filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(mtime, 0));
+
+                // Flip to Stub + drop from the Down queue, atomically. The remote
+                // head is content-verified upstream (§2.4), so verified_remote
+                // holds; attested stays false until this device hydrates.
+                let mut stub_rec = record.clone();
+                stub_rec.state = ItemState::Stub;
+                stub_rec.verified_remote = true;
+                let res = self.db.with_txn_err::<(), StateError>(|t| {
+                    t.replay_put_item(&rk, &stub_rec)?;
+                    t.queue_remove(Queue::Down, &rk)?;
+                    Ok(())
+                });
+                if let Err(e) = res {
+                    log::warn!("stub_pending_originals: commit {}: {e}", path.display());
+                }
+            }
+        }
+
         /// Read-only query of an item's current state as a snake_case string
         /// (§3.8 badge / test observability). Not part of the §3.5 mutation
         /// surface, so it is implemented rather than scaffolded.
@@ -3580,6 +3675,14 @@ mod imp {
                     .await
                     .map_err(se)?;
             }
+
+            // §3.5 download policy: turn the remote-only originals the poll just
+            // learned about into browsable cloud stubs (0-byte placeholders that
+            // hydrate on demand) instead of eagerly downloading them. Runs before
+            // pump_downloads, which is then left only sidecars + pinned items.
+            // The outer run_once reseeds the in-memory stub mirror afterwards so
+            // `is_stub` / the guard-site hydration see them.
+            self.stub_pending_originals();
 
             // §2.9 albums/presets meta lane: upload dirty meta documents and
             // apply any converged remote meta head. A no-op when no meta work
