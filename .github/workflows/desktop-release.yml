@@ -1,0 +1,98 @@
+name: 'Release: Desktop only'
+
+# Builds the desktop platforms (Windows, macOS, Linux, incl. tethering
+# variants) and uploads them to an EXISTING release — the mirror of
+# android-release.yml. Used to complete a release whose Android leg was built
+# separately (so we confirm Android works on one cheap leg before spending
+# runner-hours on the full desktop matrix), without rebuilding the Android
+# APK/AAB that are already attached.
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Existing release tag to upload the desktop assets to (e.g. v1.6.6-cloud.1)'
+        required: true
+        type: string
+
+jobs:
+  lookup:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.find.outputs.release_id }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Resolve release id from tag
+        id: find
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          id=$(gh api "repos/${{ github.repository }}/releases/tags/${{ inputs.release_tag }}" --jq '.id')
+          echo "release_id=$id" >> "$GITHUB_OUTPUT"
+          echo "release ${{ inputs.release_tag }} -> id $id"
+      - name: Tag version must match tauri.conf.json
+        run: |
+          tag='${{ inputs.release_tag }}'
+          tag_ver=$(echo "$tag" | sed -E 's/^v//; s/[-+].*$//')
+          conf_ver=$(jq -r .version src-tauri/tauri.conf.json)
+          echo "tag=$tag tag_ver=$tag_ver conf_ver=$conf_ver"
+          [ "$tag_ver" = "$conf_ver" ] || { echo "::error::release tag $tag does not match tauri.conf.json version $conf_ver"; exit 1; }
+
+  desktop:
+    needs: lookup
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: 'windows-latest'
+            builds-args: '--bundles nsis'
+            target: ''
+            asset-prefix: '01'
+          - platform: 'windows-11-arm'
+            builds-args: '--bundles nsis'
+            target: 'aarch64-pc-windows-msvc'
+            asset-prefix: '01'
+          - platform: 'macos-14'
+            target: aarch64-apple-darwin
+            asset-prefix: '02'
+          - platform: 'macos-15-intel'
+            target: x86_64-apple-darwin
+            asset-prefix: '02'
+          - platform: 'macos-14'
+            target: aarch64-apple-darwin
+            args: '--features tethering'
+            asset-prefix: '02_tethering'
+          - platform: 'macos-15-intel'
+            target: x86_64-apple-darwin
+            args: '--features tethering'
+            asset-prefix: '02_tethering'
+          - platform: 'ubuntu-22.04'
+            target: ''
+            asset-prefix: '03'
+          - platform: 'ubuntu-22.04-arm'
+            target: ''
+            asset-prefix: '03'
+          - platform: 'ubuntu-24.04'
+            target: ''
+            asset-prefix: '03'
+          - platform: 'ubuntu-24.04-arm'
+            target: ''
+            asset-prefix: '03'
+          - platform: 'ubuntu-22.04'
+            target: ''
+            args: '--features tethering'
+            asset-prefix: '03_tethering'
+          - platform: 'ubuntu-24.04'
+            target: ''
+            args: '--features tethering'
+            asset-prefix: '03_tethering'
+    uses: ./.github/workflows/build.yml
+    with:
+      release-id: ${{ needs.lookup.outputs.release_id }}
+      platform: ${{ matrix.platform }}
+      target: ${{ matrix.target }}
+      build-args: ${{ matrix.args }}
+      asset-name-pattern: '[name]_v[version]_[platform]_[arch][ext]'
+      asset-prefix: ${{ matrix.asset-prefix }}
+    secrets: inherit
+    permissions:
+      contents: write
