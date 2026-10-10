@@ -48,8 +48,8 @@ mod imp {
     use crate::semhash::ContentId;
     use crate::state::{StateError, SyncDb};
     use crate::transfer::{
-        probe_backend, pump_downloads, pump_uploads, stored_backend_profile, CancelFlag,
-        TransferConfig,
+        probe_backend, pump_downloads, pump_uploads, stored_backend_profile,
+        stub_pending_originals, CancelFlag, TransferConfig,
     };
     use crate::worker::mint_worker_device_id;
 
@@ -421,6 +421,20 @@ mod imp {
 
         if budget.is_expired(now_ms()) {
             return first_error.map_or(Ok(()), Err);
+        }
+
+        // §3.5 client download POLICY: the poll above turned every foreign
+        // original into a `PendingDown` download; before the pump fetches
+        // their full bytes, demote the unpinned ones to browsable 0-byte cloud
+        // STUBs that hydrate on demand. This is what makes an Android device a
+        // client of the one shared per-user library (it mirrors the desktop
+        // `sync::manager` cycle) rather than a full mirror of every S3 object.
+        // Best-effort: a stub-pass failure must not abort the cycle, so it is
+        // only logged, never collected into `first_error`.
+        match stub_pending_originals(db, &root) {
+            Ok(n) if n > 0 => eprintln!("rrcloud: stubbed {n} received original(s)"),
+            Ok(_) => {}
+            Err(e) => eprintln!("rrcloud: stub_pending_originals: {e}"),
         }
 
         let cancel = budget_cancel_flag(budget);

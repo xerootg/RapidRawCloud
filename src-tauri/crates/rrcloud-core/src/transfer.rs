@@ -1861,6 +1861,87 @@ pub fn local_target_path(dest_root: &Path, relkey: &RelKey, kind: Kind) -> PathB
 /// image path awaiting the suffix.
 const SIDECAR_SUFFIX: &str = ".rrdata";
 
+/// The §3.5 client download POLICY: turn every unpinned `PendingDown`
+/// ORIGINAL the poll just learned about into a browsable 0-byte cloud STUB
+/// that hydrates on demand (`ensure_local` at the open/edit/export guard
+/// sites), instead of letting [`pump_downloads`] fetch its full bytes. This
+/// is the per-user "single shared library of all S3 images" model: a photo
+/// another device uploaded shows up as a placeholder, and its bytes land only
+/// when the user opens it.
+///
+/// Call this AFTER the inbound poll and BEFORE [`pump_downloads`] in a client
+/// cycle (the Android [`crate::android`] bridge cycle and the desktop
+/// `sync::manager` cycle both do). Headless roles that must hold full bytes
+/// (the preview worker) simply do not call it. Sidecars/xmp (small, §3.5
+/// "never stubbed") and *pinned* originals are left in the Down queue and
+/// fetched eagerly.
+///
+/// For each candidate it writes the 0-byte file (mtime replayed from the
+/// record so the thumbnail cache key is stable), flips the record
+/// `PendingDown → Stub`, and `queue_remove`s it from the Down queue so the
+/// pump skips it. Per-item isolated + best-effort: a filesystem or commit
+/// failure on one item logs to stderr and moves on; a path that somehow
+/// already holds real bytes is never truncated. Returns the number of items
+/// turned into stubs. `ensure_local`'s hydrate uses [`download_item`]
+/// directly (not this queue), so on-demand download is unaffected.
+pub fn stub_pending_originals(db: &SyncDb, dest_root: &Path) -> Result<usize, StateError> {
+    let mut stubbed = 0usize;
+    for (rk, record) in db.iter_items()? {
+        if record.deleted
+            || record.kind != Kind::Original
+            || record.state != ItemState::PendingDown
+            || record.pinned
+        {
+            continue;
+        }
+        let path = local_target_path(dest_root, &rk, record.kind);
+        // A PendingDown item has no file yet; never truncate real bytes.
+        if std::fs::metadata(&path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                eprintln!(
+                    "rrcloud: stub_pending_originals: mkdir {}: {e}",
+                    parent.display()
+                );
+                continue;
+            }
+        }
+        if let Err(e) = std::fs::File::create(&path) {
+            eprintln!(
+                "rrcloud: stub_pending_originals: create {}: {e}",
+                path.display()
+            );
+            continue;
+        }
+        let mtime = record.mtime_unix_ns / 1_000_000_000;
+        let _ = filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(mtime, 0));
+
+        // Flip to Stub + drop from the Down queue, atomically. The remote
+        // head is content-verified upstream (§2.4), so verified_remote holds;
+        // attested stays false until this device hydrates.
+        let mut stub_rec = record.clone();
+        stub_rec.state = ItemState::Stub;
+        stub_rec.verified_remote = true;
+        match db.with_txn_err::<(), StateError>(|t| {
+            t.replay_put_item(&rk, &stub_rec)?;
+            t.queue_remove(Queue::Down, &rk)?;
+            Ok(())
+        }) {
+            Ok(()) => stubbed += 1,
+            Err(e) => eprintln!(
+                "rrcloud: stub_pending_originals: commit {}: {e}",
+                path.display()
+            ),
+        }
+    }
+    Ok(stubbed)
+}
+
 /// The §3.5 temp file a download streams into: `.rr.part-<name>` next to
 /// the final path (same directory, so the final rename is atomic).
 ///

@@ -1176,7 +1176,7 @@ mod imp {
     use rrcloud_core::reader::poll;
     use rrcloud_core::s3::{PutObjectOptions, S3Client, S3Config};
     use rrcloud_core::semhash::{Blake3Hex, ContentId};
-    use rrcloud_core::state::{ItemRecord, ItemState, Queue, StateError, SyncDb};
+    use rrcloud_core::state::{ItemRecord, ItemState, StateError, SyncDb};
     use rrcloud_core::transfer::{
         BackendProfile, CancelFlag, ExpectedDownload, TransferConfig, TransferError,
         bucket_key_for, download_item, local_target_path, probe_backend, pump_downloads,
@@ -3195,57 +3195,13 @@ mod imp {
         /// truncated. `ensure_local`'s hydrate uses `download_item` directly
         /// (not this queue), so on-demand download is unaffected.
         pub fn stub_pending_originals(&self) {
-            let items = match self.db.iter_items() {
-                Ok(items) => items,
-                Err(e) => {
-                    log::warn!("stub_pending_originals: iter_items: {e}");
-                    return;
-                }
-            };
-            for (rk, record) in items {
-                if record.deleted
-                    || record.kind != Kind::Original
-                    || record.state != ItemState::PendingDown
-                    || record.pinned
-                {
-                    continue;
-                }
-                let path = local_target_path(&self.sync_root, &rk, record.kind);
-                // A PendingDown item has no file yet; never truncate real bytes.
-                if std::fs::metadata(&path)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false)
-                {
-                    continue;
-                }
-                if let Some(parent) = path.parent()
-                    && let Err(e) = std::fs::create_dir_all(parent)
-                {
-                    log::warn!("stub_pending_originals: mkdir {}: {e}", parent.display());
-                    continue;
-                }
-                if let Err(e) = std::fs::File::create(&path) {
-                    log::warn!("stub_pending_originals: create {}: {e}", path.display());
-                    continue;
-                }
-                let mtime = record.mtime_unix_ns / 1_000_000_000;
-                let _ =
-                    filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(mtime, 0));
-
-                // Flip to Stub + drop from the Down queue, atomically. The remote
-                // head is content-verified upstream (§2.4), so verified_remote
-                // holds; attested stays false until this device hydrates.
-                let mut stub_rec = record.clone();
-                stub_rec.state = ItemState::Stub;
-                stub_rec.verified_remote = true;
-                let res = self.db.with_txn_err::<(), StateError>(|t| {
-                    t.replay_put_item(&rk, &stub_rec)?;
-                    t.queue_remove(Queue::Down, &rk)?;
-                    Ok(())
-                });
-                if let Err(e) = res {
-                    log::warn!("stub_pending_originals: commit {}: {e}", path.display());
-                }
+            // Delegates to the shared core policy so the desktop app cycle and
+            // the Android `rrcloud_core::android` bridge cycle stub received
+            // originals identically (single source of truth, §3.5).
+            if let Err(e) =
+                rrcloud_core::transfer::stub_pending_originals(&self.db, &self.sync_root)
+            {
+                log::warn!("stub_pending_originals: {e}");
             }
         }
 
