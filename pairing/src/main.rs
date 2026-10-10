@@ -15,6 +15,10 @@
 //!    forward-auth, which sets `X-Authentik-Username`. A user signs in once
 //!    and fills a form with their *own* library-bucket S3 coordinates; we
 //!    write their `config.json`. Return visits show "already paired".
+//!    Because that header is forgeable by anyone who can reach the pod, the
+//!    browser routes also require `X-Rrcloud-Proxy-Secret` to equal the
+//!    `BROWSER_PROXY_SECRET` env (set at the edge by a Traefik `headers`
+//!    middleware chained after forward-auth); without it they answer 401.
 //!  * **App** (`GET /api/config`): the native app obtains an OIDC/PKCE
 //!    access token and sends it as `Authorization: Bearer …`. We first
 //!    require the token's `aud` claim to name the app's own OIDC client id
@@ -66,11 +70,27 @@ struct Config {
     /// URL the *app* will use — e.g. https://garage.themissing.xyz).
     default_library_endpoint: String,
     default_library_region: String,
+    /// Shared secret the trusted edge proxy injects as `X-Rrcloud-Proxy-Secret`
+    /// on the browser routes (after forward-auth). Proves the request really
+    /// traversed Authentik, so `X-Authentik-Username` can be believed.
+    /// `None` disables the browser routes entirely (fail closed); `from_env`
+    /// always requires it.
+    browser_proxy_secret: Option<String>,
 }
+
+/// Minimum length of `BROWSER_PROXY_SECRET`, in bytes.
+const MIN_PROXY_SECRET_LEN: usize = 16;
 
 impl Config {
     fn from_env() -> Result<Self, String> {
         let get = |k: &str| std::env::var(k).map_err(|_| format!("missing env var {k}"));
+        let browser_proxy_secret = get("BROWSER_PROXY_SECRET")?;
+        if browser_proxy_secret.len() < MIN_PROXY_SECRET_LEN {
+            return Err(format!(
+                "BROWSER_PROXY_SECRET must be at least {MIN_PROXY_SECRET_LEN} bytes \
+                 (it is the proof that browser requests came through the forward-auth proxy)"
+            ));
+        }
         Ok(Config {
             admin_bucket: get("ADMIN_BUCKET")?,
             admin_s3_endpoint: get("ADMIN_S3_ENDPOINT")?,
@@ -83,6 +103,7 @@ impl Config {
             default_library_endpoint: std::env::var("DEFAULT_LIBRARY_ENDPOINT").unwrap_or_default(),
             default_library_region: std::env::var("DEFAULT_LIBRARY_REGION")
                 .unwrap_or_else(|_| "garage".into()),
+            browser_proxy_secret: Some(browser_proxy_secret),
         })
     }
 }
@@ -334,10 +355,43 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Browser username from the forward-auth header, sanitized. The route is
-/// only reachable behind Authentik forward-auth (see the IngressRoute), so a
-/// missing header means a misconfiguration, not an anonymous user.
-fn browser_user(headers: &HeaderMap) -> Option<String> {
+/// Header the trusted edge proxy sets (after forward-auth) to prove a browser
+/// request really traversed Authentik. Checked against `BROWSER_PROXY_SECRET`.
+const PROXY_SECRET_HEADER: &str = "X-Rrcloud-Proxy-Secret";
+
+/// Constant-time byte-slice equality: no early exit on the first mismatch, so
+/// the comparison cannot be used as a timing oracle for the secret.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Does this request carry proof that it came through the trusted proxy?
+/// Fail closed: no configured secret or no/mismatched header → `false`.
+fn proxy_verified(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(secret) = state.config.browser_proxy_secret.as_deref() else {
+        return false;
+    };
+    headers
+        .get(PROXY_SECRET_HEADER)
+        .is_some_and(|v| ct_eq(v.as_bytes(), secret.as_bytes()))
+}
+
+/// Browser username from the forward-auth header, sanitized. Only valid once
+/// `proxy_verified` holds — `X-Authentik-Username` is plain text that anyone
+/// reaching the pod directly could set — so callers check the proxy proof
+/// first; past that, a missing header means a misconfiguration, not an
+/// anonymous user.
+fn browser_user(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    if !proxy_verified(state, headers) {
+        return None;
+    }
     headers
         .get("X-Authentik-Username")
         .and_then(|v| v.to_str().ok())
@@ -345,7 +399,7 @@ fn browser_user(headers: &HeaderMap) -> Option<String> {
 }
 
 async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let Some(user) = browser_user(&headers) else {
+    let Some(user) = browser_user(&state, &headers) else {
         return (
             StatusCode::UNAUTHORIZED,
             "Not authenticated (this page must be reached through Authentik).",
@@ -384,7 +438,7 @@ async fn save(
     headers: HeaderMap,
     Form(form): Form<SaveForm>,
 ) -> Response {
-    let Some(user) = browser_user(&headers) else {
+    let Some(user) = browser_user(&state, &headers) else {
         return (StatusCode::UNAUTHORIZED, "Not authenticated.").into_response();
     };
 
@@ -860,6 +914,9 @@ mod tests {
                 oidc_client_id: OUR_CLIENT_ID.into(),
                 default_library_endpoint: String::new(),
                 default_library_region: "garage".into(),
+                // These tests only hit `/api/config`, which the proxy guard does
+                // not cover; `None` keeps the browser routes fail-closed.
+                browser_proxy_secret: None,
             },
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
@@ -1151,6 +1208,7 @@ mod proxy_tests {
                 oidc_client_id: "test-client-id".into(),
                 default_library_endpoint: "https://garage.example.test".into(),
                 default_library_region: "garage".into(),
+                browser_proxy_secret: Some(PROXY_SECRET.into()),
             },
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
