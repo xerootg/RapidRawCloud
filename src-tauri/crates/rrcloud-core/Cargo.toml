@@ -46,7 +46,7 @@ hex = "0.4"
 md-5 = "0.10"
 hmac = "0.12"
 percent-encoding = "2"
-quick-xml = { version = "0.38", features = ["serialize"] }
+quick-xml = { version = "0.41", features = ["serialize"] }
 # Smart-preview proxy production (ARCHITECTURE.md §4.2, P3). `proxy.rs` is
 # feature-independent in this crate and built directly against the SAME
 # pinned rawler the host app resolves (`CyberTimon/RapidRAW-DngLab` @
