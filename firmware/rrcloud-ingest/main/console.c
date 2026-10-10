@@ -154,7 +154,6 @@ esp_err_t console_start(void)
     esp_console_repl_config_t rc = ESP_CONSOLE_REPL_CONFIG_DEFAULT();
     rc.prompt = "rrc> ";
     rc.max_cmdline_length = 1200;
-    rc.max_cmdline_args = 32;
     esp_console_dev_uart_config_t uc = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     esp_err_t e = esp_console_new_repl_uart(&uc, &rc, &repl);
     if (e != ESP_OK) { ESP_LOGW(TAG, "console unavailable: %s", esp_err_to_name(e)); return e; }
