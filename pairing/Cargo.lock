@@ -1131,11 +1131,13 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "html-escape",
+ "http-body-util",
  "reqwest",
  "rust-s3",
  "serde",
  "serde_json",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
