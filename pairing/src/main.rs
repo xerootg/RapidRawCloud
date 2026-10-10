@@ -31,6 +31,7 @@
 //! same admin bucket (read-only key) and backfills each user's library with
 //! that user's credentials.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use axum::{
@@ -483,6 +484,105 @@ fn same_origin_post(headers: &HeaderMap) -> bool {
     allowed.any(|h| h.trim().eq_ignore_ascii_case(&source_host))
 }
 
+/// Offline policy check for the library endpoint a user types into the form.
+///
+/// Copy of `rrcloud-core/src/fleet.rs::validate_library_endpoint` (the
+/// source of truth — keep the two in step; pairing deliberately does not
+/// depend on rrcloud-core, see Cargo.toml). The fleet worker refuses every
+/// endpoint this rejects, so refusing it here gives the user an inline error
+/// instead of a "saved" doc that silently fails each cycle. Purely
+/// syntactic (no DNS): must parse, use `https`, and have a host; an IP
+/// literal must be public unicast (IPv4-mapped/compatible IPv6 is checked
+/// with the IPv4 rules); a name must not be `localhost`, single-label, or
+/// under `.localhost` `.local` `.internal` `.svc` `.cluster.local`.
+fn validate_library_endpoint(endpoint: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(endpoint.trim_end_matches('/'))
+        .map_err(|e| format!("unparsable URL: {e}"))?;
+    if url.scheme() != "https" {
+        return Err(format!(
+            "scheme {:?} is not allowed; library endpoints must use https://",
+            url.scheme()
+        ));
+    }
+    // `host_str()` is the *parsed* host: decimal/hex/short IPv4 spellings
+    // are already folded into dotted-quad form, IPv6 literals bracketed.
+    let host = url.host_str().ok_or_else(|| "no host".to_string())?;
+    if let Some(v6) = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .and_then(|h| h.parse::<Ipv6Addr>().ok())
+    {
+        check_public_v6(v6)
+    } else if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        check_public_v4(v4)
+    } else {
+        check_public_name(host)
+    }
+}
+
+fn check_public_v4(ip: Ipv4Addr) -> Result<(), String> {
+    let [a, b, _, _] = ip.octets();
+    let bad = ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || a == 0 // 0.0.0.0/8 "this network"
+        || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10 shared (CGNAT)
+        || a >= 240; // 240.0.0.0/4 reserved
+    if bad {
+        Err(format!("IP address {ip} is not a public address"))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_public_v6(ip: Ipv6Addr) -> Result<(), String> {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return Err(format!("IP address {ip} is not a public address"));
+    }
+    // IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`)
+    // forms reach an IPv4 host — apply the IPv4 rules to it.
+    if let Some(v4) = ip.to_ipv4() {
+        return check_public_v4(v4).map_err(|e| format!("{e} (embedded in {ip})"));
+    }
+    let seg0 = ip.segments()[0];
+    let bad = (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        || (seg0 & 0xffc0) == 0xfe80; // fe80::/10 link local
+    if bad {
+        Err(format!("IP address {ip} is not a public address"))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_public_name(name: &str) -> Result<(), String> {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() || name == "localhost" {
+        return Err(format!("host {name:?} is not a public host name"));
+    }
+    if !name.contains('.') {
+        return Err(format!(
+            "host {name:?} is a single-label name (not a public host name)"
+        ));
+    }
+    const INTERNAL_SUFFIXES: &[&str] = &[
+        ".localhost",
+        ".local",
+        ".internal",
+        ".svc",
+        ".cluster.local",
+        ".svc.cluster.local",
+    ];
+    if let Some(suffix) = INTERNAL_SUFFIXES.iter().find(|s| name.ends_with(**s)) {
+        return Err(format!(
+            "host {name:?} is under the internal suffix {suffix:?}"
+        ));
+    }
+    Ok(())
+}
+
 async fn save(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -515,6 +615,18 @@ async fn save(
             &user,
             None,
             Some("Secret key is required (it is write-only; re-enter to change it)."),
+            &state.config,
+        ))
+        .into_response();
+    }
+    // Same policy as the fleet worker: refuse up front, write nothing.
+    if let Err(reason) = validate_library_endpoint(&endpoint) {
+        return Html(render_page(
+            &user,
+            None,
+            Some(&format!(
+                "Endpoint rejected: {reason}. Use a public https:// S3 URL."
+            )),
             &state.config,
         ))
         .into_response();
@@ -1131,6 +1243,92 @@ mod tests {
         let token = format!("{}.!!not-base64!!.{}", b64url(b"{}"), b64url(b"sig"));
         let (status, body) = get_config(&token).await;
         assert_creds_leaked_free(status, &body, "JWT with undecodable payload");
+    }
+
+    /// Unit tests for the copied endpoint validator, so it cannot drift
+    /// silently from `rrcloud-core/src/fleet.rs` (same cases, abridged).
+    mod endpoint_validation {
+        use super::*;
+
+        #[test]
+        fn accepts_public_https_hosts() {
+            for ok in [
+                "https://garage.themissing.xyz",
+                "https://garage.themissing.xyz/",
+                "https://s3.eu-central-003.backblazeb2.com",
+                "https://S3.Example.COM:9443",
+                "https://8.8.8.8",
+                "https://[2606:4700:4700::1111]:443",
+                "https://[::ffff:8.8.8.8]",
+                "https://172.15.255.255",
+                "https://172.32.0.1",
+                "https://100.63.255.255",
+                "https://100.128.0.1",
+                "https://localhost.example.com",
+                "https://internal.example.com",
+                "https://svc.example.com",
+                "https://my-local.example.com",
+            ] {
+                assert_eq!(validate_library_endpoint(ok), Ok(()), "{ok}");
+            }
+        }
+
+        #[test]
+        fn rejects_plaintext_garbage_and_non_public_hosts() {
+            for bad in [
+                "http://s3.example.com",
+                "ftp://s3.example.com",
+                "file:///etc/passwd",
+                "s3.example.com",
+                "",
+                "https://",
+                "https:///path-only",
+                "https://127.0.0.1",
+                "https://127.0.0.1:3903",
+                "https://2130706433", // decimal 127.0.0.1
+                "https://0x7f000001", // hex 127.0.0.1
+                "https://127.1",      // short-form 127.0.0.1
+                "https://0.0.0.0",
+                "https://0.1.2.3",
+                "https://10.0.0.5:3903",
+                "https://172.16.0.1",
+                "https://172.31.255.254",
+                "https://192.168.1.1",
+                "https://169.254.169.254",
+                "https://100.64.0.1",
+                "https://100.127.255.255",
+                "https://224.0.0.1",
+                "https://255.255.255.255",
+                "https://240.0.0.1",
+                "https://[::1]",
+                "https://[::]",
+                "https://[fe80::1]",
+                "https://[febf::1]",
+                "https://[fc00::1]",
+                "https://[fd12:3456::1]",
+                "https://[ff02::1]",
+                "https://[::ffff:127.0.0.1]",
+                "https://[::ffff:10.0.0.5]",
+                "https://[::ffff:169.254.169.254]",
+                "https://[::ffff:7f00:1]",
+                "https://[::127.0.0.1]",
+                "https://localhost",
+                "https://LOCALHOST",
+                "https://localhost.",
+                "https://foo.localhost",
+                "https://garage",
+                "https://garage:3900",
+                "https://garage-admin.garage.svc.cluster.local:3903",
+                "https://garage-admin.garage.svc.cluster.local.",
+                "https://garage-admin.garage.svc",
+                "https://thing.cluster.local",
+                "https://printer.local",
+                "https://metadata.google.internal",
+                "https://db.internal",
+            ] {
+                assert!(validate_library_endpoint(bad).is_err(), "{bad}");
+            }
+        }
     }
 
     /// `POST /save` endpoint policy.
