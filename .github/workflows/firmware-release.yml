@@ -1,0 +1,132 @@
+name: 'Release: rrcloud-ingest firmware (ESP32-P4)'
+
+# Tag `firmware-vX.Y.Z` (any commit) → host tests + protocol conformance, ESP-IDF build,
+# GitHub pre-release with flashable binaries. Manual dispatch builds the same artifacts
+# for the chosen ref without publishing.
+on:
+  push:
+    tags: ['firmware-v*']
+  workflow_dispatch:
+
+jobs:
+  tests:
+    name: Host tests + protocol conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Generated SDK output is current
+        run: python3 protocol/rrcgen --check
+      - name: Firmware host tests (hashing, SigV4, protocol codec, glob, PTP codec)
+        run: |
+          cmake -S firmware/rrcloud-ingest/host_tests -B /tmp/ht
+          cmake --build /tmp/ht
+          ctest --test-dir /tmp/ht --output-on-failure
+      - name: Generated C/C++ SDK conformance
+        run: |
+          cmake -S protocol/tests/c -B /tmp/pc
+          cmake --build /tmp/pc
+          ctest --test-dir /tmp/pc --output-on-failure
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            protocol/tests/rust
+            src-tauri/crates/rrcloud-core
+      - name: Generated Rust SDK conformance
+        run: cd protocol/tests/rust && cargo test
+      - name: Engine decodes the firmware's documents
+        run: cd src-tauri/crates/rrcloud-core && cargo test --test firmware_interop --test proto_conformance
+
+  build:
+    name: ESP-IDF build (esp32p4)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:release-v5.5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: bash
+        run: |
+          git config --global --add safe.directory '*'
+          . $IDF_PATH/export.sh
+          cd firmware/rrcloud-ingest
+          idf.py set-target esp32p4
+          idf.py build
+          idf.py size
+      - name: Package
+        shell: bash
+        run: |
+          . $IDF_PATH/export.sh
+          cd firmware/rrcloud-ingest/build
+          VERSION="${GITHUB_REF_NAME#firmware-}"
+          [ "${GITHUB_REF_TYPE}" = "tag" ] || VERSION="dev-${GITHUB_SHA::8}"
+          OUT=../dist/rrcloud-ingest-${VERSION}-esp32p4
+          mkdir -p "$OUT"
+          # One image flashable at offset 0 (bootloader, partition table, OTA data, app)…
+          esptool.py --chip esp32p4 merge_bin -o "$OUT/rrcloud-ingest-merged.bin" @flash_args
+          # …plus the individual parts and the exact flash arguments idf.py would use.
+          cp rrcloud-ingest.bin bootloader/bootloader.bin partition_table/partition-table.bin ota_data_initial.bin flasher_args.json flash_args "$OUT/"
+          cat > "$OUT/FLASH.md" <<MD
+          # Flashing rrcloud-ingest ${VERSION} (ESP32-P4-WIFI6-POE-ETH)
+
+          Connect the board's USB-C console port, hold BOOT while pressing RST if it does not enter download mode automatically, then:
+
+              pip install esptool
+              esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 921600 write_flash 0x0 rrcloud-ingest-merged.bin
+
+          Updating the app only (keeps NVS config and the LittleFS ledger):
+
+              esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 921600 write_flash 0x20000 rrcloud-ingest.bin
+
+          Then open http://rrcloud-ingest.local/ (or the DHCP address printed on the console).
+          MD
+          cd ../dist && zip -r "rrcloud-ingest-${VERSION}-esp32p4.zip" "rrcloud-ingest-${VERSION}-esp32p4"
+          sha256sum *.zip > SHA256SUMS
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+        id: pkg
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rrcloud-ingest-${{ steps.pkg.outputs.version }}-esp32p4
+          path: |
+            firmware/rrcloud-ingest/dist/*.zip
+            firmware/rrcloud-ingest/dist/SHA256SUMS
+
+  release:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/firmware-v')
+    needs: [tests, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Release notes
+        run: |
+          VERSION="${GITHUB_REF_NAME#firmware-}"
+          {
+            echo "# rrcloud-ingest ${VERSION} — camera ingest dock firmware"
+            echo
+            echo "Target: Waveshare ESP32-P4-WIFI6-POE-ETH (ESP-IDF 5.5). Built from \`${GITHUB_SHA}\`."
+            echo
+            echo "Flash with \`esptool.py --chip esp32p4 -p PORT write_flash 0x0 rrcloud-ingest-merged.bin\` — full instructions in FLASH.md inside the zip,"
+            echo "setup and pairing in [firmware/rrcloud-ingest/README.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/firmware/rrcloud-ingest/README.md)."
+            echo
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } > notes.md
+      - uses: softprops/action-gh-release@v2
+        with:
+          name: rrcloud-ingest ${{ github.ref_name }}
+          body_path: notes.md
+          prerelease: true
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS
