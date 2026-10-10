@@ -125,6 +125,31 @@ pub use android_integration::*;
 pub use app_settings::*;
 pub use app_state::*;
 pub use launch_request::*;
+
+/// Test seams for the `rename_folder` / `rename_files` path-separator
+/// integration test (`tests/rename_separators.rs`): plain-function wrappers
+/// over the private `file_management` commands, mirroring the existing
+/// `sync::copy_files_guarded` seam. A direct `pub use` of a `#[tauri::command]`
+/// is avoided because the attribute also defines a same-named macro which a
+/// re-export would pull along. No behavior change.
+#[doc(hidden)]
+pub mod rename_test_seams {
+    pub fn rename_folder(
+        path: String,
+        new_name: String,
+        app_handle: tauri::AppHandle,
+    ) -> Result<(), String> {
+        crate::file_management::rename_folder(path, new_name, app_handle)
+    }
+
+    pub fn rename_files(
+        paths: Vec<String>,
+        name_template: String,
+        app_handle: tauri::AppHandle,
+    ) -> Result<Vec<String>, String> {
+        crate::file_management::rename_files(paths, name_template, app_handle)
+    }
+}
 use tagging_utils::{candidates, hierarchy};
 
 #[cfg(target_os = "macos")]

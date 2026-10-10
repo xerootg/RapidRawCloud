@@ -2302,8 +2302,24 @@ pub fn create_folder(path: String) -> Result<(), String> {
     fs::create_dir_all(&path).map_err(|e| e.to_string())
 }
 
+/// Ensures `name` is exactly one plain file or folder name (a single
+/// `Component::Normal`), so joining it onto a parent directory can never
+/// escape that directory via separators, `..`, or an absolute path.
+fn validate_single_path_component(name: &str) -> Result<(), String> {
+    const ERR: &str = "Invalid name: must be a single file or folder name without path separators";
+    if name.is_empty() || name == "." || name == ".." || name.contains(['/', '\\', '\0']) {
+        return Err(ERR.to_string());
+    }
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(c)), None) if c == name => Ok(()),
+        _ => Err(ERR.to_string()),
+    }
+}
+
 #[tauri::command]
 pub fn rename_folder(path: String, new_name: String, app_handle: AppHandle) -> Result<(), String> {
+    validate_single_path_component(&new_name)?;
     let p = Path::new(&path);
     if !p.is_dir() {
         return Err("Path is not a directory.".to_string());
@@ -4172,6 +4188,7 @@ pub fn rename_files(
             &file_date,
         );
         let new_filename = format!("{}.{}", new_stem, extension);
+        validate_single_path_component(&new_filename)?;
         let new_path = parent.join(new_filename);
 
         if new_path.exists() && new_path != original_path {
