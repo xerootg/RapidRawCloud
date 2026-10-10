@@ -28,3 +28,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # (`aud`) check; the tests also use it to build tokens. Already a transitive
 # dependency (0.22.x in Cargo.lock), so no new tree.
 base64 = "0.22"
+
+[dev-dependencies]
+# In-process router tests (`tower::ServiceExt::oneshot`) + body collection.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
