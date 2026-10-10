@@ -216,7 +216,7 @@ self-hosters who already run [Authentik](https://goauthentik.io/), the
 Deployment (this repo's reference homelab): the service runs in Kubernetes
 via `argo-things` (`configs/rapidraw-pairing`, `apps/93-rapidraw-pairing`)
 behind Traefik at `rrc.themissing.xyz`, with two Authentik applications —
-an OAuth2/OIDC provider (public/PKCE, redirect `rapidraw://auth-callback`)
+an OAuth2/OIDC provider (public/PKCE; allowed redirect URIs `rapidraw://auth-callback` for RapidRAW and `raw2dng://auth-callback` for [Raw2DNG](https://github.com/xerootg/RawImageSnapseedBridge), which pairs through the same service to read the library as a conversion source)
 for the app and a forward-auth Proxy provider for the browser page. The
 admin-bucket service key is supplied via a Kubernetes secret (see
 `configs/rapidraw-pairing/secret.example.yaml`). The container image must
