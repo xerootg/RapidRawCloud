@@ -433,11 +433,64 @@ struct SaveForm {
     preview_budget_gb: Option<u32>,
 }
 
+/// `host[:port]` of an `Origin`/`Referer`-style URL (`scheme://host[:port]/…`),
+/// lower-cased. `None` for anything that is not an absolute URL (e.g. the
+/// literal `Origin: null`).
+fn url_host(value: &str) -> Option<String> {
+    let rest = value.trim().split_once("://")?.1;
+    let host = rest.split(['/', '?', '#']).next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Cross-site request guard for the browser form `POST /save`.
+///
+/// The browser session is a cookie (Authentik forward-auth), so a hostile
+/// page could auto-submit the form with the victim's cookie attached and
+/// repoint their library at an attacker bucket. Policy:
+///
+///  * `Sec-Fetch-Site` present → only `same-origin` is accepted
+///    (`cross-site`, `same-site`, `none` are refused).
+///  * Otherwise `Origin` (else `Referer`) must have a host equal to the
+///    request `Host` (or `X-Forwarded-Host`, since we sit behind Traefik),
+///    compared as `host[:port]` case-insensitively.
+///  * No `Sec-Fetch-Site`, `Origin` or `Referer` at all → refused; every
+///    browser sends at least `Referer` on a same-origin form submit, and
+///    non-browser clients use `/api/config`, not `/save`.
+fn same_origin_post(headers: &HeaderMap) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+
+    if let Some(site) = header("sec-fetch-site") {
+        return site.trim().eq_ignore_ascii_case("same-origin");
+    }
+
+    let Some(source_host) = header("origin")
+        .or_else(|| header("referer"))
+        .and_then(url_host)
+    else {
+        return false;
+    };
+
+    let mut allowed = header("host").into_iter().chain(
+        header("x-forwarded-host")
+            .into_iter()
+            // Traefik may append to an existing list: `a.example, b.example`.
+            .flat_map(|v| v.split(',')),
+    );
+    allowed.any(|h| h.trim().eq_ignore_ascii_case(&source_host))
+}
+
 async fn save(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Form(form): Form<SaveForm>,
 ) -> Response {
+    if !same_origin_post(&headers) {
+        return (StatusCode::FORBIDDEN, "Cross-site request refused.").into_response();
+    }
     let Some(user) = browser_user(&state, &headers) else {
         return (StatusCode::UNAUTHORIZED, "Not authenticated.").into_response();
     };
@@ -1416,6 +1469,9 @@ mod proxy_tests {
             .post(format!("{base}/save"))
             .header("X-Authentik-Username", VICTIM)
             .header(PROXY_HEADER, PROXY_SECRET)
+            // What a browser sends on the pairing page's own form submit;
+            // `/save` also refuses cross-site POSTs (see `same_origin_post`).
+            .header("Sec-Fetch-Site", "same-origin")
             .form(&[
                 ("endpoint", "https://garage.example.test"),
                 ("bucket", "alice-new-bucket"),
