@@ -520,20 +520,24 @@ mod tests {
         // User decision (2026-10-07): a camera-roll watch list is a
         // per-device fact; pairing must never push one device's folders
         // onto another. Cloud wins for coordinates; device wins for DCIM.
-        let mut local = SyncSettings::default();
-        local.auto_watch_dcim = true;
-        local.watched_media_buckets = vec!["Camera".into(), "158ND750".into()];
-        local.endpoint = "http://old.local".into();
+        let local = SyncSettings {
+            endpoint: "http://old.local".into(),
+            auto_watch_dcim: true,
+            watched_media_buckets: vec!["Camera".into(), "158ND750".into()],
+            ..SyncSettings::default()
+        };
 
-        let mut cloud = SyncSettings::default();
-        cloud.enabled = true;
-        cloud.endpoint = "https://garage.example".into();
-        cloud.bucket = "my-photos".into();
-        cloud.region = "garage".into();
-        // The doc may carry ANY values here (older docs, other devices'
-        // choices) — they must not matter.
-        cloud.auto_watch_dcim = false;
-        cloud.watched_media_buckets = vec!["SomeoneElsesFolder".into()];
+        let cloud = SyncSettings {
+            enabled: true,
+            endpoint: "https://garage.example".into(),
+            bucket: "my-photos".into(),
+            region: "garage".into(),
+            // The doc may carry ANY values here (older docs, other devices'
+            // choices) — they must not matter.
+            auto_watch_dcim: false,
+            watched_media_buckets: vec!["SomeoneElsesFolder".into()],
+            ..SyncSettings::default()
+        };
 
         let merged = merge_cloud_sync(&local, &cloud);
         assert!(merged.enabled);
@@ -549,9 +553,11 @@ mod tests {
         // First pair on a fresh install: DCIM watch stays OFF regardless of
         // what the cloud doc says — enabling it is an on-device choice.
         let local = SyncSettings::default();
-        let mut cloud = SyncSettings::default();
-        cloud.auto_watch_dcim = true;
-        cloud.watched_media_buckets = vec!["Camera".into()];
+        let cloud = SyncSettings {
+            auto_watch_dcim: true,
+            watched_media_buckets: vec!["Camera".into()],
+            ..SyncSettings::default()
+        };
         let merged = merge_cloud_sync(&local, &cloud);
         assert!(!merged.auto_watch_dcim);
         assert!(merged.watched_media_buckets.is_empty());
