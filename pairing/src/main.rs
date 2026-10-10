@@ -665,3 +665,300 @@ async fn main() {
 async fn shutdown_signal() {
     let _ = tokio::signal::ctrl_c().await;
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    //! Audience-binding tests for `GET /api/config`.
+    //!
+    //! Authentik's userinfo endpoint resolves ANY access token the instance
+    //! has issued, no matter which OAuth2 provider/application it was issued
+    //! to. So "userinfo said 200" only proves "this is *some* valid Authentik
+    //! token for *some* user" — not "this token was issued to the RapidRAW
+    //! app". A token minted for another client (Grafana, Nextcloud, …) in the
+    //! same Authentik, or leaked from one, must not unlock the user's library
+    //! S3 credentials here. Authentik access tokens are JWTs whose `aud` (and
+    //! `azp`) carry the client id, and `Config.oidc_client_id` is already
+    //! known to the service, so the service can and should check it.
+    //!
+    //! The fakes below are tiny axum routers on 127.0.0.1:0; the real
+    //! `api_config` handler is exercised over TCP with reqwest (already a
+    //! runtime dependency), so no extra test transport crates are needed.
+
+    use super::*;
+    use axum::http::Uri;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use base64::Engine;
+    use serde_json::{json, Value};
+
+    /// Distinctive marker for alice's library access key id: if this string
+    /// shows up in a response body, alice's S3 credentials leaked.
+    const ALICE_AKID: &str = "GK-ALICE-AKID";
+    const ALICE_SECRET: &str = "alice-secret-access-key-do-not-leak";
+    /// The client id of THIS service's OIDC provider (the RapidRAW app).
+    const OUR_CLIENT_ID: &str = "rapidraw-app";
+    /// Another OAuth2 application registered in the same Authentik instance.
+    const OTHER_CLIENT_ID: &str = "grafana";
+    const ADMIN_BUCKET: &str = "rapidraw-admin";
+    const ISSUER: &str = "https://auth.example.test/application/o/rapidraw/";
+
+    /// Bind an axum router on an ephemeral loopback port and return its base URL.
+    async fn serve(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        format!("http://{addr}")
+    }
+
+    /// Fake Authentik userinfo endpoint. Mirrors the real behaviour that
+    /// matters for this bug: any non-empty bearer token the instance knows
+    /// resolves to its user, regardless of the provider it was issued to.
+    /// (It does NOT check `aud` — neither does Authentik.) Returns the URL of
+    /// the userinfo route.
+    async fn fake_userinfo() -> String {
+        async fn userinfo(headers: HeaderMap) -> Response {
+            let token = headers
+                .get(axum::http::header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(str::trim)
+                .unwrap_or("");
+            if token.is_empty() {
+                return (StatusCode::UNAUTHORIZED, "no token").into_response();
+            }
+            Json(json!({
+                "preferred_username": "alice",
+                "sub": "6b9a0e2c-alice-sub",
+                "email": "alice@example.test",
+            }))
+            .into_response()
+        }
+        let base = serve(Router::new().route("/application/o/userinfo/", get(userinfo))).await;
+        format!("{base}/application/o/userinfo/")
+    }
+
+    /// Fake S3 (path-style) admin bucket holding only alice's config doc.
+    async fn fake_s3() -> String {
+        async fn get_object(uri: Uri) -> Response {
+            if uri.path() == format!("/{ADMIN_BUCKET}/{}", config_key("alice")) {
+                let doc = ConfigDoc {
+                    version: 1,
+                    updated_at: "2026-01-01T00:00:00Z".into(),
+                    sync: SyncSettings {
+                        enabled: true,
+                        endpoint: "https://garage.example.test".into(),
+                        bucket: "alice-photos".into(),
+                        region: "garage".into(),
+                        force_path_style: true,
+                        cache_size_gb: 8,
+                        preview_budget_gb: 10,
+                        preview_prefetch_months: 12,
+                        auto_watch_dcim: false,
+                        watched_media_buckets: vec![],
+                        worker_backfill: true,
+                    },
+                    credentials: Creds {
+                        access_key_id: ALICE_AKID.into(),
+                        secret_access_key: ALICE_SECRET.into(),
+                    },
+                };
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    serde_json::to_vec(&doc).unwrap(),
+                )
+                    .into_response()
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    "<Error><Code>NoSuchKey</Code></Error>",
+                )
+                    .into_response()
+            }
+        }
+        serve(Router::new().fallback(get_object)).await
+    }
+
+    /// Build the real service (same `api_config` handler and state shape as
+    /// `main`) wired to the fakes, and return its base URL.
+    async fn pairing_service() -> String {
+        let state = Arc::new(AppState {
+            config: Config {
+                admin_bucket: ADMIN_BUCKET.into(),
+                admin_s3_endpoint: fake_s3().await,
+                admin_s3_region: "garage".into(),
+                admin_s3_access_key: "GKadmin".into(),
+                admin_s3_secret_key: "adminsecret".into(),
+                oidc_userinfo_url: fake_userinfo().await,
+                oidc_issuer_url: ISSUER.into(),
+                oidc_client_id: OUR_CLIENT_ID.into(),
+                default_library_endpoint: String::new(),
+                default_library_region: "garage".into(),
+            },
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        });
+        serve(
+            Router::new()
+                .route("/api/config", get(api_config))
+                .route("/api/pairing-info", get(api_pairing_info))
+                .with_state(state),
+        )
+        .await
+    }
+
+    /// `GET /api/config` with the given bearer; returns (status, body).
+    async fn get_config(bearer: &str) -> (StatusCode, String) {
+        let base = pairing_service().await;
+        let resp = reqwest::Client::new()
+            .get(format!("{base}/api/config"))
+            .bearer_auth(bearer)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        (StatusCode::from_u16(status.as_u16()).unwrap(), body)
+    }
+
+    fn b64url(bytes: &[u8]) -> String {
+        URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// A well-formed (header.payload.signature) JWT with the given claims.
+    /// The signature is not valid — and does not need to be: the service
+    /// treats userinfo as the authority for token validity and identity, so
+    /// the test only cares about the *claims* carried in the payload.
+    fn jwt(claims: Value) -> String {
+        let header = json!({ "alg": "RS256", "typ": "JWT", "kid": "test-key" });
+        format!(
+            "{}.{}.{}",
+            b64url(&serde_json::to_vec(&header).unwrap()),
+            b64url(&serde_json::to_vec(&claims).unwrap()),
+            b64url(b"not-a-real-signature"),
+        )
+    }
+
+    /// Claims as Authentik issues them for a user `alice` logging into the
+    /// application with client id `client_id` (aud == azp == client id).
+    fn alice_claims_for(client_id: &str) -> Value {
+        json!({
+            "iss": ISSUER,
+            "sub": "6b9a0e2c-alice-sub",
+            "aud": client_id,
+            "azp": client_id,
+            "exp": 4_102_444_800u64,
+            "iat": 1_700_000_000u64,
+            "preferred_username": "alice",
+            "scope": "openid profile email",
+        })
+    }
+
+    fn assert_creds_leaked_free(status: StatusCode, body: &str, what: &str) {
+        assert!(
+            !body.contains(ALICE_AKID),
+            "{what}: alice's library credentials LEAKED (status {status}): {body}"
+        );
+        assert!(
+            !body.contains(ALICE_SECRET),
+            "{what}: alice's library SECRET leaked (status {status}): {body}"
+        );
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{what}: expected 401, got {status} with body: {body}"
+        );
+    }
+
+    // --- positive controls -------------------------------------------------
+
+    /// (c) A token Authentik issued to OUR client id unlocks alice's config.
+    #[tokio::test]
+    async fn api_config_accepts_token_issued_to_our_client() {
+        let token = jwt(alice_claims_for(OUR_CLIENT_ID));
+        let (status, body) = get_config(&token).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc["credentials"]["accessKeyId"], ALICE_AKID);
+        assert_eq!(doc["sync"]["bucket"], "alice-photos");
+    }
+
+    /// (b) `aud` may be an array (RFC 7519 §4.1.3); it is accepted when it
+    /// contains our client id.
+    #[tokio::test]
+    async fn api_config_accepts_aud_array_containing_our_client() {
+        let mut claims = alice_claims_for(OUR_CLIENT_ID);
+        claims["aud"] = json!([OUR_CLIENT_ID, "other-resource"]);
+        let token = jwt(claims);
+        let (status, body) = get_config(&token).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let doc: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(doc["credentials"]["accessKeyId"], ALICE_AKID);
+    }
+
+    // --- the bug: tokens not issued to this client are honoured ------------
+
+    /// (a) THE BUG. A valid Authentik access token issued to a *different*
+    /// application (here Grafana) in the same instance. Authentik's userinfo
+    /// happily resolves it to alice, and today the service hands out alice's
+    /// library S3 credentials. It must be rejected (401) because `aud` is not
+    /// our client id.
+    #[tokio::test]
+    async fn api_config_rejects_token_issued_to_another_client() {
+        let token = jwt(alice_claims_for(OTHER_CLIENT_ID));
+        let (status, body) = get_config(&token).await;
+        assert_creds_leaked_free(status, &body, "token with aud=\"grafana\"");
+    }
+
+    /// (a') Array-form `aud` that does NOT include our client id.
+    #[tokio::test]
+    async fn api_config_rejects_aud_array_without_our_client() {
+        let mut claims = alice_claims_for(OTHER_CLIENT_ID);
+        claims["aud"] = json!([OTHER_CLIENT_ID, "other-resource"]);
+        let token = jwt(claims);
+        let (status, body) = get_config(&token).await;
+        assert_creds_leaked_free(
+            status,
+            &body,
+            "token with aud=[\"grafana\",\"other-resource\"]",
+        );
+    }
+
+    /// (e) A JWT with no `aud` claim at all carries no proof it was issued to
+    /// this client; it must be rejected.
+    #[tokio::test]
+    async fn api_config_rejects_jwt_without_aud_claim() {
+        let mut claims = alice_claims_for(OUR_CLIENT_ID);
+        claims.as_object_mut().unwrap().remove("aud");
+        claims.as_object_mut().unwrap().remove("azp");
+        let token = jwt(claims);
+        let (status, body) = get_config(&token).await;
+        assert_creds_leaked_free(status, &body, "JWT without aud");
+    }
+
+    /// (d) An opaque (non-JWT) token. Authentik issues JWT access tokens by
+    /// default, so the service cannot establish the audience of anything
+    /// else; the expected behaviour is to reject it (401) rather than fall
+    /// back to the audience-less userinfo-only check.
+    #[tokio::test]
+    async fn api_config_rejects_opaque_non_jwt_token() {
+        let (status, body) = get_config("opaque-token-from-some-other-client").await;
+        assert_creds_leaked_free(status, &body, "opaque non-JWT token");
+    }
+
+    /// Sanity: a token whose payload segment is not base64url/JSON must not
+    /// crash the handler or be accepted.
+    #[tokio::test]
+    async fn api_config_rejects_jwt_with_garbage_payload() {
+        let token = format!("{}.!!not-base64!!.{}", b64url(b"{}"), b64url(b"sig"));
+        let (status, body) = get_config(&token).await;
+        assert_creds_leaked_free(status, &body, "JWT with undecodable payload");
+    }
+}
