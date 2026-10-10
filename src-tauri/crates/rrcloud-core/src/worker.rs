@@ -238,7 +238,7 @@ pub enum WorkerError {
 /// The worker's resolved configuration (§6). `state_dir` is `None` exactly
 /// when `RRCLOUD_STATE_DIR` was unset — the stateless case
 /// [`Worker::open`] refuses.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WorkerConfig {
     /// The persistent redb state directory (`RRCLOUD_STATE_DIR`), or `None`
     /// when unset — a stateless invocation [`Worker::open`] refuses.
@@ -253,6 +253,21 @@ pub struct WorkerConfig {
     pub access_key_id: String,
     /// Secret access key (`RRCLOUD_SECRET_KEY`).
     pub secret_access_key: String,
+}
+
+/// Hand-written so `{:?}` (routine in tracing/anyhow error context) never
+/// prints the secret access key — mirrors [`S3Config`]'s impl.
+impl std::fmt::Debug for WorkerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerConfig")
+            .field("state_dir", &self.state_dir)
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl WorkerConfig {
