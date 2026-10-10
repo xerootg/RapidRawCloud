@@ -538,11 +538,26 @@ pub fn load_image_with_orientation(
         .with_guessed_format()
         .context("Failed to guess image format")?;
 
-    reader.no_limits();
+    // Never decode without limits: the decoder allocates the full output
+    // buffer from the header-declared dimensions before validating any pixel
+    // data, so a tiny hostile file claiming 100000x100000 would request 40 GB
+    // and abort the process. 65536 px per side and 4 GiB of decoded pixels are
+    // far beyond any camera file (a 150 MP RGBA8 decode is ~600 MB) while
+    // still refusing absurd headers up front.
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(65_536);
+    limits.max_image_height = Some(65_536);
+    limits.max_alloc = Some(4 * 1024 * 1024 * 1024);
+    reader.limits(limits);
 
     check_cancel()?;
 
-    let image = reader.decode().context("Failed to decode image")?;
+    let image = reader.decode().map_err(|e| match e {
+        image::ImageError::Limits(limit_err) => {
+            anyhow!("Image dimensions or decoded size exceed supported limits: {limit_err}")
+        }
+        other => anyhow::Error::new(other).context("Failed to decode image"),
+    })?;
     check_cancel()?;
 
     let oriented_image = {
