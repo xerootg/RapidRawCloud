@@ -664,6 +664,22 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+/// The service's route table. Shared by `main()` and the tests so the tests
+/// exercise exactly the router that ships.
+fn app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/", get(index))
+        .route("/save", post(save))
+        .route("/api/config", get(api_config))
+        .route("/api/pairing-info", get(api_pairing_info))
+        .with_state(state)
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -695,13 +711,7 @@ async fn main() {
             .expect("http client"),
     });
 
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/", get(index))
-        .route("/save", post(save))
-        .route("/api/config", get(api_config))
-        .route("/api/pairing-info", get(api_pairing_info))
-        .with_state(state);
+    let app = app(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -1011,5 +1021,403 @@ mod tests {
         let token = format!("{}.!!not-base64!!.{}", b64url(b"{}"), b64url(b"sig"));
         let (status, body) = get_config(&token).await;
         assert_creds_leaked_free(status, &body, "JWT with undecodable payload");
+    }
+}
+
+/// End-to-end tests against the real router (`app()`), a real listener and a
+/// fake S3 admin bucket. No dev-dependencies: the client is the `reqwest`
+/// we already ship, the fake S3 is a second axum router on 127.0.0.1:0.
+///
+/// The browser routes (`/`, `/save`) identify the user purely from the
+/// `X-Authentik-Username` request header. That header is only trustworthy
+/// if the request provably came through the Traefik forward-auth
+/// middleware — which the service cannot tell today. Anyone who can reach
+/// port 8080 directly (any pod in the cluster — the Service is ClusterIP
+/// with no NetworkPolicy — or the internet when the IngressRoute is enabled
+/// with `forwardAuth.enabled: false`, the chart default) can read and
+/// overwrite ANY user's stored library credentials by forging one header.
+///
+/// Contract these tests encode (see test-report.md for the fix criteria):
+/// the browser routes must reject a request that does not carry proof it
+/// came through the trusted proxy — a `X-Rrcloud-Proxy-Secret` header whose
+/// value equals the service's `BROWSER_PROXY_SECRET` (constant-time compare).
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use axum::{body::Bytes, http::Method, http::Uri};
+
+    const ADMIN_BUCKET: &str = "rapidraw-admin-test";
+    const VICTIM: &str = "alice";
+    /// Distinctive marker so a leak is unmistakable in the failure output.
+    const ALICE_AKID: &str = "GK-ALICE-AKID";
+    const ALICE_SECRET: &str = "alice-secret-access-key-DO-NOT-LEAK";
+    const ALICE_BUCKET: &str = "alice-photos";
+
+    /// Header + value that prove a request came through the trusted proxy.
+    /// TODO(fix): wire `PROXY_SECRET` into `Config` (`browser_proxy_secret`,
+    /// env `BROWSER_PROXY_SECRET`) inside `test_state()` once the field
+    /// exists; the positive-control tests below already send the header.
+    const PROXY_HEADER: &str = "X-Rrcloud-Proxy-Secret";
+    const PROXY_SECRET: &str = "test-proxy-secret-7f3a9c";
+
+    // -- fake S3 -----------------------------------------------------------
+
+    #[derive(Default)]
+    struct FakeS3 {
+        /// Every PUT the service issued: (request path, body).
+        puts: Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    fn alice_doc() -> ConfigDoc {
+        ConfigDoc {
+            version: 1,
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            sync: SyncSettings {
+                enabled: true,
+                endpoint: "https://garage.example.test".into(),
+                bucket: ALICE_BUCKET.into(),
+                region: "garage".into(),
+                force_path_style: true,
+                cache_size_gb: 8,
+                preview_budget_gb: 10,
+                preview_prefetch_months: 12,
+                auto_watch_dcim: false,
+                watched_media_buckets: vec![],
+                worker_backfill: true,
+            },
+            credentials: Creds {
+                access_key_id: ALICE_AKID.into(),
+                secret_access_key: ALICE_SECRET.into(),
+            },
+        }
+    }
+
+    async fn fake_s3_handler(
+        State(fake): State<Arc<FakeS3>>,
+        method: Method,
+        uri: Uri,
+        body: Bytes,
+    ) -> Response {
+        let alice_key = format!("/{ADMIN_BUCKET}/{}", config_key(VICTIM));
+        let path = uri.path().to_string();
+        match (method, path == alice_key) {
+            (Method::GET, true) => (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                serde_json::to_vec(&alice_doc()).unwrap(),
+            )
+                .into_response(),
+            (Method::PUT, _) => {
+                fake.puts.lock().unwrap().push((path, body.to_vec()));
+                StatusCode::OK.into_response()
+            }
+            _ => (
+                StatusCode::NOT_FOUND,
+                [("content-type", "application/xml")],
+                "<Error><Code>NoSuchKey</Code></Error>",
+            )
+                .into_response(),
+        }
+    }
+
+    /// Path-style S3 stand-in: `GET /<bucket>/users/alice/config.json`
+    /// serves alice's doc, every `PUT` is recorded, anything else is 404.
+    async fn start_fake_s3() -> (String, Arc<FakeS3>) {
+        let fake = Arc::new(FakeS3::default());
+        let router = Router::new()
+            .fallback(fake_s3_handler)
+            .with_state(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{addr}"), fake)
+    }
+
+    // -- service under test ------------------------------------------------
+
+    fn test_state(s3_endpoint: &str) -> Arc<AppState> {
+        Arc::new(AppState {
+            config: Config {
+                admin_bucket: ADMIN_BUCKET.into(),
+                admin_s3_endpoint: s3_endpoint.into(),
+                admin_s3_region: "garage".into(),
+                admin_s3_access_key: "GKadmintestkey".into(),
+                admin_s3_secret_key: "admin-test-secret".into(),
+                // Unreachable on purpose: the browser path must never need it.
+                oidc_userinfo_url: "http://127.0.0.1:9/application/o/userinfo/".into(),
+                oidc_issuer_url: "http://127.0.0.1:9/application/o/rapidraw-cloud/".into(),
+                oidc_client_id: "test-client-id".into(),
+                default_library_endpoint: "https://garage.example.test".into(),
+                default_library_region: "garage".into(),
+            },
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        })
+    }
+
+    /// Boots the REAL router (`app()`) on a loopback port; returns base URL
+    /// and the fake S3 recorder.
+    async fn start_service() -> (String, Arc<FakeS3>) {
+        let (s3_url, fake) = start_fake_s3().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = app(test_state(&s3_url));
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{addr}"), fake)
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            // We assert on the 303 itself; do not follow it.
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap()
+    }
+
+    /// Attacker-chosen library coordinates: if these land in alice's
+    /// config.json, every one of alice's devices (and the worker) starts
+    /// syncing her photos into the attacker's bucket.
+    fn attacker_form() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("endpoint", "https://attacker.example.test"),
+            ("bucket", "attacker-exfil-bucket"),
+            ("region", "garage"),
+            ("access_key_id", "GK-ATTACKER-AKID"),
+            ("secret_access_key", "attacker-secret"),
+            ("force_path_style", "on"),
+            ("worker_backfill", "on"),
+        ]
+    }
+
+    /// ~160 chars of context around the first occurrence of `needle`.
+    fn excerpt_around(body: &str, needle: &str) -> String {
+        match body.find(needle) {
+            Some(i) => {
+                let start = body[..i]
+                    .char_indices()
+                    .rev()
+                    .nth(80)
+                    .map(|(j, _)| j)
+                    .unwrap_or(0);
+                let end = body[i..]
+                    .char_indices()
+                    .nth(needle.len() + 80)
+                    .map(|(j, _)| i + j)
+                    .unwrap_or(body.len());
+                format!("…{}…", &body[start..end])
+            }
+            None => body.chars().take(240).collect(),
+        }
+    }
+
+    fn is_rejected(status: StatusCode) -> bool {
+        status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
+    }
+
+    // -- negative tests: these FAIL on the current code ----------------------
+
+    /// (a) A forged `X-Authentik-Username` header, with NO proof the request
+    /// came through the forward-auth proxy, must not reveal alice's config.
+    #[tokio::test]
+    async fn forged_username_header_alone_must_not_reveal_another_users_config() {
+        let (base, _fake) = start_service().await;
+
+        let resp = client()
+            .get(format!("{base}/"))
+            .header("X-Authentik-Username", VICTIM)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+
+        let leaked = body.contains(ALICE_AKID);
+        assert!(
+            is_rejected(status) && !leaked,
+            "\nGET / carrying only a forged `X-Authentik-Username: {VICTIM}` header (no proxy proof) \
+             was answered HTTP {status} instead of 401/403.\n\
+             alice's stored library access key id `{ALICE_AKID}` {}.\n\
+             body excerpt:\n{}\n",
+            if leaked { "WAS LEAKED to the unauthenticated caller" } else { "did not appear" },
+            excerpt_around(&body, ALICE_AKID),
+        );
+    }
+
+    /// (a') Carrying the proxy header with the WRONG value is just as
+    /// anonymous as not carrying it.
+    #[tokio::test]
+    async fn forged_username_header_with_wrong_proxy_secret_is_rejected() {
+        let (base, _fake) = start_service().await;
+
+        let resp = client()
+            .get(format!("{base}/"))
+            .header("X-Authentik-Username", VICTIM)
+            .header(PROXY_HEADER, "not-the-real-secret")
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+
+        assert!(
+            is_rejected(status) && !body.contains(ALICE_AKID),
+            "\nGET / with a forged `X-Authentik-Username: {VICTIM}` and a WRONG `{PROXY_HEADER}` \
+             was answered HTTP {status} instead of 401/403; `{ALICE_AKID}` in body: {}\n\
+             body excerpt:\n{}\n",
+            body.contains(ALICE_AKID),
+            excerpt_around(&body, ALICE_AKID),
+        );
+    }
+
+    /// (b) A forged header must not let the caller overwrite alice's stored
+    /// credentials / library coordinates. The fake S3 must see NO PUT.
+    #[tokio::test]
+    async fn forged_username_header_alone_must_not_overwrite_another_users_config() {
+        let (base, fake) = start_service().await;
+
+        let resp = client()
+            .post(format!("{base}/save"))
+            .header("X-Authentik-Username", VICTIM)
+            .form(&attacker_form())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let puts = fake.puts.lock().unwrap().clone();
+        let put_summary: Vec<String> = puts
+            .iter()
+            .map(|(path, body)| format!("PUT {path}\n{}", String::from_utf8_lossy(body)))
+            .collect();
+
+        assert!(
+            is_rejected(status) && puts.is_empty(),
+            "\nPOST /save carrying only a forged `X-Authentik-Username: {VICTIM}` header (no proxy proof) \
+             was answered HTTP {status}{} instead of 401/403, and the admin bucket received \
+             {} PUT(s) — alice's config.json was overwritten with attacker-chosen coordinates:\n{}\n",
+            if location.is_empty() { String::new() } else { format!(" (Location: {location})") },
+            puts.len(),
+            put_summary.join("\n---\n"),
+        );
+    }
+
+    // -- positive controls: these PASS today and must keep passing ----------
+
+    /// (c) The same requests carrying proof of the trusted proxy
+    /// (`X-Rrcloud-Proxy-Secret` == BROWSER_PROXY_SECRET) keep working:
+    /// GET / renders alice's page (200), POST /save writes and redirects (303).
+    ///
+    /// Today the header is simply ignored, so this passes trivially; after
+    /// the fix it is the contract that the legitimate forward-auth path still
+    /// functions. The fixer must set `browser_proxy_secret` to `PROXY_SECRET`
+    /// in `test_state()` for this to remain green.
+    #[tokio::test]
+    async fn requests_through_trusted_proxy_still_work() {
+        let (base, fake) = start_service().await;
+        let c = client();
+
+        let resp = c
+            .get(format!("{base}/"))
+            .header("X-Authentik-Username", VICTIM)
+            .header(PROXY_HEADER, PROXY_SECRET)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET / through the trusted proxy"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("You're paired"),
+            "paired view expected:\n{}",
+            excerpt_around(&body, "<h1>")
+        );
+        assert!(
+            body.contains(ALICE_AKID),
+            "paired view pre-fills the access key id"
+        );
+        assert!(
+            !body.contains(ALICE_SECRET),
+            "the secret key must never be rendered"
+        );
+
+        let resp = c
+            .post(format!("{base}/save"))
+            .header("X-Authentik-Username", VICTIM)
+            .header(PROXY_HEADER, PROXY_SECRET)
+            .form(&[
+                ("endpoint", "https://garage.example.test"),
+                ("bucket", "alice-new-bucket"),
+                ("region", "garage"),
+                ("access_key_id", "GK-ALICE-NEW-AKID"),
+                ("secret_access_key", "alice-new-secret"),
+                ("force_path_style", "on"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "POST /save through the trusted proxy"
+        );
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("/?saved=1")
+        );
+
+        let puts = fake.puts.lock().unwrap().clone();
+        assert_eq!(puts.len(), 1, "exactly one PUT to the admin bucket");
+        assert_eq!(puts[0].0, format!("/{ADMIN_BUCKET}/{}", config_key(VICTIM)));
+        let written: ConfigDoc = serde_json::from_slice(&puts[0].1).expect("valid ConfigDoc");
+        assert_eq!(written.sync.bucket, "alice-new-bucket");
+        assert_eq!(written.credentials.access_key_id, "GK-ALICE-NEW-AKID");
+        assert_eq!(written.credentials.secret_access_key, "alice-new-secret");
+    }
+
+    /// `/healthz` and `/api/*` are not browser routes: they must stay
+    /// reachable without the proxy header (the app API authenticates with its
+    /// own OIDC bearer token; pairing-info is deliberately public).
+    #[tokio::test]
+    async fn healthz_and_api_routes_do_not_require_proxy_proof() {
+        let (base, _fake) = start_service().await;
+        let c = client();
+
+        let resp = c.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+
+        let resp = c
+            .get(format!("{base}/api/pairing-info"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let info: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(info["clientId"], "test-client-id");
+        assert_eq!(info["configEndpoint"], "/api/config");
+
+        // No bearer → 401 from the API's own auth, not from any proxy check.
+        let resp = c
+            .get(format!("{base}/api/config"))
+            .header("X-Authentik-Username", VICTIM)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.text().await.unwrap(), "missing bearer token");
     }
 }
