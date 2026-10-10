@@ -1,6 +1,22 @@
 {{- if and .Values.pairing.enabled .Values.pairing.ingressRoute.enabled }}
 {{- $ir := .Values.pairing.ingressRoute }}
-{{- if $ir.forwardAuth.enabled }}
+{{- if not $ir.forwardAuth.enabled }}
+{{- fail "pairing.ingressRoute.enabled=true requires pairing.ingressRoute.forwardAuth.enabled=true: without forward-auth the browser pairing page would be public" }}
+{{- end }}
+{{- if not $ir.browserProxySecret }}
+{{- fail "pairing.ingressRoute.enabled=true requires pairing.ingressRoute.browserProxySecret (must equal the browser-proxy-secret key of pairing.existingSecret; supply it via an encrypted values file)" }}
+{{- end }}
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rapidraw-pairing-proxy-secret
+spec:
+  headers:
+    # Overwrites any client-supplied value, so only requests that really
+    # passed this edge (after forward-auth) carry the right secret.
+    customRequestHeaders:
+      X-Rrcloud-Proxy-Secret: {{ $ir.browserProxySecret | quote }}
+---
 apiVersion: traefik.io/v1alpha1
 kind: Middleware
 metadata:
@@ -17,7 +33,6 @@ spec:
       - X-Authentik-Uid
       - X-Authentik-Jwt
 ---
-{{- end }}
 apiVersion: traefik.io/v1alpha1
 kind: IngressRoute
 metadata:
@@ -31,16 +46,16 @@ spec:
       priority: 20
       services:
         - { name: rapidraw-pairing, port: 8080 }
-    # Browser pairing page (optionally behind Authentik forward-auth).
+    # Browser pairing page: Authentik forward-auth, THEN the proxy-secret
+    # header so the service can tell the request really came through here.
     - match: Host(`{{ $ir.host }}`)
       kind: Rule
       priority: 10
       services:
         - { name: rapidraw-pairing, port: 8080 }
-      {{- if $ir.forwardAuth.enabled }}
       middlewares:
         - { name: {{ $ir.forwardAuth.middlewareName }} }
-      {{- end }}
+        - { name: rapidraw-pairing-proxy-secret }
   tls:
     certResolver: {{ $ir.certResolver }}
     domains:

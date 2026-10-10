@@ -16,7 +16,8 @@ pairing:
   image: ghcr.io/xerootg/rrcloud-pairing:latest
   imagePullPolicy: Always
   replicas: 1
-  # Secret with keys: admin-s3-access-key, admin-s3-secret-key (read+write).
+  # Secret with keys: admin-s3-access-key, admin-s3-secret-key (read+write),
+  # browser-proxy-secret (>= 16 bytes; see ingressRoute.browserProxySecret).
   existingSecret: rapidraw-pairing-secret
   oidc:
     userinfoUrl: https://authentik.themissing.xyz/application/o/userinfo/
@@ -28,11 +29,17 @@ pairing:
     region: garage
   # Traefik IngressRoute + optional Authentik forward-auth (themissing.xyz
   # fleet specifics; off by default so the chart is portable).
+  # Enabling the IngressRoute REQUIRES forwardAuth.enabled=true and a
+  # browserProxySecret (the chart refuses to render otherwise).
   ingressRoute:
     enabled: false
     host: rrc.themissing.xyz
     certResolver: cloudflare
     tlsDomainMain: themissing.xyz
+    # Injected at the edge as X-Rrcloud-Proxy-Secret after forward-auth so the
+    # service can trust X-Authentik-Username. Supply via an encrypted values
+    # file; must equal the `browser-proxy-secret` key of pairing.existingSecret.
+    browserProxySecret: ""
     forwardAuth:
       enabled: false
       middlewareName: authentik-forwardauth

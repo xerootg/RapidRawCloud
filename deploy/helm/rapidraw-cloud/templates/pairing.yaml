@@ -31,6 +31,10 @@ spec:
               valueFrom: { secretKeyRef: { name: {{ .Values.pairing.existingSecret }}, key: admin-s3-access-key } }
             - name: ADMIN_S3_SECRET_KEY
               valueFrom: { secretKeyRef: { name: {{ .Values.pairing.existingSecret }}, key: admin-s3-secret-key } }
+            # Proof-of-proxy for the browser routes; must equal the value the
+            # edge `headers` middleware injects (pairing.ingressRoute.browserProxySecret).
+            - name: BROWSER_PROXY_SECRET
+              valueFrom: { secretKeyRef: { name: {{ .Values.pairing.existingSecret }}, key: browser-proxy-secret } }
             - { name: OIDC_USERINFO_URL, value: {{ .Values.pairing.oidc.userinfoUrl | quote }} }
             - { name: OIDC_ISSUER_URL, value: {{ .Values.pairing.oidc.issuerUrl | quote }} }
             - { name: OIDC_CLIENT_ID, value: {{ .Values.pairing.oidc.clientId | quote }} }

@@ -8,4 +8,5 @@ RapidRawCloud server side installed in namespace {{ .Release.Namespace }}.
 {{- end }}
 
 Reminder: the Secrets {{ .Values.pairing.existingSecret }} / {{ .Values.worker.existingSecret }}
-must exist (admin-s3-access-key, admin-s3-secret-key). See the chart README.
+must exist (admin-s3-access-key, admin-s3-secret-key). The pairing Secret also
+needs browser-proxy-secret, equal to pairing.ingressRoute.browserProxySecret. See the chart README.
