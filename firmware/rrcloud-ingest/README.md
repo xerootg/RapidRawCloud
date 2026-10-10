@@ -155,6 +155,55 @@ rrc> log            # the web UI's log panel
 `admin_password`; booleans accept `on`/`off`, `true`/`false`. `pair <url>` runs the
 device-flow pairing and `pair-status` shows the code to enter.
 
+Diagnostics: `cam-ls` lists every object the attached camera reports (handle, size,
+path — one line per storage, so a dual-slot body shows both cards); `cam-hash <handle> [n]`
+reads one object through the normal sync path `n` times and prints its BLAKE3 each pass
+(identical hashes prove the read path is deterministic; compare with the file on the
+card). `c6` / `c6-update` and `ble` / `ble-forget` are described below.
+
+## Bluetooth LE setup from the RapidRAW app
+
+The dock advertises one GATT service (`DOCK_BLE_SERVICE_UUID` in
+`protocol/rrcloud.protocol.toml`) as `rrcloud-<hostname>` (`rrcloud-ingest` by default).
+The RapidRAW Android app's *Camera dock (Bluetooth)* section finds it, bonds (LE Secure
+Connections "Just Works" — the dock has no display; Android shows its pairing prompt) and
+then does everything this web UI does over that link: status and progress, what to sync,
+cloud (manual S3 or *Pair with cloud* through the pairing service, with the sign-in link
+opened on the phone), Wi‑Fi, hostname, admin password, radio firmware, the log.
+
+- The RX characteristic is write-encrypted, so nothing is accepted before bonding; when
+  *Require a password* is on, each request must also carry the admin password.
+- Requests and replies are JSON documents fragmented at the ATT MTU (framing in the
+  protocol definition); `main/api.c` serves them, `main/ble.c` only moves bytes.
+- `ble` on the console prints the service state; `ble-forget` (or *Forget paired phones*
+  in the UI, `POST /api/ble/forget`) drops every bond so a phone pairs afresh. The
+  `ble_enabled` setting turns advertising off entirely.
+- BLE needs the ESP32-C6 to run the same ESP-Hosted major.minor as this firmware — see
+  the next section.
+
+## Radio co-processor (ESP32-C6) firmware
+
+Wi‑Fi and Bluetooth live on the board's ESP32-C6, reached over SDIO with ESP-Hosted. The
+host library this firmware is built against (`COPROC_HOST_LIB_VERSION` in
+`main/coproc.h`) must match the co-processor's firmware major.minor; Waveshare ships
+boards with an older image, and the log then says `version mismatch` and Wi‑Fi/BLE stay
+off. The dock can update the co-processor itself, over the same SDIO link:
+
+```
+rrc> c6                      # link state, co-processor version, update progress
+rrc> c6-update               # install the pinned ESP-Hosted image (sha256 verified)
+rrc> c6-update <url> [sha256] # any http(s) image
+```
+
+The web UI's *Device → Update radio firmware* button and `POST /api/coproc/update` do the
+same. The image streams straight into the C6's OTA partition in RPC-sized chunks, is
+verified there, activated, and the dock restarts to re-link (co-processors older than
+ESP-Hosted 2.6 reboot during the final step instead of answering it; that is handled).
+The default image is the stock ESP-Hosted co-processor build (Wi‑Fi + Bluetooth over
+Hosted-HCI) published by the esp-hosted-firmware project; the recovery path for a bricked
+C6 is the board's 4-pin C6 UART header (`C6_U0TXD`, `C6_U0RXD`, GND, `C6_IO9` low at
+power-on puts the C6 into download mode; hold the P4's BOOT button so it releases the bus).
+
 ## Troubleshooting the web UI
 
 Eight seconds after boot the dock connects to its own port 80 over loopback and logs the
@@ -226,7 +275,10 @@ compared with flash drives.
 
 - Write-only participant: deletions made elsewhere are not observed. A file already
   imported is never re-uploaded (the ledger remembers `(camera, path, size)`), so deleting
-  it in the library does not resurrect it from the dock. A `(camera, path, size)` reused
+  it in the library does not resurrect it from the dock. Dual-slot bodies that mirror
+  files to a second card ("backup") list each photo under two storages; the copies are
+  not byte-identical (Nikon Z 7II), so only the first one seen is uploaded and the mirror
+  is recorded as already present. A `(camera, path, size)` reused
   for a different file (card re-formatted, same numbering) uploads under the same key
   only when the previous object is gone; otherwise it is logged as a collision.
 - Camera clocks are treated as UTC for `{yyyy}/{mm}/{dd}` and `mtime` (PTP `CaptureDate`

@@ -4,7 +4,16 @@
 // needs: `sync_start_foreground_sync` (§5.1 point 2, the user-initiated
 // long-operation trigger) and `sync_dcim_access_status` (§5.2 partial-
 // photo-access detection).
-const COMMANDS: &[&str] = &["sync_start_foreground_sync", "sync_dcim_access_status"];
+const COMMANDS: &[&str] = &[
+    "sync_start_foreground_sync",
+    "sync_dcim_access_status",
+    // Camera dock over Bluetooth LE (protocol DOCK_BLE_*; Android only).
+    "dock_scan_start",
+    "dock_scan_stop",
+    "dock_connect",
+    "dock_disconnect",
+    "dock_rpc",
+];
 
 fn main() {
     tauri_plugin::Builder::new(COMMANDS)

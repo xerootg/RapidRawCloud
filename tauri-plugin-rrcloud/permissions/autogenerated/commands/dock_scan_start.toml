@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-dock-scan-start"
+description = "Enables the dock_scan_start command without any pre-configured scope."
+commands.allow = ["dock_scan_start"]
+
+[[permission]]
+identifier = "deny-dock-scan-start"
+description = "Denies the dock_scan_start command without any pre-configured scope."
+commands.deny = ["dock_scan_start"]

@@ -31,4 +31,30 @@ impl<R: Runtime> Rrcloud<R> {
     pub fn dcim_access_status(&self) -> crate::Result<DcimAccessStatus> {
         Ok(DcimAccessStatus { partial: false })
     }
+
+    pub fn dock_scan_start(&self) -> crate::Result<()> {
+        Err(crate::Error::DockUnsupported)
+    }
+
+    pub fn dock_scan_stop(&self) -> crate::Result<()> {
+        Err(crate::Error::DockUnsupported)
+    }
+
+    pub fn dock_connect(&self, _address: String) -> crate::Result<rrcloud_proto::DockBleInfo> {
+        Err(crate::Error::DockUnsupported)
+    }
+
+    pub fn dock_disconnect(&self) -> crate::Result<()> {
+        Err(crate::Error::DockUnsupported)
+    }
+
+    pub fn dock_rpc(
+        &self,
+        _method: String,
+        _path: String,
+        _body: Option<serde_json::Value>,
+        _auth: Option<String>,
+    ) -> crate::Result<crate::commands::DockRpcReply> {
+        Err(crate::Error::DockUnsupported)
+    }
 }

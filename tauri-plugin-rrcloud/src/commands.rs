@@ -47,3 +47,60 @@ pub async fn sync_dcim_access_status<R: Runtime>(
 ) -> crate::Result<DcimAccessStatus> {
     app.rrcloud().dcim_access_status()
 }
+
+// ---- camera dock over Bluetooth LE --------------------------------------------
+//
+// The dock (firmware/rrcloud-ingest) exposes its admin API as one GATT service
+// (protocol `DOCK_BLE_*`): `dock_rpc` carries the same `GET/POST /api/…`
+// operations its web UI uses, so the app can configure a dock with no network.
+// Android only; desktop rejects with `Error::DockUnsupported`.
+
+/// One `/api/…` call answered by the dock.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DockRpcReply {
+    /// HTTP-style status the dock answered with (200, 400, 401, 404, 409, 500).
+    pub status: i32,
+    /// The endpoint's JSON document.
+    pub body: serde_json::Value,
+}
+
+/// Starts a BLE scan for docks; results arrive as `dock-found` plugin events
+/// (`{address, name, rssi}`), `dock-scan` `{done}` when it stops by itself.
+#[command]
+pub async fn dock_scan_start<R: Runtime>(app: AppHandle<R>) -> crate::Result<()> {
+    app.rrcloud().dock_scan_start()
+}
+
+#[command]
+pub async fn dock_scan_stop<R: Runtime>(app: AppHandle<R>) -> crate::Result<()> {
+    app.rrcloud().dock_scan_stop()
+}
+
+/// Connects to a dock by BLE address and returns its identity (DockBleInfo).
+/// Connection state changes arrive as `dock-state` events (`{state, detail?}`).
+#[command]
+pub async fn dock_connect<R: Runtime>(
+    app: AppHandle<R>,
+    address: String,
+) -> crate::Result<rrcloud_proto::DockBleInfo> {
+    app.rrcloud().dock_connect(address)
+}
+
+#[command]
+pub async fn dock_disconnect<R: Runtime>(app: AppHandle<R>) -> crate::Result<()> {
+    app.rrcloud().dock_disconnect()
+}
+
+/// `method` is `GET` or `POST`, `path` an `/api/…` route, `body` the JSON
+/// document for a POST, `auth` the dock's admin password when it requires one.
+#[command]
+pub async fn dock_rpc<R: Runtime>(
+    app: AppHandle<R>,
+    method: String,
+    path: String,
+    body: Option<serde_json::Value>,
+    auth: Option<String>,
+) -> crate::Result<DockRpcReply> {
+    app.rrcloud().dock_rpc(method, path, body, auth)
+}

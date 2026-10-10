@@ -140,6 +140,12 @@ export enum Invokes {
   SyncFlushPath = 'sync_flush_path',
   SyncRetireDevice = 'sync_retire_device',
   SyncVerifyLibrary = 'sync_verify_library',
+  // Camera dock over Bluetooth LE (tauri-plugin-rrcloud; Android only).
+  DockScanStart = 'plugin:rrcloud|dock_scan_start',
+  DockScanStop = 'plugin:rrcloud|dock_scan_stop',
+  DockConnect = 'plugin:rrcloud|dock_connect',
+  DockDisconnect = 'plugin:rrcloud|dock_disconnect',
+  DockRpc = 'plugin:rrcloud|dock_rpc',
 }
 
 export enum ExifOverlay {

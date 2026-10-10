@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-dock-disconnect"
+description = "Enables the dock_disconnect command without any pre-configured scope."
+commands.allow = ["dock_disconnect"]
+
+[[permission]]
+identifier = "deny-dock-disconnect"
+description = "Denies the dock_disconnect command without any pre-configured scope."
+commands.deny = ["dock_disconnect"]
