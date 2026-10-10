@@ -45,6 +45,10 @@ static uint64_t key_hash(const char *sid, const char *path, uint64_t size)
     char sz[24]; snprintf(sz, sizeof sz, "\x1f%llu", (unsigned long long)size);
     return fnv1a64(sz, h) & ~3ull;
 }
+/* Second namespace in the same index: (RELKEY_NS, relkey, size) of every uploaded
+ * record, so a camera that mirrors files to a second card slot (Nikon "backup")
+ * does not upload the mirrored copy over the primary one. */
+#define RELKEY_NS "\x1erelkey"
 static uint64_t status_bits(char status) { return status == RRC_LEDGER_UPLOADED ? 1 : status == RRC_LEDGER_REMOTE_EXISTS ? 2 : 3; }
 static char status_from_bits(uint64_t b) { return (b & 3) == 1 ? RRC_LEDGER_UPLOADED : (b & 3) == 2 ? RRC_LEDGER_REMOTE_EXISTS : RRC_LEDGER_COLLISION; }
 
@@ -184,7 +188,7 @@ esp_err_t store_ledger_load(void)
         if (rrc_ledger_parse(line, &r) != 0) continue;
         idx_put(key_hash(r.source_id, r.source_path, r.size), r.status);
         ledger_count++;
-        if (r.status == RRC_LEDGER_UPLOADED) { uploaded_count++; uploaded_bytes += r.size; }
+        if (r.status == RRC_LEDGER_UPLOADED) { uploaded_count++; uploaded_bytes += r.size; idx_put(key_hash(RELKEY_NS, r.relkey, r.size), r.status); }
     }
     free(line);
     fclose(f);
@@ -201,6 +205,14 @@ char store_ledger_lookup(const char *sid, const char *path, uint64_t size)
     return s;
 }
 
+bool store_ledger_relkey_uploaded(const char *relkey, uint64_t size)
+{
+    LOCK();
+    char s = idx_get(key_hash(RELKEY_NS, relkey, size));
+    UNLOCK();
+    return s == RRC_LEDGER_UPLOADED;
+}
+
 esp_err_t store_ledger_append(const rrc_ledger_rec *r)
 {
     char line[2048];
@@ -215,7 +227,7 @@ esp_err_t store_ledger_append(const rrc_ledger_rec *r)
     if (ok) {
         idx_put(key_hash(r->source_id, r->source_path, r->size), r->status);
         ledger_count++;
-        if (r->status == RRC_LEDGER_UPLOADED) { uploaded_count++; uploaded_bytes += r->size; }
+        if (r->status == RRC_LEDGER_UPLOADED) { uploaded_count++; uploaded_bytes += r->size; idx_put(key_hash(RELKEY_NS, r->relkey, r->size), r->status); }
     }
     UNLOCK();
     return ok ? ESP_OK : ESP_FAIL;

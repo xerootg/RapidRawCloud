@@ -85,3 +85,34 @@ CONFIG_ESP_HOSTED_HOST_SDIO_PIN_D3=17
 CONFIG_ESP_HOSTED_HOST_RESET_GPIO=54
 # The co-processor is brought up from app_main (after Ethernet), not before it.
 CONFIG_ESP_HOSTED_AUTO_CALL_INIT_BEFORE_APP_MAIN=n
+
+# ---- Diagnostics: DWARF unwinding so a panic prints a real backtrace on RISC-V
+# (the raw stack dump is useless for a hardware-reported stack overflow).
+CONFIG_ESP_SYSTEM_USE_EH_FRAME=y
+# ---- Flash: the board's 32 MB GigaDevice part needs its driver linked for
+# 4-byte addressing; without it the generic driver stops at 16 MB and the tail
+# of the LittleFS partition (0x820000+0x800000 > 16 MiB) is unreachable.
+CONFIG_SPI_FLASH_SUPPORT_GD_CHIP=y
+
+# ---- Bluetooth LE admin service: NimBLE host on the P4, controller on the ESP32-C6
+# over Hosted-HCI (the same SDIO link as Wi-Fi). Peripheral only, one connection,
+# LE Secure Connections bonding persisted in NVS, 517-byte ATT MTU for the JSON RPC.
+CONFIG_ESP_HOSTED_HOST_FEAT_BT=y
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_DISABLED=y
+CONFIG_BT_NIMBLE_TRANSPORT_UART=n
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_42_FEATURE_SUPPORT=y
+CONFIG_BT_NIMBLE_50_FEATURE_SUPPORT=n
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=y
+CONFIG_BT_NIMBLE_SM_SC=y
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_MAX_BONDS=8
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144
+CONFIG_BT_NIMBLE_SVC_GAP_DEVICE_NAME="rrcloud-ingest"

@@ -31,6 +31,7 @@ static void defaults(app_config_t *c)
     strcpy(c->hostname, BOARD_HOSTNAME_DEFAULT);
     c->admin_auth = false;
     c->usb_debug = true;   /* pre-release default: camera bring-up is the open question */
+    c->ble_enabled = true;
 }
 
 static esp_err_t nvs_get_string(nvs_handle_t h, const char *key, char *out, size_t cap)
@@ -135,6 +136,7 @@ static int to_json(const app_config_t *c, char *out, size_t cap, bool for_ui)
     put_str(&w, "hostname", c->hostname, false);
     put_bool(&w, "admin_auth", c->admin_auth);
     put_bool(&w, "usb_debug", c->usb_debug);
+    put_bool(&w, "ble_enabled", c->ble_enabled);
     if (for_ui) {
         char tmp[APP_SECRET_MAX + 1];
         put_bool(&w, "has_s3_secret", app_config_get_secret(tmp, sizeof tmp) == ESP_OK && tmp[0]);
@@ -240,6 +242,7 @@ esp_err_t app_config_apply_json(const char *json, size_t len, char *err, size_t 
     copy_str(o, "hostname", c.hostname, sizeof c.hostname);
     copy_bool(o, "admin_auth", &c.admin_auth);
     copy_bool(o, "usb_debug", &c.usb_debug);
+    copy_bool(o, "ble_enabled", &c.ble_enabled);
     /* trim trailing slash on endpoint */
     size_t n = strlen(c.s3_endpoint);
     while (n && c.s3_endpoint[n - 1] == '/') c.s3_endpoint[--n] = 0;

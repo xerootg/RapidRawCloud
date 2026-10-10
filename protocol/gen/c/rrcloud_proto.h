@@ -69,6 +69,24 @@ static const uint32_t RRCP_PROTO_READ[1] = {1};
 #define RRCP_PAIRING_OIDC_SCOPE "openid profile email"
 /** RFC 8628 grant type used by headless devices to pair. */
 #define RRCP_OAUTH_DEVICE_CODE_GRANT "urn:ietf:params:oauth:grant-type:device_code"
+/** Camera dock GATT service (128-bit, advertised in the complete-UUID list; the local name is DOCK_BLE_NAME_PREFIX + hostname in the scan response). */
+#define RRCP_DOCK_BLE_SERVICE_UUID "75969b8f-4f5b-4f23-931f-79d1f9dd5114"
+/** Dock RPC request characteristic: write / write-without-response, requires an encrypted (bonded, LE Secure Connections) link; carries request fragments. */
+#define RRCP_DOCK_BLE_RX_UUID "0b0fd650-dbcf-4b31-974f-932a29b5a481"
+/** Dock RPC response characteristic: notify; carries reply fragments. Subscribe before writing a request. */
+#define RRCP_DOCK_BLE_TX_UUID "ffe3977d-ab87-4993-9537-27bd8900962b"
+/** Dock identity characteristic: plain read (no pairing) of a DockBleInfo document so a scanner can tell docks apart before bonding. */
+#define RRCP_DOCK_BLE_INFO_UUID "fba1763b-c749-4d9e-b69d-9143ad134c84"
+/** Advertised local-name prefix of a dock: the local name is its hostname when that already starts with the prefix (the default `rrcloud-ingest`), otherwise prefix + hostname. */
+#define RRCP_DOCK_BLE_NAME_PREFIX "rrcloud-"
+/** Fragment byte 0 bit: first fragment of a message (a u16 LE total length follows). */
+#define RRCP_DOCK_RPC_FLAG_FIRST (1)
+/** Fragment byte 0 bit: last fragment of a message. */
+#define RRCP_DOCK_RPC_FLAG_LAST (2)
+/** Largest request document a dock accepts over BLE. */
+#define RRCP_DOCK_RPC_MAX_REQUEST_BYTES (8192u)
+/** Largest reply document a dock sends over BLE (bounded by its log ring). */
+#define RRCP_DOCK_RPC_MAX_RESPONSE_BYTES (32768u)
 
 /* ---- errors ------------------------------------------------------------ */
 typedef enum {
@@ -421,6 +439,26 @@ void rrcp_pairing_config_doc_init(rrcp_pairing_config_doc_t *v);
 int rrcp_pairing_config_doc_encode(const rrcp_pairing_config_doc_t *v, char *out, size_t cap);
 /** Parses one JSON document (unknown fields ignored, required fields enforced). */
 rrcp_err_t rrcp_pairing_config_doc_decode(const char *json, size_t len, rrcp_pairing_config_doc_t *out);
+
+/** Camera dock identity read from DOCK_BLE_INFO_UUID before pairing. */
+typedef struct {
+    /** Dock RPC envelope version this definition describes (1). */
+    uint32_t proto;
+    /** The dock's sync participant identity (its device registry entry). */
+    char device_id[36 + 1];
+    /** Human name shown in the device registry (`device_name`). */
+    char name[48 + 1];
+    /** mDNS hostname; also the suffix of the advertised local name. */
+    char hostname[32 + 1];
+    /** Firmware version (firmware/rrcloud-ingest/version.txt). */
+    char version[32 + 1];
+} rrcp_dock_ble_info_t;
+/** Resets to defaults (zeroed, IDL defaults applied). */
+void rrcp_dock_ble_info_init(rrcp_dock_ble_info_t *v);
+/** Validates scalars and writes one JSON document (fixed field order). Returns length or a negative rrcp_err_t. */
+int rrcp_dock_ble_info_encode(const rrcp_dock_ble_info_t *v, char *out, size_t cap);
+/** Parses one JSON document (unknown fields ignored, required fields enforced). */
+rrcp_err_t rrcp_dock_ble_info_decode(const char *json, size_t len, rrcp_dock_ble_info_t *out);
 
 /* ---- bucket keys --------------------------------------------------------- */
 /** Provided by the integrator: BLAKE3-256 of `data` into `out` (used by hashed key parts). */

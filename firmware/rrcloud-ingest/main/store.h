@@ -37,6 +37,9 @@ bool store_kv_get_str(const char *key, char *out, size_t cap);
 esp_err_t store_ledger_load(void);
 /* Lookup by (source_id, source_path, size). Returns the record status char or 0 when absent. */
 char store_ledger_lookup(const char *source_id, const char *source_path, uint64_t size);
+/* True when an uploaded record with this library key and size exists (any source
+ * path): the same photo mirrored to a second card slot. */
+bool store_ledger_relkey_uploaded(const char *relkey, uint64_t size);
 /* Appends a record (fsync) and indexes it. */
 esp_err_t store_ledger_append(const rrc_ledger_rec *r);
 /* Iterates uploaded ('U') records — used to build the manifest. Return non-zero from cb to stop. */

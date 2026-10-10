@@ -696,6 +696,52 @@
         "sync",
         "credentials"
       ]
+    },
+    "DockBleInfo": {
+      "type": "object",
+      "description": "Camera dock identity read from DOCK_BLE_INFO_UUID before pairing.",
+      "properties": {
+        "proto": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Dock RPC envelope version this definition describes (1)."
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The dock's sync participant identity (its device registry entry)."
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 48,
+          "description": "Human name shown in the device registry (`device_name`)."
+        },
+        "hostname": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "mDNS hostname; also the suffix of the advertised local name."
+        },
+        "version": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Firmware version (firmware/rrcloud-ingest/version.txt)."
+        }
+      },
+      "required": [
+        "proto",
+        "device_id",
+        "name",
+        "hostname",
+        "version"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "proto",
+        "device_id",
+        "name",
+        "hostname",
+        "version"
+      ]
     }
   }
 }

@@ -101,6 +101,33 @@ pub const PAIRING_OIDC_SCOPE: &str = "openid profile email";
 /// RFC 8628 grant type used by headless devices to pair.
 pub const OAUTH_DEVICE_CODE_GRANT: &str = "urn:ietf:params:oauth:grant-type:device_code";
 
+/// Camera dock GATT service (128-bit, advertised in the complete-UUID list; the local name is DOCK_BLE_NAME_PREFIX + hostname in the scan response).
+pub const DOCK_BLE_SERVICE_UUID: &str = "75969b8f-4f5b-4f23-931f-79d1f9dd5114";
+
+/// Dock RPC request characteristic: write / write-without-response, requires an encrypted (bonded, LE Secure Connections) link; carries request fragments.
+pub const DOCK_BLE_RX_UUID: &str = "0b0fd650-dbcf-4b31-974f-932a29b5a481";
+
+/// Dock RPC response characteristic: notify; carries reply fragments. Subscribe before writing a request.
+pub const DOCK_BLE_TX_UUID: &str = "ffe3977d-ab87-4993-9537-27bd8900962b";
+
+/// Dock identity characteristic: plain read (no pairing) of a DockBleInfo document so a scanner can tell docks apart before bonding.
+pub const DOCK_BLE_INFO_UUID: &str = "fba1763b-c749-4d9e-b69d-9143ad134c84";
+
+/// Advertised local-name prefix of a dock: the local name is its hostname when that already starts with the prefix (the default `rrcloud-ingest`), otherwise prefix + hostname.
+pub const DOCK_BLE_NAME_PREFIX: &str = "rrcloud-";
+
+/// Fragment byte 0 bit: first fragment of a message (a u16 LE total length follows).
+pub const DOCK_RPC_FLAG_FIRST: u8 = 1;
+
+/// Fragment byte 0 bit: last fragment of a message.
+pub const DOCK_RPC_FLAG_LAST: u8 = 2;
+
+/// Largest request document a dock accepts over BLE.
+pub const DOCK_RPC_MAX_REQUEST_BYTES: usize = 8192;
+
+/// Largest reply document a dock sends over BLE (bounded by its log ring).
+pub const DOCK_RPC_MAX_RESPONSE_BYTES: usize = 32768;
+
 // ---------------------------------------------------------------- errors
 
 /// Decode/validation failure. Fail-closed by design (§2.2 min-reader rule).
@@ -1286,6 +1313,34 @@ fn default_pairing_config_doc_updated_at() -> String {
 }
 
 impl PairingConfigDoc {
+    /// Serializes as one JSON document (deterministic: fixed field order, omitted `None`s).
+    pub fn to_json(&self) -> Result<String, ProtoError> {
+        Ok(serde_json::to_string(self)?)
+    }
+    pub fn from_json(s: &str) -> Result<Self, ProtoError> {
+        Ok(serde_json::from_str(s)?)
+    }
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self, ProtoError> {
+        Ok(serde_json::from_slice(bytes)?)
+    }
+}
+
+/// Camera dock identity read from DOCK_BLE_INFO_UUID before pairing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DockBleInfo {
+    /// Dock RPC envelope version this definition describes (1).
+    pub proto: u32,
+    /// The dock's sync participant identity (its device registry entry).
+    pub device_id: DeviceId,
+    /// Human name shown in the device registry (`device_name`).
+    pub name: String,
+    /// mDNS hostname; also the suffix of the advertised local name.
+    pub hostname: String,
+    /// Firmware version (firmware/rrcloud-ingest/version.txt).
+    pub version: String,
+}
+
+impl DockBleInfo {
     /// Serializes as one JSON document (deterministic: fixed field order, omitted `None`s).
     pub fn to_json(&self) -> Result<String, ProtoError> {
         Ok(serde_json::to_string(self)?)

@@ -37,6 +37,15 @@ Definition v1, wire version 1. Normative design: `docs/ARCHITECTURE.md`.
 | `PAIRING_REDIRECT_URI_RAW2DNG` | `str` | `raw2dng://auth-callback` | OAuth redirect URI of the Raw2DNG (RawImageSnapseedBridge) PKCE flow. Each app owns a scheme so two apps on one phone never fight over a callback; the OIDC provider must allow every URI in PairingInfo.redirectUris. |
 | `PAIRING_OIDC_SCOPE` | `str` | `openid profile email` | OIDC scopes requested by both the PKCE (app) and device-code (headless) pairing flows. |
 | `OAUTH_DEVICE_CODE_GRANT` | `str` | `urn:ietf:params:oauth:grant-type:device_code` | RFC 8628 grant type used by headless devices to pair. |
+| `DOCK_BLE_SERVICE_UUID` | `str` | `75969b8f-4f5b-4f23-931f-79d1f9dd5114` | Camera dock GATT service (128-bit, advertised in the complete-UUID list; the local name is DOCK_BLE_NAME_PREFIX + hostname in the scan response). |
+| `DOCK_BLE_RX_UUID` | `str` | `0b0fd650-dbcf-4b31-974f-932a29b5a481` | Dock RPC request characteristic: write / write-without-response, requires an encrypted (bonded, LE Secure Connections) link; carries request fragments. |
+| `DOCK_BLE_TX_UUID` | `str` | `ffe3977d-ab87-4993-9537-27bd8900962b` | Dock RPC response characteristic: notify; carries reply fragments. Subscribe before writing a request. |
+| `DOCK_BLE_INFO_UUID` | `str` | `fba1763b-c749-4d9e-b69d-9143ad134c84` | Dock identity characteristic: plain read (no pairing) of a DockBleInfo document so a scanner can tell docks apart before bonding. |
+| `DOCK_BLE_NAME_PREFIX` | `str` | `rrcloud-` | Advertised local-name prefix of a dock: the local name is its hostname when that already starts with the prefix (the default `rrcloud-ingest`), otherwise prefix + hostname. |
+| `DOCK_RPC_FLAG_FIRST` | `u8` | `1` | Fragment byte 0 bit: first fragment of a message (a u16 LE total length follows). |
+| `DOCK_RPC_FLAG_LAST` | `u8` | `2` | Fragment byte 0 bit: last fragment of a message. |
+| `DOCK_RPC_MAX_REQUEST_BYTES` | `usize` | `8192` | Largest request document a dock accepts over BLE. |
+| `DOCK_RPC_MAX_RESPONSE_BYTES` | `usize` | `32768` | Largest reply document a dock sends over BLE (bounded by its log ring). |
 
 ## Scalars
 
@@ -263,6 +272,18 @@ Wire names are camelCase.
 | `updated_at` | `updatedAt` | `string` | default `''` | ISO-8601 UTC. |
 | `sync` | `sync` | `PairingSyncSettings` | required |  |
 | `credentials` | `credentials` | `PairingCredentials` | required |  |
+
+### `DockBleInfo`
+
+Camera dock identity read from DOCK_BLE_INFO_UUID before pairing.
+
+| Field | Wire name | Type | Presence | Meaning |
+|---|---|---|---|---|
+| `proto` | `proto` | `u32` | required | Dock RPC envelope version this definition describes (1). |
+| `device_id` | `device_id` | `DeviceId` | required | The dock's sync participant identity (its device registry entry). |
+| `name` | `name` | `string` | required | Human name shown in the device registry (`device_name`). |
+| `hostname` | `hostname` | `string` | required | mDNS hostname; also the suffix of the advertised local name. |
+| `version` | `version` | `string` | required | Firmware version (firmware/rrcloud-ingest/version.txt). |
 
 ## Bucket keys
 

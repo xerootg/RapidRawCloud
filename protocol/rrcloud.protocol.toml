@@ -165,6 +165,59 @@ type = "str"
 value = "urn:ietf:params:oauth:grant-type:device_code"
 doc = "RFC 8628 grant type used by headless devices to pair."
 
+# ---- camera ingest dock over Bluetooth LE (firmware/rrcloud-ingest, §9) ------------------------
+# The dock exposes its admin API (the same operations as its web UI) as one GATT
+# service so the RapidRAW app can configure it without a network. A request is a
+# JSON document `{"id":<u32>,"m":"GET"|"POST","p":"/api/…","b":<object, optional>,"auth":<admin password, optional>}`
+# and the reply is `{"id":<u32>,"s":<http-style status>,"b":<the endpoint's JSON>}`.
+# Both travel as fragments of at most ATT_MTU-3 bytes: byte 0 carries DOCK_RPC_FLAG_FIRST /
+# DOCK_RPC_FLAG_LAST and a 4-bit message tag in its high nibble; a FIRST fragment then
+# carries the total message length as a u16 little-endian before the payload.
+[constants.DOCK_BLE_SERVICE_UUID]
+type = "str"
+value = "75969b8f-4f5b-4f23-931f-79d1f9dd5114"
+doc = "Camera dock GATT service (128-bit, advertised in the complete-UUID list; the local name is DOCK_BLE_NAME_PREFIX + hostname in the scan response)."
+
+[constants.DOCK_BLE_RX_UUID]
+type = "str"
+value = "0b0fd650-dbcf-4b31-974f-932a29b5a481"
+doc = "Dock RPC request characteristic: write / write-without-response, requires an encrypted (bonded, LE Secure Connections) link; carries request fragments."
+
+[constants.DOCK_BLE_TX_UUID]
+type = "str"
+value = "ffe3977d-ab87-4993-9537-27bd8900962b"
+doc = "Dock RPC response characteristic: notify; carries reply fragments. Subscribe before writing a request."
+
+[constants.DOCK_BLE_INFO_UUID]
+type = "str"
+value = "fba1763b-c749-4d9e-b69d-9143ad134c84"
+doc = "Dock identity characteristic: plain read (no pairing) of a DockBleInfo document so a scanner can tell docks apart before bonding."
+
+[constants.DOCK_BLE_NAME_PREFIX]
+type = "str"
+value = "rrcloud-"
+doc = "Advertised local-name prefix of a dock: the local name is its hostname when that already starts with the prefix (the default `rrcloud-ingest`), otherwise prefix + hostname."
+
+[constants.DOCK_RPC_FLAG_FIRST]
+type = "u8"
+value = 1
+doc = "Fragment byte 0 bit: first fragment of a message (a u16 LE total length follows)."
+
+[constants.DOCK_RPC_FLAG_LAST]
+type = "u8"
+value = 2
+doc = "Fragment byte 0 bit: last fragment of a message."
+
+[constants.DOCK_RPC_MAX_REQUEST_BYTES]
+type = "usize"
+value = 8192
+doc = "Largest request document a dock accepts over BLE."
+
+[constants.DOCK_RPC_MAX_RESPONSE_BYTES]
+type = "usize"
+value = 32768
+doc = "Largest reply document a dock sends over BLE (bounded by its log ring)."
+
 # ----------------------------------------------------------------------------- scalars
 # `format` drives generated validation. Strings carry `max_length` (bytes) for fixed-buffer targets.
 
@@ -401,6 +454,17 @@ fields = [
 # ----------------------------------------------------------------------------- bucket keys
 # Templates: {param} is substituted verbatim after validation; {param:hex16} zero-padded 16-char
 # lowercase hex; {blake3_32(param)} first 32 hex chars of blake3(param bytes).
+
+[records.DockBleInfo]
+doc = "Camera dock identity read from DOCK_BLE_INFO_UUID before pairing."
+naming = "snake"
+fields = [
+  { name = "proto", type = "u32", doc = "Dock RPC envelope version this definition describes (1)." },
+  { name = "device_id", type = "DeviceId", doc = "The dock's sync participant identity (its device registry entry)." },
+  { name = "name", type = "string", max_length = 48, doc = "Human name shown in the device registry (`device_name`)." },
+  { name = "hostname", type = "string", max_length = 32, doc = "mDNS hostname; also the suffix of the advertised local name." },
+  { name = "version", type = "string", max_length = 32, doc = "Firmware version (firmware/rrcloud-ingest/version.txt)." },
+]
 
 [keys.library_original]
 template = "library/{relkey}"

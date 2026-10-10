@@ -38,6 +38,9 @@
 #include "store.h"
 #include "log_ring.h"
 #include "usb_diag.h"
+#include "coproc.h"
+#include "api.h"
+#include "util.h"
 #include "lwip/sockets.h"
 #include "lwip/stats.h"
 
@@ -98,17 +101,6 @@ static esp_err_t send_json(httpd_req_t *req, const char *json, int len)
     return httpd_resp_send(req, json, len < 0 ? HTTPD_RESP_USE_STRLEN : len);
 }
 
-static esp_err_t send_ok(httpd_req_t *req) { return send_json(req, "{\"ok\":true}", -1); }
-
-static esp_err_t send_err(httpd_req_t *req, int code, const char *msg)
-{
-    char buf[300];
-    char q[260];
-    rrc_json_quote(msg, q, sizeof q);
-    snprintf(buf, sizeof buf, "{\"ok\":false,\"error\":%s}", q);
-    httpd_resp_set_status(req, code == 400 ? "400 Bad Request" : code == 409 ? "409 Conflict" : "500 Internal Server Error");
-    return send_json(req, buf, -1);
-}
 
 static char *read_body(httpd_req_t *req, size_t max)
 {
@@ -132,126 +124,38 @@ static esp_err_t h_index(httpd_req_t *req)
     return httpd_resp_send(req, index_html_start, index_html_end - index_html_start - 1);
 }
 
-static esp_err_t h_status(httpd_req_t *req)
+static const char *status_line(int code)
 {
-    AUTH();
-    char *buf = malloc(3072);
-    if (!buf) return send_err(req, 500, "oom");
-    char sync_json[1800];
-    sync_status_json(sync_json, sizeof sync_json);
-    char netd[64];
-    net_describe(netd, sizeof netd);
-    size_t total = 0, used = 0;
-    store_usage(&total, &used);
-    const esp_app_desc_t *app = esp_app_get_description();
-    char q_net[80], q_ver[48], q_host[48], q_dev[48], q_time[24];
-    rrc_json_quote(netd, q_net, sizeof q_net);
-    rrc_json_quote(app->version, q_ver, sizeof q_ver);
-    rrc_json_quote(app_config_get()->hostname, q_host, sizeof q_host);
-    rrc_json_quote(app_device_id(), q_dev, sizeof q_dev);
-    char iso[21] = "";
-    if (net_time_synced()) rrc_format_iso8601((int64_t)time(NULL), iso);
-    rrc_json_quote(iso, q_time, sizeof q_time);
-    int n = snprintf(buf, 3072,
-        "{\"sync\":%s,\"network\":%s,\"eth_link\":%s,\"wifi\":%s,\"time_synced\":%s,\"time\":%s,\"version\":%s,\"hostname\":%s,\"device_id\":%s,"
-        "\"storage_total\":%u,\"storage_used\":%u,\"heap_free\":%u,\"psram_free\":%u,\"uptime_s\":%lld,\"usb_devices\":%d}",
-        sync_json, q_net, net_eth_link() ? "true" : "false", net_wifi_connected() ? "true" : "false", net_time_synced() ? "true" : "false", q_time, q_ver, q_host, q_dev,
-        (unsigned)total, (unsigned)used, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-        (long long)(esp_timer_get_time() / 1000000), usb_diag_device_count());
-    esp_err_t e = send_json(req, buf, n);
-    free(buf);
-    return e;
+    switch (code) {
+    case 200: return "200 OK";
+    case 400: return "400 Bad Request";
+    case 401: return "401 Unauthorized";
+    case 404: return "404 Not Found";
+    case 409: return "409 Conflict";
+    case 413: return "413 Payload Too Large";
+    default: return "500 Internal Server Error";
+    }
 }
 
-static esp_err_t h_config_get(httpd_req_t *req)
+/* Every /api route: auth + CSRF gate here, the operation in api.c. */
+static esp_err_t h_api(httpd_req_t *req)
 {
     AUTH();
-    char *buf = malloc(4096);
-    if (!buf) return send_err(req, 500, "oom");
-    int n = app_config_to_json(buf, 4096);
-    esp_err_t e = n < 0 ? send_err(req, 500, "encode") : send_json(req, buf, n);
-    free(buf);
-    return e;
-}
-
-static esp_err_t h_config_post(httpd_req_t *req)
-{
-    AUTH();
-    char *body = read_body(req, 8192);
-    if (!body) return send_err(req, 400, "missing or oversized body");
-    char err[96];
-    esp_err_t e = app_config_apply_json(body, strlen(body), err, sizeof err);
+    char *body = NULL;
+    if (req->method == HTTP_POST && req->content_len) {
+        if (req->content_len > 8192) { httpd_resp_set_status(req, status_line(413)); return send_json(req, "{\"ok\":false,\"error\":\"body too large\"}", -1); }
+        body = read_body(req, 8192);
+        if (!body) { httpd_resp_set_status(req, status_line(400)); return send_json(req, "{\"ok\":false,\"error\":\"could not read body\"}", -1); }
+    }
+    api_resp_t r;
+    api_dispatch(req->method == HTTP_POST ? "POST" : "GET", req->uri, body, body ? strlen(body) : 0, &r);
     free(body);
-    if (e != ESP_OK) return send_err(req, 400, err[0] ? err : "invalid config");
-    e = app_config_save(app_config_get());
-    if (e != ESP_OK) return send_err(req, 500, "could not persist config");
-    sync_config_changed();
-    net_wifi_reconfigure();
-    usb_diag_set_verbose(app_config_get()->usb_debug);
-    log_ring_printf("configuration saved");
-    return send_ok(req);
-}
-
-static esp_err_t h_sync_now(httpd_req_t *req) { AUTH(); sync_request_now(); return send_ok(req); }
-static esp_err_t h_sync_cancel(httpd_req_t *req) { AUTH(); sync_cancel(); return send_ok(req); }
-static esp_err_t h_usb_reset(httpd_req_t *req)
-{
-    AUTH();
-    log_ring_printf("usb: power-cycling the root port on request");
-    return usb_diag_power_cycle() == ESP_OK ? send_ok(req) : send_err(req, 500, "root port power cycle failed");
-}
-
-static esp_err_t h_pair_begin(httpd_req_t *req)
-{
-    AUTH();
-    char *body = read_body(req, 1024);
-    if (!body) return send_err(req, 400, "missing body");
-    cJSON *o = cJSON_Parse(body);
-    free(body);
-    cJSON *u = o ? cJSON_GetObjectItemCaseSensitive(o, "url") : NULL;
-    if (!cJSON_IsString(u) || !u->valuestring[0]) { if (o) cJSON_Delete(o); return send_err(req, 400, "url required"); }
-    esp_err_t e = pairing_begin(u->valuestring);
-    cJSON_Delete(o);
-    if (e == ESP_ERR_INVALID_STATE) return send_err(req, 409, "pairing already in progress");
-    if (e != ESP_OK) return send_err(req, 500, esp_err_to_name(e));
-    return send_ok(req);
-}
-
-static esp_err_t h_pair_status(httpd_req_t *req)
-{
-    AUTH();
-    char buf[1024];
-    int n = pairing_status_json(buf, sizeof buf);
-    return send_json(req, buf, n);
-}
-
-static esp_err_t h_pair_cancel(httpd_req_t *req) { AUTH(); pairing_cancel(); return send_ok(req); }
-
-static esp_err_t h_log(httpd_req_t *req)
-{
-    AUTH();
-    char *buf = malloc(24576);
-    if (!buf) return send_err(req, 500, "oom");
-    int n = log_ring_to_json(buf, 24576);
-    esp_err_t e = n < 0 ? send_err(req, 500, "encode") : send_json(req, buf, n);
-    free(buf);
+    httpd_resp_set_status(req, status_line(r.status));
+    esp_err_t e = send_json(req, r.json ? r.json : "{\"ok\":false,\"error\":\"oom\"}", r.json ? (int)r.len : -1);
+    api_resp_free(&r);
     return e;
 }
 
-static esp_err_t h_reboot(httpd_req_t *req)
-{
-    AUTH();
-    send_ok(req);
-    log_ring_printf("reboot requested from UI");
-    vTaskDelay(pdMS_TO_TICKS(300));
-    esp_restart();
-    return ESP_OK;
-}
-
-/* Every accepted TCP connection is logged with its peer address, so the serial
- * log answers "did the browser's packets reach the dock at all?" — the
- * question a silent timeout leaves open (e.g. a stateless inter-VLAN ACL
- * that drops the SYN-ACK on the way back). */
 static volatile unsigned external_connections;
 
 static esp_err_t on_open(httpd_handle_t hd, int sockfd)
@@ -317,7 +221,7 @@ esp_err_t web_start(void)
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
     cfg.open_fn = on_open;
-    cfg.max_uri_handlers = 16;
+    cfg.max_uri_handlers = 24;
     cfg.stack_size = 8192;
     cfg.lru_purge_enable = true;
     cfg.max_open_sockets = 6;
@@ -326,17 +230,19 @@ esp_err_t web_start(void)
     if (e != ESP_OK) { ESP_LOGE(TAG, "httpd_start: %s", esp_err_to_name(e)); return e; }
     const httpd_uri_t routes[] = {
         {.uri = "/", .method = HTTP_GET, .handler = h_index},
-        {.uri = "/api/status", .method = HTTP_GET, .handler = h_status},
-        {.uri = "/api/config", .method = HTTP_GET, .handler = h_config_get},
-        {.uri = "/api/config", .method = HTTP_POST, .handler = h_config_post},
-        {.uri = "/api/sync/now", .method = HTTP_POST, .handler = h_sync_now},
-        {.uri = "/api/sync/cancel", .method = HTTP_POST, .handler = h_sync_cancel},
-        {.uri = "/api/usb/reset", .method = HTTP_POST, .handler = h_usb_reset},
-        {.uri = "/api/pair/begin", .method = HTTP_POST, .handler = h_pair_begin},
-        {.uri = "/api/pair/status", .method = HTTP_GET, .handler = h_pair_status},
-        {.uri = "/api/pair/cancel", .method = HTTP_POST, .handler = h_pair_cancel},
-        {.uri = "/api/log", .method = HTTP_GET, .handler = h_log},
-        {.uri = "/api/reboot", .method = HTTP_POST, .handler = h_reboot},
+        {.uri = "/api/status", .method = HTTP_GET, .handler = h_api},
+        {.uri = "/api/config", .method = HTTP_GET, .handler = h_api},
+        {.uri = "/api/config", .method = HTTP_POST, .handler = h_api},
+        {.uri = "/api/sync/now", .method = HTTP_POST, .handler = h_api},
+        {.uri = "/api/sync/cancel", .method = HTTP_POST, .handler = h_api},
+        {.uri = "/api/usb/reset", .method = HTTP_POST, .handler = h_api},
+        {.uri = "/api/pair/begin", .method = HTTP_POST, .handler = h_api},
+        {.uri = "/api/pair/status", .method = HTTP_GET, .handler = h_api},
+        {.uri = "/api/pair/cancel", .method = HTTP_POST, .handler = h_api},
+        {.uri = "/api/log", .method = HTTP_GET, .handler = h_api},
+        {.uri = "/api/reboot", .method = HTTP_POST, .handler = h_api},
+        {.uri = "/api/coproc/update", .method = HTTP_POST, .handler = h_api},
+        {.uri = "/api/ble/forget", .method = HTTP_POST, .handler = h_api},
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++) httpd_register_uri_handler(s, &routes[i]);
     log_ring_printf("web ui listening on port 80");

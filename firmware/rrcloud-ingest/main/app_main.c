@@ -19,6 +19,8 @@
 #include "camera_source.h"
 #include "log_ring.h"
 #include "usb_diag.h"
+#include "coproc.h"
+#include "ble.h"
 #include "console.h"
 
 static const char *TAG = "main";
@@ -42,6 +44,8 @@ void app_main(void)
     log_ring_printf("rrcloud-ingest starting; device %s; psram free %u KiB", app_device_id(), (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 
     ESP_ERROR_CHECK(net_init());
+    coproc_start(); /* ESP32-C6 link for BLE/version reporting, with or without Wi-Fi */
+    ble_start();    /* BLE admin service once the C6 is linked */
 
     /* The host library's default peripheral on the P4 is the USB 2.0 High-Speed
      * OTG controller (UTMI PHY), which is what the board's USB-A port is wired

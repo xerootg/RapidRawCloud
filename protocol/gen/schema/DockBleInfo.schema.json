@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://rapidrawcloud.dev/schema/PairingInfo.json",
-  "$ref": "#/$defs/PairingInfo",
+  "$id": "https://rapidrawcloud.dev/schema/DockBleInfo.json",
+  "$ref": "#/$defs/DockBleInfo",
   "$defs": {
     "DeviceId": {
       "type": "string",

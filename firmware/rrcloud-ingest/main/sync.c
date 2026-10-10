@@ -25,6 +25,10 @@
 static const char *TAG = "sync";
 
 #define PART_BUF_BYTES   (8u * 1024u * 1024u)   /* one multipart part / max single PUT */
+/* The sync task runs the S3 client and its TLS session (mbedTLS handshake and
+ * record buffers on the stack) under several KiB of path/key/journal-line locals;
+ * 24 KiB overflowed by ~6 KiB on hardware (stack protection fault in "sync"). */
+#define SYNC_TASK_STACK  (48u * 1024u)
 #define READ_CHUNK       (256u * 1024u)
 #define SEGMENT_FREEZE_ENTRIES 900
 #define SEGMENT_FREEZE_BYTES   (900u * 1024u)
@@ -34,8 +38,8 @@ static const char *TAG = "sync";
 #define MANIFEST_RECONFIRM_S (24 * 3600)   /* §2.10 rule 2 */
 #define LAGGARD_CAP_S       (14 * 24 * 3600) /* §2.10 rule 3 */
 
-typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG } cmd_t;
-typedef struct { cmd_t cmd; cam_source_t *src; } msg_t;
+typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG, CMD_DEBUG_LS, CMD_DEBUG_HASH } cmd_t;
+typedef struct { cmd_t cmd; cam_source_t *src; char *arg; int repeat; } msg_t;
 
 static QueueHandle_t q;
 static SemaphoreHandle_t st_mtx;
@@ -373,9 +377,13 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     }
     if (total != o->size) { set_error("short read from camera: %llu of %llu bytes", (unsigned long long)total, (unsigned long long)o->size); e = ESP_FAIL; goto fail; }
     if (multipart) {
-        const char *etag_ptrs[1024];
+        /* Heap, not stack: up to 1024 pointers (4 KiB) on top of the TLS session
+         * below this frame overflowed the sync task on hardware. */
+        const char **etag_ptrs = calloc((size_t)(parts > 0 ? parts : 1), sizeof *etag_ptrs);
+        if (!etag_ptrs) { set_error("multipart complete: out of memory"); e = ESP_ERR_NO_MEM; goto fail; }
         for (int i = 0; i < parts; i++) etag_ptrs[i] = etags[i];
         e = rrc_s3_multipart_complete(&s3, key, upload_id, etag_ptrs, parts, &res);
+        free(etag_ptrs);
         if (e != ESP_OK) { char b[96]; set_error("multipart complete failed: %s", rrc_s3_result_str(&res, b, sizeof b)); goto fail; }
         upload_id[0] = 0;
     }
@@ -475,6 +483,16 @@ static void sync_run(cam_source_t *src)
         rrc_relkey_err re = rrc_template_expand(cfg->key_template, &tv, relkey, sizeof relkey);
         if (re != RRC_RELKEY_OK) { set_error("%s: unsyncable key (%s)", o->path, rrc_relkey_err_str(re)); ST_LOCK(); st.run_failed++; ST_UNLOCK(); continue; }
         rrc_key_library(relkey, key, sizeof key);
+        /* Dual-slot bodies (Nikon "backup" to the second card) list the same photo
+         * twice under two storages; the copies are not byte-identical, so only the
+         * first one seen is the library's. Record the mirror so it is never retried. */
+        if (store_ledger_relkey_uploaded(relkey, o->size)) {
+            rrc_ledger_rec mirror = {.source_id = src->source_id, .source_path = o->path, .size = o->size, .mtime = o->mtime, .relkey = relkey, .blake3_hex = "", .seq = 0, .ts = 0, .status = RRC_LEDGER_REMOTE_EXISTS};
+            log_ring_printf("skip %s: the same photo was already uploaded from this camera's other card slot", relkey);
+            store_ledger_append(&mirror);
+            ST_LOCK(); st.run_skipped++; ST_UNLOCK();
+            continue;
+        }
         /* HEAD: already in the bucket? */
         rrc_s3_result_t hr;
         if (rrc_s3_head(&s3, key, &hr) != ESP_OK) { set_error("%s: HEAD failed (%d)", relkey, hr.status); ST_LOCK(); st.run_failed++; ST_UNLOCK(); consecutive_failures++; continue; }
@@ -566,6 +584,69 @@ static void on_tick(void)
     }
 }
 
+/* ---- console diagnostics (run on the sync task: it owns the camera session) -- */
+static int debug_ls_cb(void *ctx, const cam_object_t *o)
+{
+    size_t *n = ctx;
+    (*n)++;
+    printf("  %08lx %12llu  %s\n", (unsigned long)o->handle, (unsigned long long)o->size, o->path);
+    return 0;
+}
+
+static void debug_ls(void)
+{
+    if (!cam || !cam->connected(cam)) { printf("no camera attached\n"); return; }
+    if (!strcmp(cam->kind, "ptp") && !cam_identified) {
+        if (source_ptp_identify(cam) != ESP_OK) { printf("camera did not answer OpenSession/GetDeviceInfo\n"); return; }
+        cam_identified = true;
+    }
+    printf("objects on %s [%s] (handle, size, path):\n", cam->model, cam->source_id);
+    size_t n = 0;
+    esp_err_t e = cam->enumerate(cam, debug_ls_cb, &n);
+    printf("%u objects (%s)\n", (unsigned)n, esp_err_to_name(e));
+}
+
+/* Reads one object end to end `repeat` times through the normal source read
+ * path and prints the BLAKE3 of each pass: identical hashes prove the camera
+ * read path is deterministic; the hash can be compared with the file on the
+ * card. `arg` is a hex PTP handle or an MSC path. */
+static void debug_hash(const char *arg, int repeat)
+{
+    if (!cam || !cam->connected(cam)) { printf("no camera attached\n"); return; }
+    cam_object_t o = {0};
+    char *end = NULL;
+    unsigned long h = strtoul(arg, &end, 16);
+    if (end && *end == 0 && h) o.handle = (uint32_t)h;
+    scpy(o.path, sizeof o.path, arg);
+    const char *slash = strrchr(arg, '/');
+    scpy(o.name, sizeof o.name, slash ? slash + 1 : arg);
+    o.size = 0xFFFFFFFFFFFFFFFFull; /* unknown: read to EOF */
+    for (int r = 0; r < (repeat > 0 ? repeat : 1); r++) {
+        void *fh = NULL;
+        esp_err_t e = cam->open(cam, &o, &fh);
+        if (e != ESP_OK) { printf("open failed: %s\n", esp_err_to_name(e)); return; }
+        rrc_blake3_ctx b3;
+        rrc_blake3_init(&b3);
+        uint64_t total = 0;
+        int64_t t0 = esp_timer_get_time();
+        for (;;) {
+            size_t got = 0;
+            e = cam->read(cam, fh, total, part_buf, READ_CHUNK, &got);
+            if (e != ESP_OK) { printf("read failed at %llu: %s\n", (unsigned long long)total, esp_err_to_name(e)); break; }
+            if (got == 0) break;
+            rrc_blake3_update(&b3, part_buf, got);
+            total += got;
+            if (got < READ_CHUNK) break;
+        }
+        cam->close(cam, fh);
+        char hex[65];
+        rrc_blake3_final_hex(&b3, hex);
+        int64_t ms = (esp_timer_get_time() - t0) / 1000;
+        printf("pass %d: %llu bytes blake3 %s in %lld ms (%.2f MB/s)\n", r + 1, (unsigned long long)total, hex, (long long)ms,
+               ms > 0 ? (double)total / 1048576.0 * 1000.0 / (double)ms : 0.0);
+    }
+}
+
 /* ---- task ------------------------------------------------------------------- */
 static void sync_task(void *arg)
 {
@@ -603,6 +684,8 @@ static void sync_task(void *arg)
         case CMD_CANCEL: break; /* flag already set */
         case CMD_TICK: on_tick(); break;
         case CMD_CONFIG: configure_s3(); break;
+        case CMD_DEBUG_LS: debug_ls(); break;
+        case CMD_DEBUG_HASH: debug_hash(m.arg ? m.arg : "", m.repeat); free(m.arg); break;
         }
     }
 }
@@ -629,7 +712,7 @@ esp_err_t sync_init(void)
     st.last_manifest_ts = manifest_ts();
     ST_UNLOCK();
     configure_s3();
-    if (xTaskCreatePinnedToCore(sync_task, "sync", 24576, NULL, 4, NULL, tskNO_AFFINITY) != pdPASS) return ESP_ERR_NO_MEM;
+    if (xTaskCreatePinnedToCore(sync_task, "sync", SYNC_TASK_STACK, NULL, 4, NULL, tskNO_AFFINITY) != pdPASS) return ESP_ERR_NO_MEM;
     const esp_timer_create_args_t ta = {.callback = tick_cb, .name = "sync_tick"};
     esp_timer_create(&ta, &tick_timer);
     esp_timer_start_periodic(tick_timer, 60ull * 1000 * 1000);
@@ -640,6 +723,12 @@ void sync_get_status(sync_status_t *out) { ST_LOCK(); *out = st; out->pending_en
 void sync_request_now(void) { msg_t m = {.cmd = CMD_SYNC_NOW}; xQueueSend(q, &m, 0); }
 void sync_cancel(void) { cancel_flag = true; msg_t m = {.cmd = CMD_CANCEL}; xQueueSend(q, &m, 0); }
 void sync_config_changed(void) { msg_t m = {.cmd = CMD_CONFIG}; xQueueSend(q, &m, 0); }
+void sync_debug_list(void) { msg_t m = {.cmd = CMD_DEBUG_LS}; xQueueSend(q, &m, 0); }
+void sync_debug_hash(const char *handle_or_path, int repeat)
+{
+    msg_t m = {.cmd = CMD_DEBUG_HASH, .arg = strdup(handle_or_path ? handle_or_path : ""), .repeat = repeat};
+    if (xQueueSend(q, &m, 0) != pdTRUE) free(m.arg);
+}
 
 static const char *phase_str(sync_phase_t p)
 {

@@ -1694,6 +1694,91 @@ rrcp_err_t rrcp_pairing_config_doc_decode(const char *json, size_t len, rrcp_pai
     return r_end(&r);
 }
 
+void rrcp_dock_ble_info_init(rrcp_dock_ble_info_t *v)
+{
+    memset(v, 0, sizeof *v);
+}
+
+static rrcp_err_t dock_ble_info_write(w_t *w, const rrcp_dock_ble_info_t *v)
+{
+    bool first = true;
+    w_putc(w, '{');
+    w_key(w, "proto", &first);
+    w_u64(w, (uint64_t)v->proto);
+    w_key(w, "device_id", &first);
+    if (rrcp_validate_device_id(v->device_id)) return RRCP_E_INVALID;
+    w_str(w, v->device_id);
+    w_key(w, "name", &first);
+    w_str(w, v->name);
+    w_key(w, "hostname", &first);
+    w_str(w, v->hostname);
+    w_key(w, "version", &first);
+    w_str(w, v->version);
+    w_putc(w, '}');
+    return RRCP_OK;
+}
+
+int rrcp_dock_ble_info_encode(const rrcp_dock_ble_info_t *v, char *out, size_t cap)
+{
+    w_t w = {out, cap, 0, cap == 0};
+    if (cap) out[0] = 0;
+    rrcp_err_t e = dock_ble_info_write(&w, v);
+    if (e) return e;
+    return w.overflow ? RRCP_E_OVERFLOW : (int)w.len;
+}
+
+static rrcp_err_t dock_ble_info_read(r_t *r, rrcp_dock_ble_info_t *v)
+{
+    rrcp_dock_ble_info_init(v);
+    uint32_t seen = 0;
+    (void)seen;
+    bool empty;
+    rrcp_err_t e = r_obj_begin(r, &empty);
+    if (e) return e;
+    if (!empty) for (;;) {
+        char key[64];
+        e = r_obj_key(r, key, sizeof key);
+        if (e) return e;
+        if (!strcmp(key, "proto")) {
+            { uint64_t u; e = r_u64(r, &u); if (e) return e; if (u > UINT32_MAX) return RRCP_E_BAD_VALUE; v->proto = (uint32_t)u; }
+            seen |= 1u << 0;
+        } else if (!strcmp(key, "device_id")) {
+            e = r_string(r, v->device_id, sizeof v->device_id);
+            if (e) return e;
+            if (rrcp_validate_device_id(v->device_id)) return RRCP_E_INVALID;
+            seen |= 1u << 1;
+        } else if (!strcmp(key, "name")) {
+            e = r_string_ex(r, v->name, sizeof v->name, true);
+            if (e) return e;
+            seen |= 1u << 2;
+        } else if (!strcmp(key, "hostname")) {
+            e = r_string_ex(r, v->hostname, sizeof v->hostname, true);
+            if (e) return e;
+            seen |= 1u << 3;
+        } else if (!strcmp(key, "version")) {
+            e = r_string_ex(r, v->version, sizeof v->version, true);
+            if (e) return e;
+            seen |= 1u << 4;
+        } else {
+            e = r_skip(r, 0);
+            if (e) return e;
+        }
+        int more = r_obj_sep(r);
+        if (more < 0) return (rrcp_err_t)more;
+        if (!more) break;
+    }
+    if ((seen & 0x1fu) != 0x1fu) return RRCP_E_MISSING_FIELD;
+    return RRCP_OK;
+}
+
+rrcp_err_t rrcp_dock_ble_info_decode(const char *json, size_t len, rrcp_dock_ble_info_t *out)
+{
+    r_t r = {json, json + len};
+    rrcp_err_t e = dock_ble_info_read(&r, out);
+    if (e) return e;
+    return r_end(&r);
+}
+
 
 /* ---- keys ------------------------------------------------------------------- */
 static int k_put(char *out, size_t cap, size_t *pos, const char *s)

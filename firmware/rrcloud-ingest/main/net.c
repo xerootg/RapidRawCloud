@@ -18,6 +18,7 @@
 #include "log_ring.h"
 #if CONFIG_ESP_WIFI_REMOTE_ENABLED
 #include "esp_hosted.h"
+#include "coproc.h"
 #endif
 
 static const char *TAG = "net";
@@ -106,14 +107,8 @@ static esp_err_t wifi_start(void)
     app_config_get_wifi_password(pw, sizeof pw);
     if (!c->wifi_ssid[0]) return ESP_OK;
 #if CONFIG_ESP_WIFI_REMOTE_ENABLED
-    static bool hosted_up;
-    if (!hosted_up) {
-        int rc = esp_hosted_init();
-        if (rc != 0) { log_ring_printf("esp-hosted init failed (%d): is the ESP32-C6 slave firmware present?", rc); return ESP_FAIL; }
-        rc = esp_hosted_connect_to_slave();
-        if (rc != 0) { log_ring_printf("esp-hosted: cannot reach the ESP32-C6 over SDIO (%d)", rc); return ESP_FAIL; }
-        hosted_up = true;
-    }
+    /* The radio lives on the ESP32-C6; its ESP-Hosted link is owned by coproc.c. */
+    if (coproc_ensure_link(15000) != ESP_OK) { log_ring_printf("wifi: the ESP32-C6 co-processor is not linked — Wi-Fi stays off"); return ESP_FAIL; }
 #endif
     if (!wifi_netif) {
         wifi_netif = esp_netif_create_default_wifi_sta();

@@ -40,5 +40,9 @@ int sync_status_json(char *out, size_t cap);
 void sync_request_now(void);
 void sync_cancel(void);
 void sync_config_changed(void);
+/* Console diagnostics, executed on the sync task (output goes to the console UART):
+ * list the attached camera's objects; hash one object `repeat` times. */
+void sync_debug_list(void);
+void sync_debug_hash(const char *handle_or_path, int repeat);
 /* Camera event hook (registered with the source installers). */
 void sync_on_camera_event(cam_event_t ev, cam_source_t *src, void *arg);

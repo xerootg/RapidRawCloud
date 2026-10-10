@@ -117,6 +117,10 @@
     <label class="check"><input type="checkbox" id="admin_auth"> Require a password for this page (user <code>admin</code>)</label>
     <input id="admin_password" type="password" autocomplete="new-password" placeholder="admin password (leave blank to keep)">
     <label class="check"><input type="checkbox" id="usb_debug"> Verbose USB host logging on the serial console (debugging camera detection)</label>
+    <label class="check"><input type="checkbox" id="ble_enabled"> Bluetooth LE setup from the RapidRAW app (advertises as <code id="blename">rrcloud-…</code>)</label>
+    <div class="note" id="radio">Radio co-processor: …</div>
+    <div class="note" id="c6upd"></div>
+    <div><button id="c6update" class="secondary" type="button">Update radio firmware</button> <button id="bleforget" class="secondary" type="button">Forget paired phones</button></div>
     <div>
       <button id="save">Save</button>
       <button id="reboot" class="secondary">Reboot</button>
@@ -138,7 +142,7 @@ let toastT; function toast(m){ const t=$('toast'); t.textContent=m; t.style.disp
 async function api(path, body){ const r = await fetch(path, body!==undefined ? {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)} : {}); const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||('HTTP '+r.status)); return j; }
 
 const strFields = ['include_globs','exclude_globs','msc_root','key_template','s3_endpoint','s3_bucket','s3_region','s3_access_key','device_name','hostname','wifi_ssid'];
-const boolFields = ['auto_sync','upload_videos','s3_tls_insecure','admin_auth','usb_debug'];
+const boolFields = ['auto_sync','upload_videos','s3_tls_insecure','admin_auth','usb_debug','ble_enabled'];
 async function loadConfig(){
   const c = await api('/api/config');
   strFields.forEach(f => $(f).value = c[f] ?? '');
@@ -163,6 +167,8 @@ $('reboot').onclick = async () => { if (confirm('Reboot the dock?')) { try { awa
 $('syncnow').onclick = () => api('/api/sync/now', {}).then(()=>toast('Sync requested')).catch(e=>toast(e.message));
 $('synccancel').onclick = () => api('/api/sync/cancel', {}).then(()=>toast('Cancelling')).catch(e=>toast(e.message));
 $('usbreset').onclick = () => api('/api/usb/reset', {}).then(()=>toast('USB port power-cycled')).catch(e=>toast(e.message));
+$('bleforget').onclick = () => api('/api/ble/forget', {}).then(()=>toast('Paired phones forgotten')).catch(e=>toast(e.message));
+$('c6update').onclick = () => { if (confirm('Download the ESP-Hosted co-processor image and install it on the ESP32-C6? The dock restarts afterwards.')) api('/api/coproc/update', {}).then(()=>toast('Radio update started')).catch(e=>toast(e.message)); };
 $('pairbegin').onclick = async () => { try { await api('/api/pair/begin', {url: $('pairurl').value.trim()}); $('pairbox').style.display='block'; pollPair(); } catch(e) { toast(e.message); } };
 $('paircancel').onclick = () => api('/api/pair/cancel', {}).catch(()=>{});
 
@@ -198,6 +204,19 @@ async function refresh(){
     $('progwrap').style.display = active ? 'block' : 'none';
     if (active) { $('curfile').textContent = y.current_file ? `${y.current_file} — ${fmtBytes(y.current_done)} / ${fmtBytes(y.current_size)}` : (y.phase==='enumerating' ? 'scanning camera…' : 'publishing journal…'); $('prog').value = y.current_size ? 100*y.current_done/y.current_size : 0; $('runstats').textContent = `${y.run_done} uploaded · ${y.run_skipped} skipped · ${y.run_failed} failed · ${y.run_total} queued · ${fmtBytes(y.run_bytes)}`; }
     $('lasterr').textContent = y.last_error ? 'Last error: ' + y.last_error : '';
+    const r = s.coproc, b = s.ble;
+    if (r) {
+      $('radio').textContent = r.linked
+        ? `Radio co-processor (ESP32-C6): ESP-Hosted ${r.version}` + (r.compatible ? ' · compatible with this firmware' : ` · needs ${r.host_lib} — Wi-Fi and Bluetooth stay off until updated`)
+        : (r.linking ? 'Radio co-processor: linking over SDIO…' : 'Radio co-processor: not linked' + (r.error ? ' — ' + r.error : ''));
+      const u = r.update;
+      $('c6upd').textContent = u.state === 'idle' ? '' : `Radio update ${u.state}: ${u.message}` + (u.total ? ` (${fmtBytes(u.done)} / ${fmtBytes(u.total)})` : '');
+      $('c6update').disabled = u.state === 'running' || !r.linked;
+    }
+    if (b) {
+      $('blename').textContent = b.name || 'rrcloud-…';
+      $('ble_enabled').title = b.up ? (b.connected ? `app connected (${b.encrypted ? 'encrypted' : 'not yet encrypted'}, MTU ${b.mtu})` : (b.advertising ? `advertising as ${b.name} (${b.address})` : 'idle')) : (b.error ? 'unavailable: ' + b.error : 'starting…');
+    }
     $('syncnow').disabled = !y.camera_attached || active; $('synccancel').disabled = !active;
     const log = await api('/api/log'); $('log').textContent = log.join('\n'); 
   } catch (e) { $('sub').textContent = 'connection lost… ' + e.message; }

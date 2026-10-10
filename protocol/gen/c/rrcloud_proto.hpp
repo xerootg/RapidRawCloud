@@ -54,6 +54,15 @@ inline constexpr std::string_view PAIRING_REDIRECT_URI = RRCP_PAIRING_REDIRECT_U
 inline constexpr std::string_view PAIRING_REDIRECT_URI_RAW2DNG = RRCP_PAIRING_REDIRECT_URI_RAW2DNG;
 inline constexpr std::string_view PAIRING_OIDC_SCOPE = RRCP_PAIRING_OIDC_SCOPE;
 inline constexpr std::string_view OAUTH_DEVICE_CODE_GRANT = RRCP_OAUTH_DEVICE_CODE_GRANT;
+inline constexpr std::string_view DOCK_BLE_SERVICE_UUID = RRCP_DOCK_BLE_SERVICE_UUID;
+inline constexpr std::string_view DOCK_BLE_RX_UUID = RRCP_DOCK_BLE_RX_UUID;
+inline constexpr std::string_view DOCK_BLE_TX_UUID = RRCP_DOCK_BLE_TX_UUID;
+inline constexpr std::string_view DOCK_BLE_INFO_UUID = RRCP_DOCK_BLE_INFO_UUID;
+inline constexpr std::string_view DOCK_BLE_NAME_PREFIX = RRCP_DOCK_BLE_NAME_PREFIX;
+inline constexpr uint8_t DOCK_RPC_FLAG_FIRST = RRCP_DOCK_RPC_FLAG_FIRST;
+inline constexpr uint8_t DOCK_RPC_FLAG_LAST = RRCP_DOCK_RPC_FLAG_LAST;
+inline constexpr size_t DOCK_RPC_MAX_REQUEST_BYTES = RRCP_DOCK_RPC_MAX_REQUEST_BYTES;
+inline constexpr size_t DOCK_RPC_MAX_RESPONSE_BYTES = RRCP_DOCK_RPC_MAX_RESPONSE_BYTES;
 
 // ---- enums
 enum class Op : int {
@@ -749,6 +758,45 @@ struct PairingConfigDoc {
     static PairingConfigDoc from_json(std::string_view json) {
         rrcp_pairing_config_doc_t c;
         detail::check(rrcp_pairing_config_doc_decode(json.data(), json.size(), &c));
+        return from_c(c);
+    }
+};
+
+struct DockBleInfo {
+    uint32_t proto{};
+    std::string device_id{};
+    std::string name{};
+    std::string hostname{};
+    std::string version{};
+
+    void to_c(rrcp_dock_ble_info_t &c) const {
+        rrcp_dock_ble_info_init(&c);
+        c.proto = proto;
+        detail::copy_str(c.device_id, sizeof c.device_id, device_id);
+        detail::copy_str(c.name, sizeof c.name, name);
+        detail::copy_str(c.hostname, sizeof c.hostname, hostname);
+        detail::copy_str(c.version, sizeof c.version, version);
+    }
+    static DockBleInfo from_c(const rrcp_dock_ble_info_t &c) {
+        DockBleInfo v;
+        v.proto = c.proto;
+        v.device_id = std::string(c.device_id);
+        v.name = std::string(c.name);
+        v.hostname = std::string(c.hostname);
+        v.version = std::string(c.version);
+        return v;
+    }
+    std::string to_json() const {
+        rrcp_dock_ble_info_t c;
+        to_c(c);
+        char buf[8192];
+        int n = rrcp_dock_ble_info_encode(&c, buf, sizeof buf);
+        detail::check(n);
+        return std::string(buf, static_cast<size_t>(n));
+    }
+    static DockBleInfo from_json(std::string_view json) {
+        rrcp_dock_ble_info_t c;
+        detail::check(rrcp_dock_ble_info_decode(json.data(), json.size(), &c));
         return from_c(c);
     }
 };

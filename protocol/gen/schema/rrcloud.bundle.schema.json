@@ -33,7 +33,16 @@
     "PAIRING_REDIRECT_URI": "rapidraw://auth-callback",
     "PAIRING_REDIRECT_URI_RAW2DNG": "raw2dng://auth-callback",
     "PAIRING_OIDC_SCOPE": "openid profile email",
-    "OAUTH_DEVICE_CODE_GRANT": "urn:ietf:params:oauth:grant-type:device_code"
+    "OAUTH_DEVICE_CODE_GRANT": "urn:ietf:params:oauth:grant-type:device_code",
+    "DOCK_BLE_SERVICE_UUID": "75969b8f-4f5b-4f23-931f-79d1f9dd5114",
+    "DOCK_BLE_RX_UUID": "0b0fd650-dbcf-4b31-974f-932a29b5a481",
+    "DOCK_BLE_TX_UUID": "ffe3977d-ab87-4993-9537-27bd8900962b",
+    "DOCK_BLE_INFO_UUID": "fba1763b-c749-4d9e-b69d-9143ad134c84",
+    "DOCK_BLE_NAME_PREFIX": "rrcloud-",
+    "DOCK_RPC_FLAG_FIRST": 1,
+    "DOCK_RPC_FLAG_LAST": 2,
+    "DOCK_RPC_MAX_REQUEST_BYTES": 8192,
+    "DOCK_RPC_MAX_RESPONSE_BYTES": 32768
   },
   "x-rrcloud-keys": {
     "library_original": "library/{relkey}",
@@ -742,6 +751,52 @@
         "updatedAt",
         "sync",
         "credentials"
+      ]
+    },
+    "DockBleInfo": {
+      "type": "object",
+      "description": "Camera dock identity read from DOCK_BLE_INFO_UUID before pairing.",
+      "properties": {
+        "proto": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Dock RPC envelope version this definition describes (1)."
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The dock's sync participant identity (its device registry entry)."
+        },
+        "name": {
+          "type": "string",
+          "maxLength": 48,
+          "description": "Human name shown in the device registry (`device_name`)."
+        },
+        "hostname": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "mDNS hostname; also the suffix of the advertised local name."
+        },
+        "version": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Firmware version (firmware/rrcloud-ingest/version.txt)."
+        }
+      },
+      "required": [
+        "proto",
+        "device_id",
+        "name",
+        "hostname",
+        "version"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "proto",
+        "device_id",
+        "name",
+        "hostname",
+        "version"
       ]
     }
   }
