@@ -133,7 +133,35 @@ www/index.html          the admin page (embedded)
 host_tests/             gcc/ctest suite + reference vectors + Rust interop fixtures
 ```
 
+## Serial console
+
+The USB-C console port is also a command line (115200 baud; `idf.py monitor`, `screen`,
+PuTTY — anything that sends keystrokes). Type `help`. It is the fallback when the web UI
+cannot be reached, and it is enough to configure and test a sync without it:
+
+```
+rrc> set s3_endpoint https://garage.example
+rrc> set s3_bucket my-photos
+rrc> set s3_region garage
+rrc> set s3_access_key GK...
+rrc> set s3_secret_key ...
+rrc> status
+rrc> sync
+rrc> net            # addresses + lwIP packet counters
+rrc> log            # the web UI's log panel
+```
+
+`set` takes any key that `config` prints, plus `s3_secret_key`, `wifi_password` and
+`admin_password`; booleans accept `on`/`off`, `true`/`false`. `pair <url>` runs the
+device-flow pairing and `pair-status` shows the code to enter.
+
 ## Troubleshooting the web UI
+
+Eight seconds after boot the dock connects to its own port 80 over loopback and logs the
+result (`web self-test over loopback: HTTP/1.1 200 OK`): a pass proves the server listens,
+accepts and answers. While no outside client has ever connected it then logs the lwIP
+packet counters once a minute. Try to open the page and watch `tcp rx`: if it does not
+grow, your SYNs are not reaching the dock and the problem is on the network path.
 
 When the dock gets an address it prints the URL on the console and in the log panel:
 
@@ -154,6 +182,12 @@ times out: **did any packet reach the dock?**
 
 `rrcloud-ingest.local` needs an mDNS resolver on the client (macOS, iOS, Windows 10+, Linux
 with Avahi); on Android use the IP address.
+
+Wi‑Fi: the ESP32‑C6 co-processor speaks ESP-Hosted over SDIO. A boot line such as
+`eh_init_evt: major version mismatch — OTA coprocessor from host` means the C6's slave
+firmware is older than the host library (3.0.x); Wi‑Fi stays unavailable until the C6 is
+reflashed with a matching ESP-Hosted slave image (its UART is on the 4-pin header). Ethernet
+is unaffected.
 
 ## Troubleshooting camera detection
 

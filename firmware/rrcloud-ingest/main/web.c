@@ -39,6 +39,7 @@
 #include "log_ring.h"
 #include "usb_diag.h"
 #include "lwip/sockets.h"
+#include "lwip/stats.h"
 
 static const char *TAG = "web";
 extern const char index_html_start[] asm("_binary_index_html_start");
@@ -251,6 +252,8 @@ static esp_err_t h_reboot(httpd_req_t *req)
  * log answers "did the browser's packets reach the dock at all?" — the
  * question a silent timeout leaves open (e.g. a stateless inter-VLAN ACL
  * that drops the SYN-ACK on the way back). */
+static volatile unsigned external_connections;
+
 static esp_err_t on_open(httpd_handle_t hd, int sockfd)
 {
     (void)hd;
@@ -261,8 +264,52 @@ static esp_err_t on_open(httpd_handle_t hd, int sockfd)
         if (peer.ss_family == AF_INET) inet_ntop(AF_INET, &((struct sockaddr_in *)&peer)->sin_addr, ip, sizeof ip);
         else if (peer.ss_family == AF_INET6) inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&peer)->sin6_addr, ip, sizeof ip);
     }
+    bool loopback = !strcmp(ip, "127.0.0.1") || !strcmp(ip, "::1") || !strcmp(ip, "::ffff:127.0.0.1");
+    if (!loopback) external_connections++;
     ESP_LOGI(TAG, "http: connection from %s", ip);
     return ESP_OK;
+}
+
+/* Reachability self-test: once the server is up, open a TCP connection to it
+ * over loopback and fetch /api/status. A pass proves listen/accept/handler
+ * work end to end, so a browser timeout with a passing self-test is a network
+ * path problem, not a server one. While no external client has connected the
+ * lwIP packet counters are logged every minute: if `tcp rx` never moves after
+ * the self-test, no SYN is reaching the dock. */
+static void selftest_task(void *arg)
+{
+    (void)arg;
+    vTaskDelay(pdMS_TO_TICKS(8000));
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    bool ok = false;
+    if (fd >= 0) {
+        struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(80)};
+        a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        struct timeval tv = {.tv_sec = 5};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        if (connect(fd, (struct sockaddr *)&a, sizeof a) == 0) {
+            const char req[] = "GET /api/status HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
+            if (send(fd, req, sizeof req - 1, 0) == (int)(sizeof req - 1)) {
+                char line[64] = "";
+                int n = recv(fd, line, sizeof line - 1, 0);
+                if (n > 0) { line[n] = 0; char *nl = strpbrk(line, "\r\n"); if (nl) *nl = 0; ok = strstr(line, " 200") != NULL || strstr(line, " 401") != NULL; log_ring_printf("web self-test over loopback: %s", line); }
+            }
+        }
+        close(fd);
+    }
+    if (!ok) log_ring_printf("web self-test over loopback FAILED: the HTTP server is not accepting connections");
+#if LWIP_STATS
+    unsigned last_tcp = lwip_stats.tcp.recv;
+    for (int minute = 1;; minute++) {
+        vTaskDelay(pdMS_TO_TICKS(60000));
+        if (external_connections) break;
+        unsigned tcp = lwip_stats.tcp.recv;
+        log_ring_printf("web: no client has connected yet (%d min); lwip tcp rx=%u (+%u) tx=%u, ip rx=%u, arp rx=%u — if tcp rx does not grow while you try, the packets are not reaching the dock",
+                        minute, tcp, tcp - last_tcp, (unsigned)lwip_stats.tcp.xmit, (unsigned)lwip_stats.ip.recv, (unsigned)lwip_stats.etharp.recv);
+        last_tcp = tcp;
+    }
+#endif
+    vTaskDelete(NULL);
 }
 
 esp_err_t web_start(void)
@@ -293,5 +340,6 @@ esp_err_t web_start(void)
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++) httpd_register_uri_handler(s, &routes[i]);
     log_ring_printf("web ui listening on port 80");
+    xTaskCreate(selftest_task, "web_selftest", 4096, NULL, 2, NULL);
     return ESP_OK;
 }

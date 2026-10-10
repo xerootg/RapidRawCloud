@@ -19,6 +19,7 @@
 #include "camera_source.h"
 #include "log_ring.h"
 #include "usb_diag.h"
+#include "console.h"
 
 static const char *TAG = "main";
 
@@ -56,5 +57,6 @@ void app_main(void)
     ESP_ERROR_CHECK(source_ptp_install(sync_on_camera_event, NULL));
 
     ESP_ERROR_CHECK(web_start());
+    console_start();
     log_ring_printf("ready — plug in a camera");
 }
