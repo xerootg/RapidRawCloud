@@ -1190,6 +1190,7 @@ name = "rrcloud-pairing"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.22.1",
  "html-escape",
  "reqwest",
  "rrcloud-proto",

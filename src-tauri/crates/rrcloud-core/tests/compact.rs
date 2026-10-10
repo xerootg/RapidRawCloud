@@ -51,6 +51,30 @@ use std::collections::HashSet;
 // is deterministic relative to it.
 const NOW: i64 = 1_769_904_000;
 
+/// The real wall clock in unix seconds — the shared Garage runs on this host,
+/// so it is (to within a second) what the bucket stamps on a freshly PUT
+/// object's `LastModified`.
+fn real_now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs(),
+    )
+    .expect("fits i64")
+}
+
+/// The pinned "server now" for the tombstone-GC tests: 31 days after the
+/// real write instant. GC ages a tombstone by the **server-asserted**
+/// `LastModified` of its object as well as its body's `server_ts`
+/// (`min` of the two), so these tests pin the clock relative to the real
+/// PUT instant — a tombstone planted `now - 31 days` is then past grace by
+/// both measures, and younger plantings stay bounded by their `server_ts`
+/// exactly as under the fixed `NOW`.
+fn gc_now() -> i64 {
+    real_now() + 31 * 86_400
+}
+
 const BLAKE3_HEX: &str = "4878ca0425c739fa427f7eda20fe845f6b2e46ba5fe2a14df5b1e32f50603215";
 
 // ---------------------------------------------------------------------------
@@ -894,6 +918,7 @@ async fn tombstone_gc_happy_path_destroys_and_bootstrapper_learns_from_deleted_s
     let client = g.client();
     let (a, b) = (dev(DEV_A), dev(DEV_B));
     let (_dir, _path, db) = open_db(&a);
+    let now = gc_now();
 
     let image = rel("img/old.NEF");
     let content = rrcloud_core::semhash::ContentId::from_bytes(b"old-image-bytes");
@@ -905,14 +930,14 @@ async fn tombstone_gc_happy_path_destroys_and_bootstrapper_learns_from_deleted_s
         &image,
         &content,
         vv(&[(&a, 5)]),
-        NOW - 31 * 86_400,
+        now - 31 * 86_400,
     )
     .await;
 
     // One active device that applied past the deletion.
-    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 9)])).await;
+    put_device(&client, &bucket, &b, &device_entry(0, now - 60, &[(&a, 9)])).await;
 
-    let clock = ServerClock::pinned(NOW);
+    let clock = ServerClock::pinned(now);
     let summary = tombstone_gc(&db, &client, &bucket, &clock, &CompactConfig::default())
         .await
         .expect("gc");
@@ -977,6 +1002,7 @@ async fn tombstone_gc_resurrection_guard_preserves_superseded_tombstone() {
     let client = g.client();
     let (a, b) = (dev(DEV_A), dev(DEV_B));
     let (_dir, _path, db) = open_db(&a);
+    let now = gc_now();
 
     let image = rel("img/edited.NEF");
     let content = rrcloud_core::semhash::ContentId::from_bytes(b"edited-image");
@@ -988,7 +1014,7 @@ async fn tombstone_gc_resurrection_guard_preserves_superseded_tombstone() {
         &image,
         &content,
         vv(&[(&a, 5)]),
-        NOW - 31 * 86_400,
+        now - 31 * 86_400,
     )
     .await;
 
@@ -1019,9 +1045,9 @@ async fn tombstone_gc_resurrection_guard_preserves_superseded_tombstone() {
     db.remove_deleted(&image)
         .expect("clear deleted row on resurrect");
 
-    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 9)])).await;
+    put_device(&client, &bucket, &b, &device_entry(0, now - 60, &[(&a, 9)])).await;
 
-    let clock = ServerClock::pinned(NOW);
+    let clock = ServerClock::pinned(now);
     let summary = tombstone_gc(&db, &client, &bucket, &clock, &CompactConfig::default())
         .await
         .expect("gc");
@@ -1058,6 +1084,7 @@ async fn tombstone_gc_content_id_liveness_keeps_shared_preview_until_both_gone()
     let client = g.client();
     let (a, b) = (dev(DEV_A), dev(DEV_B));
     let (_dir, _path, db) = open_db(&a);
+    let now = gc_now();
 
     let content = rrcloud_core::semhash::ContentId::from_bytes(b"shared-bytes");
     let dead = rel("img/dup-a.NEF");
@@ -1076,12 +1103,12 @@ async fn tombstone_gc_content_id_liveness_keeps_shared_preview_until_both_gone()
         &dead,
         &content,
         vv(&[(&a, 5)]),
-        NOW - 31 * 86_400,
+        now - 31 * 86_400,
     )
     .await;
-    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 9)])).await;
+    put_device(&client, &bucket, &b, &device_entry(0, now - 60, &[(&a, 9)])).await;
 
-    let clock = ServerClock::pinned(NOW);
+    let clock = ServerClock::pinned(now);
     let first = tombstone_gc(&db, &client, &bucket, &clock, &CompactConfig::default())
         .await
         .expect("gc 1");
@@ -1112,7 +1139,7 @@ async fn tombstone_gc_content_id_liveness_keeps_shared_preview_until_both_gone()
         &live,
         &DeletedRecord {
             vv: vv(&[(&a, 6)]),
-            server_ts: NOW - 31 * 86_400,
+            server_ts: now - 31 * 86_400,
         },
     )
     .expect("sibling deleted row");
@@ -1120,7 +1147,7 @@ async fn tombstone_gc_content_id_liveness_keeps_shared_preview_until_both_gone()
         relkey: live.clone(),
         vv: vv(&[(&a, 6)]),
         device: a.clone(),
-        server_ts: NOW - 31 * 86_400,
+        server_ts: now - 31 * 86_400,
         kinds: vec![Kind::Original],
     };
     put_object_raw(
@@ -1153,6 +1180,7 @@ async fn tombstone_gc_grace_window_keeps_a_young_tombstone() {
     let client = g.client();
     let (a, b) = (dev(DEV_A), dev(DEV_B));
     let (_dir, _path, db) = open_db(&a);
+    let now = gc_now();
 
     let image = rel("img/fresh.NEF");
     let content = rrcloud_core::semhash::ContentId::from_bytes(b"fresh-image");
@@ -1164,7 +1192,7 @@ async fn tombstone_gc_grace_window_keeps_a_young_tombstone() {
         &image,
         &content,
         vv(&[(&a, 5)]),
-        NOW - 5 * 86_400,
+        now - 5 * 86_400,
     )
     .await;
     // Even though every active device applied well past it.
@@ -1172,12 +1200,12 @@ async fn tombstone_gc_grace_window_keeps_a_young_tombstone() {
         &client,
         &bucket,
         &b,
-        &device_entry(0, NOW - 60, &[(&a, 99)]),
+        &device_entry(0, now - 60, &[(&a, 99)]),
     )
     .await;
 
     const { assert!(5 * 86_400 < RECENTLY_DELETED_GRACE_SECS) };
-    let clock = ServerClock::pinned(NOW);
+    let clock = ServerClock::pinned(now);
     let summary = tombstone_gc(&db, &client, &bucket, &clock, &CompactConfig::default())
         .await
         .expect("gc");
@@ -1211,6 +1239,7 @@ async fn tombstone_gc_crash_between_fold_and_delete_is_recoverable() {
     let client = g.client();
     let (a, b) = (dev(DEV_A), dev(DEV_B));
     let (_dir, _path, db) = open_db(&a);
+    let now = gc_now();
 
     let image = rel("img/crash.NEF");
     let content = rrcloud_core::semhash::ContentId::from_bytes(b"crash-image");
@@ -1221,15 +1250,15 @@ async fn tombstone_gc_crash_between_fold_and_delete_is_recoverable() {
         &image,
         &content,
         vv(&[(&a, 5)]),
-        NOW - 31 * 86_400,
+        now - 31 * 86_400,
     )
     .await;
-    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 9)])).await;
+    put_device(&client, &bucket, &b, &device_entry(0, now - 60, &[(&a, 9)])).await;
 
     // Fault: the data-key DELETE fails (crash right after the fold PUT).
     let mut fault = FaultS3::new(g.client());
     fault.fail_deletes.insert(library_key(&image));
-    let clock = ServerClock::pinned(NOW);
+    let clock = ServerClock::pinned(now);
     let crashed = tombstone_gc(&db, &fault, &bucket, &clock, &CompactConfig::default()).await;
     assert!(crashed.is_err(), "the DELETE failure surfaces");
 
@@ -1275,6 +1304,7 @@ async fn tombstone_gc_resurrection_guard_from_on_wire_journal_only() {
     let client = g.client();
     let (a, b) = (dev(DEV_A), dev(DEV_B));
     let (_dir, _path, db) = open_db(&a);
+    let now = gc_now();
 
     let image = rel("img/wire-edited.NEF");
     let content = rrcloud_core::semhash::ContentId::from_bytes(b"wire-edited");
@@ -1287,7 +1317,7 @@ async fn tombstone_gc_resurrection_guard_from_on_wire_journal_only() {
         &image,
         &content,
         vv(&[(&a, 5)]),
-        NOW - 31 * 86_400,
+        now - 31 * 86_400,
     )
     .await;
 
@@ -1299,9 +1329,9 @@ async fn tombstone_gc_resurrection_guard_from_on_wire_journal_only() {
         e
     };
     common::sync::put_raw_segment(&client, &bucket, &b, 1, &[put]).await;
-    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 9)])).await;
+    put_device(&client, &bucket, &b, &device_entry(0, now - 60, &[(&a, 9)])).await;
 
-    let clock = ServerClock::pinned(NOW);
+    let clock = ServerClock::pinned(now);
     let summary = tombstone_gc(&db, &client, &bucket, &clock, &CompactConfig::default())
         .await
         .expect("gc");
@@ -1341,6 +1371,7 @@ async fn tombstone_gc_content_liveness_from_on_wire_sibling() {
     let client = g.client();
     let (a, b) = (dev(DEV_A), dev(DEV_B));
     let (_dir, _path, db) = open_db(&a);
+    let now = gc_now();
 
     let content = rrcloud_core::semhash::ContentId::from_bytes(b"shared-on-wire");
     let dead = rel("img/dup-dead.NEF");
@@ -1354,7 +1385,7 @@ async fn tombstone_gc_content_liveness_from_on_wire_sibling() {
         &dead,
         &content,
         vv(&[(&a, 5)]),
-        NOW - 31 * 86_400,
+        now - 31 * 86_400,
     )
     .await;
 
@@ -1368,9 +1399,9 @@ async fn tombstone_gc_content_liveness_from_on_wire_sibling() {
         e
     };
     common::sync::put_raw_segment(&client, &bucket, &b, 1, &[put]).await;
-    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 9)])).await;
+    put_device(&client, &bucket, &b, &device_entry(0, now - 60, &[(&a, 9)])).await;
 
-    let clock = ServerClock::pinned(NOW);
+    let clock = ServerClock::pinned(now);
     let summary = tombstone_gc(&db, &client, &bucket, &clock, &CompactConfig::default())
         .await
         .expect("gc");
@@ -1413,6 +1444,7 @@ async fn tombstone_gc_content_kept_by_horizon_blocked_sibling() {
     let client = g.client();
     let (a, b) = (dev(DEV_A), dev(DEV_B));
     let (_dir, _path, db) = open_db(&a);
+    let now = gc_now();
 
     // Aggressive policy: grace (5d) below the cap (14d).
     let cfg = CompactConfig {
@@ -1433,7 +1465,7 @@ async fn tombstone_gc_content_kept_by_horizon_blocked_sibling() {
         &x,
         &content,
         vv(&[(&a, 5)]),
-        NOW - 20 * 86_400,
+        now - 20 * 86_400,
     )
     .await;
     // Y: 8 days old -> past the 5-day grace, inside the 14-day cap, and with
@@ -1445,12 +1477,12 @@ async fn tombstone_gc_content_kept_by_horizon_blocked_sibling() {
         &y,
         &content,
         vv(&[(&a, 7)]),
-        NOW - 8 * 86_400,
+        now - 8 * 86_400,
     )
     .await;
-    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 9)])).await;
+    put_device(&client, &bucket, &b, &device_entry(0, now - 60, &[(&a, 9)])).await;
 
-    let clock = ServerClock::pinned(NOW);
+    let clock = ServerClock::pinned(now);
     let summary = tombstone_gc(&db, &client, &bucket, &clock, &cfg)
         .await
         .expect("gc");
@@ -1511,6 +1543,7 @@ async fn tombstone_gc_horizon_fast_path_uses_seq_not_vv_component() {
     let client = g.client();
     let (a, b) = (dev(DEV_A), dev(DEV_B));
     let (_dir, _path, db) = open_db(&a);
+    let now = gc_now();
 
     // grace 5d < cap 14d, so the fast path (not the cap) gates (a).
     let cfg = CompactConfig {
@@ -1530,7 +1563,7 @@ async fn tombstone_gc_horizon_fast_path_uses_seq_not_vv_component() {
         &image,
         &content,
         vv(&[(&a, 1)]),
-        NOW - 8 * 86_400,
+        now - 8 * 86_400,
     )
     .await;
 
@@ -1545,9 +1578,9 @@ async fn tombstone_gc_horizon_fast_path_uses_seq_not_vv_component() {
 
     // The only active peer applied A's prefix only to seq 5 (< the del's
     // seq 10): it has NOT learned the deletion.
-    put_device(&client, &bucket, &b, &device_entry(0, NOW - 60, &[(&a, 5)])).await;
+    put_device(&client, &bucket, &b, &device_entry(0, now - 60, &[(&a, 5)])).await;
 
-    let clock = ServerClock::pinned(NOW);
+    let clock = ServerClock::pinned(now);
     let summary = tombstone_gc(&db, &client, &bucket, &clock, &cfg)
         .await
         .expect("gc");
