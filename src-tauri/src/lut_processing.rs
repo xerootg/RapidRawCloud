@@ -725,3 +725,219 @@ pub fn load_and_parse_lut(path: String, state: State<AppState>) -> Result<LutPar
 
     Ok(LutParseResult { size: lut_size })
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod remove_lut_traversal_tests {
+    //! Regression test for the `remove_lut` directory-containment guard.
+    //!
+    //! `remove_lut` checks `target_path.starts_with(&luts_dir)` on the raw,
+    //! un-canonicalized path the webview handed it. `Path::starts_with` is a
+    //! lexical, component-wise comparison that never resolves `..`, so
+    //! `<app_data>/luts/../../../<anything>` passes the check and the file
+    //! outside the LUT directory is deleted. The command is reachable from
+    //! the webview, so any XSS becomes an arbitrary file delete.
+    //!
+    //! Harness notes (reusable by other command-level tests):
+    //! - `#[tauri::command]` fns take `AppHandle` = `AppHandle<Wry>`, so a
+    //!   `tauri::test::MockRuntime` handle does not type-check. The harness
+    //!   builds a real `tauri::Builder::<Wry>` app instead. Wry needs a GTK
+    //!   display on Linux: an existing `DISPLAY`/`WAYLAND_DISPLAY` is used,
+    //!   otherwise an `Xvfb` is spawned (killed with the test process via
+    //!   `PR_SET_PDEATHSIG`). The event loop is created with `.any_thread()`
+    //!   (tests do not run on the main thread) and is never run; the `App`
+    //!   is leaked so the one-per-process GTK application outlives the tests.
+    //! - The context is the real `tauri::generate_context!()` (already used
+    //!   by `run()`, so it costs no extra feature or dependency; in debug
+    //!   builds it does not embed `../dist`) with `app.windows` cleared so no
+    //!   webview is created. `tauri::test::mock_context(noop_assets())` would
+    //!   work too but needs the `test` feature on a `tauri` dev-dependency,
+    //!   which rebuilds tauri and every plugin for the test profile.
+    //! - `app_data_dir()` is pointed at a `tempfile::tempdir()` through
+    //!   `config.app.app_directories_override = AppDirectoriesOverride::Root`,
+    //!   so nothing under `~/.local/share` is touched.
+
+    use std::path::{Component, Path, PathBuf};
+    use std::sync::OnceLock;
+
+    use tauri::utils::config::AppDirectoriesOverride;
+    use tauri::{AppHandle, Manager, Wry};
+
+    use super::{get_luts_dir, remove_lut};
+
+    struct Harness {
+        handle: AppHandle,
+        // Kept so the directory lives as long as the (leaked) app.
+        _data_root: tempfile::TempDir,
+    }
+
+    static HARNESS: OnceLock<Harness> = OnceLock::new();
+
+    /// Spawns an `Xvfb` when no display is available, from a thread that
+    /// lives until process exit so `PR_SET_PDEATHSIG` tears the server down
+    /// together with the test binary.
+    fn ensure_display() {
+        if std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<Option<String>>();
+        std::thread::spawn(move || {
+            use std::os::unix::process::CommandExt;
+            let base = 1000 + (std::process::id() % 20000);
+            let mut children = Vec::new();
+            for attempt in 0..5 {
+                let display = base + attempt;
+                let mut cmd = std::process::Command::new("Xvfb");
+                cmd.arg(format!(":{display}"))
+                    .args(["-screen", "0", "320x240x24", "-nolisten", "tcp"])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null());
+                // SAFETY: `prctl` is async-signal-safe and touches no Rust state.
+                unsafe {
+                    cmd.pre_exec(|| {
+                        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+                        Ok(())
+                    });
+                }
+                let Ok(mut child) = cmd.spawn() else {
+                    let _ = tx.send(None);
+                    return;
+                };
+                let socket = PathBuf::from(format!("/tmp/.X11-unix/X{display}"));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                loop {
+                    if socket.exists() {
+                        children.push(child);
+                        let _ = tx.send(Some(format!(":{display}")));
+                        loop {
+                            std::thread::park();
+                        }
+                    }
+                    if child.try_wait().map(|s| s.is_some()).unwrap_or(true)
+                        || std::time::Instant::now() > deadline
+                    {
+                        let _ = child.kill();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            let _ = tx.send(None);
+        });
+        match rx.recv().ok().flatten() {
+            Some(display) => {
+                // SAFETY: called once, before GTK is initialised, while no
+                // other thread of this test binary reads the environment.
+                unsafe { std::env::set_var("DISPLAY", &display) };
+                eprintln!("remove_lut harness: spawned Xvfb on DISPLAY={display}");
+            }
+            None => panic!(
+                "remove_lut harness: no DISPLAY/WAYLAND_DISPLAY and Xvfb could not be started; \
+                 run under `xvfb-run -a cargo test ...`"
+            ),
+        }
+    }
+
+    fn harness() -> &'static Harness {
+        HARNESS.get_or_init(|| {
+            ensure_display();
+            let data_root = tempfile::Builder::new()
+                .prefix("rapidraw-remove-lut-appdata-")
+                .tempdir()
+                .expect("tempdir");
+            let mut context = tauri::generate_context!();
+            context.config_mut().app.windows.clear();
+            context.config_mut().app.app_directories_override =
+                Some(AppDirectoriesOverride::Root(data_root.path().to_path_buf()));
+            let app = tauri::Builder::<Wry>::new()
+                .any_thread()
+                .build(context)
+                .expect("build headless Wry app");
+            let handle = app.handle().clone();
+            // Never run; leaked so the GTK application stays alive for the
+            // whole test process (tao allows one event loop per process).
+            std::mem::forget(app);
+            eprintln!(
+                "remove_lut harness: app_data_dir = {}",
+                handle.path().app_data_dir().unwrap().display()
+            );
+            Harness {
+                handle,
+                _data_root: data_root,
+            }
+        })
+    }
+
+    fn luts_dir(handle: &AppHandle) -> PathBuf {
+        let data_dir = handle.path().app_data_dir().expect("app_data_dir");
+        get_luts_dir(&data_dir).expect("luts dir")
+    }
+
+    /// `<luts_dir>/../../..(one hop per component)/<victim without root>`:
+    /// lexically inside `luts_dir`, physically the victim.
+    fn traversal_path(luts_dir: &Path, victim: &Path) -> PathBuf {
+        assert!(luts_dir.is_absolute() && victim.is_absolute());
+        let hops = luts_dir
+            .components()
+            .filter(|c| matches!(c, Component::Normal(_)))
+            .count();
+        let mut path = luts_dir.to_path_buf();
+        for _ in 0..hops {
+            path.push("..");
+        }
+        for component in victim.components() {
+            if let Component::Normal(part) = component {
+                path.push(part);
+            }
+        }
+        path
+    }
+
+    #[test]
+    fn remove_lut_deletes_a_lut_inside_the_user_lut_dir() {
+        let handle = &harness().handle;
+        let luts_dir = luts_dir(handle);
+        let inside = luts_dir.join("positive-control.cube");
+        std::fs::write(&inside, "TITLE \"x\"\nLUT_3D_SIZE 2\n").unwrap();
+
+        let result = remove_lut(handle.clone(), inside.to_string_lossy().into_owned());
+
+        assert!(result.is_ok(), "in-dir LUT should be removable: {result:?}");
+        assert!(!inside.exists(), "in-dir LUT should be gone");
+    }
+
+    #[test]
+    fn remove_lut_rejects_dot_dot_traversal_out_of_the_user_lut_dir() {
+        let handle = &harness().handle;
+        let luts_dir = luts_dir(handle);
+
+        let victim_dir = tempfile::Builder::new()
+            .prefix("rapidraw-remove-lut-victim-")
+            .tempdir()
+            .unwrap();
+        let victim = victim_dir.path().join("not-a-lut.txt");
+        std::fs::write(&victim, "precious user data").unwrap();
+
+        let traversal = traversal_path(&luts_dir, &victim);
+        eprintln!("luts_dir  = {}", luts_dir.display());
+        eprintln!("traversal = {}", traversal.display());
+        // Sanity: the attack string passes the lexical check and resolves
+        // to the victim, i.e. this is exactly the input the webview can send.
+        assert!(traversal.starts_with(&luts_dir));
+        assert_eq!(
+            traversal.canonicalize().unwrap(),
+            victim.canonicalize().unwrap()
+        );
+
+        let result = remove_lut(handle.clone(), traversal.to_string_lossy().into_owned());
+
+        assert!(
+            victim.exists(),
+            "remove_lut deleted a file OUTSIDE the LUT directory via `..` traversal \
+             (result = {result:?})"
+        );
+        assert!(
+            result.is_err(),
+            "remove_lut must reject paths that escape the LUT directory, got {result:?}"
+        );
+    }
+}
