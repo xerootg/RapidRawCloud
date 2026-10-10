@@ -52,7 +52,10 @@ fn firmware_journal_segment_decodes_as_v1_put_originals() {
     assert_eq!(e2.mtime, None);
     match classify_key(&e2.key) {
         KeyClass::Original { relkey } => {
-            assert_eq!(relkey.as_str(), "Camera Import/NIKON Z f/2026/10/10/DSC_0002.NEF")
+            assert_eq!(
+                relkey.as_str(),
+                "Camera Import/NIKON Z f/2026/10/10/DSC_0002.NEF"
+            )
         }
         other => panic!("unexpected class {other:?}"),
     }
@@ -60,7 +63,8 @@ fn firmware_journal_segment_decodes_as_v1_put_originals() {
 
 #[test]
 fn firmware_device_entry_decodes() {
-    let d: DeviceEntry = serde_json::from_slice(&fixture("device.json")).expect("device entry decodes");
+    let d: DeviceEntry =
+        serde_json::from_slice(&fixture("device.json")).expect("device entry decodes");
     assert_eq!(d.name, "Camera dock");
     assert_eq!(d.platform, "esp32");
     assert_eq!(d.created, 1769000000);
@@ -89,6 +93,9 @@ fn firmware_manifest_gzip_decodes_with_the_strict_decoder() {
     assert_eq!(r.mtime, Some(1769899000));
     assert_eq!(r.ts, Some(1769900000));
     assert_eq!(r.vv.get(&dev), 1);
-    assert_eq!(m.rows[1].key.as_str(), "Camera Import/NIKON Z f/2026/10/10/DSC_0002.NEF");
+    assert_eq!(
+        m.rows[1].key.as_str(),
+        "Camera Import/NIKON Z f/2026/10/10/DSC_0002.NEF"
+    );
     assert_eq!(m.rows[1].mtime, None);
 }
