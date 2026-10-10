@@ -3889,6 +3889,27 @@ pub async fn import_files(
     app_handle: AppHandle,
 ) -> Result<(), String> {
     let total_files = source_paths.len();
+
+    // The date folder format comes from the webview. Validate it once, before
+    // anything is emitted or touched on disk: chrono panics on an invalid
+    // specifier inside `to_string()`, which would kill the un-awaited blocking
+    // task below without ever emitting `import-error`/`import-complete`.
+    let date_format_str = settings
+        .date_folder_format
+        .replace("YYYY", "%Y")
+        .replace("MM", "%m")
+        .replace("DD", "%d");
+    if settings.organize_by_date {
+        use std::fmt::Write as _;
+        let mut probe = String::new();
+        write!(probe, "{}", Utc::now().format(&date_format_str)).map_err(|_| {
+            format!(
+                "Invalid date folder format: {:?}",
+                settings.date_folder_format
+            )
+        })?;
+    }
+
     let _ = app_handle.emit("import-start", serde_json::json!({ "total": total_files }));
 
     tauri::async_runtime::spawn_blocking(move || {
@@ -3912,11 +3933,6 @@ pub async fn import_files(
 
                     let mut final_dest_folder = PathBuf::from(&destination_folder);
                     if settings.organize_by_date {
-                        let date_format_str = settings
-                            .date_folder_format
-                            .replace("YYYY", "%Y")
-                            .replace("MM", "%m")
-                            .replace("DD", "%d");
                         let subfolder = file_date.format(&date_format_str).to_string();
                         final_dest_folder.push(subfolder);
                     }
@@ -3972,11 +3988,6 @@ pub async fn import_files(
 
                 let mut final_dest_folder = PathBuf::from(&destination_folder);
                 if settings.organize_by_date {
-                    let date_format_str = settings
-                        .date_folder_format
-                        .replace("YYYY", "%Y")
-                        .replace("MM", "%m")
-                        .replace("DD", "%d");
                     let subfolder = file_date.format(&date_format_str).to_string();
                     final_dest_folder.push(subfolder);
                 }
