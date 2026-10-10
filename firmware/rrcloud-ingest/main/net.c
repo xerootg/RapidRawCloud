@@ -123,14 +123,33 @@ static esp_err_t wifi_start(void)
         if (e != ESP_OK) { log_ring_printf("wifi init failed: %s", esp_err_to_name(e)); return e; }
         ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
     }
+    /* Re-applying identical credentials would bounce a live association. */
+    static char applied_ssid[33], applied_pw[65];
+    if (wifi_started && !strcmp(applied_ssid, c->wifi_ssid) && !strcmp(applied_pw, pw)) return ESP_OK;
     wifi_config_t wc = {0};
-    scpy((char *)wc.sta.ssid, sizeof wc.sta.ssid, c->wifi_ssid);
-    scpy((char *)wc.sta.password, sizeof wc.sta.password, pw);
+    /* SSIDs are 1..32 octets and need no terminator in wifi_config_t. */
+    size_t sl = strlen(c->wifi_ssid);
+    if (sl > sizeof wc.sta.ssid) sl = sizeof wc.sta.ssid;
+    memcpy(wc.sta.ssid, c->wifi_ssid, sl);
+    size_t pl = strlen(pw);
+    if (pl > sizeof wc.sta.password) pl = sizeof wc.sta.password;
+    memcpy(wc.sta.password, pw, pl);
     wc.sta.threshold.authmode = pw[0] ? WIFI_AUTH_WPA2_PSK : WIFI_AUTH_OPEN;
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wc));
-    if (!wifi_started) { ESP_ERROR_CHECK(esp_wifi_start()); wifi_started = true; }
-    else esp_wifi_connect();
+    /* User-supplied settings must never take the device down: an invalid
+     * password (1–7 chars) is a logged configuration error, not a panic. */
+    esp_err_t e = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (e == ESP_OK) e = esp_wifi_set_config(WIFI_IF_STA, &wc);
+    if (e != ESP_OK) { log_ring_printf("wifi: rejected credentials for %s: %s", c->wifi_ssid, esp_err_to_name(e)); return e; }
+    if (!wifi_started) {
+        e = esp_wifi_start();
+        if (e != ESP_OK) { log_ring_printf("wifi: start failed: %s", esp_err_to_name(e)); return e; }
+        wifi_started = true;
+    } else {
+        esp_wifi_disconnect();
+        esp_wifi_connect();
+    }
+    scpy(applied_ssid, sizeof applied_ssid, c->wifi_ssid);
+    scpy(applied_pw, sizeof applied_pw, pw);
     log_ring_printf("wifi: connecting to %s", c->wifi_ssid);
     return ESP_OK;
 }

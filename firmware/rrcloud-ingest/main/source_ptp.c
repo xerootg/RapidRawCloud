@@ -22,7 +22,11 @@ static struct {
     void *arg;
     cam_source_t src;
     ptp_impl_t impl;
+    bool attached;            /* g.src handed to the sync task and not yet released */
+    rrc_ptp_dev_t *pending;   /* a device that appeared while `attached` */
 } g;
+
+static void attach(rrc_ptp_dev_t *dev);
 
 typedef struct { uint32_t handle, parent; uint16_t fmt; bool is_dir; char name[128]; } node_t;
 
@@ -162,24 +166,39 @@ static esp_err_t ptp_read(cam_source_t *s, void *fh, uint64_t offset, uint8_t *b
 
 static void ptp_close(cam_source_t *s, void *fh) { (void)s; free(fh); }
 static bool ptp_connected(cam_source_t *s) { return rrc_ptp_is_connected(((ptp_impl_t *)s->impl)->dev); }
-static void ptp_release(cam_source_t *s) { ptp_impl_t *p = s->impl; p->session = false; p->dev = NULL; }
+static void ptp_release(cam_source_t *s)
+{
+    ptp_impl_t *p = s->impl;
+    p->session = false; p->dev = NULL;
+    g.attached = false;
+    if (g.pending && rrc_ptp_is_connected(g.pending)) { rrc_ptp_dev_t *d = g.pending; g.pending = NULL; attach(d); }
+    else g.pending = NULL;
+}
+
+static void attach(rrc_ptp_dev_t *dev)
+{
+    memset(&g.src, 0, sizeof g.src);
+    g.impl.dev = dev; g.impl.session = false;
+    g.src.kind = "ptp";
+    g.src.impl = &g.impl;
+    /* Model/serial are known only after OpenSession+GetDeviceInfo, which must not
+     * run inside a USB callback; the sync task fills them via source_ptp_identify. */
+    snprintf(g.src.source_id, sizeof g.src.source_id, "ptp:%04x:%04x", rrc_ptp_vid(dev), rrc_ptp_pid(dev));
+    strcpy(g.src.model, "PTP camera");
+    g.src.enumerate = ptp_enumerate; g.src.open = ptp_open; g.src.read = ptp_read; g.src.close = ptp_close;
+    g.src.connected = ptp_connected; g.src.release = ptp_release;
+    g.attached = true;
+    if (g.cb) g.cb(CAM_EV_ATTACHED, &g.src, g.arg);
+}
 
 static void ptp_event(rrc_ptp_event_t ev, rrc_ptp_dev_t *dev, void *arg)
 {
     (void)arg;
     if (ev == RRC_PTP_EV_CONNECTED) {
-        memset(&g.src, 0, sizeof g.src);
-        g.impl.dev = dev; g.impl.session = false;
-        g.src.kind = "ptp";
-        g.src.impl = &g.impl;
-        /* Model/serial are known only after OpenSession+GetDeviceInfo, which must
-         * not run inside this callback; the sync task fills them via source_ptp_identify. */
-        snprintf(g.src.source_id, sizeof g.src.source_id, "ptp:%04x:%04x", rrc_ptp_vid(dev), rrc_ptp_pid(dev));
-        strcpy(g.src.model, "PTP camera");
-        g.src.enumerate = ptp_enumerate; g.src.open = ptp_open; g.src.read = ptp_read; g.src.close = ptp_close;
-        g.src.connected = ptp_connected; g.src.release = ptp_release;
-        if (g.cb) g.cb(CAM_EV_ATTACHED, &g.src, g.arg);
+        if (g.attached) { ESP_LOGI(TAG, "camera re-attached before the previous source was released; queued"); g.pending = dev; return; }
+        attach(dev);
     } else {
+        if (dev == g.pending) { g.pending = NULL; return; }
         g.impl.session = false;
         if (g.cb) g.cb(CAM_EV_DETACHED, &g.src, g.arg);
     }

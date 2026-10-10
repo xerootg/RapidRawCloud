@@ -47,6 +47,8 @@ static volatile bool cancel_flag;
 static uint8_t *part_buf;
 static esp_timer_handle_t tick_timer;
 static int64_t last_tick_pending_check;
+static bool cam_identified;      /* PTP: OpenSession + DeviceInfo succeeded (source_id is final) */
+static bool run_deferred;        /* a sync was wanted but network/cloud was not ready */
 
 #define ST_LOCK() xSemaphoreTake(st_mtx, portMAX_DELAY)
 #define ST_UNLOCK() xSemaphoreGive(st_mtx)
@@ -192,6 +194,7 @@ static esp_err_t publish_manifest(void)
     uint64_t cursor = store_journal_published_cursor();
     char line[256];
     int n = rrc_manifest_header_encode(now, app_device_id(), cursor, line, sizeof line);
+    if (n < 0) { free(gb.buf); set_error("manifest header encode failed"); return ESP_FAIL; }
     line[n++] = '\n';
     rrc_gzip_store_write(&gz, line, (size_t)n);
     manifest_ctx_t mc = {.gz = &gz};
@@ -205,13 +208,31 @@ static esp_err_t publish_manifest(void)
     free(gb.buf);
     if (e != ESP_OK) { char b[96]; set_error("manifest publish failed: %s", rrc_s3_result_str(&res, b, sizeof b)); return e; }
     int64_t ts = res.server_date > 0 ? res.server_date : now;
-    store_kv_set_str("manifest_etag", res.etag);
-    store_kv_set_i64("manifest_ts", ts);
-    store_kv_set_u64("manifest_cursor", cursor);
+    /* One record, one durable write: etag, server ts and covered cursor always
+     * describe the same manifest (three separate keys could be torn by a crash). */
+    char rec[160];
+    snprintf(rec, sizeof rec, "%s\t%lld\t%llu", res.etag, (long long)ts, (unsigned long long)cursor);
+    store_kv_set_str("manifest", rec);
+    store_kv_set_u64("manifest_dirty", 0);
     ST_LOCK(); st.last_manifest_ts = ts; ST_UNLOCK();
     log_ring_printf("manifest published (%u rows, %u bytes gz, cursor %llu)", (unsigned)store_ledger_uploaded_count(), (unsigned)gb.len, (unsigned long long)cursor);
     return ESP_OK;
 }
+
+/* Reads the combined manifest record written by publish_manifest. */
+static bool manifest_record(char *etag, size_t etag_cap, int64_t *ts, uint64_t *cursor)
+{
+    char rec[160];
+    if (!store_kv_get_str("manifest", rec, sizeof rec)) return false;
+    char *t1 = strchr(rec, '\t'); if (!t1) return false; *t1 = 0;
+    char *t2 = strchr(t1 + 1, '\t'); if (!t2) return false; *t2 = 0;
+    scpy(etag, etag_cap, rec);
+    *ts = strtoll(t1 + 1, NULL, 10);
+    *cursor = strtoull(t2 + 1, NULL, 10);
+    return *ts > 0;
+}
+
+static int64_t manifest_ts(void) { char e[80]; int64_t ts; uint64_t c; return manifest_record(e, sizeof e, &ts, &c) ? ts : 0; }
 
 /* §2.10 segment compaction, own prefix only: rule 1 (manifest covers), rule 2
  * (manifest ≥ 24 h old and re-confirmed by HEAD with matching ETag), rule 3
@@ -219,10 +240,8 @@ static esp_err_t publish_manifest(void)
  * fast path is never taken — segments live at least 14 days). */
 static void compact_segments(void)
 {
-    int64_t mts = store_kv_get_i64("manifest_ts", 0);
-    uint64_t mcursor = store_kv_get_u64("manifest_cursor", 0);
-    char metag[80];
-    if (!mts || !store_kv_get_str("manifest_etag", metag, sizeof metag)) return;
+    int64_t mts; uint64_t mcursor; char metag[80];
+    if (!manifest_record(metag, sizeof metag, &mts, &mcursor)) return;
     int64_t now = rrc_s3_server_now(&s3);
     if (now - mts < MANIFEST_RECONFIRM_S) return;
     store_segment_t segs[64];
@@ -382,8 +401,14 @@ static int cmp_obj(const void *a, const void *b)
 /* ---- one sync run ---------------------------------------------------------- */
 static void sync_run(cam_source_t *src)
 {
-    if (!s3_ready) { set_error("cloud not configured — pair or enter S3 settings first"); return; }
-    if (!net_has_ip()) { set_phase(SYNC_WAITING_NETWORK); set_error("no network"); return; }
+    if (!s3_ready) { run_deferred = true; set_error("cloud not configured — pair or enter S3 settings first; the sync starts once it is"); return; }
+    if (!net_has_ip()) { run_deferred = true; set_phase(SYNC_WAITING_NETWORK); set_error("waiting for the network"); return; }
+    if (!strcmp(src->kind, "ptp") && !cam_identified) {
+        if (source_ptp_identify(src) != ESP_OK) { run_deferred = true; set_error("camera did not answer OpenSession/GetDeviceInfo — is it awake and in MTP/PTP USB mode? retrying"); return; }
+        cam_identified = true;
+        ST_LOCK(); scpy(st.camera_model, sizeof st.camera_model, src->model); scpy(st.camera_serial, sizeof st.camera_serial, src->serial); ST_UNLOCK();
+    }
+    run_deferred = false;
     cancel_flag = false;
     ST_LOCK(); st.phase = SYNC_ENUMERATING; st.run_total = st.run_done = st.run_skipped = st.run_failed = 0; st.run_bytes = 0; st.last_error[0] = 0; ST_UNLOCK();
     run_digest_probe_if_needed();
@@ -437,6 +462,12 @@ static void sync_run(cam_source_t *src)
         }
         /* journal (§2.1.5 order: object verified → journal entry → ledger commit) */
         uint64_t seq = store_journal_alloc_seq();
+        if (seq == 0) {
+            set_error("%s: cannot reserve a journal seq (flash full?) — object is in the bucket and will be adopted by the worker", relkey);
+            ST_LOCK(); st.run_failed++; ST_UNLOCK();
+            consecutive_failures++;
+            continue;
+        }
         int64_t ts = rrc_s3_server_now(&s3);
         rrc_journal_put_original je = {.seq = seq, .ts = ts, .device = app_device_id(), .bucket_key = key, .vv_self = 1, .size = size,
                                        .blake3_hex = b3hex, .content_id_hex = b3hex, .has_mtime = o->mtime > 0, .mtime = o->mtime};
@@ -448,6 +479,7 @@ static void sync_run(cam_source_t *src)
         }
         lr.status = RRC_LEDGER_UPLOADED; lr.blake3_hex = b3hex; lr.seq = seq; lr.ts = ts;
         store_ledger_append(&lr);
+        store_kv_set_u64("manifest_dirty", 1);
         consecutive_failures = 0;
         ST_LOCK(); st.run_done++; st.run_bytes += size; st.lifetime_uploaded++; st.lifetime_bytes += size; ST_UNLOCK();
         log_ring_printf("uploaded %s (%llu bytes)", relkey, (unsigned long long)size);
@@ -461,7 +493,7 @@ static void sync_run(cam_source_t *src)
     ST_LOCK(); uploaded_any = st.run_done > 0; ST_UNLOCK();
     if (flush_journal() == ESP_OK) {
         heartbeat();
-        if (uploaded_any || store_kv_get_i64("manifest_ts", 0) == 0) publish_manifest();
+        if (uploaded_any || store_kv_get_u64("manifest_dirty", 0) || manifest_ts() == 0) publish_manifest();
     }
     ST_LOCK();
     st.last_run_ts = (int64_t)time(NULL);
@@ -473,6 +505,9 @@ static void sync_run(cam_source_t *src)
 /* ---- periodic tick ---------------------------------------------------------- */
 static void on_tick(void)
 {
+    /* A run that could not start (no network yet, cloud unconfigured, camera asleep)
+     * is retried here instead of waiting for a replug. */
+    if (run_deferred && cam && cam->connected(cam) && app_config_get()->auto_sync) sync_run(cam);
     if (!s3_ready || !net_has_ip()) return;
     int64_t now = (int64_t)time(NULL);
     int64_t hb;
@@ -482,9 +517,10 @@ static void on_tick(void)
     /* leftovers from a crash: pending entries / frozen segments */
     if (store_journal_pending_entries() > 0 && now - last_tick_pending_check > 60) { last_tick_pending_check = now; flush_journal(); }
     else publish_frozen_segments();
+    { uint64_t frozen[1]; if (store_kv_get_u64("manifest_dirty", 0) && store_journal_pending_entries() == 0 && store_journal_frozen_list(frozen, 1) == 0) publish_manifest(); }
     if (hb == 0 || rrc_s3_server_now(&s3) - hb >= interval) {
         run_digest_probe_if_needed();
-        if (heartbeat() == ESP_OK && store_kv_get_i64("manifest_ts", 0) == 0 && store_ledger_uploaded_count() > 0) publish_manifest();
+        if (heartbeat() == ESP_OK && manifest_ts() == 0 && store_ledger_uploaded_count() > 0) publish_manifest();
     }
     int64_t last_compact = store_kv_get_i64("last_compact_check", 0);
     if (now - last_compact >= COMPACT_CHECK_S) {
@@ -503,10 +539,8 @@ static void sync_task(void *arg)
         switch (m.cmd) {
         case CMD_ATTACH:
             cam = m.src;
-            if (!strcmp(cam->kind, "ptp")) {
-                esp_err_t e = source_ptp_identify(cam);
-                if (e != ESP_OK) log_ring_printf("ptp: identify failed (%s) — is the camera in MTP/PTP USB mode and awake?", esp_err_to_name(e));
-            }
+            cam_identified = strcmp(cam->kind, "ptp") != 0; /* MSC needs no session */
+            run_deferred = false;
             ST_LOCK();
             st.camera_attached = true;
             scpy(st.camera_kind, sizeof st.camera_kind, cam->kind);
@@ -519,6 +553,7 @@ static void sync_task(void *arg)
         case CMD_DETACH:
             if (cam) { cam->release(cam); }
             cam = NULL;
+            run_deferred = false;
             ST_LOCK(); st.camera_attached = false; st.camera_kind[0] = 0; st.camera_model[0] = 0; st.camera_serial[0] = 0; st.current_file[0] = 0;
             if (st.phase == SYNC_ENUMERATING || st.phase == SYNC_UPLOADING) st.phase = SYNC_IDLE;
             ST_UNLOCK();
@@ -554,7 +589,7 @@ esp_err_t sync_init(void)
     ST_LOCK();
     st.lifetime_uploaded = (uint32_t)store_ledger_uploaded_count();
     st.lifetime_bytes = store_ledger_uploaded_bytes();
-    st.last_manifest_ts = store_kv_get_i64("manifest_ts", 0);
+    st.last_manifest_ts = manifest_ts();
     ST_UNLOCK();
     configure_s3();
     if (xTaskCreatePinnedToCore(sync_task, "sync", 24576, NULL, 4, NULL, tskNO_AFFINITY) != pdPASS) return ESP_ERR_NO_MEM;

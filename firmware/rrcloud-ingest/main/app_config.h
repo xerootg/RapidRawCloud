@@ -9,6 +9,8 @@
 #include "esp_err.h"
 
 #define CFG_STR 160
+/* Longest secret (S3 secret key / Wi-Fi / admin password) the device stores. */
+#define APP_SECRET_MAX 128
 
 typedef struct {
     /* Cloud */

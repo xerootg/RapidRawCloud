@@ -103,6 +103,18 @@ int main(int argc, char **argv)
     CHECK(rrcp_pairing_config_doc_decode(minimal, strlen(minimal), &cfg) == RRCP_OK && cfg.sync.cache_size_gb == 8 && cfg.sync.force_path_style && !cfg.sync.worker_backfill && cfg.version == 1, "pairing config defaults");
     free(pc);
 
+    /* plain strings longer than this target's buffer are truncated (UTF-8 safe); validated scalars never are */
+    { char longname[300]; memset(longname, 'n', 200); memcpy(longname + 200, "\xc3\xa9", 2); longname[202] = 0;
+      char doc[600]; snprintf(doc, sizeof doc, "{\"name\":\"%s\",\"platform\":\"esp32\",\"created\":1,\"last_seen_server_ts\":2,\"applied\":{},\"proto\":{\"read\":[1],\"write\":1}}", longname);
+      rrcp_device_entry_t de2;
+      rrcp_err_t rc2 = rrcp_device_entry_decode(doc, strlen(doc), &de2);
+      CHECK(rc2 == RRCP_OK, "long name decodes: %s", rrcp_err_str(rc2));
+      CHECK(strlen(de2.name) == 128 && de2.name[127] == 'n', "name truncated to buffer (%u)", (unsigned)strlen(de2.name));
+      char doc2[600]; snprintf(doc2, sizeof doc2, "{\"name\":\"x\",\"platform\":\"%s\",\"created\":1,\"last_seen_server_ts\":2,\"applied\":{},\"proto\":{\"read\":[1],\"write\":1}}", longname);
+      CHECK(rrcp_device_entry_decode(doc2, strlen(doc2), &de2) == RRCP_OK && strlen(de2.platform) == 32, "platform truncated");
+      const char *longkey = "{\"v\":1,\"seq\":1,\"ts\":0,\"device\":\"" D "x\",\"op\":\"put\",\"kind\":\"original\",\"key\":\"library/x\",\"vv\":{}}";
+      CHECK(rrcp_journal_entry_decode(longkey, strlen(longkey), &e) == RRCP_E_OVERFLOW, "oversized scalar still fails closed"); }
+
     /* manifest lines */
     char *mf = read_file("manifest.ndjson");
     int ml = 0;

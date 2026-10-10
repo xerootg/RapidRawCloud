@@ -691,10 +691,9 @@ impl VersionVector {
     pub fn compare(&self, other: &Self) -> VvOrder {
         let mut ge = true;
         let mut le = true;
-        for (k, &v) in self.0.iter().chain(other.0.iter()) {
+        for k in self.0.keys().chain(other.0.keys()) {
             let a = self.get(k);
             let b = other.get(k);
-            let _ = v;
             if a < b {
                 ge = false;
             }

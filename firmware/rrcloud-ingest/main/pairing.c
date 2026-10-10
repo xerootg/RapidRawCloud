@@ -52,8 +52,14 @@ static int http_fetch(const char *url, const char *method, const char *form_body
     if (!c) return -1;
     if (form_body) esp_http_client_set_header(c, "Content-Type", "application/x-www-form-urlencoded");
     esp_http_client_set_header(c, "Accept", "application/json");
-    char auth[1200];
-    if (bearer) { snprintf(auth, sizeof auth, "Bearer %s", bearer); esp_http_client_set_header(c, "Authorization", auth); }
+    char *auth = NULL;
+    if (bearer) {
+        size_t al = strlen(bearer) + 8;
+        auth = malloc(al);
+        if (!auth) { esp_http_client_cleanup(c); return -1; }
+        snprintf(auth, al, "Bearer %s", bearer); /* JWTs are routinely > 1 KiB */
+        esp_http_client_set_header(c, "Authorization", auth);
+    }
     size_t blen = form_body ? strlen(form_body) : 0;
     int status = -1;
     if (esp_http_client_open(c, (int)blen) != ESP_OK) goto out;
@@ -74,6 +80,7 @@ static int http_fetch(const char *url, const char *method, const char *form_body
 out:
     esp_http_client_close(c);
     esp_http_client_cleanup(c);
+    free(auth);
     return status;
 }
 
@@ -175,7 +182,8 @@ static void pairing_task(void *arg)
     /* 5. config */
     {
         const char *ep = config_endpoint && *config_endpoint ? config_endpoint : "/api/config";
-        snprintf(url, sizeof url, "%s%s%s", service_base, ep[0] == '/' ? "" : "/", ep);
+        if (!strncmp(ep, "http://", 7) || !strncmp(ep, "https://", 8)) snprintf(url, sizeof url, "%s", ep); /* absolute URL */
+        else snprintf(url, sizeof url, "%s%s%s", service_base, ep[0] == '/' ? "" : "/", ep);
         status = http_fetch(url, "GET", NULL, access_token, &body, &blen);
         memset(access_token, 0, strlen(access_token)); free(access_token);
         if (status == 404) { set_state(PAIR_FAILED, "no cloud config stored for your account yet — sign in to the pairing site in a browser and add your bucket first"); goto done; }

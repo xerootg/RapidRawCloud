@@ -209,14 +209,25 @@ static size_t utf8_put(char *out, size_t cap, size_t o, uint32_t cp, bool *ovf)
     return o + (size_t)n;
 }
 
-/* Parses a JSON string into out (NUL-terminated). out==NULL just skips. */
-static rrcp_err_t r_string(r_t *r, char *out, size_t cap)
+/* Parses a JSON string into out (NUL-terminated). out==NULL just skips. With
+ * `trunc` a value longer than the buffer is cut at a UTF-8 boundary instead of
+ * failing (plain string fields: max_length is this target's buffer size, not a
+ * wire rule); validated scalars never truncate. */
+static rrcp_err_t r_string_ex(r_t *r, char *out, size_t cap, bool trunc)
 {
     if (r_expect(r, '"')) return RRCP_E_SYNTAX;
     size_t o = 0; bool ovf = false;
     while (r->p < r->e) {
         unsigned char c = (unsigned char)*r->p++;
-        if (c == '"') { if (out) { if (ovf) return RRCP_E_OVERFLOW; out[o] = 0; } return RRCP_OK; }
+        if (c == '"') {
+            if (out) {
+                if (ovf && !trunc) return RRCP_E_OVERFLOW;
+                if (ovf) { o = cap - 1; while (o > 0 && ((unsigned char)out[o - 1] & 0xc0) == 0x80) o--; if (o > 0 && ((unsigned char)out[o - 1] & 0xc0) == 0xc0) o--; }
+                if (o >= cap) o = cap - 1;
+                out[o] = 0;
+            }
+            return RRCP_OK;
+        }
         if (c == '\\') {
             if (r->p >= r->e) return RRCP_E_SYNTAX;
             char e = *r->p++;
@@ -246,11 +257,12 @@ static rrcp_err_t r_string(r_t *r, char *out, size_t cap)
         } else {
             if (c < 0x20) return RRCP_E_SYNTAX;
             if (out) { if (o + 1 >= cap) ovf = true; else out[o] = (char)c; }
-            o++;
+            if (!ovf || !out) o++;
         }
     }
     return RRCP_E_SYNTAX;
 }
+static rrcp_err_t r_string(r_t *r, char *out, size_t cap) { return r_string_ex(r, out, cap, false); }
 
 static rrcp_err_t r_u64(r_t *r, uint64_t *out)
 {
@@ -658,7 +670,7 @@ def read_leaf(m: Model, t: TypeRef, expr: str, ind: str, f: Field) -> str:
     if n == "i64":
         return f"{ind}e = r_i64(r, &{expr});\n{ind}if (e) return e;\n"
     if n == "string":
-        return f"{ind}e = r_string(r, {expr}, sizeof {expr});\n{ind}if (e) return e;\n"
+        return f"{ind}e = r_string_ex(r, {expr}, sizeof {expr}, true);\n{ind}if (e) return e;\n"
     kind = m.kind_of(n)
     if kind == "scalar":
         s = m.scalars[n]

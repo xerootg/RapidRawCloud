@@ -5,11 +5,13 @@ on:
     branches: [main]
     paths:
       - 'firmware/rrcloud-ingest/**'
+      - 'protocol/**'
       - 'src-tauri/crates/rrcloud-core/tests/firmware_interop.rs'
       - '.github/workflows/firmware.yml'
   pull_request:
     paths:
       - 'firmware/rrcloud-ingest/**'
+      - 'protocol/**'
       - 'src-tauri/crates/rrcloud-core/tests/firmware_interop.rs'
       - '.github/workflows/firmware.yml'
   workflow_dispatch:

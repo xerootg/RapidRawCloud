@@ -134,7 +134,7 @@ static int to_json(const app_config_t *c, char *out, size_t cap, bool for_ui)
     put_str(&w, "hostname", c->hostname, false);
     put_bool(&w, "admin_auth", c->admin_auth);
     if (for_ui) {
-        char tmp[8];
+        char tmp[APP_SECRET_MAX + 1];
         put_bool(&w, "has_s3_secret", app_config_get_secret(tmp, sizeof tmp) == ESP_OK && tmp[0]);
         put_bool(&w, "has_wifi_password", app_config_get_wifi_password(tmp, sizeof tmp) == ESP_OK && tmp[0]);
         put_bool(&w, "has_admin_password", app_config_get_admin_password(tmp, sizeof tmp) == ESP_OK && tmp[0]);
@@ -176,22 +176,31 @@ static esp_err_t set_secret_key(const char *key, const char *val)
     return e;
 }
 
+/* "" when unset. A stored value that does not fit `cap` is an error (never
+ * silently reported as unset — callers such as Basic auth must fail closed). */
 static esp_err_t get_secret_key(const char *key, char *out, size_t cap)
 {
     out[0] = 0;
     nvs_handle_t h;
     esp_err_t e = nvs_open(NS, NVS_READONLY, &h);
     if (e != ESP_OK) return ESP_OK;
-    nvs_get_string(h, key, out, cap);
+    e = nvs_get_string(h, key, out, cap);
     nvs_close(h);
-    return ESP_OK;
+    if (e == ESP_ERR_NVS_NOT_FOUND) return ESP_OK;
+    return e;
 }
 
-esp_err_t app_config_set_secret(const char *s) { return set_secret_key("s3_secret", s); }
+static esp_err_t set_secret_checked(const char *key, const char *val)
+{
+    if (val && strlen(val) > APP_SECRET_MAX) return ESP_ERR_INVALID_SIZE;
+    return set_secret_key(key, val);
+}
+
+esp_err_t app_config_set_secret(const char *s) { return set_secret_checked("s3_secret", s); }
 esp_err_t app_config_get_secret(char *out, size_t cap) { return get_secret_key("s3_secret", out, cap); }
-esp_err_t app_config_set_wifi_password(const char *s) { return set_secret_key("wifi_pw", s); }
+esp_err_t app_config_set_wifi_password(const char *s) { return set_secret_checked("wifi_pw", s); }
 esp_err_t app_config_get_wifi_password(char *out, size_t cap) { return get_secret_key("wifi_pw", out, cap); }
-esp_err_t app_config_set_admin_password(const char *s) { return set_secret_key("admin_pw", s); }
+esp_err_t app_config_set_admin_password(const char *s) { return set_secret_checked("admin_pw", s); }
 esp_err_t app_config_get_admin_password(char *out, size_t cap) { return get_secret_key("admin_pw", out, cap); }
 
 static void copy_str(cJSON *o, const char *k, char *dst, size_t cap)
@@ -243,10 +252,19 @@ esp_err_t app_config_apply_json(const char *json, size_t len, char *err, size_t 
     if (!c.hostname[0]) strcpy(c.hostname, BOARD_HOSTNAME_DEFAULT);
     /* secrets: present → set; absent → unchanged; empty string → cleared */
     cJSON *sec = cJSON_GetObjectItemCaseSensitive(o, "s3_secret_key");
-    if (cJSON_IsString(sec)) app_config_set_secret(sec->valuestring);
     cJSON *wpw = cJSON_GetObjectItemCaseSensitive(o, "wifi_password");
-    if (cJSON_IsString(wpw)) app_config_set_wifi_password(wpw->valuestring);
     cJSON *apw = cJSON_GetObjectItemCaseSensitive(o, "admin_password");
+    for (int i = 0; i < 3; i++) {
+        cJSON *v = i == 0 ? sec : i == 1 ? wpw : apw;
+        if (cJSON_IsString(v) && strlen(v->valuestring) > APP_SECRET_MAX) {
+            snprintf(err, err_cap, "%s: longer than %d characters", i == 0 ? "s3_secret_key" : i == 1 ? "wifi_password" : "admin_password", APP_SECRET_MAX);
+            cJSON_Delete(o);
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    if (cJSON_IsString(wpw) && wpw->valuestring[0] && strlen(wpw->valuestring) < 8) { snprintf(err, err_cap, "wifi_password: WPA2 passphrases are 8–63 characters"); cJSON_Delete(o); return ESP_ERR_INVALID_ARG; }
+    if (cJSON_IsString(sec)) app_config_set_secret(sec->valuestring);
+    if (cJSON_IsString(wpw)) app_config_set_wifi_password(wpw->valuestring);
     if (cJSON_IsString(apw)) app_config_set_admin_password(apw->valuestring);
     cJSON_Delete(o);
     cur = c;

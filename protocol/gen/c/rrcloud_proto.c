@@ -65,14 +65,25 @@ static size_t utf8_put(char *out, size_t cap, size_t o, uint32_t cp, bool *ovf)
     return o + (size_t)n;
 }
 
-/* Parses a JSON string into out (NUL-terminated). out==NULL just skips. */
-static rrcp_err_t r_string(r_t *r, char *out, size_t cap)
+/* Parses a JSON string into out (NUL-terminated). out==NULL just skips. With
+ * `trunc` a value longer than the buffer is cut at a UTF-8 boundary instead of
+ * failing (plain string fields: max_length is this target's buffer size, not a
+ * wire rule); validated scalars never truncate. */
+static rrcp_err_t r_string_ex(r_t *r, char *out, size_t cap, bool trunc)
 {
     if (r_expect(r, '"')) return RRCP_E_SYNTAX;
     size_t o = 0; bool ovf = false;
     while (r->p < r->e) {
         unsigned char c = (unsigned char)*r->p++;
-        if (c == '"') { if (out) { if (ovf) return RRCP_E_OVERFLOW; out[o] = 0; } return RRCP_OK; }
+        if (c == '"') {
+            if (out) {
+                if (ovf && !trunc) return RRCP_E_OVERFLOW;
+                if (ovf) { o = cap - 1; while (o > 0 && ((unsigned char)out[o - 1] & 0xc0) == 0x80) o--; if (o > 0 && ((unsigned char)out[o - 1] & 0xc0) == 0xc0) o--; }
+                if (o >= cap) o = cap - 1;
+                out[o] = 0;
+            }
+            return RRCP_OK;
+        }
         if (c == '\\') {
             if (r->p >= r->e) return RRCP_E_SYNTAX;
             char e = *r->p++;
@@ -102,11 +113,12 @@ static rrcp_err_t r_string(r_t *r, char *out, size_t cap)
         } else {
             if (c < 0x20) return RRCP_E_SYNTAX;
             if (out) { if (o + 1 >= cap) ovf = true; else out[o] = (char)c; }
-            o++;
+            if (!ovf || !out) o++;
         }
     }
     return RRCP_E_SYNTAX;
 }
+static rrcp_err_t r_string(r_t *r, char *out, size_t cap) { return r_string_ex(r, out, cap, false); }
 
 static rrcp_err_t r_u64(r_t *r, uint64_t *out)
 {
@@ -590,7 +602,7 @@ static rrcp_err_t journal_entry_read(r_t *r, rrcp_journal_entry_t *v)
             { uint64_t u; e = r_u64(r, &u); if (e) return e; if (u > UINT8_MAX) return RRCP_E_BAD_VALUE; v->rating = (uint8_t)u; }
             v->has_rating = true;
         } else if (!strcmp(key, "color_label")) {
-            e = r_string(r, v->color_label, sizeof v->color_label);
+            e = r_string_ex(r, v->color_label, sizeof v->color_label, true);
             if (e) return e;
             v->has_color_label = true;
         } else if (!strcmp(key, "content_id")) {
@@ -973,7 +985,7 @@ static rrcp_err_t manifest_row_read(r_t *r, rrcp_manifest_row_t *v)
             { uint64_t u; e = r_u64(r, &u); if (e) return e; if (u > UINT8_MAX) return RRCP_E_BAD_VALUE; v->rating = (uint8_t)u; }
             v->has_rating = true;
         } else if (!strcmp(key, "color_label")) {
-            e = r_string(r, v->color_label, sizeof v->color_label);
+            e = r_string_ex(r, v->color_label, sizeof v->color_label, true);
             if (e) return e;
             v->has_color_label = true;
         } else {
@@ -1200,11 +1212,11 @@ static rrcp_err_t device_entry_read(r_t *r, rrcp_device_entry_t *v)
         e = r_obj_key(r, key, sizeof key);
         if (e) return e;
         if (!strcmp(key, "name")) {
-            e = r_string(r, v->name, sizeof v->name);
+            e = r_string_ex(r, v->name, sizeof v->name, true);
             if (e) return e;
             seen |= 1u << 0;
         } else if (!strcmp(key, "platform")) {
-            e = r_string(r, v->platform, sizeof v->platform);
+            e = r_string_ex(r, v->platform, sizeof v->platform, true);
             if (e) return e;
             seen |= 1u << 1;
         } else if (!strcmp(key, "created")) {
@@ -1294,19 +1306,19 @@ static rrcp_err_t pairing_info_read(r_t *r, rrcp_pairing_info_t *v)
             { uint64_t u; e = r_u64(r, &u); if (e) return e; if (u > UINT32_MAX) return RRCP_E_BAD_VALUE; v->version = (uint32_t)u; }
             seen |= 1u << 0;
         } else if (!strcmp(key, "issuer")) {
-            e = r_string(r, v->issuer, sizeof v->issuer);
+            e = r_string_ex(r, v->issuer, sizeof v->issuer, true);
             if (e) return e;
             seen |= 1u << 1;
         } else if (!strcmp(key, "clientId")) {
-            e = r_string(r, v->client_id, sizeof v->client_id);
+            e = r_string_ex(r, v->client_id, sizeof v->client_id, true);
             if (e) return e;
             seen |= 1u << 2;
         } else if (!strcmp(key, "configEndpoint")) {
-            e = r_string(r, v->config_endpoint, sizeof v->config_endpoint);
+            e = r_string_ex(r, v->config_endpoint, sizeof v->config_endpoint, true);
             if (e) return e;
             seen |= 1u << 3;
         } else if (!strcmp(key, "redirectUri")) {
-            e = r_string(r, v->redirect_uri, sizeof v->redirect_uri);
+            e = r_string_ex(r, v->redirect_uri, sizeof v->redirect_uri, true);
             if (e) return e;
             v->has_redirect_uri = true;
         } else {
@@ -1405,15 +1417,15 @@ static rrcp_err_t pairing_sync_settings_read(r_t *r, rrcp_pairing_sync_settings_
             if (e) return e;
             seen |= 1u << 0;
         } else if (!strcmp(key, "endpoint")) {
-            e = r_string(r, v->endpoint, sizeof v->endpoint);
+            e = r_string_ex(r, v->endpoint, sizeof v->endpoint, true);
             if (e) return e;
             seen |= 1u << 1;
         } else if (!strcmp(key, "bucket")) {
-            e = r_string(r, v->bucket, sizeof v->bucket);
+            e = r_string_ex(r, v->bucket, sizeof v->bucket, true);
             if (e) return e;
             seen |= 1u << 2;
         } else if (!strcmp(key, "region")) {
-            e = r_string(r, v->region, sizeof v->region);
+            e = r_string_ex(r, v->region, sizeof v->region, true);
             if (e) return e;
             seen |= 1u << 3;
         } else if (!strcmp(key, "forcePathStyle")) {
@@ -1441,7 +1453,7 @@ static rrcp_err_t pairing_sync_settings_read(r_t *r, rrcp_pairing_sync_settings_
                 v->watched_media_buckets_len = 0;
                 if (!aempty) for (;;) {
                     if (v->watched_media_buckets_len >= 16) return RRCP_E_OVERFLOW;
-                    e = r_string(r, v->watched_media_buckets[v->watched_media_buckets_len], sizeof v->watched_media_buckets[v->watched_media_buckets_len]);
+                    e = r_string_ex(r, v->watched_media_buckets[v->watched_media_buckets_len], sizeof v->watched_media_buckets[v->watched_media_buckets_len], true);
                     if (e) return e;
                     v->watched_media_buckets_len++;
                     int amore = r_arr_sep(r);
@@ -1512,11 +1524,11 @@ static rrcp_err_t pairing_credentials_read(r_t *r, rrcp_pairing_credentials_t *v
         e = r_obj_key(r, key, sizeof key);
         if (e) return e;
         if (!strcmp(key, "accessKeyId")) {
-            e = r_string(r, v->access_key_id, sizeof v->access_key_id);
+            e = r_string_ex(r, v->access_key_id, sizeof v->access_key_id, true);
             if (e) return e;
             seen |= 1u << 0;
         } else if (!strcmp(key, "secretAccessKey")) {
-            e = r_string(r, v->secret_access_key, sizeof v->secret_access_key);
+            e = r_string_ex(r, v->secret_access_key, sizeof v->secret_access_key, true);
             if (e) return e;
             seen |= 1u << 1;
         } else {
@@ -1589,7 +1601,7 @@ static rrcp_err_t pairing_config_doc_read(r_t *r, rrcp_pairing_config_doc_t *v)
             { uint64_t u; e = r_u64(r, &u); if (e) return e; if (u > UINT32_MAX) return RRCP_E_BAD_VALUE; v->version = (uint32_t)u; }
             seen |= 1u << 0;
         } else if (!strcmp(key, "updatedAt")) {
-            e = r_string(r, v->updated_at, sizeof v->updated_at);
+            e = r_string_ex(r, v->updated_at, sizeof v->updated_at, true);
             if (e) return e;
             seen |= 1u << 1;
         } else if (!strcmp(key, "sync")) {

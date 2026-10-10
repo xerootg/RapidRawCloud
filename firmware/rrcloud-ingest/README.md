@@ -75,7 +75,8 @@ cloud, network and upload progress; configures what to sync:
   Output is sanitized to the §1.1 relkey rules (no `\` `:`, control chars, reserved names, `.rr.` segments).
 - **Auto sync on plug-in**, minimum size, mass-storage scan folder, device name, hostname,
   optional Wi‑Fi credentials, optional Basic-auth password for the page.
-- JSON API under `/api/…` (see `main/web.c`).
+- JSON API under `/api/…` (see `main/web.c`). State-changing calls must send `Content-Type: application/json`;
+  that requirement is the CSRF gate (an HTML form cannot send it without a CORS preflight the dock never approves).
 
 Secrets are write-only: the S3 secret, Wi‑Fi and admin passwords are stored in NVS and
 never returned by the API.
@@ -142,5 +143,6 @@ host_tests/             gcc/ctest suite + reference vectors + Rust interop fixtu
 - Camera clocks are treated as UTC for `{yyyy}/{mm}/{dd}` and `mtime` (PTP `CaptureDate`
   carries no zone; FAT timestamps are local time).
 - Objects ≥ 4 GiB (PTP reports `0xFFFFFFFF`) are skipped.
-- One camera at a time; USB hubs are not supported.
+- One camera at a time; USB hubs are not supported. A camera re-attached while the previous session is still
+  being torn down is queued and attached once the sync task has released the old source.
 - Manifest rows are emitted in ledger order rather than sorted by relkey (readers merge by key, so order is not load-bearing).

@@ -25,6 +25,11 @@ jobs:
         run: |
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             VERSION="${GITHUB_REF_NAME#firmware-v}"
+            FILE_VERSION="$(tr -d ' \n\r' < firmware/rrcloud-ingest/version.txt)"
+            if [ "$VERSION" != "$FILE_VERSION" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match firmware/rrcloud-ingest/version.txt (${FILE_VERSION}); the binary would report a different version than the release"
+              exit 1
+            fi
             RELEASE=true
           else
             VERSION="$(tr -d ' \n\r' < firmware/rrcloud-ingest/version.txt)"
@@ -73,7 +78,7 @@ jobs:
     needs: meta
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:release-v5.5
+      image: espressif/idf:v5.5
     steps:
       - uses: actions/checkout@v4
       - name: Build

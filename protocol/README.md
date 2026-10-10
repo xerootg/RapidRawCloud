@@ -52,6 +52,8 @@ python3 protocol/rrcgen --lang c   # one emitter
 - A `version_field` outside `supported_versions` is a distinct error (`UnsupportedVersion` / `RRCP_E_UNSUPPORTED_VERSION`) so
   callers can surface "update required" instead of skipping.
 - Integers are exact 64-bit (the C decoder has its own parser; no `double` round-trip).
+- `max_length` on plain `string` fields sizes fixed buffers; the C decoder truncates longer values at a UTF-8
+  boundary (a display name is not a protocol invariant). Validated scalars (`DeviceId`, hex, `RelKey`) never truncate.
 - Encoders validate scalars and emit fields in definition order with serde_json-compatible escaping, so every
   implementation produces identical bytes for identical content (required for crash-replayed segments, §2.1.5).
 

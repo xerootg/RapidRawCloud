@@ -28,8 +28,13 @@ static struct {
     void *arg;
     cam_source_t src;
     msc_impl_t impl;
-    bool in_use;
+    bool in_use;              /* g.src handed to the sync task and not yet released */
+    bool teardown_pending;    /* device gone; VFS/device still registered until release */
+    bool has_pending_addr;    /* a disk appeared while in_use */
+    uint8_t pending_addr;
 } g;
+
+static void attach_address(uint8_t address);
 
 static void wcs_to_utf8(const wchar_t *w, char *out, size_t cap)
 {
@@ -131,47 +136,63 @@ static esp_err_t msc_read(cam_source_t *s, void *fh, uint64_t offset, uint8_t *b
 
 static void msc_close(cam_source_t *s, void *fh) { (void)s; fclose((FILE *)fh); }
 static bool msc_connected(cam_source_t *s) { return ((msc_impl_t *)s->impl)->connected; }
-static void msc_release(cam_source_t *s) { (void)s; g.in_use = false; }
+/* Runs on the sync task once it has closed every file: only now is it safe to pull
+ * the VFS and the device out from under /usb. */
+static void msc_release(cam_source_t *s)
+{
+    (void)s;
+    if (g.teardown_pending) {
+        msc_host_vfs_unregister(g.impl.vfs);
+        msc_host_uninstall_device(g.impl.dev);
+        g.teardown_pending = false;
+        ESP_LOGI(TAG, "disk removed");
+    }
+    g.in_use = false;
+    if (g.has_pending_addr) { g.has_pending_addr = false; attach_address(g.pending_addr); }
+}
+
+static void attach_address(uint8_t address)
+{
+    memset(&g.impl, 0, sizeof g.impl);
+    esp_err_t e = msc_host_install_device(address, &g.impl.dev);
+    if (e != ESP_OK) { ESP_LOGE(TAG, "install_device: %s", esp_err_to_name(e)); return; }
+    const esp_vfs_fat_mount_config_t mc = {.format_if_mount_failed = false, .max_files = 4, .allocation_unit_size = 0};
+    e = msc_host_vfs_register(g.impl.dev, MOUNT, &mc, &g.impl.vfs);
+    if (e != ESP_OK) { ESP_LOGE(TAG, "vfs_register: %s", esp_err_to_name(e)); msc_host_uninstall_device(g.impl.dev); return; }
+    msc_host_device_info_t info;
+    memset(&g.src, 0, sizeof g.src);
+    if (msc_host_get_device_info(g.impl.dev, &info) == ESP_OK) {
+        char prod[64], ser[64];
+        wcs_to_utf8(info.iProduct, prod, sizeof prod); trim(prod);
+        wcs_to_utf8(info.iSerialNumber, ser, sizeof ser); trim(ser);
+        scpy(g.src.model, sizeof g.src.model, prod[0] ? prod : "USB disk");
+        scpy(g.src.serial, sizeof g.src.serial, ser);
+        snprintf(g.src.source_id, sizeof g.src.source_id, "msc:%04x:%04x:%s", info.idVendor, info.idProduct, ser);
+        ESP_LOGI(TAG, "disk: %s sn %s, %u MiB", g.src.model, ser, (unsigned)((uint64_t)info.sector_count * info.sector_size / (1024 * 1024)));
+    } else {
+        strcpy(g.src.model, "USB disk");
+        strcpy(g.src.source_id, "msc:unknown");
+    }
+    g.src.kind = "msc";
+    g.src.impl = &g.impl;
+    g.src.enumerate = msc_enumerate; g.src.open = msc_open; g.src.read = msc_read; g.src.close = msc_close;
+    g.src.connected = msc_connected; g.src.release = msc_release;
+    g.impl.connected = true;
+    g.in_use = true;
+    if (g.cb) g.cb(CAM_EV_ATTACHED, &g.src, g.arg);
+}
 
 static void msc_event(const msc_host_event_t *ev, void *arg)
 {
     (void)arg;
     if (ev->event == MSC_DEVICE_CONNECTED) {
-        if (g.in_use) { ESP_LOGW(TAG, "second MSC device ignored"); return; }
-        memset(&g.impl, 0, sizeof g.impl);
-        esp_err_t e = msc_host_install_device(ev->device.address, &g.impl.dev);
-        if (e != ESP_OK) { ESP_LOGE(TAG, "install_device: %s", esp_err_to_name(e)); return; }
-        const esp_vfs_fat_mount_config_t mc = {.format_if_mount_failed = false, .max_files = 4, .allocation_unit_size = 0};
-        e = msc_host_vfs_register(g.impl.dev, MOUNT, &mc, &g.impl.vfs);
-        if (e != ESP_OK) { ESP_LOGE(TAG, "vfs_register: %s", esp_err_to_name(e)); msc_host_uninstall_device(g.impl.dev); return; }
-        msc_host_device_info_t info;
-        memset(&g.src, 0, sizeof g.src);
-        if (msc_host_get_device_info(g.impl.dev, &info) == ESP_OK) {
-            char prod[64], ser[64];
-            wcs_to_utf8(info.iProduct, prod, sizeof prod); trim(prod);
-            wcs_to_utf8(info.iSerialNumber, ser, sizeof ser); trim(ser);
-            scpy(g.src.model, sizeof g.src.model, prod[0] ? prod : "USB disk");
-            scpy(g.src.serial, sizeof g.src.serial, ser);
-            snprintf(g.src.source_id, sizeof g.src.source_id, "msc:%04x:%04x:%s", info.idVendor, info.idProduct, ser);
-            ESP_LOGI(TAG, "disk: %s sn %s, %u MiB", g.src.model, ser, (unsigned)((uint64_t)info.sector_count * info.sector_size / (1024 * 1024)));
-        } else {
-            strcpy(g.src.model, "USB disk");
-            strcpy(g.src.source_id, "msc:unknown");
-        }
-        g.src.kind = "msc";
-        g.src.impl = &g.impl;
-        g.src.enumerate = msc_enumerate; g.src.open = msc_open; g.src.read = msc_read; g.src.close = msc_close;
-        g.src.connected = msc_connected; g.src.release = msc_release;
-        g.impl.connected = true;
-        g.in_use = true;
-        if (g.cb) g.cb(CAM_EV_ATTACHED, &g.src, g.arg);
+        if (g.in_use) { ESP_LOGI(TAG, "disk attached before the previous one was released; queued"); g.has_pending_addr = true; g.pending_addr = ev->device.address; return; }
+        attach_address(ev->device.address);
     } else if (ev->event == MSC_DEVICE_DISCONNECTED) {
         if (!g.in_use || ev->device.handle != g.impl.dev) return;
         g.impl.connected = false;
+        g.teardown_pending = true; /* the sync task still owns open files on /usb */
         if (g.cb) g.cb(CAM_EV_DETACHED, &g.src, g.arg);
-        msc_host_vfs_unregister(g.impl.vfs);
-        msc_host_uninstall_device(g.impl.dev);
-        ESP_LOGI(TAG, "disk removed");
     }
 }
 

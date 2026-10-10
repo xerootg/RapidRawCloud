@@ -19,6 +19,7 @@
  */
 #include "web.h"
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "esp_log.h"
@@ -44,15 +45,16 @@ extern const char index_html_end[] asm("_binary_index_html_end");
 static bool authorized(httpd_req_t *req)
 {
     const app_config_t *c = app_config_get();
-    char pw[64];
-    app_config_get_admin_password(pw, sizeof pw);
-    if (!c->admin_auth || !pw[0]) return true;
+    if (!c->admin_auth) return true;
+    char pw[APP_SECRET_MAX + 1];
+    if (app_config_get_admin_password(pw, sizeof pw) != ESP_OK) return false; /* set but unreadable: fail closed */
+    if (!pw[0]) return true; /* auth enabled without a password: nothing to check against */
     char hdr[256];
     if (httpd_req_get_hdr_value_str(req, "Authorization", hdr, sizeof hdr) != ESP_OK) return false;
     if (strncmp(hdr, "Basic ", 6)) return false;
-    char cred[96];
+    char cred[APP_SECRET_MAX + 8];
     snprintf(cred, sizeof cred, "admin:%s", pw);
-    char want[160];
+    char want[(APP_SECRET_MAX + 8) * 4 / 3 + 8];
     rrc_base64_encode((const uint8_t *)cred, strlen(cred), want);
     return strcmp(hdr + 6, want) == 0;
 }
@@ -65,7 +67,26 @@ static esp_err_t deny(httpd_req_t *req)
     return httpd_resp_send(req, "auth required", HTTPD_RESP_USE_STRLEN);
 }
 
-#define AUTH() do { if (!authorized(req)) return deny(req); } while (0)
+/* CSRF gate: every state-changing endpoint takes a JSON body, and an HTML form can
+ * only send urlencoded/multipart/text bodies without a CORS preflight (which this
+ * server never approves). Requiring application/json therefore closes the cross-site
+ * form-POST vector without Origin/Host heuristics (proxies, DNS rebinding, long
+ * headers). curl/scripts set the header anyway. */
+static bool json_request(httpd_req_t *req)
+{
+    char ct[96];
+    if (httpd_req_get_hdr_value_str(req, "Content-Type", ct, sizeof ct) != ESP_OK) return false;
+    return strncasecmp(ct, "application/json", 16) == 0;
+}
+
+static esp_err_t forbid(httpd_req_t *req)
+{
+    httpd_resp_set_status(req, "415 Unsupported Media Type");
+    httpd_resp_set_type(req, "text/plain");
+    return httpd_resp_send(req, "state-changing requests must be application/json", HTTPD_RESP_USE_STRLEN);
+}
+
+#define AUTH() do { if (!authorized(req)) return deny(req); if (req->method != HTTP_GET && !json_request(req)) return forbid(req); } while (0)
 
 static esp_err_t send_json(httpd_req_t *req, const char *json, int len)
 {
