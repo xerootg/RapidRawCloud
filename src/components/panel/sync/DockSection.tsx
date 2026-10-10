@@ -218,6 +218,7 @@ export default function DockSection() {
             setStatus(null);
             setConfig(null);
             setPair(null);
+            setMessage(d.detail ? `Dock disconnected (${d.detail})` : 'Dock disconnected');
           }
         });
       } catch {

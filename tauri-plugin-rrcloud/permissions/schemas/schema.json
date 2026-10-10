@@ -379,10 +379,16 @@
           "markdownDescription": "Denies the sync_start_foreground_sync command without any pre-configured scope."
         },
         {
-          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-sync-start-foreground-sync`\n- `allow-sync-dcim-access-status`\n- `allow-dock-scan-start`\n- `allow-dock-scan-stop`\n- `allow-dock-connect`\n- `allow-dock-disconnect`\n- `allow-dock-rpc`",
+          "description": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-sync-start-foreground-sync`\n- `allow-sync-dcim-access-status`\n- `allow-dock-scan-start`\n- `allow-dock-scan-stop`\n- `allow-dock-connect`\n- `allow-dock-disconnect`\n- `allow-dock-rpc`\n- `allow-plugin-events`",
           "type": "string",
           "const": "default",
-          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-sync-start-foreground-sync`\n- `allow-sync-dcim-access-status`\n- `allow-dock-scan-start`\n- `allow-dock-scan-stop`\n- `allow-dock-connect`\n- `allow-dock-disconnect`\n- `allow-dock-rpc`"
+          "markdownDescription": "Default permissions for the plugin\n#### This default permission set includes:\n\n- `allow-sync-start-foreground-sync`\n- `allow-sync-dcim-access-status`\n- `allow-dock-scan-start`\n- `allow-dock-scan-stop`\n- `allow-dock-connect`\n- `allow-dock-disconnect`\n- `allow-dock-rpc`\n- `allow-plugin-events`"
+        },
+        {
+          "description": "Lets the webview subscribe to and unsubscribe from the plugin's events (camera dock scan results and connection state).",
+          "type": "string",
+          "const": "allow-plugin-events",
+          "markdownDescription": "Lets the webview subscribe to and unsubscribe from the plugin's events (camera dock scan results and connection state)."
         }
       ]
     }

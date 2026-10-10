@@ -11,6 +11,7 @@ Default permissions for the plugin
 - `allow-dock-connect`
 - `allow-dock-disconnect`
 - `allow-dock-rpc`
+- `allow-plugin-events`
 
 ## Permission Table
 
@@ -199,6 +200,19 @@ Enables the sync_start_foreground_sync command without any pre-configured scope.
 <td>
 
 Denies the sync_start_foreground_sync command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`rrcloud:allow-plugin-events`
+
+</td>
+<td>
+
+Lets the webview subscribe to and unsubscribe from the plugin's events (camera dock scan results and connection state).
 
 </td>
 </tr>

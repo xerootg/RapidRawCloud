@@ -8,4 +8,5 @@ permissions = [
     "allow-dock-connect",
     "allow-dock-disconnect",
     "allow-dock-rpc",
+    "allow-plugin-events",
 ]

@@ -177,7 +177,9 @@ class DockBleClient(private val context: Context, private val emit: (String, JSO
         val r = rpcQueue.poll() ?: return
         current = r
         assembly.reset(); assemblyTotal = -1
-        val maxPayload = (mtu - 3).coerceAtLeast(20)
+        // ATT allows MTU-3 bytes per write, but Android refuses attribute values over
+        // 512 bytes (GATT_MAX_ATTR_LEN) and NimBLE's attribute limit is the same.
+        val maxPayload = (mtu - 3).coerceAtLeast(20).coerceAtMost(512)
         var off = 0; var first = true
         val tag = (r.id and 0xF) shl 4
         while (first || off < r.payload.size) {
@@ -192,7 +194,9 @@ class DockBleClient(private val context: Context, private val emit: (String, JSO
             writeQueue.add(frag)
             off += n; first = false
         }
-        val d = Runnable { if (current === r) { current = null; failAll("the dock did not reply in time") } }
+        // failAll() answers `current` (this request) and everything queued behind it;
+        // never clear `current` before it runs or the invoke behind it hangs forever.
+        val d = Runnable { if (current === r) failAll("the dock did not reply in time") }
         deadline = d; main.postDelayed(d, RPC_TIMEOUT_MS)
         pumpWrite()
     }
@@ -203,13 +207,18 @@ class DockBleClient(private val context: Context, private val emit: (String, JSO
         val c = rx ?: return
         val frag = writeQueue.poll() ?: return
         writing = true
-        val ok = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            g.writeCharacteristic(c, frag, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothGatt.GATT_SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            run { c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT; c.value = frag; g.writeCharacteristic(c) }
+        val ok = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                g.writeCharacteristic(c, frag, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT) == BluetoothGatt.GATT_SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                run { c.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT; c.value = frag; g.writeCharacteristic(c) }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "writeCharacteristic threw: $e")
+            false
         }
-        if (!ok) { writing = false; current = null; failAll("write to the dock failed") }
+        if (!ok) { writing = false; failAll("write to the dock failed") }
     }
 
     private fun onFragment(data: ByteArray) {
@@ -320,11 +329,10 @@ class DockBleClient(private val context: Context, private val emit: (String, JSO
                 if (g !== gatt) return@post
                 writing = false
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    // 5 / 15 = insufficient authentication/encryption: Android bonds and the
-                    // caller retries; anything else ends the request.
-                    val r = current; current = null
-                    failAll(if (status == 5 || status == 15 || status == 8) "pairing with the dock is required — accept the pairing request and try again" else "the dock rejected the write ($status)")
-                    if (r != null) Log.w(TAG, "write failed status=$status for rpc ${r.id}")
+                    // 5 / 15 / 8 = insufficient authentication/encryption after the stack's own
+                    // bonding retry gave up (declined or timed out); anything else is a plain failure.
+                    Log.w(TAG, "write failed status=$status for rpc ${current?.id}")
+                    failAll(if (status == 5 || status == 15 || status == 8) "pairing with the dock is required — accept the pairing request on the phone and try again" else "the dock rejected the write ($status)")
                     return@post
                 }
                 pumpWrite()
