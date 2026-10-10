@@ -23,6 +23,7 @@
 //! credentials, corrupt config doc) is recorded and skipped, never aborting
 //! the rest of the fleet. Users who turned `workerBackfill` off are skipped.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::path::PathBuf;
 
 use serde::Deserialize;
@@ -167,6 +168,118 @@ pub fn username_from_config_key(key: &str) -> Option<&str> {
     Some(user)
 }
 
+/// Offline policy check for a paired user's self-typed library endpoint.
+///
+/// The fleet worker runs **inside the cluster** and sends SigV4-signed
+/// requests — including `PUT` and `DELETE` — to whatever `sync.endpoint`
+/// says. The endpoint comes from the user's own config doc, so without this
+/// check any paired user could aim those requests at loopback, RFC1918
+/// space, the cloud metadata address, or an in-cluster service name
+/// (`*.svc.cluster.local`) from the worker's network position (SSRF), or
+/// use plain `http://` and expose their own credentials to a MITM.
+///
+/// Rules (purely syntactic — no DNS, so it never blocks or leaks a lookup):
+/// the URL must parse, use `https`, and have a host. An IP-literal host must
+/// be a public unicast address (loopback, private, link-local, unspecified,
+/// multicast, broadcast, shared `100.64/10`, unique-local `fc00::/7`, and the
+/// IPv4-mapped IPv6 forms of all of those are rejected). A named host must
+/// not be `localhost`, a single label (no dot), or end in `.localhost`,
+/// `.local`, `.internal`, `.svc`, `.cluster.local`.
+///
+/// This applies to *user-controlled* endpoints only. The operator-set admin
+/// endpoint and the single-tenant worker's `RRCLOUD_ENDPOINT` legitimately
+/// point at `http://127.0.0.1:3900`-style Garage addresses in dev/tests, so
+/// [`S3Client::new`] itself stays permissive.
+pub fn validate_library_endpoint(endpoint: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(endpoint.trim_end_matches('/'))
+        .map_err(|e| format!("unparsable URL: {e}"))?;
+    if url.scheme() != "https" {
+        return Err(format!(
+            "scheme {:?} is not allowed; library endpoints must use https://",
+            url.scheme()
+        ));
+    }
+    // `host_str()` is the *parsed* host: the url crate has already folded
+    // decimal/hex/short IPv4 spellings (`2130706433`, `0x7f000001`,
+    // `127.1`) into dotted-quad form and bracketed IPv6 literals, so an IP
+    // literal cannot slip past these checks as a "name".
+    let host = url.host_str().ok_or_else(|| "no host".to_string())?;
+    if let Some(v6) = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .and_then(|h| h.parse::<Ipv6Addr>().ok())
+    {
+        check_public_v6(v6)
+    } else if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        check_public_v4(v4)
+    } else {
+        check_public_name(host)
+    }
+}
+
+fn check_public_v4(ip: Ipv4Addr) -> Result<(), String> {
+    let [a, b, _, _] = ip.octets();
+    let bad = ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || a == 0 // 0.0.0.0/8 "this network"
+        || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10 shared (CGNAT)
+        || a >= 240; // 240.0.0.0/4 reserved
+    if bad {
+        Err(format!("IP address {ip} is not a public address"))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_public_v6(ip: Ipv6Addr) -> Result<(), String> {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return Err(format!("IP address {ip} is not a public address"));
+    }
+    // IPv4-mapped (`::ffff:a.b.c.d`) and the deprecated IPv4-compatible
+    // (`::a.b.c.d`) forms reach an IPv4 host — apply the IPv4 rules to it.
+    if let Some(v4) = ip.to_ipv4() {
+        return check_public_v4(v4).map_err(|e| format!("{e} (embedded in {ip})"));
+    }
+    let seg0 = ip.segments()[0];
+    let bad = (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        || (seg0 & 0xffc0) == 0xfe80; // fe80::/10 link local
+    if bad {
+        Err(format!("IP address {ip} is not a public address"))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_public_name(name: &str) -> Result<(), String> {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() || name == "localhost" {
+        return Err(format!("host {name:?} is not a public host name"));
+    }
+    if !name.contains('.') {
+        return Err(format!(
+            "host {name:?} is a single-label name (not a public host name)"
+        ));
+    }
+    const INTERNAL_SUFFIXES: &[&str] = &[
+        ".localhost",
+        ".local",
+        ".internal",
+        ".svc",
+        ".cluster.local",
+        ".svc.cluster.local",
+    ];
+    if let Some(suffix) = INTERNAL_SUFFIXES.iter().find(|s| name.ends_with(**s)) {
+        return Err(format!(
+            "host {name:?} is under the internal suffix {suffix:?}"
+        ));
+    }
+    Ok(())
+}
+
 /// Run one backfill cycle for every paired user in the admin bucket.
 ///
 /// Fatal (returns `Err`): the admin bucket cannot be listed. Everything
@@ -226,6 +339,14 @@ async fn run_one_user(
         || doc.credentials.secret_access_key.is_empty()
     {
         return UserOutcome::Failed("config doc missing endpoint/bucket/credentials".into());
+    }
+    // SSRF guard: the endpoint is user-typed and the worker is in-cluster.
+    // Reject before anything is built or any state dir is created.
+    if let Err(reason) = validate_library_endpoint(&doc.sync.endpoint) {
+        return UserOutcome::Failed(format!(
+            "endpoint rejected ({:?}): {reason}",
+            doc.sync.endpoint
+        ));
     }
 
     let cfg = WorkerConfig {
@@ -322,6 +443,130 @@ mod tests {
         let doc: ConfigDoc = serde_json::from_slice(json).expect("parse");
         assert!(!doc.sync.worker_backfill);
         assert!(doc.sync.region.is_none());
+    }
+
+    #[test]
+    fn endpoint_validation_accepts_public_https_hosts() {
+        for ok in [
+            "https://garage.themissing.xyz",
+            "https://garage.themissing.xyz/",
+            "https://s3.eu-central-003.backblazeb2.com",
+            "https://s3.rrcloud-control.test",
+            "https://S3.Example.COM:9443",
+            "https://8.8.8.8",
+            "https://[2606:4700:4700::1111]:443",
+            "https://[::ffff:8.8.8.8]",
+        ] {
+            assert_eq!(validate_library_endpoint(ok), Ok(()), "{ok}");
+        }
+    }
+
+    #[test]
+    fn endpoint_validation_rejects_plaintext_and_garbage() {
+        for bad in [
+            "http://s3.example.com",
+            "http://garage.themissing.xyz",
+            "ftp://s3.example.com",
+            "file:///etc/passwd",
+            "s3.example.com",
+            "",
+            "https://",
+            "https:///path-only",
+        ] {
+            assert!(validate_library_endpoint(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn endpoint_validation_rejects_non_public_ipv4_literals() {
+        for bad in [
+            "https://127.0.0.1",
+            "https://127.0.0.1:3903",
+            "https://127.1.2.3",
+            "https://2130706433", // decimal 127.0.0.1
+            "https://0x7f000001", // hex 127.0.0.1
+            "https://127.1",      // short-form 127.0.0.1
+            "https://0.0.0.0",
+            "https://0.1.2.3",
+            "https://10.0.0.5",
+            "https://10.0.0.5:3903",
+            "https://172.16.0.1",
+            "https://172.31.255.254",
+            "https://192.168.1.1",
+            "https://169.254.169.254",
+            "https://169.254.169.254:80",
+            "https://100.64.0.1",
+            "https://100.127.255.255",
+            "https://224.0.0.1",
+            "https://255.255.255.255",
+            "https://240.0.0.1",
+        ] {
+            assert!(validate_library_endpoint(bad).is_err(), "{bad}");
+        }
+        // Boundaries just outside the private ranges are public.
+        for ok in [
+            "https://172.15.255.255",
+            "https://172.32.0.1",
+            "https://100.63.255.255",
+            "https://100.128.0.1",
+            "https://11.0.0.1",
+        ] {
+            assert_eq!(validate_library_endpoint(ok), Ok(()), "{ok}");
+        }
+    }
+
+    #[test]
+    fn endpoint_validation_rejects_non_public_ipv6_literals() {
+        for bad in [
+            "https://[::1]",
+            "https://[::1]:3903",
+            "https://[::]",
+            "https://[fe80::1]",
+            "https://[febf::1]",
+            "https://[fc00::1]",
+            "https://[fd12:3456::1]",
+            "https://[ff02::1]",
+            // IPv4-mapped / IPv4-compatible forms of blocked v4 ranges.
+            "https://[::ffff:127.0.0.1]",
+            "https://[::ffff:10.0.0.5]",
+            "https://[::ffff:169.254.169.254]",
+            "https://[::ffff:192.168.0.1]",
+            "https://[::ffff:7f00:1]",
+            "https://[::127.0.0.1]",
+        ] {
+            assert!(validate_library_endpoint(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn endpoint_validation_rejects_internal_host_names() {
+        for bad in [
+            "https://localhost",
+            "https://localhost:3903",
+            "https://LOCALHOST",
+            "https://localhost.",
+            "https://foo.localhost",
+            "https://garage",
+            "https://garage:3900",
+            "https://garage-admin.garage.svc.cluster.local:3903",
+            "https://garage-admin.garage.svc.cluster.local.",
+            "https://garage-admin.garage.svc",
+            "https://thing.cluster.local",
+            "https://printer.local",
+            "https://metadata.google.internal",
+            "https://db.internal",
+        ] {
+            assert!(validate_library_endpoint(bad).is_err(), "{bad}");
+        }
+        // Lookalikes that merely contain the words are fine.
+        for ok in [
+            "https://localhost.example.com",
+            "https://internal.example.com",
+            "https://svc.example.com",
+            "https://my-local.example.com",
+        ] {
+            assert_eq!(validate_library_endpoint(ok), Ok(()), "{ok}");
+        }
     }
 
     #[test]
