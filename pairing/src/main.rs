@@ -16,9 +16,11 @@
 //!    and fills a form with their *own* library-bucket S3 coordinates; we
 //!    write their `config.json`. Return visits show "already paired".
 //!  * **App** (`GET /api/config`): the native app obtains an OIDC/PKCE
-//!    access token and sends it as `Authorization: Bearer …`. We validate
-//!    it by calling Authentik's userinfo endpoint, then return that user's
-//!    `config.json` so the app configures itself with zero typing.
+//!    access token and sends it as `Authorization: Bearer …`. We first
+//!    require the token's `aud` claim to name the app's own OIDC client id
+//!    (so tokens Authentik issued to other applications are refused), then
+//!    validate it by calling Authentik's userinfo endpoint, and return that
+//!    user's `config.json` so the app configures itself with zero typing.
 //!
 //! The service never creates buckets or mints credentials — users bring
 //! their own bucket and paste its key once. The headless worker reads the
@@ -34,6 +36,7 @@ use axum::{
     routing::{get, post},
     Form, Json, Router,
 };
+use base64::Engine;
 use s3::{creds::Credentials, Bucket, Region};
 use serde::{Deserialize, Serialize};
 
@@ -257,9 +260,57 @@ struct UserInfo {
     sub: Option<String>,
 }
 
-/// Validate an app's bearer token by calling Authentik's userinfo endpoint,
-/// returning the sanitized username. `None` → invalid/unusable token.
+/// Does this bearer token's `aud` claim name `client_id`?
+///
+/// Authentik's userinfo endpoint resolves ANY access token the instance has
+/// issued — for any provider/application — to its user. So "userinfo said
+/// 200" only proves the token is *some* valid Authentik token for *some*
+/// user, not that it was issued to the RapidRAW app. A token minted for (or
+/// leaked from) another application in the same Authentik must not unlock a
+/// user's library credentials here, so we additionally require the token's
+/// `aud` (string, or array of strings per RFC 7519 §4.1.3) to contain our
+/// client id. The token is parsed as a JWT (Authentik access tokens are JWTs)
+/// WITHOUT verifying its signature or expiry: userinfo remains the sole
+/// authority for validity and identity; this is purely the audience gate.
+/// Anything that is not a 3-segment JWT with a decodable JSON payload, or
+/// whose `aud` is missing/does not match, is rejected.
+fn token_audience_matches(token: &str, client_id: &str) -> bool {
+    let mut parts = token.split('.');
+    let (Some(_header), Some(payload), Some(_sig), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        tracing::debug!("bearer rejected: not a 3-segment JWT");
+        return false;
+    };
+    // Authentik emits unpadded base64url; tolerate padded input too.
+    let payload = payload.trim_end_matches('=');
+    let Ok(bytes) = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(payload) else {
+        tracing::debug!("bearer rejected: JWT payload is not base64url");
+        return false;
+    };
+    let Ok(claims) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        tracing::debug!("bearer rejected: JWT payload is not JSON");
+        return false;
+    };
+    let matches = match claims.get("aud") {
+        Some(serde_json::Value::String(aud)) => aud == client_id,
+        Some(serde_json::Value::Array(auds)) => auds.iter().any(|a| a.as_str() == Some(client_id)),
+        _ => false,
+    };
+    if !matches {
+        tracing::warn!("bearer rejected: token audience does not include this client id");
+    }
+    matches
+}
+
+/// Validate an app's bearer token: first require its `aud` claim to name our
+/// OIDC client id (see [`token_audience_matches`]), then call Authentik's
+/// userinfo endpoint and return the sanitized username. `None` →
+/// invalid/unusable token.
 async fn validate_bearer(state: &AppState, bearer: &str) -> Option<String> {
+    if !token_audience_matches(bearer, &state.config.oidc_client_id) {
+        return None;
+    }
     let resp = state
         .http
         .get(&state.config.oidc_userinfo_url)

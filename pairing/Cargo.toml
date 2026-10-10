@@ -24,8 +24,7 @@ rust-s3 = { version = "0.35", default-features = false, features = ["tokio-rustl
 html-escape = "0.2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-[dev-dependencies]
-# base64url-encodes JWT segments when the tests build bearer tokens.
-# Already a transitive dependency (0.22.x in Cargo.lock), so no new tree.
+# base64url-decodes the JWT payload of app bearer tokens for the audience
+# (`aud`) check; the tests also use it to build tokens. Already a transitive
+# dependency (0.22.x in Cargo.lock), so no new tree.
 base64 = "0.22"
