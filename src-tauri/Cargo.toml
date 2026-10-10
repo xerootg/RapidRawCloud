@@ -40,7 +40,11 @@ pollster = "1.0"
 bytemuck = { version = "1.25", features = ["derive"] }
 anyhow = "1.0.104"
 kamadak-exif = "0.6.1"
-rawler = { git = "https://github.com/CyberTimon/RapidRAW-DngLab.git" }
+# Pinned by `rev` to the commit Cargo.lock already resolved, so a `cargo update`
+# (or a fresh clone without the lock) cannot silently move the raw decoder.
+# NOTE: crates/rrcloud-core pins a DIFFERENT rawler rev (934af4b) of the same
+# fork; unifying the two is a separate decision, not made here.
+rawler = { git = "https://github.com/CyberTimon/RapidRAW-DngLab.git", rev = "a32bc1ff1f4f3c56d4d3226082f6eb17414f9159" }
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1.25", features = ["v4", "serde"] }
 walkdir = "2.5.0"
@@ -107,7 +111,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "mul
 tauri-plugin-clerk = "0.1.1"
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
-gphoto2 = { git = "https://github.com/CyberTimon/libgphoto2-rs", optional = true }
+# Pinned by `rev` to the commit Cargo.lock already resolved (see rawler above).
+gphoto2 = { git = "https://github.com/CyberTimon/libgphoto2-rs", rev = "878ca523624223b95ed6b303de39e45b0c27c1a9", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
