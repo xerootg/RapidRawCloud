@@ -840,6 +840,30 @@ static rrcp_err_t manifest_header_read(r_t *r, rrcp_manifest_header_t *v)
 rrcp_err_t rrcp_manifest_header_decode(const char *json, size_t len, rrcp_manifest_header_t *out)
 {
     r_t r = {json, json + len};
+    /* min-reader gate: locate `proto` before decoding anything else */
+    {
+        r_t probe = r;
+        bool empty;
+        if (r_obj_begin(&probe, &empty)) return RRCP_E_SYNTAX;
+        bool found = false;
+        if (!empty) for (;;) {
+            char key[64];
+            if (r_obj_key(&probe, key, sizeof key)) return RRCP_E_SYNTAX;
+            if (!strcmp(key, "proto")) {
+                uint64_t ver;
+                if (r_u64(&probe, &ver)) return RRCP_E_BAD_VALUE;
+                static const uint64_t ok[] = {1};
+                bool sup = false;
+                for (size_t i = 0; i < sizeof ok / sizeof ok[0]; i++) if (ok[i] == ver) sup = true;
+                if (!sup) return RRCP_E_UNSUPPORTED_VERSION;
+                found = true;
+            } else if (r_skip(&probe, 0)) return RRCP_E_SYNTAX;
+            int more = r_obj_sep(&probe);
+            if (more < 0) return RRCP_E_SYNTAX;
+            if (!more) break;
+        }
+        if (!found) return RRCP_E_MISSING_FIELD;
+    }
     rrcp_err_t e = manifest_header_read(&r, out);
     if (e) return e;
     return r_end(&r);
@@ -1349,6 +1373,8 @@ void rrcp_pairing_sync_settings_init(rrcp_pairing_sync_settings_t *v)
     snprintf(v->bucket, sizeof v->bucket, "%s", "");
     snprintf(v->region, sizeof v->region, "%s", "");
     v->force_path_style = true;
+    v->upload_requires_unmetered = false;
+    v->upload_requires_charging = false;
     v->cache_size_gb = 8;
     v->preview_budget_gb = 10;
     v->preview_prefetch_months = 12;
@@ -1370,6 +1396,10 @@ static rrcp_err_t pairing_sync_settings_write(w_t *w, const rrcp_pairing_sync_se
     w_str(w, v->region);
     w_key(w, "forcePathStyle", &first);
     w_raw(w, v->force_path_style ? "true" : "false");
+    w_key(w, "uploadRequiresUnmetered", &first);
+    w_raw(w, v->upload_requires_unmetered ? "true" : "false");
+    w_key(w, "uploadRequiresCharging", &first);
+    w_raw(w, v->upload_requires_charging ? "true" : "false");
     w_key(w, "cacheSizeGb", &first);
     w_u64(w, (uint64_t)v->cache_size_gb);
     w_key(w, "previewBudgetGb", &first);
@@ -1432,19 +1462,27 @@ static rrcp_err_t pairing_sync_settings_read(r_t *r, rrcp_pairing_sync_settings_
             e = r_bool(r, &v->force_path_style);
             if (e) return e;
             seen |= 1u << 4;
+        } else if (!strcmp(key, "uploadRequiresUnmetered")) {
+            e = r_bool(r, &v->upload_requires_unmetered);
+            if (e) return e;
+            seen |= 1u << 5;
+        } else if (!strcmp(key, "uploadRequiresCharging")) {
+            e = r_bool(r, &v->upload_requires_charging);
+            if (e) return e;
+            seen |= 1u << 6;
         } else if (!strcmp(key, "cacheSizeGb")) {
             { uint64_t u; e = r_u64(r, &u); if (e) return e; if (u > UINT32_MAX) return RRCP_E_BAD_VALUE; v->cache_size_gb = (uint32_t)u; }
-            seen |= 1u << 5;
+            seen |= 1u << 7;
         } else if (!strcmp(key, "previewBudgetGb")) {
             { uint64_t u; e = r_u64(r, &u); if (e) return e; if (u > UINT32_MAX) return RRCP_E_BAD_VALUE; v->preview_budget_gb = (uint32_t)u; }
-            seen |= 1u << 6;
+            seen |= 1u << 8;
         } else if (!strcmp(key, "previewPrefetchMonths")) {
             { uint64_t u; e = r_u64(r, &u); if (e) return e; if (u > UINT32_MAX) return RRCP_E_BAD_VALUE; v->preview_prefetch_months = (uint32_t)u; }
-            seen |= 1u << 7;
+            seen |= 1u << 9;
         } else if (!strcmp(key, "autoWatchDcim")) {
             e = r_bool(r, &v->auto_watch_dcim);
             if (e) return e;
-            seen |= 1u << 8;
+            seen |= 1u << 10;
         } else if (!strcmp(key, "watchedMediaBuckets")) {
             {
                 bool aempty;
@@ -1461,11 +1499,11 @@ static rrcp_err_t pairing_sync_settings_read(r_t *r, rrcp_pairing_sync_settings_
                     if (!amore) break;
                 }
             }
-            seen |= 1u << 9;
+            seen |= 1u << 11;
         } else if (!strcmp(key, "workerBackfill")) {
             e = r_bool(r, &v->worker_backfill);
             if (e) return e;
-            seen |= 1u << 10;
+            seen |= 1u << 12;
         } else {
             e = r_skip(r, 0);
             if (e) return e;

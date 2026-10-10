@@ -185,7 +185,8 @@ doc = "Lowercase hex BLAKE3-256 of object bytes."
 kind = "string"
 format = "lower-hex"
 length = 64
-doc = "Content identity of an original: blake3(original bytes), lowercase hex (§1.2)."
+derived_from = "Blake3Hex"
+doc = "Content identity of an original: blake3(original bytes), lowercase hex (§1.2). A relabeling of the original's full-file Blake3Hex, never a rehash."
 
 [scalars.SemHash]
 kind = "string"
@@ -289,7 +290,9 @@ fields = [
 ]
 
 [records.ManifestHeader]
-doc = "First line of a per-writer manifest (§2.3)."
+doc = "First line of a per-writer manifest (§2.3). `proto` is the min-reader gate: a header carrying a proto this reader does not support fails the whole decode (§2.2/§2.3)."
+version_field = "proto"
+supported_versions = [1]
 fields = [
   { name = "written_server_ts", type = "UnixSeconds" },
   { name = "cursors", type = "AppliedCursors", doc = "Writer's applied cursors plus its own published cursor." },
@@ -361,6 +364,8 @@ fields = [
   { name = "bucket", type = "string", max_length = 128, default = "" },
   { name = "region", type = "string", max_length = 64, default = "" },
   { name = "force_path_style", type = "bool", default = true },
+  { name = "upload_requires_unmetered", type = "bool", default = false, doc = "Upload only on unmetered networks (Wi-Fi/Ethernet); metered links are download-only." },
+  { name = "upload_requires_charging", type = "bool", default = false, doc = "Upload only while the device is charging." },
   { name = "cache_size_gb", type = "u32", default = 8 },
   { name = "preview_budget_gb", type = "u32", default = 10 },
   { name = "preview_prefetch_months", type = "u32", default = 12 },
@@ -471,6 +476,7 @@ key = "manifest"
 encoding = "gzip-ndjson"
 header = "ManifestHeader"
 rows = ["ManifestRow", "DeletedRow"]
+row_fields = ["rows", "deleted"]
 writer = "owner-only"
 limits = ["MANIFEST_MAX_FETCH_BYTES", "MANIFEST_MAX_DECODED_BYTES"]
 doc = "Header line, then live rows, then deleted rows. Row kind is distinguished by the presence of `key` (live) vs `del` (deleted)."

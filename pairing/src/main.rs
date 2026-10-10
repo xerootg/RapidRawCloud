@@ -34,8 +34,12 @@ use axum::{
     routing::{get, post},
     Form, Json, Router,
 };
+use rrcloud_proto::{
+    key_pairing_user_config, PairingConfigDoc, PairingCredentials, PairingInfo,
+    PairingSyncSettings, PAIRING_CONFIG_PATH, PAIRING_INFO_PATH, PAIRING_REDIRECT_URI,
+};
 use s3::{creds::Credentials, Bucket, Region};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 // ---------------------------------------------------------------------------
 // Configuration (from env)
@@ -114,64 +118,15 @@ impl AppState {
 // Config document model
 // ---------------------------------------------------------------------------
 
-/// Mirrors the app's `SyncSettings` (camelCase). Only the fields the app
-/// actually consumes; extra fields the app writes later are preserved by the
-/// browser form round-trip only for the ones below (v1 keeps it minimal).
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct SyncSettings {
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default)]
-    endpoint: String,
-    #[serde(default)]
-    bucket: String,
-    #[serde(default)]
-    region: String,
-    #[serde(default = "default_true")]
-    force_path_style: bool,
-    #[serde(default = "default_cache_gb")]
-    cache_size_gb: u32,
-    #[serde(default = "default_preview_gb")]
-    preview_budget_gb: u32,
-    #[serde(default = "default_prefetch_months")]
-    preview_prefetch_months: u32,
-    #[serde(default)]
-    auto_watch_dcim: bool,
-    #[serde(default)]
-    watched_media_buckets: Vec<String>,
-    #[serde(default)]
-    worker_backfill: bool,
-}
-
-fn default_true() -> bool {
-    true
-}
-fn default_cache_gb() -> u32 {
-    8
-}
-fn default_preview_gb() -> u32 {
-    10
-}
-fn default_prefetch_months() -> u32 {
-    12
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct Creds {
-    access_key_id: String,
-    secret_access_key: String,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct ConfigDoc {
-    version: u32,
-    updated_at: String,
-    sync: SyncSettings,
-    credentials: Creds,
-}
+/// The documents are the generated protocol SDK's ([`PairingConfigDoc`] =
+/// `{version, updatedAt, sync: PairingSyncSettings, credentials}`,
+/// camelCase): one definition shared with the app's pairing client and the
+/// firmware, so a field added to `protocol/rrcloud.protocol.toml` reaches
+/// all three. Device-local sync fields (`autoWatchDcim`,
+/// `watchedMediaBuckets`) are written as inert defaults — a camera-roll
+/// watch list belongs to one physical device, and the app ignores them when
+/// applying a pair.
+type ConfigDoc = PairingConfigDoc;
 
 // ---------------------------------------------------------------------------
 // Username handling
@@ -197,8 +152,11 @@ fn sanitize_username(raw: &str) -> Option<String> {
     }
 }
 
+/// `users/<username>/config.json` — the SDK's key template; `username` has
+/// already passed [`sanitize_username`], which is the charset the template
+/// documents.
 fn config_key(username: &str) -> String {
-    format!("users/{username}/config.json")
+    key_pairing_user_config(username)
 }
 
 // ---------------------------------------------------------------------------
@@ -362,28 +320,26 @@ async fn save(
         .into_response();
     }
 
+    // Start from the protocol defaults (what `{}` decodes to) so every field
+    // the form does not collect — the prefetch window, the device-local
+    // camera-roll fields, the upload-policy flags — carries its documented
+    // default rather than a value invented here.
+    let defaults = PairingSyncSettings::default();
     let doc = ConfigDoc {
         version: 1,
         updated_at: now_iso8601(),
-        sync: SyncSettings {
+        sync: PairingSyncSettings {
             enabled: true,
             endpoint,
             bucket,
             region,
             force_path_style: form.force_path_style.is_some(),
-            cache_size_gb: form.cache_size_gb.unwrap_or_else(default_cache_gb),
-            preview_budget_gb: form.preview_budget_gb.unwrap_or_else(default_preview_gb),
-            preview_prefetch_months: default_prefetch_months(),
-            // DEVICE-LOCAL fields — deliberately NOT collected here and
-            // written as inert defaults: a camera-roll watch list belongs
-            // to one physical device, and the app ignores these two doc
-            // fields when applying a pair (merge_cloud_sync in the app's
-            // sync::pairing preserves the device's own values).
-            auto_watch_dcim: false,
-            watched_media_buckets: Vec::new(),
+            cache_size_gb: form.cache_size_gb.unwrap_or(defaults.cache_size_gb),
+            preview_budget_gb: form.preview_budget_gb.unwrap_or(defaults.preview_budget_gb),
             worker_backfill: form.worker_backfill.is_some(),
+            ..defaults
         },
-        credentials: Creds {
+        credentials: PairingCredentials {
             access_key_id,
             secret_access_key,
         },
@@ -403,13 +359,13 @@ async fn save(
 /// (none of this is secret — the client id is a public client, and the
 /// issuer's own `.well-known/openid-configuration` is public too).
 async fn api_pairing_info(State(state): State<Arc<AppState>>) -> Response {
-    Json(serde_json::json!({
-        "version": 1,
-        "issuer": state.config.oidc_issuer_url,
-        "clientId": state.config.oidc_client_id,
-        "configEndpoint": "/api/config",
-        "redirectUri": "rapidraw://auth-callback",
-    }))
+    Json(PairingInfo {
+        version: 1,
+        issuer: state.config.oidc_issuer_url.clone(),
+        client_id: state.config.oidc_client_id.clone(),
+        config_endpoint: PAIRING_CONFIG_PATH.to_string(),
+        redirect_uri: Some(PAIRING_REDIRECT_URI.to_string()),
+    })
     .into_response()
 }
 
@@ -493,16 +449,19 @@ fn render_page(
             d.sync.cache_size_gb,
             d.sync.preview_budget_gb,
         ),
-        None => (
-            esc(&cfg.default_library_endpoint),
-            String::new(),
-            esc(&cfg.default_library_region),
-            String::new(),
-            true,
-            true,
-            default_cache_gb(),
-            default_preview_gb(),
-        ),
+        None => {
+            let d = PairingSyncSettings::default();
+            (
+                esc(&cfg.default_library_endpoint),
+                String::new(),
+                esc(&cfg.default_library_region),
+                String::new(),
+                d.force_path_style,
+                true,
+                d.cache_size_gb,
+                d.preview_budget_gb,
+            )
+        }
     };
     let ck = |b: bool| if b { "checked" } else { "" };
     let secret_ph = if existing.is_some() {
@@ -641,8 +600,8 @@ async fn main() {
         .route("/healthz", get(healthz))
         .route("/", get(index))
         .route("/save", post(save))
-        .route("/api/config", get(api_config))
-        .route("/api/pairing-info", get(api_pairing_info))
+        .route(PAIRING_CONFIG_PATH, get(api_config))
+        .route(PAIRING_INFO_PATH, get(api_pairing_info))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind)

@@ -44,7 +44,7 @@ Definition v1, wire version 1. Normative design: `docs/ARCHITECTURE.md`.
 | `DeviceId` | string | uuid4-lower, max 36 bytes | Sync participant identity: canonical lowercase hyphenated UUIDv4, minted once per device (§1.2). Compared lexicographically as the §2.6 tiebreak. |
 | `RelKey` | string | relkey, max 768 bytes | Library-relative path, `/`-separated, NFC, no leading slash, with the §1.1 rejection rules. Wire decoders reject non-NFC input instead of normalizing it. |
 | `Blake3Hex` | string | lower-hex (len 64) | Lowercase hex BLAKE3-256 of object bytes. |
-| `ContentId` | string | lower-hex (len 64) | Content identity of an original: blake3(original bytes), lowercase hex (§1.2). |
+| `ContentId` | string | lower-hex (len 64) | Content identity of an original: blake3(original bytes), lowercase hex (§1.2). A relabeling of the original's full-file Blake3Hex, never a rehash. |
 | `SemHash` | string | lower-hex (len 64) | Semantic sidecar hash (§2.5). |
 | `BucketKey` | string | any, max 1024 bytes | A full bucket key. Deliberately unvalidated on decode; consumers classify it before acting (keys.rs classify_key). |
 | `UnixSeconds` | i64 | any | Seconds since the Unix epoch. Fields named *_server_ts carry server time (S3 Date header); `ts` is device wall clock. |
@@ -139,7 +139,9 @@ Deletion marker at the tombstone key (§2.7). Idempotent under concurrent write.
 
 ### `ManifestHeader`
 
-First line of a per-writer manifest (§2.3).
+First line of a per-writer manifest (§2.3). `proto` is the min-reader gate: a header carrying a proto this reader does not support fails the whole decode (§2.2/§2.3).
+
+Version gate: field `proto` must be one of [1]; anything else is a fail-closed decode error.
 
 | Field | Wire name | Type | Presence | Meaning |
 |---|---|---|---|---|
@@ -227,6 +229,8 @@ Wire names are camelCase.
 | `bucket` | `bucket` | `string` | default `''` |  |
 | `region` | `region` | `string` | default `''` |  |
 | `force_path_style` | `forcePathStyle` | `bool` | default `True` |  |
+| `upload_requires_unmetered` | `uploadRequiresUnmetered` | `bool` | default `False` | Upload only on unmetered networks (Wi-Fi/Ethernet); metered links are download-only. |
+| `upload_requires_charging` | `uploadRequiresCharging` | `bool` | default `False` | Upload only while the device is charging. |
 | `cache_size_gb` | `cacheSizeGb` | `u32` | default `8` |  |
 | `preview_budget_gb` | `previewBudgetGb` | `u32` | default `10` |  |
 | `preview_prefetch_months` | `previewPrefetchMonths` | `u32` | default `12` |  |

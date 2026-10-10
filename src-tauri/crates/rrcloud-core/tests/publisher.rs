@@ -13,6 +13,7 @@ use bytes::Bytes;
 use common::garage;
 use common::sync::{dev, entry, open_db, sidecar_entries, FakeS3, RecordingConsumer, DEV_A, DEV_B};
 use md5::{Digest as _, Md5};
+use rrcloud_core::journal::JournalEntryExt as _;
 use rrcloud_core::journal::{
     decode_segment, Kind, Op, JOURNAL_VERSION, SEGMENT_MAX_BYTES, SEGMENT_MAX_ENTRIES,
 };

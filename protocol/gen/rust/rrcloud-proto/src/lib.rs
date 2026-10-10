@@ -125,6 +125,62 @@ pub enum ProtoError {
     Gzip(#[from] std::io::Error),
     #[error("manifest line {line}: {reason}")]
     ManifestLine { line: usize, reason: String },
+    #[error("manifest has no header line")]
+    MissingHeader,
+    #[error(transparent)]
+    RelKey(#[from] RelKeyError),
+}
+
+/// Why a string is not a relkey (§1.1). Every variant but `Empty` carries the offending text.
+///
+/// The rules exist because distinct bucket keys must never silently collide onto one local
+/// file on any receiver platform (Windows is the strictest), and because a remote-controlled
+/// key must never escape the sync root when mapped to a local path.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RelKeyError {
+    /// Empty string.
+    #[error("empty relkey")]
+    Empty,
+    /// A backslash — never a valid separator in the cloud namespace.
+    #[error("backslash in relkey: {0:?}")]
+    Backslash(String),
+    /// A colon — illegal in Windows filenames, and a `C:`-style segment pushed onto a `PathBuf`
+    /// on Windows *replaces* the accumulated path (drive-relative), which would let a
+    /// remote-controlled key escape the sync root.
+    #[error("colon in relkey: {0:?}")]
+    Colon(String),
+    /// An ASCII control character (including NUL).
+    #[error("control character in relkey: {0:?}")]
+    ControlChar(String),
+    /// A `.` or `..` segment, or an empty segment (`//`, trailing `/`).
+    #[error("dot, dot-dot, or empty segment in relkey: {0:?}")]
+    BadSegment(String),
+    /// A leading slash (relkeys are always relative).
+    #[error("leading slash in relkey: {0:?}")]
+    LeadingSlash(String),
+    /// A segment ending in `.` or ` `. Win32 strips trailing dots and spaces at file-create
+    /// time, so `a.jpg` and `a.jpg.` would collide onto one local file on a Windows receiver.
+    #[error("segment ends with dot or space: {0:?}")]
+    TrailingDotOrSpace(String),
+    /// A segment whose base name is a Win32 reserved device name (`CON`, `PRN`, `AUX`, `NUL`,
+    /// `COM1`–`COM9`, `LPT1`–`LPT9`, plus the superscript variants `COM¹`–`COM³`/`LPT¹`–`LPT³`,
+    /// any ASCII case, with or without an extension). Win32 resolves these in *any* directory
+    /// to the device itself.
+    #[error("Windows-reserved device name segment: {0:?}")]
+    WindowsReserved(String),
+    /// A segment beginning with `ENGINE_TEMP_PREFIX` (`.rr.`): the engines' reserved temp
+    /// namespace (`<dir>/.rr.part-<name>` partial downloads live next to final files, so a
+    /// library file literally named `.rr.part-foo.NEF` would alias another key's partial).
+    #[error("engine-reserved temp-namespace segment (`.rr.` prefix): {0:?}")]
+    EngineReserved(String),
+    /// Wire input that is not already NFC. Normalizing a wire relkey would be
+    /// validation-by-rewriting: an NFD relkey names a *distinct* bucket object, and a deletion
+    /// record silently re-aimed at the NFC spelling would hide/GC the wrong object.
+    #[error("relkey is not NFC-normalized: {0:?}")]
+    NotNfc(String),
+    /// Longer than the protocol's relkey byte cap (fixed-buffer implementations).
+    #[error("relkey longer than {max} bytes: {value:?}")]
+    TooLong { max: usize, value: String },
 }
 
 // ---------------------------------------------------------------- scalars
@@ -132,7 +188,6 @@ pub enum ProtoError {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFormat {
     Uuid4Lower,
-    RelKey,
     LowerHex,
     Any,
 }
@@ -188,41 +243,54 @@ fn is_windows_reserved(seg: &str) -> bool {
     false
 }
 
-/// The §1.1 relkey rule set on already-NFC input (the strict wire lane).
-pub fn validate_relkey(s: &str) -> Result<(), &'static str> {
+/// Byte cap on a relkey (fixed-buffer implementations size their buffers from it).
+pub const RELKEY_MAX_BYTES: usize = 768;
+
+/// The §1.1 segment/shape rules on text that is already NFC (the lane shared by both
+/// constructors; [`validate_relkey`] adds the NFC check for the strict wire lane).
+fn relkey_rules(s: &str) -> Result<(), RelKeyError> {
     if s.is_empty() {
-        return Err("empty");
+        return Err(RelKeyError::Empty);
     }
     if s.contains('\\') {
-        return Err("backslash");
+        return Err(RelKeyError::Backslash(s.to_string()));
     }
     if s.contains(':') {
-        return Err("colon");
+        return Err(RelKeyError::Colon(s.to_string()));
     }
     if s.chars().any(|c| c.is_control()) {
-        return Err("control character");
+        return Err(RelKeyError::ControlChar(s.to_string()));
     }
-    if !unicode_normalization::is_nfc(s) {
-        return Err("not NFC");
+    if s.len() > RELKEY_MAX_BYTES {
+        return Err(RelKeyError::TooLong { max: RELKEY_MAX_BYTES, value: s.to_string() });
     }
     if s.starts_with('/') {
-        return Err("leading slash");
+        return Err(RelKeyError::LeadingSlash(s.to_string()));
     }
     for seg in s.split('/') {
         if seg.is_empty() || seg == "." || seg == ".." {
-            return Err("dot, dot-dot, or empty segment");
+            return Err(RelKeyError::BadSegment(s.to_string()));
         }
         if seg.ends_with('.') || seg.ends_with(' ') {
-            return Err("segment ends with dot or space");
+            return Err(RelKeyError::TrailingDotOrSpace(s.to_string()));
         }
         if seg.starts_with(ENGINE_TEMP_PREFIX) {
-            return Err("engine-reserved `.rr.` segment");
+            return Err(RelKeyError::EngineReserved(s.to_string()));
         }
         if is_windows_reserved(seg) {
-            return Err("Windows-reserved device name");
+            return Err(RelKeyError::WindowsReserved(s.to_string()));
         }
     }
     Ok(())
+}
+
+/// The strict wire lane: the full §1.1 rule set, rejecting (never rewriting) non-NFC input.
+/// This is what every decoder applies to a relkey inside a document.
+pub fn validate_relkey(s: &str) -> Result<(), RelKeyError> {
+    if !unicode_normalization::is_nfc(s) {
+        return Err(RelKeyError::NotNfc(s.to_string()));
+    }
+    relkey_rules(s)
 }
 
 fn validate_scalar(ty: &'static str, s: &str, max_len: usize, fmt: ScalarFormat, exact_len: usize) -> Result<(), ProtoError> {
@@ -241,7 +309,6 @@ fn validate_scalar(ty: &'static str, s: &str, max_len: usize, fmt: ScalarFormat,
                 return Err(fail("not lowercase hex of the required length"));
             }
         }
-        ScalarFormat::RelKey => validate_relkey(s).map_err(fail)?,
         ScalarFormat::Any => {}
     }
     Ok(())
@@ -253,7 +320,7 @@ fn validate_scalar(ty: &'static str, s: &str, max_len: usize, fmt: ScalarFormat,
 pub struct DeviceId(String);
 
 impl DeviceId {
-    /// Validates `s` (uuid4-lower) without rewriting it (the strict wire lane).
+    /// Validates `s` (uuid4-lower) without rewriting it.
     pub fn new(s: impl Into<String>) -> Result<Self, ProtoError> {
         let s = s.into();
         validate_scalar("DeviceId", &s, 36, ScalarFormat::Uuid4Lower, 0)?;
@@ -292,17 +359,33 @@ impl fmt::Display for DeviceId {
 pub struct RelKey(String);
 
 impl RelKey {
-    /// Validates `s` (relkey) without rewriting it (the strict wire lane).
-    pub fn new(s: impl Into<String>) -> Result<Self, ProtoError> {
-        let s = s.into();
-        validate_scalar("RelKey", &s, 768, ScalarFormat::RelKey, 0)?;
+    /// The **local path-mapping lane**: NFC-normalizes `s` (macOS NFD filenames legitimately need
+    /// it), then applies the §1.1 rules. Composed and decomposed spellings of the same text yield
+    /// the same key. Text arriving off the wire goes through [`Self::parse_wire`] instead.
+    pub fn new(s: impl Into<String>) -> Result<Self, RelKeyError> {
+        use unicode_normalization::UnicodeNormalization;
+        let raw = s.into();
+        if raw.contains('\\') {
+            return Err(RelKeyError::Backslash(raw));
+        }
+        if raw.contains(':') {
+            return Err(RelKeyError::Colon(raw));
+        }
+        if raw.chars().any(|c| c.is_control()) {
+            return Err(RelKeyError::ControlChar(raw));
+        }
+        let s: String = raw.nfc().collect();
+        relkey_rules(&s)?;
         Ok(Self(s))
     }
-    /// The local path-mapping lane: NFC-normalizes first, then validates (keys.rs RelKey::new).
-    pub fn normalize(s: impl Into<String>) -> Result<Self, ProtoError> {
-        use unicode_normalization::UnicodeNormalization;
-        let s: String = s.into().nfc().collect();
-        Self::new(s)
+    /// The **strict wire lane**: input that is not already NFC is [`RelKeyError::NotNfc`], never
+    /// rewritten; then the full rule set applies. `Deserialize`/`TryFrom<String>` use this lane.
+    pub fn parse_wire(s: impl Into<String>) -> Result<Self, RelKeyError> {
+        let raw = s.into();
+        if !unicode_normalization::is_nfc(&raw) {
+            return Err(RelKeyError::NotNfc(raw));
+        }
+        Self::new(raw)
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -310,9 +393,9 @@ impl RelKey {
 }
 
 impl TryFrom<String> for RelKey {
-    type Error = ProtoError;
-    fn try_from(s: String) -> Result<Self, ProtoError> {
-        Self::new(s)
+    type Error = RelKeyError;
+    fn try_from(s: String) -> Result<Self, RelKeyError> {
+        Self::parse_wire(s)
     }
 }
 impl From<RelKey> for String {
@@ -337,11 +420,24 @@ impl fmt::Display for RelKey {
 pub struct Blake3Hex(String);
 
 impl Blake3Hex {
-    /// Validates `s` (lower-hex) without rewriting it (the strict wire lane).
+    /// Validates `s` (lower-hex) without rewriting it.
     pub fn new(s: impl Into<String>) -> Result<Self, ProtoError> {
         let s = s.into();
         validate_scalar("Blake3Hex", &s, 64, ScalarFormat::LowerHex, 64)?;
         Ok(Self(s))
+    }
+    /// Same as [`Self::new`] (the engines' spelling for hash strings).
+    pub fn parse(s: impl Into<String>) -> Result<Self, ProtoError> {
+        Self::new(s)
+    }
+    /// BLAKE3-256 of `bytes`, lowercase hex (infallible by construction).
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self(blake3::hash(bytes).to_hex().to_string())
+    }
+    /// Wraps an already-finalized BLAKE3 hash (the streaming-hash path: the digest covers bytes
+    /// that never exist in one buffer).
+    pub fn from_hash(hash: &blake3::Hash) -> Self {
+        Self(hash.to_hex().to_string())
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -370,17 +466,34 @@ impl fmt::Display for Blake3Hex {
     }
 }
 
-/// Content identity of an original: blake3(original bytes), lowercase hex (§1.2).
+/// Content identity of an original: blake3(original bytes), lowercase hex (§1.2). A relabeling of the original's full-file Blake3Hex, never a rehash.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct ContentId(String);
 
 impl ContentId {
-    /// Validates `s` (lower-hex) without rewriting it (the strict wire lane).
+    /// Validates `s` (lower-hex) without rewriting it.
     pub fn new(s: impl Into<String>) -> Result<Self, ProtoError> {
         let s = s.into();
         validate_scalar("ContentId", &s, 64, ScalarFormat::LowerHex, 64)?;
         Ok(Self(s))
+    }
+    /// Same as [`Self::new`] (the engines' spelling for hash strings).
+    pub fn parse(s: impl Into<String>) -> Result<Self, ProtoError> {
+        Self::new(s)
+    }
+    /// BLAKE3-256 of `bytes`, lowercase hex (infallible by construction).
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self(blake3::hash(bytes).to_hex().to_string())
+    }
+    /// Wraps an already-finalized BLAKE3 hash (the streaming-hash path: the digest covers bytes
+    /// that never exist in one buffer).
+    pub fn from_hash(hash: &blake3::Hash) -> Self {
+        Self(hash.to_hex().to_string())
+    }
+    /// A `ContentId` naming the same bytes as `digest`: a relabeling of a [`Blake3Hex`], never a rehash.
+    pub fn from_blake3(digest: &Blake3Hex) -> Self {
+        Self(digest.as_str().to_owned())
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -415,11 +528,24 @@ impl fmt::Display for ContentId {
 pub struct SemHash(String);
 
 impl SemHash {
-    /// Validates `s` (lower-hex) without rewriting it (the strict wire lane).
+    /// Validates `s` (lower-hex) without rewriting it.
     pub fn new(s: impl Into<String>) -> Result<Self, ProtoError> {
         let s = s.into();
         validate_scalar("SemHash", &s, 64, ScalarFormat::LowerHex, 64)?;
         Ok(Self(s))
+    }
+    /// Same as [`Self::new`] (the engines' spelling for hash strings).
+    pub fn parse(s: impl Into<String>) -> Result<Self, ProtoError> {
+        Self::new(s)
+    }
+    /// BLAKE3-256 of `bytes`, lowercase hex (infallible by construction).
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self(blake3::hash(bytes).to_hex().to_string())
+    }
+    /// Wraps an already-finalized BLAKE3 hash (the streaming-hash path: the digest covers bytes
+    /// that never exist in one buffer).
+    pub fn from_hash(hash: &blake3::Hash) -> Self {
+        Self(hash.to_hex().to_string())
     }
     pub fn as_str(&self) -> &str {
         &self.0
@@ -449,43 +575,8 @@ impl fmt::Display for SemHash {
 }
 
 /// A full bucket key. Deliberately unvalidated on decode; consumers classify it before acting (keys.rs classify_key).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct BucketKey(String);
-
-impl BucketKey {
-    /// Validates `s` (any) without rewriting it (the strict wire lane).
-    pub fn new(s: impl Into<String>) -> Result<Self, ProtoError> {
-        let s = s.into();
-        validate_scalar("BucketKey", &s, 1024, ScalarFormat::Any, 0)?;
-        Ok(Self(s))
-    }
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for BucketKey {
-    type Error = ProtoError;
-    fn try_from(s: String) -> Result<Self, ProtoError> {
-        Self::new(s)
-    }
-}
-impl From<BucketKey> for String {
-    fn from(v: BucketKey) -> String {
-        v.0
-    }
-}
-impl AsRef<str> for BucketKey {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-impl fmt::Display for BucketKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+/// Deliberately a plain `String`: carried unvalidated, classified by the consumer.
+pub type BucketKey = String;
 
 /// Seconds since the Unix epoch. Fields named *_server_ts carry server time (S3 Date header); `ts` is device wall clock.
 pub type UnixSeconds = i64;
@@ -663,9 +754,13 @@ impl VersionVector {
             self.0.insert(k, v);
         }
     }
-    /// Increments a component (saturating).
+    /// Increments a component by one (one admitted upload = one version, §2.6).
+    ///
+    /// Saturates at the counter maximum; a saturated bump would silently produce a "new" version
+    /// comparing `Equal` to the old one, so debug builds assert instead.
     pub fn bump(&mut self, k: &DeviceId) {
         let slot = self.0.entry(k.clone()).or_insert(0);
+        debug_assert!(*slot < u32::MAX, "version vector component overflow for {k}: bump would not be monotonic");
         *slot = slot.saturating_add(1);
     }
     /// Element-wise maximum.
@@ -691,7 +786,8 @@ impl VersionVector {
     pub fn compare(&self, other: &Self) -> VvOrder {
         let mut ge = true;
         let mut le = true;
-        for k in self.0.keys().chain(other.0.keys()) {
+        let keys: std::collections::BTreeSet<&DeviceId> = self.0.keys().chain(other.0.keys()).collect();
+        for k in keys {
             let a = self.get(k);
             let b = other.get(k);
             if a < b {
@@ -849,7 +945,7 @@ impl Tombstone {
     }
 }
 
-/// First line of a per-writer manifest (§2.3).
+/// First line of a per-writer manifest (§2.3). `proto` is the min-reader gate: a header carrying a proto this reader does not support fails the whole decode (§2.2/§2.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestHeader {
     pub written_server_ts: i64,
@@ -864,11 +960,22 @@ impl ManifestHeader {
     pub fn to_json(&self) -> Result<String, ProtoError> {
         Ok(serde_json::to_string(self)?)
     }
+    /// Versions this reader accepts in `proto`.
+    pub const SUPPORTED_VERSIONS: &'static [u64] = &[1];
+    /// Decodes with the min-reader gate: an unsupported version is a typed error, never skipped.
     pub fn from_json(s: &str) -> Result<Self, ProtoError> {
-        Ok(serde_json::from_str(s)?)
+        Self::from_json_slice(s.as_bytes())
     }
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, ProtoError> {
-        Ok(serde_json::from_slice(bytes)?)
+        let value: serde_json::Value = serde_json::from_slice(bytes)?;
+        let version = match value.get("proto") {
+            None => return Err(ProtoError::MissingVersion),
+            Some(v) => v.as_u64().ok_or_else(|| ProtoError::MalformedVersion { value: v.to_string() })?,
+        };
+        if !Self::SUPPORTED_VERSIONS.contains(&version) {
+            return Err(ProtoError::UnsupportedVersion { version });
+        }
+        Ok(serde_json::from_value(value)?)
     }
 }
 
@@ -1034,6 +1141,12 @@ pub struct PairingSyncSettings {
     pub region: String,
     #[serde(default = "default_pairing_sync_settings_force_path_style")]
     pub force_path_style: bool,
+    /// Upload only on unmetered networks (Wi-Fi/Ethernet); metered links are download-only.
+    #[serde(default = "default_pairing_sync_settings_upload_requires_unmetered")]
+    pub upload_requires_unmetered: bool,
+    /// Upload only while the device is charging.
+    #[serde(default = "default_pairing_sync_settings_upload_requires_charging")]
+    pub upload_requires_charging: bool,
     #[serde(default = "default_pairing_sync_settings_cache_size_gb")]
     pub cache_size_gb: u32,
     #[serde(default = "default_pairing_sync_settings_preview_budget_gb")]
@@ -1063,6 +1176,12 @@ fn default_pairing_sync_settings_region() -> String {
 fn default_pairing_sync_settings_force_path_style() -> bool {
     true
 }
+fn default_pairing_sync_settings_upload_requires_unmetered() -> bool {
+    false
+}
+fn default_pairing_sync_settings_upload_requires_charging() -> bool {
+    false
+}
 fn default_pairing_sync_settings_cache_size_gb() -> u32 {
     8
 }
@@ -1080,6 +1199,27 @@ fn default_pairing_sync_settings_watched_media_buckets() -> Vec<String> {
 }
 fn default_pairing_sync_settings_worker_backfill() -> bool {
     false
+}
+
+impl Default for PairingSyncSettings {
+    /// The document every field's wire default describes (what `{}` decodes to).
+    fn default() -> Self {
+        Self {
+            enabled: default_pairing_sync_settings_enabled(),
+            endpoint: default_pairing_sync_settings_endpoint(),
+            bucket: default_pairing_sync_settings_bucket(),
+            region: default_pairing_sync_settings_region(),
+            force_path_style: default_pairing_sync_settings_force_path_style(),
+            upload_requires_unmetered: default_pairing_sync_settings_upload_requires_unmetered(),
+            upload_requires_charging: default_pairing_sync_settings_upload_requires_charging(),
+            cache_size_gb: default_pairing_sync_settings_cache_size_gb(),
+            preview_budget_gb: default_pairing_sync_settings_preview_budget_gb(),
+            preview_prefetch_months: default_pairing_sync_settings_preview_prefetch_months(),
+            auto_watch_dcim: default_pairing_sync_settings_auto_watch_dcim(),
+            watched_media_buckets: default_pairing_sync_settings_watched_media_buckets(),
+            worker_backfill: default_pairing_sync_settings_worker_backfill(),
+        }
+    }
 }
 
 impl PairingSyncSettings {
@@ -1316,26 +1456,24 @@ pub fn decode_journal_segment(bytes: &[u8]) -> Result<Vec<JournalEntry>, ProtoEr
     Ok(out)
 }
 
-/// A decoded `manifest` document: header line, then rows.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// A decoded `manifest` document: the header line, then rows in declaration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
-    pub header: Option<ManifestHeader>,
-    pub manifest_rows: Vec<ManifestRow>,
-    pub deleted_rows: Vec<DeletedRow>,
+    pub header: ManifestHeader,
+    pub rows: Vec<ManifestRow>,
+    pub deleted: Vec<DeletedRow>,
 }
 
 /// gzip NDJSON: header, then rows in declaration order. Deterministic for the same input.
 pub fn encode_manifest(doc: &Manifest) -> Result<Vec<u8>, ProtoError> {
     let mut nd = Vec::new();
-    if let Some(h) = &doc.header {
-        nd.extend_from_slice(h.to_json()?.as_bytes());
-        nd.push(b'\n');
-    }
-    for r in &doc.manifest_rows {
+    nd.extend_from_slice(doc.header.to_json()?.as_bytes());
+    nd.push(b'\n');
+    for r in &doc.rows {
         nd.extend_from_slice(r.to_json()?.as_bytes());
         nd.push(b'\n');
     }
-    for r in &doc.deleted_rows {
+    for r in &doc.deleted {
         nd.extend_from_slice(r.to_json()?.as_bytes());
         nd.push(b'\n');
     }
@@ -1344,7 +1482,9 @@ pub fn encode_manifest(doc: &Manifest) -> Result<Vec<u8>, ProtoError> {
     Ok(enc.finish()?)
 }
 
-/// Inflates (multi-member aware) and decodes fail-closed; row kind is chosen by which row record's first field is present.
+/// Inflates (multi-member aware) and decodes fail-closed and header-first: the first line must be a
+/// `ManifestHeader` whose version gate passes before any row is read; row kind is chosen by which row
+/// record's first field is present.
 pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ProtoError> {
     if bytes.len() > MANIFEST_MAX_FETCH_BYTES {
         return Err(ProtoError::TooLarge { size: bytes.len(), cap: MANIFEST_MAX_FETCH_BYTES });
@@ -1355,24 +1495,27 @@ pub fn decode_manifest(bytes: &[u8]) -> Result<Manifest, ProtoError> {
     if nd.len() > MANIFEST_MAX_DECODED_BYTES {
         return Err(ProtoError::TooLarge { size: nd.len(), cap: MANIFEST_MAX_DECODED_BYTES });
     }
-    let mut doc = Manifest::default();
+    let mut header: Option<ManifestHeader> = None;
+    let mut rows: Vec<ManifestRow> = Vec::new();
+    let mut deleted: Vec<DeletedRow> = Vec::new();
     for (i, line) in nd.split(|&b| b == b'\n').enumerate() {
         if line.is_empty() {
             continue;
         }
-        if i == 0 {
-            doc.header = Some(ManifestHeader::from_json_slice(line)?);
+        if header.is_none() {
+            header = Some(ManifestHeader::from_json_slice(line)?);
             continue;
         }
         let v: serde_json::Value = serde_json::from_slice(line)?;
         if v.get("key").is_some() {
-            doc.manifest_rows.push(serde_json::from_value(v)?);
+            rows.push(serde_json::from_value(v)?);
         } else if v.get("del").is_some() {
-            doc.deleted_rows.push(serde_json::from_value(v)?);
+            deleted.push(serde_json::from_value(v)?);
         } else {
             return Err(ProtoError::ManifestLine { line: i + 1, reason: "row is neither a live nor a deleted row".into() });
         }
     }
-    Ok(doc)
+    let header = header.ok_or(ProtoError::MissingHeader)?;
+    Ok(Manifest { header, rows, deleted })
 }
 

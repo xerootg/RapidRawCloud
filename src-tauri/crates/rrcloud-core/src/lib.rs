@@ -73,10 +73,7 @@ pub(crate) mod hexutil {
     /// classification (`keys`), hash validation (`semhash`), and segment
     /// filename parsing (`journal`) must never drift apart on what counts
     /// as hex (e.g. one of them accepting uppercase would silently widen
-    /// `classify_key`'s Foreign boundary).
-    pub(crate) fn is_lower_hex(s: &str, len: usize) -> bool {
-        s.len() == len
-            && s.bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-    }
+    /// `classify_key`'s Foreign boundary). It is the generated SDK's, so
+    /// the firmware and every other implementation share it too.
+    pub(crate) use rrcloud_proto::is_lower_hex;
 }

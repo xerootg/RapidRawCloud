@@ -74,24 +74,24 @@ fn manifest_round_trips_through_gzip() {
     let mut lines = nd.lines();
     let header = ManifestHeader::from_json(lines.next().unwrap()).unwrap();
     let doc = Manifest {
-        header: Some(header),
-        manifest_rows: lines.clone().filter(|l| l.starts_with("{\"key\"")).map(|l| ManifestRow::from_json(l).unwrap()).collect(),
-        deleted_rows: lines.filter(|l| l.starts_with("{\"del\"")).map(|l| DeletedRow::from_json(l).unwrap()).collect(),
+        header,
+        rows: lines.clone().filter(|l| l.starts_with("{\"key\"")).map(|l| ManifestRow::from_json(l).unwrap()).collect(),
+        deleted: lines.filter(|l| l.starts_with("{\"del\"")).map(|l| DeletedRow::from_json(l).unwrap()).collect(),
     };
     let gz = encode_manifest(&doc).unwrap();
     let back = decode_manifest(&gz).unwrap();
     assert_eq!(back, doc);
-    assert_eq!(back.manifest_rows.len(), 2);
-    assert_eq!(back.deleted_rows.len(), 1);
+    assert_eq!(back.rows.len(), 2);
+    assert_eq!(back.deleted.len(), 1);
     // The re-encoded NDJSON equals the fixture text.
     let mut again = String::new();
-    again.push_str(&back.header.as_ref().unwrap().to_json().unwrap());
+    again.push_str(&back.header.to_json().unwrap());
     again.push('\n');
-    for r in &back.manifest_rows {
+    for r in &back.rows {
         again.push_str(&r.to_json().unwrap());
         again.push('\n');
     }
-    for r in &back.deleted_rows {
+    for r in &back.deleted {
         again.push_str(&r.to_json().unwrap());
         again.push('\n');
     }
@@ -116,6 +116,8 @@ fn pairing_documents_round_trip_in_camel_case() {
     assert!(!minimal.sync.worker_backfill);
     assert_eq!(minimal.sync.cache_size_gb, 8);
     assert!(minimal.sync.force_path_style);
+    assert!(!minimal.sync.upload_requires_unmetered);
+    assert!(!minimal.sync.upload_requires_charging);
 }
 
 #[test]
@@ -127,12 +129,25 @@ fn scalars_validate_like_the_engine() {
     assert!(Blake3Hex::new("6A0F").is_err());
     assert!(RelKey::new("2026/10/IMG_0042.NEF").is_ok());
     for bad in ["", "/a", "a\\b", "C:/x", "a/../b", "a//b", "a./b", "a /b", "x/CON", "x/Com1.txt", "x/COM\u{b9}.jpg", "a/.rr.part-foo", "a\tb", "cafe\u{301}"] {
-        assert!(RelKey::new(bad).is_err(), "{bad:?} should be rejected");
+        assert!(RelKey::parse_wire(bad).is_err(), "{bad:?} should be rejected on the wire");
     }
     assert!(RelKey::new("x/com0").is_ok());
     assert!(RelKey::new("caf\u{e9}/x.jpg").is_ok());
-    // The local lane normalizes NFD → NFC; the wire lane rejects it.
-    assert_eq!(RelKey::normalize("cafe\u{301}").unwrap().as_str(), "caf\u{e9}");
+    // The local lane normalizes NFD → NFC; the wire lane (what decoders use) rejects it.
+    assert_eq!(RelKey::new("cafe\u{301}").unwrap().as_str(), "caf\u{e9}");
+    assert!(matches!(RelKey::parse_wire("cafe\u{301}"), Err(RelKeyError::NotNfc(_))));
+    assert!(matches!(RelKey::new("x/CON.txt"), Err(RelKeyError::WindowsReserved(_))));
+    assert!(matches!(RelKey::new("a/b:c"), Err(RelKeyError::Colon(_))));
+    assert!(matches!(RelKey::new("a".repeat(RELKEY_MAX_BYTES + 1)), Err(RelKeyError::TooLong { .. })));
+    // A manifest without a header line is a fail-closed decode error.
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    std::io::Write::write_all(&mut gz, b"").unwrap();
+    assert!(matches!(decode_manifest(&gz.finish().unwrap()), Err(ProtoError::MissingHeader)));
+    // … and so is a header with an unsupported proto.
+    assert!(matches!(
+        ManifestHeader::from_json(r#"{"written_server_ts":1,"cursors":{},"proto":2}"#),
+        Err(ProtoError::UnsupportedVersion { version: 2 })
+    ));
     // Deserializing a non-NFC relkey inside a document fails closed.
     assert!(Tombstone::from_json(r#"{"relkey":"cafe\u0301","vv":{},"device":"0f6b2a1e-1111-4222-8333-944444444444","server_ts":1,"kinds":[]}"#).is_err());
 }

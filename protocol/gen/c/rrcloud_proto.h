@@ -91,7 +91,7 @@ rrcp_err_t rrcp_validate_rel_key(const char *s);
 /** Lowercase hex BLAKE3-256 of object bytes. */
 #define RRCP_BLAKE3_HEX_MAX 64
 rrcp_err_t rrcp_validate_blake3_hex(const char *s);
-/** Content identity of an original: blake3(original bytes), lowercase hex (§1.2). */
+/** Content identity of an original: blake3(original bytes), lowercase hex (§1.2). A relabeling of the original's full-file Blake3Hex, never a rehash. */
 #define RRCP_CONTENT_ID_MAX 64
 rrcp_err_t rrcp_validate_content_id(const char *s);
 /** Semantic sidecar hash (§2.5). */
@@ -246,7 +246,7 @@ int rrcp_tombstone_encode(const rrcp_tombstone_t *v, char *out, size_t cap);
 /** Parses one JSON document (unknown fields ignored, required fields enforced). */
 rrcp_err_t rrcp_tombstone_decode(const char *json, size_t len, rrcp_tombstone_t *out);
 
-/** First line of a per-writer manifest (§2.3). */
+/** First line of a per-writer manifest (§2.3). `proto` is the min-reader gate: a header carrying a proto this reader does not support fails the whole decode (§2.2/§2.3). */
 typedef struct {
     int64_t written_server_ts;
     /** Writer's applied cursors plus its own published cursor. */
@@ -258,7 +258,7 @@ typedef struct {
 void rrcp_manifest_header_init(rrcp_manifest_header_t *v);
 /** Validates scalars and writes one JSON document (fixed field order). Returns length or a negative rrcp_err_t. */
 int rrcp_manifest_header_encode(const rrcp_manifest_header_t *v, char *out, size_t cap);
-/** Parses one JSON document (unknown fields ignored, required fields enforced). */
+/** Parses one JSON document (unknown fields ignored, required fields enforced, version gate on `proto`). */
 rrcp_err_t rrcp_manifest_header_decode(const char *json, size_t len, rrcp_manifest_header_t *out);
 
 /** One live row of a manifest: the writer's knowledge of one live relkey (§2.3). */
@@ -371,6 +371,10 @@ typedef struct {
     char bucket[128 + 1];
     char region[64 + 1];
     bool force_path_style;
+    /** Upload only on unmetered networks (Wi-Fi/Ethernet); metered links are download-only. */
+    bool upload_requires_unmetered;
+    /** Upload only while the device is charging. */
+    bool upload_requires_charging;
     uint32_t cache_size_gb;
     uint32_t preview_budget_gb;
     uint32_t preview_prefetch_months;

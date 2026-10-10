@@ -10,10 +10,7 @@
 //! which is why a library key whose relpath is not already NFC classifies
 //! as [`KeyClass::Foreign`] rather than being silently normalized.
 
-use std::fmt;
 use std::path::{Path, PathBuf};
-
-use serde::{Deserialize, Serialize};
 
 use crate::clock::DeviceId;
 use crate::hexutil::is_lower_hex;
@@ -45,227 +42,41 @@ pub const ENGINE_TEMP_PREFIX: &str = rrcloud_proto::ENGINE_TEMP_PREFIX;
 /// Error from relkey mapping or key construction.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeyError {
-    /// Empty path, or a path that resolves to the sync root itself.
-    #[error("empty relkey")]
-    Empty,
-    /// A backslash — never a valid separator in the cloud namespace.
-    #[error("backslash in relkey: {0:?}")]
-    Backslash(String),
-    /// A colon — illegal in Windows filenames, and a `C:`-style segment
-    /// pushed onto a `PathBuf` on Windows *replaces* the accumulated path
-    /// (drive-relative), which would let a remote-controlled key escape
-    /// the sync root in [`local_path`].
-    #[error("colon in relkey: {0:?}")]
-    Colon(String),
-    /// An ASCII control character (including NUL).
-    #[error("control character in relkey: {0:?}")]
-    ControlChar(String),
-    /// A `.` or `..` segment, or an empty segment (`//`, trailing `/`).
-    #[error("dot, dot-dot, or empty segment in relkey: {0:?}")]
-    BadSegment(String),
-    /// A leading slash (relkeys are always relative).
-    #[error("leading slash in relkey: {0:?}")]
-    LeadingSlash(String),
+    /// The text is not a relkey (§1.1): every segment-shape rule and its
+    /// rationale is on the SDK's [`RelKeyError`] variants.
+    #[error(transparent)]
+    RelKey(#[from] RelKeyError),
     /// The local path does not live under the sync root.
     #[error("path escapes the sync root: {0:?}")]
     OutsideRoot(String),
     /// The local path is not valid Unicode.
     #[error("non-Unicode path")]
     NonUnicode,
-    /// A segment ending in `.` or ` `. Win32 strips trailing dots and
-    /// spaces at file-create time, so the distinct bucket keys
-    /// `library/a.jpg` and `library/a.jpg.` would collide onto one local
-    /// file on a Windows receiver — a silent cross-key clobber that the
-    /// engine's blake3 verification would then misreport as corruption.
-    #[error("segment ends with dot or space: {0:?}")]
-    TrailingDotOrSpace(String),
-    /// A segment whose base name is a Win32 reserved device name
-    /// (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`, plus
-    /// the superscript variants `COM¹`–`COM³`/`LPT¹`–`LPT³`, any ASCII
-    /// case, with or without an extension). Win32 resolves these in
-    /// *any* directory to the device itself, so hydrating such a key on a
-    /// Windows receiver would write to a device or fail the item.
-    #[error("Windows-reserved device name segment: {0:?}")]
-    WindowsReserved(String),
-    /// A segment beginning with [`ENGINE_TEMP_PREFIX`] (`.rr.`) — the
-    /// engine's own reserved temp namespace. The §3.5 download engine
-    /// streams into `<dir>/.rr.part-<name>` next to the final file, so a
-    /// library file literally named `.rr.part-foo.NEF` would make one
-    /// relkey's *final* path another relkey's *partial* path: downloading
-    /// `dir/foo.NEF` would adopt `dir/.rr.part-foo.NEF`'s installed,
-    /// verified bytes as its own surviving partial, fail the blake3
-    /// backstop, and the scratch retry would delete the sibling's file
-    /// while its record still read `hydrated` (review finding, round 3).
-    /// Rejected by the same standard as [`KeyError::WindowsReserved`]:
-    /// distinct bucket keys must never silently collide onto one local
-    /// file.
-    #[error("engine-reserved temp-namespace segment (`.rr.` prefix): {0:?}")]
-    EngineReserved(String),
     /// A virtual-copy suffix that is not exactly 6 lowercase hex chars.
     #[error("invalid virtual-copy suffix: {0:?}")]
     BadVcSuffix(String),
-    /// Wire input ([`RelKey::parse_wire`], serde) that is not already NFC.
-    /// The wire lane never normalizes: a non-NFC relkey inside a decoded
-    /// document (tombstone §2.7, manifest deleted-set row §2.3) names a
-    /// *different* bucket object than its NFC spelling, and silently
-    /// rewriting it would re-aim the record — e.g. a deletion — at the
-    /// user's distinct NFC object. Fail closed instead, the same stance
-    /// [`classify_key`] takes for non-NFC library keys.
-    #[error("relkey is not NFC-normalized: {0:?}")]
-    NotNfc(String),
 }
 
-/// A validated library-relative key (§1.1): `/`-separated, NFC-normalized,
-/// no leading slash.
+/// The validated library-relative key (§1.1) and the thumb flavour are the
+/// generated `rrcloud-proto` SDK's types.
 ///
-/// Ordered and hashable so it can key `BTreeMap`/`HashMap` state tables;
-/// the ordering is the byte order of the normalized string.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct RelKey(String);
-
-impl RelKey {
-    /// Validates and NFC-normalizes a relative path string into a [`RelKey`].
-    ///
-    /// This is the **local path-mapping lane** ([`relkey`] from on-disk
-    /// paths), where macOS NFD filenames legitimately need normalization.
-    /// Text arriving off the wire goes through [`RelKey::parse_wire`]
-    /// instead, which rejects non-NFC input rather than rewriting it.
-    ///
-    /// Rejects empty strings, leading `/`, backslashes, colons, control
-    /// characters, `.`/`..`/empty segments, segments ending in a dot or
-    /// space, Win32 reserved device names — the full set of segment
-    /// shapes that are ambiguous or hazardous on a Windows receiver — and
-    /// segments in the engine's own reserved temp namespace
-    /// ([`ENGINE_TEMP_PREFIX`], which would collide a relkey's final path
-    /// with a sibling's `.rr.part` partial) (§1.1; each rejection's
-    /// rationale is on its [`KeyError`] variant). Composed
-    /// and decomposed spellings of the same Unicode text normalize to the
-    /// same [`RelKey`].
-    ///
-    /// Interop consequence (documented §1.1 limitation): files whose names
-    /// hit any of these rules are creatable on Linux/macOS libraries but
-    /// can never sync — the mapping layer errors, and the corresponding
-    /// bucket keys classify as [`KeyClass::Foreign`] rather than reaching
-    /// [`local_path`] on any platform.
-    pub fn new(s: impl Into<String>) -> Result<Self, KeyError> {
-        use unicode_normalization::UnicodeNormalization;
-        let raw = s.into();
-        if raw.contains('\\') {
-            return Err(KeyError::Backslash(raw));
-        }
-        if raw.contains(':') {
-            return Err(KeyError::Colon(raw));
-        }
-        if raw.chars().any(|c| c.is_control()) {
-            return Err(KeyError::ControlChar(raw));
-        }
-        let s: String = raw.nfc().collect();
-        if s.is_empty() {
-            return Err(KeyError::Empty);
-        }
-        if s.starts_with('/') {
-            return Err(KeyError::LeadingSlash(s));
-        }
-        for seg in s.split('/') {
-            if seg.is_empty() || seg == "." || seg == ".." {
-                return Err(KeyError::BadSegment(s));
-            }
-            if seg.ends_with('.') || seg.ends_with(' ') {
-                return Err(KeyError::TrailingDotOrSpace(s));
-            }
-            if seg.starts_with(ENGINE_TEMP_PREFIX) {
-                return Err(KeyError::EngineReserved(s));
-            }
-            if is_windows_reserved(seg) {
-                return Err(KeyError::WindowsReserved(s));
-            }
-        }
-        Ok(RelKey(s))
-    }
-
-    /// Validates a **wire-format** relkey without normalizing: input that
-    /// is not already NFC is rejected with [`KeyError::NotNfc`], then the
-    /// full [`RelKey::new`] rule set applies (on already-NFC input the
-    /// normalization inside is the identity).
-    ///
-    /// This is the decode lane for relkeys arriving inside documents —
-    /// [`crate::journal::Tombstone::relkey`] (§2.7) and the manifest
-    /// deleted-set rows (§2.3) — and is what `Deserialize` /
-    /// `TryFrom<String>` use (review finding, round 2). Normalizing here
-    /// would be validation-by-rewriting: an NFD relkey names a distinct
-    /// bucket object, and a deletion record silently re-aimed at the NFC
-    /// spelling would hide/GC the wrong object. [`RelKey::new`] remains
-    /// the normalizing constructor for the local path-mapping lane.
-    pub fn parse_wire(s: impl Into<String>) -> Result<Self, KeyError> {
-        let raw = s.into();
-        if !unicode_normalization::is_nfc(&raw) {
-            return Err(KeyError::NotNfc(raw));
-        }
-        Self::new(raw)
-    }
-
-    /// The normalized relative path, `/`-separated.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// `true` when `seg`'s base name — the part before the first `.`, with any
-/// trailing spaces stripped, matching Win32's own name parsing — is a
-/// reserved device name: `CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
-/// `LPT1`–`LPT9`, in any ASCII case, plus the Latin-1 superscript variants
-/// `COM¹`/`COM²`/`COM³` and `LPT¹`/`LPT²`/`LPT³` (U+00B9/U+00B2/U+00B3) —
-/// Win32's reserved-name parser treats the superscript digits as digits,
-/// and Microsoft's file-naming documentation lists them alongside
-/// `COM1`–`COM9` (review finding, round 2; NFC does not decompose them,
-/// so they survive relkey normalization). Win32 resolves these, with or
-/// without an extension, in any directory, to the device itself.
-fn is_windows_reserved(seg: &str) -> bool {
-    let base = seg.split('.').next().unwrap_or(seg).trim_end_matches(' ');
-    let bytes = base.as_bytes();
-    if bytes.len() == 3 {
-        return [&b"con"[..], b"prn", b"aux", b"nul"]
-            .iter()
-            .any(|r| bytes.eq_ignore_ascii_case(r));
-    }
-    // `com`/`lpt` followed by exactly one digit character: ASCII `1`–`9`
-    // or superscript `¹`/`²`/`³`. (`COM0`/`LPT0` are not reserved, nor is
-    // U+2074 ⁴ — only ¹ ² ³ exist in Latin-1.) The prefix match is pure
-    // ASCII, so index 3 is always a char boundary.
-    if bytes.len() > 3
-        && (bytes[..3].eq_ignore_ascii_case(b"com") || bytes[..3].eq_ignore_ascii_case(b"lpt"))
-    {
-        let mut rest = base[3..].chars();
-        if let (Some(c), None) = (rest.next(), rest.next()) {
-            return matches!(c, '1'..='9' | '\u{b9}' | '\u{b2}' | '\u{b3}');
-        }
-    }
-    false
-}
-
-impl TryFrom<String> for RelKey {
-    type Error = KeyError;
-
-    /// The serde decode path: strict wire parsing via
-    /// [`RelKey::parse_wire`] — non-NFC input is an error, never
-    /// normalized.
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        Self::parse_wire(s)
-    }
-}
-
-impl From<RelKey> for String {
-    fn from(k: RelKey) -> String {
-        k.0
-    }
-}
-
-impl fmt::Display for RelKey {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
+/// [`RelKey`] has two constructors with deliberately different lanes:
+///
+/// - [`RelKey::new`] is the **local path-mapping lane** ([`relkey`] from
+///   on-disk paths): it NFC-normalizes first (macOS NFD filenames
+///   legitimately need it), then validates.
+/// - [`RelKey::parse_wire`] is the **strict wire lane** — what
+///   `Deserialize` uses for [`crate::journal::Tombstone::relkey`] and the
+///   manifest rows: non-NFC input is [`RelKeyError::NotNfc`], never
+///   rewritten, because an NFD relkey names a *distinct* bucket object and
+///   a deletion record silently re-aimed at the NFC spelling would
+///   hide/GC the wrong object.
+///
+/// Interop consequence (documented §1.1 limitation): files whose names hit
+/// any rule are creatable on Linux/macOS libraries but can never sync —
+/// the mapping layer errors, and the corresponding bucket keys classify as
+/// [`KeyClass::Foreign`] rather than reaching [`local_path`].
+pub use rrcloud_proto::{RelKey, RelKeyError, ThumbSize};
 
 /// Maps a local absolute path under `sync_root` to its [`RelKey`] (§1.1).
 ///
@@ -291,7 +102,7 @@ pub fn relkey(path: &Path, sync_root: &Path) -> Result<RelKey, KeyError> {
         }
         joined.push_str(seg);
     }
-    RelKey::new(joined)
+    Ok(RelKey::new(joined)?)
 }
 
 /// Joins a [`RelKey`] back onto the local `sync_root` (§1.1 reverse
@@ -300,7 +111,9 @@ pub fn relkey(path: &Path, sync_root: &Path) -> Result<RelKey, KeyError> {
 /// Every pushed segment is a plain relative path component on both Unix and
 /// Windows: [`RelKey`] validation rejects `/`-in-segment (by construction),
 /// backslashes, colons (so no `C:`-style drive-relative segment can make
-/// `PathBuf::push` discard the root), and dot segments.
+/// `PathBuf::push` discard the root), dot segments, and trailing dots or
+/// spaces and Win32 device names (which would collide distinct keys onto
+/// one file on a Windows receiver).
 pub fn local_path(rel: &RelKey, sync_root: &Path) -> PathBuf {
     let mut p = sync_root.to_path_buf();
     for seg in rel.as_str().split('/') {
@@ -311,12 +124,12 @@ pub fn local_path(rel: &RelKey, sync_root: &Path) -> PathBuf {
 
 /// `library/<relpath>` — an original (or `.xmp`) byte-identical to local.
 pub fn library_key(rel: &RelKey) -> String {
-    format!("{LIBRARY_PREFIX}{rel}")
+    rrcloud_proto::key_library_original(rel)
 }
 
 /// `library/<relpath>.rrdata` — the primary sidecar.
 pub fn sidecar_key(rel: &RelKey) -> String {
-    format!("{LIBRARY_PREFIX}{rel}.rrdata")
+    rrcloud_proto::key_sidecar(rel)
 }
 
 /// `library/<relpath>.<6hex>.rrdata` — a virtual-copy sidecar (including
@@ -326,62 +139,45 @@ pub fn vc_sidecar_key(rel: &RelKey, vc6: &str) -> Result<String, KeyError> {
     if !is_lower_hex(vc6, 6) {
         return Err(KeyError::BadVcSuffix(vc6.to_string()));
     }
-    Ok(format!("{LIBRARY_PREFIX}{rel}.{vc6}.rrdata"))
+    Ok(rrcloud_proto::key_vc_sidecar(rel, vc6))
 }
 
 /// `.rrcloud/v1/journal/<device>/<seq:016x>.v1.ndjson` — a journal segment
 /// (§2.2). The filename part is [`crate::journal::format_segment_filename`].
 pub fn journal_segment_key(device: &DeviceId, seq: u64) -> String {
-    format!(
-        "{CONTROL_PREFIX}journal/{device}/{}",
-        crate::journal::format_segment_filename(seq)
-    )
+    rrcloud_proto::key_journal_segment(device, seq)
 }
 
 /// `.rrcloud/v1/manifests/<device>.json.gz` — the per-writer manifest (§2.3).
 pub fn manifest_key(device: &DeviceId) -> String {
-    format!("{CONTROL_PREFIX}manifests/{device}.json.gz")
+    rrcloud_proto::key_manifest(device)
 }
 
 /// `.rrcloud/v1/devices/<device>.json` — the device registry entry (§1.2).
 pub fn device_registry_key(device: &DeviceId) -> String {
-    format!("{CONTROL_PREFIX}devices/{device}.json")
+    rrcloud_proto::key_device_registry(device)
 }
 
 /// `.rrcloud/v1/devices/<device>.retired` — the retirement marker (§2.10).
 pub fn device_retired_key(device: &DeviceId) -> String {
-    format!("{CONTROL_PREFIX}devices/{device}.retired")
+    rrcloud_proto::key_device_retired(device)
 }
 
 /// `.rrcloud/v1/tombstones/<blake3(relkey)[..32]>.json` — a deletion marker
 /// (§2.7). The hash prefix is the first 32 lowercase hex chars of
 /// `blake3(relkey bytes)`.
 pub fn tombstone_key(rel: &RelKey) -> String {
-    let hex = blake3::hash(rel.as_str().as_bytes()).to_hex();
-    format!("{CONTROL_PREFIX}tombstones/{}.json", &hex.as_str()[..32])
+    rrcloud_proto::key_tombstone(rel)
 }
 
 /// `.rrcloud/v1/previews/<content_id>.pxy.dng` — a smart preview (§4).
 pub fn preview_key(content_id: &ContentId) -> String {
-    format!("{CONTROL_PREFIX}previews/{content_id}.pxy.dng")
-}
-
-/// Thumb flavor for [`thumb_key`] (§1.2: 480px `_small`, 1280px `_medium`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ThumbSize {
-    /// 480px, `<content_id>_small.jpg`.
-    Small,
-    /// 1280px, `<content_id>_medium.jpg`.
-    Medium,
+    rrcloud_proto::key_preview(content_id)
 }
 
 /// `.rrcloud/v1/thumbs/<content_id>_small.jpg` / `_medium.jpg`.
 pub fn thumb_key(content_id: &ContentId, size: ThumbSize) -> String {
-    let suffix = match size {
-        ThumbSize::Small => "small",
-        ThumbSize::Medium => "medium",
-    };
-    format!("{CONTROL_PREFIX}thumbs/{content_id}_{suffix}.jpg")
+    rrcloud_proto::key_thumb(content_id, size)
 }
 
 /// `.rrcloud/v1/thumbpacks/<blake3(folder relkey)[..32]>.tar` — a per-folder
@@ -393,8 +189,7 @@ pub fn thumb_key(content_id: &ContentId, size: ThumbSize) -> String {
 /// wrong-thumb transients, but the wider prefix costs nothing while the
 /// schema is still open).
 pub fn thumbpack_key(folder: &RelKey) -> String {
-    let hex = blake3::hash(folder.as_str().as_bytes()).to_hex();
-    format!("{CONTROL_PREFIX}thumbpacks/{}.tar", &hex.as_str()[..32])
+    rrcloud_proto::key_thumbpack(folder)
 }
 
 /// The schema role of a bucket key, as parsed back by [`classify_key`].

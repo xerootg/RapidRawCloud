@@ -1877,21 +1877,38 @@ const SIDECAR_SUFFIX: &str = ".rrdata";
 /// fetched eagerly.
 ///
 /// For each candidate it writes the 0-byte file (mtime replayed from the
-/// record so the thumbnail cache key is stable), flips the record
-/// `PendingDown → Stub`, and `queue_remove`s it from the Down queue so the
-/// pump skips it. Per-item isolated + best-effort: a filesystem or commit
-/// failure on one item logs to stderr and moves on; a path that somehow
-/// already holds real bytes is never truncated. Returns the number of items
-/// turned into stubs. `ensure_local`'s hydrate uses [`download_item`]
-/// directly (not this queue), so on-demand download is unaffected.
-pub fn stub_pending_originals(db: &SyncDb, dest_root: &Path) -> Result<usize, StateError> {
+/// record so the thumbnail cache key is stable), then — inside one
+/// transaction that **re-reads the record and compare-and-swaps on
+/// `PendingDown`** ([`crate::state::StateTxn::replay_put_item_cas`]) — flips
+/// it to `Stub` and `queue_remove`s it from the Down queue so the pump skips
+/// it. The CAS matters because the candidate list is a snapshot: an
+/// `ensure_local` hydrate or a later poll may have moved the record on
+/// between the scan and the commit, and blindly re-putting the stale clone
+/// would resurrect the old state. A CAS loss removes the empty file again
+/// (if it is still empty) and counts as "not stubbed".
+///
+/// Per-item isolated + best-effort: a filesystem or commit failure on one
+/// item is logged (`log::warn!`) and the pass moves on; a path that already
+/// holds real bytes is never truncated. `cancel` is checked between items
+/// so a bounded cycle (the Android `CycleBudget`) can stop a long first pass
+/// cleanly; what is left stays `PendingDown` for the next cycle. Returns the
+/// number of items turned into stubs. `ensure_local`'s hydrate uses
+/// [`download_item`] directly (not this queue), so on-demand download is
+/// unaffected.
+pub fn stub_pending_originals_bounded(
+    db: &SyncDb,
+    dest_root: &Path,
+    cancel: &CancelFlag,
+) -> Result<usize, StateError> {
     let mut stubbed = 0usize;
-    for (rk, record) in db.iter_items()? {
-        if record.deleted
-            || record.kind != Kind::Original
-            || record.state != ItemState::PendingDown
-            || record.pinned
-        {
+    // `items_in_state` is the indexed scan: one pass over the items table,
+    // but only PendingDown records come back (the review's full
+    // `iter_items` scan materialized every record on every cycle).
+    for (rk, record) in db.items_in_state(ItemState::PendingDown)? {
+        if cancel.is_cancelled() {
+            break;
+        }
+        if record.deleted || record.kind != Kind::Original || record.pinned {
             continue;
         }
         let path = local_target_path(dest_root, &rk, record.kind);
@@ -1904,42 +1921,63 @@ pub fn stub_pending_originals(db: &SyncDb, dest_root: &Path) -> Result<usize, St
         }
         if let Some(parent) = path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!(
-                    "rrcloud: stub_pending_originals: mkdir {}: {e}",
-                    parent.display()
-                );
+                log::warn!("stub_pending_originals: mkdir {}: {e}", parent.display());
                 continue;
             }
         }
         if let Err(e) = std::fs::File::create(&path) {
-            eprintln!(
-                "rrcloud: stub_pending_originals: create {}: {e}",
-                path.display()
-            );
+            log::warn!("stub_pending_originals: create {}: {e}", path.display());
             continue;
         }
         let mtime = record.mtime_unix_ns / 1_000_000_000;
         let _ = filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(mtime, 0));
 
-        // Flip to Stub + drop from the Down queue, atomically. The remote
-        // head is content-verified upstream (§2.4), so verified_remote holds;
+        // Flip to Stub + drop from the Down queue, atomically, against the
+        // record AS IT IS NOW (not the scanned clone). The remote head is
+        // content-verified upstream (§2.4), so verified_remote holds;
         // attested stays false until this device hydrates.
-        let mut stub_rec = record.clone();
-        stub_rec.state = ItemState::Stub;
-        stub_rec.verified_remote = true;
-        match db.with_txn_err::<(), StateError>(|t| {
-            t.replay_put_item(&rk, &stub_rec)?;
+        let committed = db.with_txn_err::<bool, StateError>(|t| {
+            let Some(current) = t.get_item(&rk)? else {
+                return Ok(false);
+            };
+            if current.state != ItemState::PendingDown
+                || current.deleted
+                || current.pinned
+                || current.kind != Kind::Original
+            {
+                return Ok(false);
+            }
+            let mut stub_rec = current;
+            stub_rec.state = ItemState::Stub;
+            stub_rec.verified_remote = true;
+            t.replay_put_item_cas(&rk, ItemState::PendingDown, &stub_rec)?;
             t.queue_remove(Queue::Down, &rk)?;
-            Ok(())
-        }) {
-            Ok(()) => stubbed += 1,
-            Err(e) => eprintln!(
-                "rrcloud: stub_pending_originals: commit {}: {e}",
-                path.display()
-            ),
+            Ok(true)
+        });
+        match committed {
+            Ok(true) => stubbed += 1,
+            Ok(false) => {
+                // Lost the race: the record moved on since the scan. The
+                // placeholder we just wrote belongs to no state now — drop it
+                // unless something has already put real bytes there.
+                if std::fs::metadata(&path)
+                    .map(|m| m.len() == 0)
+                    .unwrap_or(false)
+                {
+                    let _ = std::fs::remove_file(&path);
+                }
+                log::debug!("stub_pending_originals: {rk} changed state during the pass; skipped");
+            }
+            Err(e) => log::warn!("stub_pending_originals: commit {}: {e}", path.display()),
         }
     }
     Ok(stubbed)
+}
+
+/// [`stub_pending_originals_bounded`] without a cancellation flag: runs the
+/// whole pass (the desktop cycle, which has no per-cycle budget).
+pub fn stub_pending_originals(db: &SyncDb, dest_root: &Path) -> Result<usize, StateError> {
+    stub_pending_originals_bounded(db, dest_root, &CancelFlag::new())
 }
 
 /// The §3.5 temp file a download streams into: `.rr.part-<name>` next to

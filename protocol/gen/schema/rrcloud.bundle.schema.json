@@ -71,7 +71,7 @@
     "ContentId": {
       "type": "string",
       "pattern": "^[0-9a-f]{64}$",
-      "description": "Content identity of an original: blake3(original bytes), lowercase hex (§1.2)."
+      "description": "Content identity of an original: blake3(original bytes), lowercase hex (§1.2). A relabeling of the original's full-file Blake3Hex, never a rehash."
     },
     "SemHash": {
       "type": "string",
@@ -319,7 +319,7 @@
     },
     "ManifestHeader": {
       "type": "object",
-      "description": "First line of a per-writer manifest (§2.3).",
+      "description": "First line of a per-writer manifest (§2.3). `proto` is the min-reader gate: a header carrying a proto this reader does not support fails the whole decode (§2.2/§2.3).",
       "properties": {
         "written_server_ts": {
           "$ref": "#/$defs/UnixSeconds"
@@ -332,7 +332,10 @@
           "type": "integer",
           "minimum": 0,
           "maximum": 4294967295,
-          "description": "MANIFEST_PROTO."
+          "description": "MANIFEST_PROTO.",
+          "enum": [
+            1
+          ]
         }
       },
       "required": [
@@ -345,6 +348,10 @@
         "written_server_ts",
         "cursors",
         "proto"
+      ],
+      "x-rrcloud-version-field": "proto",
+      "x-rrcloud-supported-versions": [
+        1
       ]
     },
     "ManifestRow": {
@@ -603,6 +610,16 @@
           "type": "boolean",
           "default": true
         },
+        "uploadRequiresUnmetered": {
+          "type": "boolean",
+          "description": "Upload only on unmetered networks (Wi-Fi/Ethernet); metered links are download-only.",
+          "default": false
+        },
+        "uploadRequiresCharging": {
+          "type": "boolean",
+          "description": "Upload only while the device is charging.",
+          "default": false
+        },
         "cacheSizeGb": {
           "type": "integer",
           "minimum": 0,
@@ -647,6 +664,8 @@
         "bucket",
         "region",
         "forcePathStyle",
+        "uploadRequiresUnmetered",
+        "uploadRequiresCharging",
         "cacheSizeGb",
         "previewBudgetGb",
         "previewPrefetchMonths",

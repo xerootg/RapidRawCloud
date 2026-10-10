@@ -26,15 +26,21 @@ python3 protocol/rrcgen --lang c   # one emitter
 
 | Implementation | Relationship to the definition |
 |---|---|
-| `src-tauri/crates/rrcloud-core` (app engine, worker) | Its constants are aliases of `rrcloud-proto`; `tests/proto_conformance.rs` proves the hand-written wire types encode byte-identically to the generated ones on every fixture, and that the key schema and relkey rules agree. Migrating the engine's own types onto the generated crate is now a mechanical follow-up with that test as the safety net. |
+| `src-tauri/crates/rrcloud-core` (app engine, worker) | Its wire types **are** the generated crate's (`clock`, `keys`, `semhash`, `journal`, `manifest`, `publisher` re-export `rrcloud-proto`'s scalars, enums, maps and records); the engine keeps its own codecs with a richer error taxonomy (`JournalError`, `ManifestError`), its path-mapping and key-classification logic, and the sync state machine. `tests/proto_conformance.rs` proves both codec lanes agree byte-for-byte on every fixture. |
+| `pairing/` (pairing/discovery service) | Serves and stores `PairingInfo` / `PairingConfigDoc` straight from the generated crate (the Docker build context is the repository root for that reason). |
 | `firmware/rrcloud-ingest` (ESP32 dock) | Links `protocol/gen/c` as an IDF component; its journal/manifest/registry encoders and key builders delegate to the generated code. |
 | future SDKs | Add an emitter (below), or feed `gen/schema` to an existing generator (e.g. Java via jsonschema2pojo) and reuse `fixtures/` for conformance. |
 
 ## What the definition captures
 
 - **Constants**: format versions, size caps, prefixes, time windows, pairing paths.
-- **Scalars** with validation `format`s: `uuid4-lower` (DeviceId), `lower-hex` (Blake3Hex/ContentId/SemHash), `relkey`
-  (the full §1.1 rule set incl. NFC, Windows-reserved names, `.rr.` prefix), `any` (BucketKey — classified by consumers).
+- **Scalars** with validation `format`s: `uuid4-lower` (DeviceId), `lower-hex` (Blake3Hex/ContentId/SemHash; the Rust
+  crate adds `parse`/`from_bytes`/`from_hash`, and `derived_from` yields `ContentId::from_blake3`), `relkey`
+  (the full §1.1 rule set incl. NFC, Windows-reserved names, `.rr.` prefix — two lanes in Rust: `RelKey::new`
+  normalizes NFC for local paths, `RelKey::parse_wire` is the strict decoder lane, and `RelKeyError` names the rule
+  that failed), `any` (BucketKey — a plain `String`, classified by consumers).
+- **Version gates** on records: `JournalEntry.v` and `ManifestHeader.proto` must be a supported value; a manifest
+  without a header line is a fail-closed decode error in every SDK.
 - **Enums** with explicit wire spellings.
 - **Maps** with `drop_zero` semantics (version vectors: `{a:1,b:0}` decodes equal to `{a:1}`).
 - **Records**: ordered fields (encoding order is normative), `optional` (omitted when absent), `default` (filled in by decoders),

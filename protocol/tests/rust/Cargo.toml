@@ -9,3 +9,4 @@ publish = false
 rrcloud-proto = { path = "../../gen/rust/rrcloud-proto" }
 serde_json = "1"
 blake3 = "1"
+flate2 = "1"

@@ -89,30 +89,10 @@ def lib_rs(m: Model) -> str:
 
     # ---- scalars
     o.append("// ---------------------------------------------------------------- scalars\n\n")
-    o.append(VALIDATORS_RS)
-    for s in m.scalars.values():
-        if s.kind != "string":
-            o.append(doc(s.doc))
-            o.append(f"pub type {s.name} = {s.kind};\n\n")
-            continue
-        o.append(doc(s.doc))
-        o.append("#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]\n")
-        o.append('#[serde(try_from = "String", into = "String")]\n')
-        o.append(f"pub struct {s.name}(String);\n\n")
-        o.append(f"impl {s.name} {{\n")
-        o.append(f"    /// Validates `s` ({s.format}) without rewriting it (the strict wire lane).\n")
-        o.append(f"    pub fn new(s: impl Into<String>) -> Result<Self, ProtoError> {{\n        let s = s.into();\n")
-        o.append(f"        validate_scalar(\"{s.name}\", &s, {s.buf_len}, ScalarFormat::{fmt_variant(s.format)}, {s.length if s.length is not None else 0})?;\n")
-        o.append("        Ok(Self(s))\n    }\n")
-        if s.format == "relkey":
-            o.append("    /// The local path-mapping lane: NFC-normalizes first, then validates (keys.rs RelKey::new).\n")
-            o.append("    pub fn normalize(s: impl Into<String>) -> Result<Self, ProtoError> {\n        use unicode_normalization::UnicodeNormalization;\n")
-            o.append("        let s: String = s.into().nfc().collect();\n        Self::new(s)\n    }\n")
-        o.append("    pub fn as_str(&self) -> &str {\n        &self.0\n    }\n}\n\n")
-        o.append(f"impl TryFrom<String> for {s.name} {{\n    type Error = ProtoError;\n    fn try_from(s: String) -> Result<Self, ProtoError> {{\n        Self::new(s)\n    }}\n}}\n")
-        o.append(f"impl From<{s.name}> for String {{\n    fn from(v: {s.name}) -> String {{\n        v.0\n    }}\n}}\n")
-        o.append(f"impl AsRef<str> for {s.name} {{\n    fn as_ref(&self) -> &str {{\n        &self.0\n    }}\n}}\n")
-        o.append(f"impl fmt::Display for {s.name} {{\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {{\n        f.write_str(&self.0)\n    }}\n}}\n\n")
+    relkey_max = next((sc.buf_len for sc in m.scalars.values() if sc.format == "relkey"), 1024)
+    o.append(VALIDATORS_RS.replace("@RELKEY_MAX@", str(relkey_max)))
+    for sc in m.scalars.values():
+        o.append(scalar_rs(m, sc))
 
     # ---- enums
     o.append("// ---------------------------------------------------------------- enums\n\n")
@@ -149,11 +129,11 @@ def lib_rs(m: Model) -> str:
         o.append(f"impl {mp.name} {{\n    pub fn new() -> Self {{\n        Self::default()\n    }}\n")
         o.append(f"    /// Missing components read as 0.\n    pub fn get(&self, k: &{mp.key}) -> {mp.value} {{\n        self.0.get(k).copied().unwrap_or(0)\n    }}\n")
         o.append(f"    /// Sets a component; a zero removes it (zero components are never stored).\n    pub fn set(&mut self, k: {mp.key}, v: {mp.value}) {{\n        if v == 0 {{\n            self.0.remove(&k);\n        }} else {{\n            self.0.insert(k, v);\n        }}\n    }}\n")
-        o.append(f"    /// Increments a component (saturating).\n    pub fn bump(&mut self, k: &{mp.key}) {{\n        let slot = self.0.entry(k.clone()).or_insert(0);\n        *slot = slot.saturating_add(1);\n    }}\n")
+        o.append(f"    /// Increments a component by one (one admitted upload = one version, §2.6).\n    ///\n    /// Saturates at the counter maximum; a saturated bump would silently produce a \"new\" version\n    /// comparing `Equal` to the old one, so debug builds assert instead.\n    pub fn bump(&mut self, k: &{mp.key}) {{\n        let slot = self.0.entry(k.clone()).or_insert(0);\n        debug_assert!(*slot < {mp.value}::MAX, \"version vector component overflow for {{k}}: bump would not be monotonic\");\n        *slot = slot.saturating_add(1);\n    }}\n")
         o.append("    /// Element-wise maximum.\n    pub fn merge(&mut self, other: &Self) {\n        for (k, &v) in &other.0 {\n            if v == 0 {\n                continue;\n            }\n            let slot = self.0.entry(k.clone()).or_insert(0);\n            *slot = (*slot).max(v);\n        }\n    }\n")
         o.append(f"    pub fn iter(&self) -> std::collections::btree_map::Iter<'_, {mp.key}, {mp.value}> {{\n        self.0.iter()\n    }}\n")
         o.append("    pub fn len(&self) -> usize {\n        self.0.len()\n    }\n    pub fn is_empty(&self) -> bool {\n        self.0.is_empty()\n    }\n")
-        o.append(f"    /// Ordering of two vectors: Equal, Greater (self dominates), Less, or Concurrent (§2.6).\n    pub fn compare(&self, other: &Self) -> VvOrder {{\n        let mut ge = true;\n        let mut le = true;\n        for k in self.0.keys().chain(other.0.keys()) {{\n            let a = self.get(k);\n            let b = other.get(k);\n            if a < b {{\n                ge = false;\n            }}\n            if a > b {{\n                le = false;\n            }}\n        }}\n        match (ge, le) {{\n            (true, true) => VvOrder::Equal,\n            (true, false) => VvOrder::Greater,\n            (false, true) => VvOrder::Less,\n            (false, false) => VvOrder::Concurrent,\n        }}\n    }}\n}}\n\n")
+        o.append(f"    /// Ordering of two vectors: Equal, Greater (self dominates), Less, or Concurrent (§2.6).\n    pub fn compare(&self, other: &Self) -> VvOrder {{\n        let mut ge = true;\n        let mut le = true;\n        let keys: std::collections::BTreeSet<&{mp.key}> = self.0.keys().chain(other.0.keys()).collect();\n        for k in keys {{\n            let a = self.get(k);\n            let b = other.get(k);\n            if a < b {{\n                ge = false;\n            }}\n            if a > b {{\n                le = false;\n            }}\n        }}\n        match (ge, le) {{\n            (true, true) => VvOrder::Equal,\n            (true, false) => VvOrder::Greater,\n            (false, true) => VvOrder::Less,\n            (false, false) => VvOrder::Concurrent,\n        }}\n    }}\n}}\n\n")
         o.append(f"impl From<BTreeMap<{mp.key}, {mp.value}>> for {mp.name} {{\n    fn from(map: BTreeMap<{mp.key}, {mp.value}>) -> Self {{\n        map.into_iter().collect()\n    }}\n}}\n")
         o.append(f"impl From<{mp.name}> for BTreeMap<{mp.key}, {mp.value}> {{\n    fn from(v: {mp.name}) -> Self {{\n        v.0\n    }}\n}}\n")
         o.append(f"impl FromIterator<({mp.key}, {mp.value})> for {mp.name} {{\n    fn from_iter<T: IntoIterator<Item = ({mp.key}, {mp.value})>>(iter: T) -> Self {{\n        let mut map = BTreeMap::new();\n        for (k, v) in iter {{\n            if v == 0 {{\n                continue;\n            }}\n            let slot = map.entry(k).or_insert(0);\n            *slot = (*slot).max(v);\n        }}\n        Self(map)\n    }}\n}}\n\n")
@@ -176,7 +156,66 @@ def lib_rs(m: Model) -> str:
 
 
 def fmt_variant(fmt: str) -> str:
-    return {"uuid4-lower": "Uuid4Lower", "relkey": "RelKey", "lower-hex": "LowerHex", "any": "Any"}[fmt]
+    return {"uuid4-lower": "Uuid4Lower", "lower-hex": "LowerHex", "any": "Any"}[fmt]
+
+
+def scalar_rs(m: Model, s) -> str:
+    """One scalar: integer alias, free-form string alias, or a validated newtype."""
+    o: list[str] = [doc(s.doc)]
+    if s.kind != "string":
+        o.append(f"pub type {s.name} = {s.kind};\n\n")
+        return "".join(o)
+    if s.format == "any":
+        o.append(f"/// Deliberately a plain `String`: carried unvalidated, classified by the consumer.\n")
+        o.append(f"pub type {s.name} = String;\n\n")
+        return "".join(o)
+    o.append("#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]\n")
+    o.append('#[serde(try_from = "String", into = "String")]\n')
+    o.append(f"pub struct {s.name}(String);\n\n")
+    o.append(f"impl {s.name} {{\n")
+    if s.format == "relkey":
+        err = "RelKeyError"
+        o.append("    /// The **local path-mapping lane**: NFC-normalizes `s` (macOS NFD filenames legitimately need\n")
+        o.append("    /// it), then applies the §1.1 rules. Composed and decomposed spellings of the same text yield\n")
+        o.append("    /// the same key. Text arriving off the wire goes through [`Self::parse_wire`] instead.\n")
+        o.append(f"    pub fn new(s: impl Into<String>) -> Result<Self, {err}> {{\n")
+        o.append("        use unicode_normalization::UnicodeNormalization;\n        let raw = s.into();\n")
+        o.append("        if raw.contains('\\\\') {\n            return Err(RelKeyError::Backslash(raw));\n        }\n")
+        o.append("        if raw.contains(':') {\n            return Err(RelKeyError::Colon(raw));\n        }\n")
+        o.append("        if raw.chars().any(|c| c.is_control()) {\n            return Err(RelKeyError::ControlChar(raw));\n        }\n")
+        o.append("        let s: String = raw.nfc().collect();\n        relkey_rules(&s)?;\n        Ok(Self(s))\n    }\n")
+        o.append("    /// The **strict wire lane**: input that is not already NFC is [`RelKeyError::NotNfc`], never\n")
+        o.append("    /// rewritten; then the full rule set applies. `Deserialize`/`TryFrom<String>` use this lane.\n")
+        o.append(f"    pub fn parse_wire(s: impl Into<String>) -> Result<Self, {err}> {{\n        let raw = s.into();\n")
+        o.append("        if !unicode_normalization::is_nfc(&raw) {\n            return Err(RelKeyError::NotNfc(raw));\n        }\n        Self::new(raw)\n    }\n")
+        wire_ctor = "parse_wire"
+    else:
+        err = "ProtoError"
+        o.append(f"    /// Validates `s` ({s.format}) without rewriting it.\n")
+        o.append(f"    pub fn new(s: impl Into<String>) -> Result<Self, ProtoError> {{\n        let s = s.into();\n")
+        o.append(f"        validate_scalar(\"{s.name}\", &s, {s.buf_len}, ScalarFormat::{fmt_variant(s.format)}, {s.length if s.length is not None else 0})?;\n")
+        o.append("        Ok(Self(s))\n    }\n")
+        if s.format == "lower-hex":
+            o.append("    /// Same as [`Self::new`] (the engines' spelling for hash strings).\n")
+            o.append("    pub fn parse(s: impl Into<String>) -> Result<Self, ProtoError> {\n        Self::new(s)\n    }\n")
+            if s.length == 64:
+                o.append("    /// BLAKE3-256 of `bytes`, lowercase hex (infallible by construction).\n")
+                o.append("    pub fn from_bytes(bytes: &[u8]) -> Self {\n        Self(blake3::hash(bytes).to_hex().to_string())\n    }\n")
+                o.append("    /// Wraps an already-finalized BLAKE3 hash (the streaming-hash path: the digest covers bytes\n")
+                o.append("    /// that never exist in one buffer).\n")
+                o.append("    pub fn from_hash(hash: &blake3::Hash) -> Self {\n        Self(hash.to_hex().to_string())\n    }\n")
+        if s.derived_from:
+            base = s.derived_from
+            ctor = "from_" + snake(base).removesuffix("_hex")
+            o.append(f"    /// A `{s.name}` naming the same bytes as `digest`: a relabeling of a [`{base}`], never a rehash.\n")
+            o.append(f"    pub fn {ctor}(digest: &{base}) -> Self {{\n        Self(digest.as_str().to_owned())\n    }}\n")
+        wire_ctor = "new"
+    o.append("    pub fn as_str(&self) -> &str {\n        &self.0\n    }\n}\n\n")
+    o.append(f"impl TryFrom<String> for {s.name} {{\n    type Error = {err};\n    fn try_from(s: String) -> Result<Self, {err}> {{\n        Self::{wire_ctor}(s)\n    }}\n}}\n")
+    o.append(f"impl From<{s.name}> for String {{\n    fn from(v: {s.name}) -> String {{\n        v.0\n    }}\n}}\n")
+    o.append(f"impl AsRef<str> for {s.name} {{\n    fn as_ref(&self) -> &str {{\n        &self.0\n    }}\n}}\n")
+    o.append(f"impl fmt::Display for {s.name} {{\n    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {{\n        f.write_str(&self.0)\n    }}\n}}\n\n")
+    return "".join(o)
 
 
 ERROR_RS = """// ---------------------------------------------------------------- errors
@@ -206,6 +245,62 @@ pub enum ProtoError {
     Gzip(#[from] std::io::Error),
     #[error("manifest line {line}: {reason}")]
     ManifestLine { line: usize, reason: String },
+    #[error("manifest has no header line")]
+    MissingHeader,
+    #[error(transparent)]
+    RelKey(#[from] RelKeyError),
+}
+
+/// Why a string is not a relkey (§1.1). Every variant but `Empty` carries the offending text.
+///
+/// The rules exist because distinct bucket keys must never silently collide onto one local
+/// file on any receiver platform (Windows is the strictest), and because a remote-controlled
+/// key must never escape the sync root when mapped to a local path.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RelKeyError {
+    /// Empty string.
+    #[error("empty relkey")]
+    Empty,
+    /// A backslash — never a valid separator in the cloud namespace.
+    #[error("backslash in relkey: {0:?}")]
+    Backslash(String),
+    /// A colon — illegal in Windows filenames, and a `C:`-style segment pushed onto a `PathBuf`
+    /// on Windows *replaces* the accumulated path (drive-relative), which would let a
+    /// remote-controlled key escape the sync root.
+    #[error("colon in relkey: {0:?}")]
+    Colon(String),
+    /// An ASCII control character (including NUL).
+    #[error("control character in relkey: {0:?}")]
+    ControlChar(String),
+    /// A `.` or `..` segment, or an empty segment (`//`, trailing `/`).
+    #[error("dot, dot-dot, or empty segment in relkey: {0:?}")]
+    BadSegment(String),
+    /// A leading slash (relkeys are always relative).
+    #[error("leading slash in relkey: {0:?}")]
+    LeadingSlash(String),
+    /// A segment ending in `.` or ` `. Win32 strips trailing dots and spaces at file-create
+    /// time, so `a.jpg` and `a.jpg.` would collide onto one local file on a Windows receiver.
+    #[error("segment ends with dot or space: {0:?}")]
+    TrailingDotOrSpace(String),
+    /// A segment whose base name is a Win32 reserved device name (`CON`, `PRN`, `AUX`, `NUL`,
+    /// `COM1`–`COM9`, `LPT1`–`LPT9`, plus the superscript variants `COM¹`–`COM³`/`LPT¹`–`LPT³`,
+    /// any ASCII case, with or without an extension). Win32 resolves these in *any* directory
+    /// to the device itself.
+    #[error("Windows-reserved device name segment: {0:?}")]
+    WindowsReserved(String),
+    /// A segment beginning with `ENGINE_TEMP_PREFIX` (`.rr.`): the engines' reserved temp
+    /// namespace (`<dir>/.rr.part-<name>` partial downloads live next to final files, so a
+    /// library file literally named `.rr.part-foo.NEF` would alias another key's partial).
+    #[error("engine-reserved temp-namespace segment (`.rr.` prefix): {0:?}")]
+    EngineReserved(String),
+    /// Wire input that is not already NFC. Normalizing a wire relkey would be
+    /// validation-by-rewriting: an NFD relkey names a *distinct* bucket object, and a deletion
+    /// record silently re-aimed at the NFC spelling would hide/GC the wrong object.
+    #[error("relkey is not NFC-normalized: {0:?}")]
+    NotNfc(String),
+    /// Longer than the protocol's relkey byte cap (fixed-buffer implementations).
+    #[error("relkey longer than {max} bytes: {value:?}")]
+    TooLong { max: usize, value: String },
 }
 
 """
@@ -213,7 +308,6 @@ pub enum ProtoError {
 VALIDATORS_RS = """#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFormat {
     Uuid4Lower,
-    RelKey,
     LowerHex,
     Any,
 }
@@ -269,41 +363,54 @@ fn is_windows_reserved(seg: &str) -> bool {
     false
 }
 
-/// The §1.1 relkey rule set on already-NFC input (the strict wire lane).
-pub fn validate_relkey(s: &str) -> Result<(), &'static str> {
+/// Byte cap on a relkey (fixed-buffer implementations size their buffers from it).
+pub const RELKEY_MAX_BYTES: usize = @RELKEY_MAX@;
+
+/// The §1.1 segment/shape rules on text that is already NFC (the lane shared by both
+/// constructors; [`validate_relkey`] adds the NFC check for the strict wire lane).
+fn relkey_rules(s: &str) -> Result<(), RelKeyError> {
     if s.is_empty() {
-        return Err("empty");
+        return Err(RelKeyError::Empty);
     }
     if s.contains('\\\\') {
-        return Err("backslash");
+        return Err(RelKeyError::Backslash(s.to_string()));
     }
     if s.contains(':') {
-        return Err("colon");
+        return Err(RelKeyError::Colon(s.to_string()));
     }
     if s.chars().any(|c| c.is_control()) {
-        return Err("control character");
+        return Err(RelKeyError::ControlChar(s.to_string()));
     }
-    if !unicode_normalization::is_nfc(s) {
-        return Err("not NFC");
+    if s.len() > RELKEY_MAX_BYTES {
+        return Err(RelKeyError::TooLong { max: RELKEY_MAX_BYTES, value: s.to_string() });
     }
     if s.starts_with('/') {
-        return Err("leading slash");
+        return Err(RelKeyError::LeadingSlash(s.to_string()));
     }
     for seg in s.split('/') {
         if seg.is_empty() || seg == "." || seg == ".." {
-            return Err("dot, dot-dot, or empty segment");
+            return Err(RelKeyError::BadSegment(s.to_string()));
         }
         if seg.ends_with('.') || seg.ends_with(' ') {
-            return Err("segment ends with dot or space");
+            return Err(RelKeyError::TrailingDotOrSpace(s.to_string()));
         }
         if seg.starts_with(ENGINE_TEMP_PREFIX) {
-            return Err("engine-reserved `.rr.` segment");
+            return Err(RelKeyError::EngineReserved(s.to_string()));
         }
         if is_windows_reserved(seg) {
-            return Err("Windows-reserved device name");
+            return Err(RelKeyError::WindowsReserved(s.to_string()));
         }
     }
     Ok(())
+}
+
+/// The strict wire lane: the full §1.1 rule set, rejecting (never rewriting) non-NFC input.
+/// This is what every decoder applies to a relkey inside a document.
+pub fn validate_relkey(s: &str) -> Result<(), RelKeyError> {
+    if !unicode_normalization::is_nfc(s) {
+        return Err(RelKeyError::NotNfc(s.to_string()));
+    }
+    relkey_rules(s)
 }
 
 fn validate_scalar(ty: &'static str, s: &str, max_len: usize, fmt: ScalarFormat, exact_len: usize) -> Result<(), ProtoError> {
@@ -322,7 +429,6 @@ fn validate_scalar(ty: &'static str, s: &str, max_len: usize, fmt: ScalarFormat,
                 return Err(fail("not lowercase hex of the required length"));
             }
         }
-        ScalarFormat::RelKey => validate_relkey(s).map_err(fail)?,
         ScalarFormat::Any => {}
     }
     Ok(())
@@ -355,6 +461,15 @@ def record_rs(m: Model, r: Record) -> str:
     o.extend(defaults)
     if defaults:
         o.append("\n")
+    if all(f.optional or f.has_default for f in r.fields):
+        # Every field has a wire default, so the empty document `{}` is a valid instance: expose it as Default.
+        o.append(f"impl Default for {r.name} {{\n    /// The document every field's wire default describes (what `{{}}` decodes to).\n    fn default() -> Self {{\n        Self {{\n")
+        for f in r.fields:
+            if f.optional:
+                o.append(f"            {f.name}: None,\n")
+            else:
+                o.append(f"            {f.name}: default_{snake(r.name)}_{f.name}(),\n")
+        o.append("        }\n    }\n}\n\n")
     o.append(f"impl {r.name} {{\n")
     o.append("    /// Serializes as one JSON document (deterministic: fixed field order, omitted `None`s).\n")
     o.append("    pub fn to_json(&self) -> Result<String, ProtoError> {\n        Ok(serde_json::to_string(self)?)\n    }\n")
@@ -436,20 +551,21 @@ def documents_rs(m: Model) -> str:
         elif enc == "gzip-ndjson":
             hdr = d.data["header"]
             rows = d.data["rows"]
+            fields = d.data.get("row_fields") or [f"{snake(rr)}s" for rr in rows]
             name = d.name.capitalize()
             lim_fetch = next((l for l in d.data.get("limits", []) if "FETCH" in l), None)
             lim_dec = next((l for l in d.data.get("limits", []) if "DECODED" in l), None)
-            o.append(f"/// A decoded `{d.name}` document: header line, then rows.\n#[derive(Debug, Clone, PartialEq, Eq, Default)]\npub struct {name} {{\n    pub header: Option<{hdr}>,\n")
-            for rr in rows:
-                o.append(f"    pub {snake(rr)}s: Vec<{rr}>,\n")
+            o.append(f"/// A decoded `{d.name}` document: the header line, then rows in declaration order.\n#[derive(Debug, Clone, PartialEq, Eq)]\npub struct {name} {{\n    pub header: {hdr},\n")
+            for rr, fld in zip(rows, fields):
+                o.append(f"    pub {fld}: Vec<{rr}>,\n")
             o.append("}\n\n")
             o.append(f"/// gzip NDJSON: header, then rows in declaration order. Deterministic for the same input.\n")
             o.append(f"pub fn encode_{d.name}(doc: &{name}) -> Result<Vec<u8>, ProtoError> {{\n    let mut nd = Vec::new();\n")
-            o.append("    if let Some(h) = &doc.header {\n        nd.extend_from_slice(h.to_json()?.as_bytes());\n        nd.push(b'\\n');\n    }\n")
-            for rr in rows:
-                o.append(f"    for r in &doc.{snake(rr)}s {{\n        nd.extend_from_slice(r.to_json()?.as_bytes());\n        nd.push(b'\\n');\n    }}\n")
+            o.append("    nd.extend_from_slice(doc.header.to_json()?.as_bytes());\n    nd.push(b'\\n');\n")
+            for rr, fld in zip(rows, fields):
+                o.append(f"    for r in &doc.{fld} {{\n        nd.extend_from_slice(r.to_json()?.as_bytes());\n        nd.push(b'\\n');\n    }}\n")
             o.append("    let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());\n    enc.write_all(&nd)?;\n    Ok(enc.finish()?)\n}\n\n")
-            o.append(f"/// Inflates (multi-member aware) and decodes fail-closed; row kind is chosen by which row record's first field is present.\n")
+            o.append(f"/// Inflates (multi-member aware) and decodes fail-closed and header-first: the first line must be a\n/// `{hdr}` whose version gate passes before any row is read; row kind is chosen by which row\n/// record's first field is present.\n")
             o.append(f"pub fn decode_{d.name}(bytes: &[u8]) -> Result<{name}, ProtoError> {{\n")
             if lim_fetch:
                 o.append(f"    if bytes.len() > {lim_fetch} {{\n        return Err(ProtoError::TooLarge {{ size: bytes.len(), cap: {lim_fetch} }});\n    }}\n")
@@ -458,15 +574,18 @@ def documents_rs(m: Model) -> str:
                 o.append(f"    dec.by_ref().take({lim_dec} as u64 + 1).read_to_end(&mut nd)?;\n    if nd.len() > {lim_dec} {{\n        return Err(ProtoError::TooLarge {{ size: nd.len(), cap: {lim_dec} }});\n    }}\n")
             else:
                 o.append("    dec.read_to_end(&mut nd)?;\n")
-            o.append(f"    let mut doc = {name}::default();\n    for (i, line) in nd.split(|&b| b == b'\\n').enumerate() {{\n        if line.is_empty() {{\n            continue;\n        }}\n")
-            o.append("        if i == 0 {\n")
-            o.append(f"            doc.header = Some({hdr}::from_json_slice(line)?);\n            continue;\n        }}\n")
+            o.append(f"    let mut header: Option<{hdr}> = None;\n")
+            for rr, fld in zip(rows, fields):
+                o.append(f"    let mut {fld}: Vec<{rr}> = Vec::new();\n")
+            o.append("    for (i, line) in nd.split(|&b| b == b'\\n').enumerate() {\n        if line.is_empty() {\n            continue;\n        }\n")
+            o.append(f"        if header.is_none() {{\n            header = Some({hdr}::from_json_slice(line)?);\n            continue;\n        }}\n")
             o.append("        let v: serde_json::Value = serde_json::from_slice(line)?;\n")
             first = True
-            for rr in rows:
+            for rr, fld in zip(rows, fields):
                 disc = m.records[rr].fields[0].wire_name(m.records[rr].naming)
                 kw = "if" if first else "} else if"
-                o.append(f'        {kw} v.get("{disc}").is_some() {{\n            doc.{snake(rr)}s.push(serde_json::from_value(v)?);\n')
+                o.append(f'        {kw} v.get("{disc}").is_some() {{\n            {fld}.push(serde_json::from_value(v)?);\n')
                 first = False
-            o.append('        } else {\n            return Err(ProtoError::ManifestLine { line: i + 1, reason: "row is neither a live nor a deleted row".into() });\n        }\n    }\n    Ok(doc)\n}\n\n')
+            o.append('        } else {\n            return Err(ProtoError::ManifestLine { line: i + 1, reason: "row is neither a live nor a deleted row".into() });\n        }\n    }\n')
+            o.append(f"    let header = header.ok_or(ProtoError::MissingHeader)?;\n    Ok({name} {{ header, {', '.join(fields)} }})\n}}\n\n")
     return "".join(o)

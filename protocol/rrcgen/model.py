@@ -50,6 +50,7 @@ class Scalar:
     length: int | None = None
     max_length: int | None = None
     doc: str = ""
+    derived_from: str | None = None   # another scalar this one relabels (same format/length); emits a conversion
 
     @property
     def buf_len(self) -> int:
@@ -196,7 +197,7 @@ def parse_template(tpl: str, params: dict[str, str]) -> list[KeyPart]:
 def load(path: Path) -> Model:
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
     constants = {k: Const(k, v["type"], v["value"], v.get("doc", "")) for k, v in raw.get("constants", {}).items()}
-    scalars = {k: Scalar(k, v["kind"], v.get("format", "any"), v.get("length"), v.get("max_length"), v.get("doc", ""))
+    scalars = {k: Scalar(k, v["kind"], v.get("format", "any"), v.get("length"), v.get("max_length"), v.get("doc", ""), v.get("derived_from"))
                for k, v in raw.get("scalars", {}).items()}
     enums = {k: Enum(k, [EnumValue(e["name"], e["wire"], e.get("doc", "")) for e in v["values"]], v.get("doc", ""))
              for k, v in raw.get("enums", {}).items()}
@@ -228,6 +229,10 @@ def validate(m: Model) -> None:
             raise ValueError(f"scalar {s.name}: string scalars need length or max_length")
         if s.format == "lower-hex" and s.length is None:
             raise ValueError(f"scalar {s.name}: lower-hex needs length")
+        if s.derived_from is not None:
+            base = m.scalars.get(s.derived_from)
+            if base is None or (base.kind, base.format, base.length, base.max_length) != (s.kind, s.format, s.length, s.max_length):
+                raise ValueError(f"scalar {s.name}: derived_from must name a scalar of identical shape")
     for mp in m.maps.values():
         if m.kind_of(mp.key) != "scalar" or m.scalars[mp.key].kind != "string":
             raise ValueError(f"map {mp.name}: key must be a string scalar")

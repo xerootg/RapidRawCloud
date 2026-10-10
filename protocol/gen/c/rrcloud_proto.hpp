@@ -610,6 +610,8 @@ struct PairingSyncSettings {
     std::string bucket{};
     std::string region{};
     bool force_path_style{};
+    bool upload_requires_unmetered{};
+    bool upload_requires_charging{};
     uint32_t cache_size_gb{};
     uint32_t preview_budget_gb{};
     uint32_t preview_prefetch_months{};
@@ -624,6 +626,8 @@ struct PairingSyncSettings {
         detail::copy_str(c.bucket, sizeof c.bucket, bucket);
         detail::copy_str(c.region, sizeof c.region, region);
         c.force_path_style = force_path_style;
+        c.upload_requires_unmetered = upload_requires_unmetered;
+        c.upload_requires_charging = upload_requires_charging;
         c.cache_size_gb = cache_size_gb;
         c.preview_budget_gb = preview_budget_gb;
         c.preview_prefetch_months = preview_prefetch_months;
@@ -642,6 +646,8 @@ struct PairingSyncSettings {
         v.bucket = std::string(c.bucket);
         v.region = std::string(c.region);
         v.force_path_style = c.force_path_style;
+        v.upload_requires_unmetered = c.upload_requires_unmetered;
+        v.upload_requires_charging = c.upload_requires_charging;
         v.cache_size_gb = c.cache_size_gb;
         v.preview_budget_gb = c.preview_budget_gb;
         v.preview_prefetch_months = c.preview_prefetch_months;

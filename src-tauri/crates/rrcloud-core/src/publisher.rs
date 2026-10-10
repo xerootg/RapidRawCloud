@@ -22,11 +22,10 @@
 
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
-
 use crate::clock::DeviceId;
 use crate::journal::{
-    encode_segment, JournalEntry, JournalError, SEGMENT_MAX_BYTES, SEGMENT_MAX_ENTRIES,
+    encode_segment, JournalEntry, JournalEntryExt as _, JournalError, SEGMENT_MAX_BYTES,
+    SEGMENT_MAX_ENTRIES,
 };
 use crate::keys::{device_registry_key, journal_segment_key};
 use crate::s3::{PutObjectOptions, S3Api, S3Error};
@@ -464,37 +463,14 @@ pub struct DeviceProfile {
     pub created: i64,
 }
 
-/// Protocol support advertisement (§2.2 min-reader rule): which journal
-/// format versions this device reads, and which it writes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ProtoSupport {
-    /// Versions this device can read.
-    pub read: Vec<u32>,
-    /// The version this device writes.
-    pub write: u32,
-}
-
-/// The device registry entry, `devices/<device_id>.json` (§1.2):
-/// `{name, platform, created, last_seen_server_ts, applied: {device: seq},
-/// proto: {read, write}}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeviceEntry {
-    /// Human-readable device name.
-    pub name: String,
-    /// Platform string.
-    pub platform: String,
-    /// Unix seconds the device joined the library.
-    pub created: i64,
-    /// **Server** time (unix seconds, from the S3 `Date` header) of the
-    /// last heartbeat — never the device clock (§2.10).
-    pub last_seen_server_ts: i64,
-    /// Highest contiguously-applied seq per peer device
-    /// ([`crate::state::SyncDb::iter_cursors`]) — what compaction's
-    /// min-cursor rule reads (§2.10).
-    pub applied: BTreeMap<DeviceId, u64>,
-    /// Protocol support advertisement.
-    pub proto: ProtoSupport,
-}
+/// The device registry entry (`devices/<device_id>.json`, §1.2) and its
+/// protocol support advertisement are the generated `rrcloud-proto` SDK's
+/// types: `{name, platform, created, last_seen_server_ts, applied: {device:
+/// seq}, proto: {read, write}}`, where `applied` is the highest
+/// contiguously-applied seq per peer device
+/// ([`crate::state::SyncDb::iter_cursors`]) — what compaction's min-cursor
+/// rule reads (§2.10) — and `last_seen_server_ts` is **server** time.
+pub use rrcloud_proto::{DeviceEntry, ProtoSupport};
 
 /// The §2.2 heartbeat: PUTs this device's registry entry to
 /// [`crate::keys::device_registry_key`], with `applied` snapshotted from

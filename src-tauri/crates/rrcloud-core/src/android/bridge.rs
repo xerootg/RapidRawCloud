@@ -49,7 +49,7 @@ mod imp {
     use crate::state::{StateError, SyncDb};
     use crate::transfer::{
         probe_backend, pump_downloads, pump_uploads, stored_backend_profile,
-        stub_pending_originals, CancelFlag, TransferConfig,
+        stub_pending_originals_bounded, CancelFlag, TransferConfig,
     };
     use crate::worker::mint_worker_device_id;
 
@@ -429,15 +429,25 @@ mod imp {
         // STUBs that hydrate on demand. This is what makes an Android device a
         // client of the one shared per-user library (it mirrors the desktop
         // `sync::manager` cycle) rather than a full mirror of every S3 object.
-        // Best-effort: a stub-pass failure must not abort the cycle, so it is
-        // only logged, never collected into `first_error`.
-        match stub_pending_originals(db, &root) {
-            Ok(n) if n > 0 => eprintln!("rrcloud: stubbed {n} received original(s)"),
+        // The pass shares the cycle's cancel flag, so a budget expiry stops it
+        // between items. If it FAILS (a state-db error, not a per-item
+        // filesystem slip — those are logged inside and skipped) the pump
+        // must not run: with the stub pass gone, `pump_downloads` would
+        // eagerly fetch the full bytes of every received original, which is
+        // the exact opposite of the §3.5 client policy and could pull
+        // gigabytes onto the phone. The error is reported and the cycle ends
+        // here; the next cycle retries the pass.
+        let cancel = budget_cancel_flag(budget);
+        match stub_pending_originals_bounded(db, &root, &cancel) {
+            Ok(n) if n > 0 => log::info!("stubbed {n} received original(s)"),
             Ok(_) => {}
-            Err(e) => eprintln!("rrcloud: stub_pending_originals: {e}"),
+            Err(e) => {
+                log::warn!("stub_pending_originals: {e}");
+                first_error.get_or_insert(format!("stub pass failed: {e}"));
+                return first_error.map_or(Ok(()), Err);
+            }
         }
 
-        let cancel = budget_cancel_flag(budget);
         let down = pump_downloads(db, s3, &cfg, 2, &cancel)
             .await
             .map_err(|e| e.to_string())?;

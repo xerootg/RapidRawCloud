@@ -33,9 +33,7 @@
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
 
-use serde::{Deserialize, Serialize};
-
-use crate::clock::{DeviceId, VersionVector};
+use crate::clock::DeviceId;
 use crate::journal::{JournalEntry, Kind, Op, JOURNAL_VERSION};
 use crate::keys::{
     library_key, manifest_key, preview_key, sidecar_key, thumbpack_key, RelKey, ALBUMS_META_KEY,
@@ -43,7 +41,6 @@ use crate::keys::{
 };
 use crate::reader::{ConsumerError, JournalConsumer};
 use crate::s3::{PutObjectOptions, S3Api, S3Error};
-use crate::semhash::{Blake3Hex, ContentId, SemHash};
 use crate::state::{ItemRecord, ItemState, StateError, SyncDb};
 
 /// The manifest format version this build reads and writes (the header's
@@ -151,102 +148,24 @@ pub enum ManifestError {
     },
 }
 
-/// The manifest header (first NDJSON line, §2.3):
-/// `{written_server_ts, cursors, proto}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestHeader {
-    /// **Server** time (unix seconds) the manifest was written (§2.10
-    /// horizons run on server time).
-    pub written_server_ts: i64,
-    /// The writer's applied cursors ([`crate::state::SyncDb::iter_cursors`])
-    /// at write time: highest contiguously-applied seq per peer device.
-    pub cursors: BTreeMap<DeviceId, u64>,
-    /// Format version; [`MANIFEST_PROTO`] for manifests this build
-    /// writes.
-    pub proto: u32,
-}
-
-/// One live row (§2.3): the writer's knowledge of one live relkey.
-/// Fields absent from [`crate::state::ItemRecord`] v1 (`device`,
-/// `rating`, `color_label`) are `Option` and omitted when `None`, like
-/// journal-entry optionals; unknown fields in incoming rows are ignored
-/// (min-reader rule within a supported proto).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ManifestRow {
-    /// The library-relative key (strict wire decode).
-    pub key: RelKey,
-    /// Object kind.
-    pub kind: Kind,
-    /// Size in bytes.
-    pub size: u64,
-    /// blake3 of the current version's bytes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub blake3: Option<Blake3Hex>,
-    /// Semantic hash (sidecars).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sem_hash: Option<SemHash>,
-    /// Per-relkey version vector (§2.6).
-    pub vv: VersionVector,
-    /// Authoring device of the current version, when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device: Option<DeviceId>,
-    /// Content identity (originals).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub content_id: Option<ContentId>,
-    /// Final displayed width (originals).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub w: Option<u32>,
-    /// Final displayed height (originals).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub h: Option<u32>,
-    /// File mtime, unix **seconds** (journal-entry provenance, §2.2).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mtime: Option<i64>,
-    /// The advertised head version's journal `ts` — the §2.6 case-4
-    /// tiebreak input (review round 0: without it, [`merge`] stamped the
-    /// synthetic put with `written_server_ts`, so a device learning a
-    /// version via manifest could pick a different conflict primary
-    /// than every journal replayer — fleet-visible divergence plus a
-    /// wrong-blake3 download wedge). Additive within proto 1 (readers
-    /// ignore unknown fields); absent in rows from older writers, for
-    /// which [`live_row_entry`] falls back to the header ts (residual,
-    /// documented there). Withheld while an upload intent is in flight —
-    /// the record's `head_ts` then names the in-flight version, not the
-    /// advertised published one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ts: Option<i64>,
-    /// Star rating (sidecars), when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub rating: Option<u8>,
-    /// Color label (sidecars), when known.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub color_label: Option<String>,
-}
-
-/// One deleted-set row (§2.3): `{del, vv, server_ts}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DeletedRow {
-    /// The deleted relkey (strict wire decode — [`RelKey::parse_wire`]
-    /// lane; a non-NFC spelling fails the decode rather than re-aiming
-    /// the deletion).
-    pub del: RelKey,
-    /// The deletion's version vector.
-    pub vv: VersionVector,
-    /// Server time of the deletion (unix seconds).
-    pub server_ts: i64,
-}
-
-/// A decoded (or to-be-encoded) per-writer manifest.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Manifest {
-    /// The header line.
-    pub header: ManifestHeader,
-    /// Live rows, ascending by relkey (the order [`build_manifest`]
-    /// produces and [`encode_manifest`] preserves).
-    pub rows: Vec<ManifestRow>,
-    /// Deleted-set rows, ascending by relkey.
-    pub deleted: Vec<DeletedRow>,
-}
+/// The header, live row, deleted row and the decoded document are the
+/// generated `rrcloud-proto` SDK's types. Relkeys inside rows (`key`,
+/// `del`) decode through the strict wire lane ([`RelKey::parse_wire`]); the
+/// additive provenance fields (`device`, `ts`, `rating`, `color_label`)
+/// are `Option` and omitted when `None`; unknown fields in incoming rows
+/// are ignored (min-reader rule within a supported proto). `ManifestRow.ts`
+/// is the advertised head version's journal `ts` — the §2.6 case-4
+/// tiebreak input (review round 0: without it, [`merge`] stamped the
+/// synthetic put with `written_server_ts`, so a device learning a version
+/// via manifest could pick a different conflict primary than every journal
+/// replayer); absent in rows from older writers, for which
+/// [`live_row_entry`] falls back to the header ts, and withheld while an
+/// upload intent is in flight (the record's `head_ts` then names the
+/// in-flight version, not the advertised published one).
+///
+/// [`Manifest::rows`] and [`Manifest::deleted`] are ascending by relkey —
+/// the order [`build_manifest`] produces and [`encode_manifest`] preserves.
+pub use rrcloud_proto::{DeletedRow, Manifest, ManifestHeader, ManifestRow};
 
 /// Builds this device's manifest from the state db: header
 /// `{written_server_ts, cursors, proto:` [`MANIFEST_PROTO`]`}`, one live
