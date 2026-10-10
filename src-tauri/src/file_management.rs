@@ -3570,34 +3570,56 @@ pub fn clear_thumbnail_cache(app_handle: AppHandle) -> Result<(), String> {
 pub fn show_in_finder(path: String) -> Result<(), String> {
     let (source_path, _) = parse_virtual_path(&path);
 
+    // Only ever hand the system file manager a canonical, existing file or
+    // directory whose parent is a directory. Anything else (URLs, non-paths,
+    // dangling symlinks, a "parent" that is a regular file) is rejected before
+    // any external command is spawned.
+    let source_path = fs::canonicalize(&source_path)
+        .map_err(|e| format!("Cannot show '{}' in file manager: {}", path, e))?;
+    let metadata = fs::metadata(&source_path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() && !metadata.is_dir() {
+        return Err("Path is not a regular file or directory".into());
+    }
+    #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
+    let parent = source_path
+        .parent()
+        .filter(|parent| parent.is_dir())
+        .ok_or_else(|| "Could not get parent directory".to_string())?;
+
     #[cfg(target_os = "windows")]
     {
-        let source_path_str = source_path.to_string_lossy().to_string();
+        // `canonicalize` yields an extended-length path on Windows (`\\?\C:\...`,
+        // or `\\?\UNC\server\share\...` for network shares and mapped drives),
+        // which `explorer /select,` does not accept. Validation above used the
+        // canonical path; only the spawned argument is mapped back to the
+        // plain `C:\...` / `\\server\share\...` form.
+        let lossy = source_path.to_string_lossy();
+        let source_path_str: String = if let Some(rest) = lossy.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else {
+            lossy.strip_prefix(r"\\?\").unwrap_or(&lossy).to_string()
+        };
         Command::new("explorer")
-            .args(["/select,", &source_path_str])
+            .args(["/select,", source_path_str.as_str()])
             .spawn()
             .map_err(|e| e.to_string())?;
     }
 
     #[cfg(target_os = "macos")]
     {
-        let source_path_str = source_path.to_string_lossy().to_string();
         Command::new("open")
-            .args(["-R", &source_path_str])
+            .args(["-R", "--"])
+            .arg(&source_path)
             .spawn()
             .map_err(|e| e.to_string())?;
     }
 
     #[cfg(target_os = "linux")]
     {
-        if let Some(parent) = source_path.parent() {
-            Command::new("xdg-open")
-                .arg(parent)
-                .spawn()
-                .map_err(|e| e.to_string())?;
-        } else {
-            return Err("Could not get parent directory".into());
-        }
+        Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| e.to_string())?;
     }
 
     #[cfg(target_os = "android")]
