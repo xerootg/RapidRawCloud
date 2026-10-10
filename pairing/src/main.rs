@@ -1479,3 +1479,327 @@ mod proxy_tests {
         assert_eq!(resp.text().await.unwrap(), "missing bearer token");
     }
 }
+
+#[cfg(test)]
+mod csrf_tests {
+    //! CSRF regression tests for `POST /save`.
+    //!
+    //! The browser session is a cookie (Authentik forward-auth); the only
+    //! thing standing between an attacker page and a config overwrite is the
+    //! service itself. These tests drive the real router in-process against
+    //! a fake S3 server that records every `PUT` to the admin bucket, so a
+    //! forged cross-site form submission that "succeeds" is visible as a
+    //! stored `config.json` carrying the attacker's endpoint + credentials.
+    //!
+    //! Expected policy (what a fix must satisfy):
+    //!   * `Sec-Fetch-Site` present: only `same-origin` is accepted
+    //!     (`cross-site`, `same-site` → 403).
+    //!   * No `Sec-Fetch-Site`: `Origin` (else `Referer`) host must equal
+    //!     the request `Host`; neither present → 403.
+    //!   * `GET /` is unaffected.
+
+    use super::*;
+    use axum::{
+        body::{Body, Bytes},
+        http::{header, Method, Request, Uri},
+    };
+    use http_body_util::BodyExt;
+    use std::sync::Mutex;
+    use tower::ServiceExt;
+
+    const ADMIN_BUCKET: &str = "rapidraw-admin";
+    const SITE_HOST: &str = "rrc.example";
+    /// Proof the request traversed the forward-auth proxy (`proxy_verified`).
+    /// Every request below carries it so the CSRF guard, not the proxy-secret
+    /// guard, is what decides the outcome.
+    const PROXY_SECRET: &str = "csrf-test-proxy-secret-0b1d";
+    const ALICE_KEY: &str = "/rapidraw-admin/users/alice/config.json";
+
+    /// Form a legitimate user would submit (her own library bucket).
+    const ALICE_FORM: &str = "endpoint=https%3A%2F%2Fgarage.example&bucket=alice-photos&region=garage\
+        &access_key_id=GKALICE&secret_access_key=alice-secret&force_path_style=on&worker_backfill=on";
+    /// Form an attacker page auto-submits: points the victim's library at
+    /// the attacker's bucket with the attacker's credentials.
+    const EVIL_FORM: &str = "endpoint=https%3A%2F%2Fevil-s3.example&bucket=loot&region=garage\
+        &access_key_id=EVILKEY&secret_access_key=evil-secret&force_path_style=on&worker_backfill=on";
+
+    /// (request path, body) of every PUT the fake admin bucket received.
+    type PutLog = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Minimal S3 stand-in: records PUTs (200), answers everything else 404
+    /// (→ `read_config` sees "not configured yet").
+    async fn start_fake_s3() -> (String, PutLog) {
+        let log: PutLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let router = Router::new().fallback(move |method: Method, uri: Uri, body: Bytes| {
+            let sink = sink.clone();
+            async move {
+                if method == Method::PUT {
+                    sink.lock().unwrap().push((
+                        uri.path().to_string(),
+                        String::from_utf8_lossy(&body).into_owned(),
+                    ));
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{addr}"), log)
+    }
+
+    async fn test_app() -> (Router, PutLog) {
+        let (endpoint, log) = start_fake_s3().await;
+        let state = Arc::new(AppState {
+            config: Config {
+                admin_bucket: ADMIN_BUCKET.into(),
+                admin_s3_endpoint: endpoint,
+                admin_s3_region: "garage".into(),
+                admin_s3_access_key: "GKADMIN".into(),
+                admin_s3_secret_key: "admin-secret".into(),
+                oidc_userinfo_url: "http://127.0.0.1:1/userinfo".into(),
+                oidc_issuer_url: "http://127.0.0.1:1/application/o/rrc/".into(),
+                oidc_client_id: "rrc".into(),
+                default_library_endpoint: "https://garage.example".into(),
+                default_library_region: "garage".into(),
+                browser_proxy_secret: Some(PROXY_SECRET.into()),
+            },
+            http: reqwest::Client::new(),
+        });
+        (app(state), log)
+    }
+
+    /// `POST /save` as the logged-in browser user `alice`, with `Host`
+    /// set the way Traefik forwards it, plus the given extra headers.
+    fn save_request(extra: &[(&str, &str)], form: &str) -> Request<Body> {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/save")
+            .header(header::HOST, SITE_HOST)
+            .header("X-Authentik-Username", "alice")
+            .header(PROXY_SECRET_HEADER, PROXY_SECRET)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        req.body(Body::from(form.to_string())).unwrap()
+    }
+
+    async fn send(app: Router, req: Request<Body>) -> (StatusCode, HeaderMap, String) {
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn puts(log: &PutLog) -> Vec<(String, String)> {
+        log.lock().unwrap().clone()
+    }
+
+    fn describe_puts(puts: &[(String, String)]) -> String {
+        if puts.is_empty() {
+            return "(none)".into();
+        }
+        puts.iter()
+            .map(|(path, body)| format!("PUT {path}\n{body}"))
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+    }
+
+    /// A forged submission must be refused (403) AND must leave the admin
+    /// bucket untouched. The failure message prints whatever got stored so
+    /// the overwrite is visible in the test output.
+    fn assert_rejected(label: &str, status: StatusCode, body: &str, puts: &[(String, String)]) {
+        assert!(
+            status == StatusCode::FORBIDDEN && puts.is_empty(),
+            "{label}: expected HTTP 403 and NO write to the admin bucket, got HTTP {status} \
+             (body: {body:?}) and {} PUT(s) to the admin bucket:\n{}",
+            puts.len(),
+            describe_puts(puts),
+        );
+    }
+
+    /// A genuine same-origin submission must still work exactly as today:
+    /// 303 → `/?saved=1` and one `config.json` PUT for alice.
+    fn assert_accepted(
+        label: &str,
+        status: StatusCode,
+        headers: &HeaderMap,
+        puts: &[(String, String)],
+    ) {
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "{label}: expected redirect after save"
+        );
+        assert_eq!(
+            headers.get(header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some("/?saved=1"),
+            "{label}: redirect target"
+        );
+        assert_eq!(
+            puts.len(),
+            1,
+            "{label}: exactly one admin-bucket write, got:\n{}",
+            describe_puts(puts)
+        );
+        assert_eq!(puts[0].0, ALICE_KEY, "{label}: config key");
+        let doc: ConfigDoc = serde_json::from_str(&puts[0].1).expect("stored doc is valid JSON");
+        assert_eq!(
+            doc.sync.endpoint, "https://garage.example",
+            "{label}: stored endpoint"
+        );
+        assert_eq!(doc.sync.bucket, "alice-photos", "{label}: stored bucket");
+        assert_eq!(
+            doc.credentials.access_key_id, "GKALICE",
+            "{label}: stored access key"
+        );
+    }
+
+    // -- negative: forged submissions -------------------------------------
+
+    /// (a) The classic attack: victim is logged in, visits evil.example,
+    /// which auto-submits `<form method=post action=https://rrc.example/save>`.
+    /// Every current browser sends `Sec-Fetch-Site: cross-site` and
+    /// `Origin: https://evil.example` on that request.
+    #[tokio::test]
+    async fn save_rejects_cross_site_form_post() {
+        let (app, log) = test_app().await;
+        let req = save_request(
+            &[
+                ("Sec-Fetch-Site", "cross-site"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Origin", "https://evil.example"),
+                ("Referer", "https://evil.example/"),
+            ],
+            EVIL_FORM,
+        );
+        let (status, _, body) = send(app, req).await;
+        let stored = puts(&log);
+        assert_rejected("cross-site POST /save", status, &body, &stored);
+    }
+
+    /// (b) A sibling subdomain (anything else on *.example that shares the
+    /// Authentik cookie scope) is still not the pairing site. Must be
+    /// rejected too — `same-site` is not `same-origin`.
+    #[tokio::test]
+    async fn save_rejects_same_site_sibling_form_post() {
+        let (app, log) = test_app().await;
+        let req = save_request(
+            &[
+                ("Sec-Fetch-Site", "same-site"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Origin", "https://wiki.example"),
+                ("Referer", "https://wiki.example/page"),
+            ],
+            EVIL_FORM,
+        );
+        let (status, _, body) = send(app, req).await;
+        let stored = puts(&log);
+        assert_rejected("same-site POST /save", status, &body, &stored);
+    }
+
+    /// (a') Browser without Fetch Metadata support: the only cross-site
+    /// signal is `Origin` not matching `Host`. Must be rejected.
+    #[tokio::test]
+    async fn save_rejects_mismatched_origin_without_fetch_metadata() {
+        let (app, log) = test_app().await;
+        let req = save_request(
+            &[
+                ("Origin", "https://evil.example"),
+                ("Referer", "https://evil.example/"),
+            ],
+            EVIL_FORM,
+        );
+        let (status, _, body) = send(app, req).await;
+        let stored = puts(&log);
+        assert_rejected("Origin-mismatch POST /save", status, &body, &stored);
+    }
+
+    /// (c3) Oldest client: no Fetch Metadata, no `Origin`, no `Referer`.
+    /// There is nothing to prove where the form came from, and a
+    /// credential-overwriting POST is not worth guessing on: reject.
+    #[tokio::test]
+    async fn save_rejects_post_with_no_provenance_headers() {
+        let (app, log) = test_app().await;
+        let req = save_request(&[], EVIL_FORM);
+        let (status, _, body) = send(app, req).await;
+        let stored = puts(&log);
+        assert_rejected("header-less POST /save", status, &body, &stored);
+    }
+
+    // -- positive controls: real submissions keep working -----------------
+
+    /// (c1) The pairing page's own form: `same-origin`, matching `Origin`.
+    #[tokio::test]
+    async fn save_accepts_same_origin_form_post() {
+        let (app, log) = test_app().await;
+        let req = save_request(
+            &[
+                ("Sec-Fetch-Site", "same-origin"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Origin", &format!("https://{SITE_HOST}")),
+                ("Referer", &format!("https://{SITE_HOST}/")),
+            ],
+            ALICE_FORM,
+        );
+        let (status, headers, _) = send(app, req).await;
+        assert_accepted("same-origin POST /save", status, &headers, &puts(&log));
+    }
+
+    /// (c2) Browser without Fetch Metadata, but `Origin` host == `Host`.
+    #[tokio::test]
+    async fn save_accepts_matching_origin_without_fetch_metadata() {
+        let (app, log) = test_app().await;
+        let req = save_request(
+            &[
+                ("Origin", &format!("https://{SITE_HOST}")),
+                ("Referer", &format!("https://{SITE_HOST}/")),
+            ],
+            ALICE_FORM,
+        );
+        let (status, headers, _) = send(app, req).await;
+        assert_accepted("Origin-only POST /save", status, &headers, &puts(&log));
+    }
+
+    /// (c2') Browser that sends neither Fetch Metadata nor `Origin` on a
+    /// same-origin form POST, but does send `Referer` with a matching host.
+    #[tokio::test]
+    async fn save_accepts_matching_referer_without_origin() {
+        let (app, log) = test_app().await;
+        let req = save_request(&[("Referer", &format!("https://{SITE_HOST}/"))], ALICE_FORM);
+        let (status, headers, _) = send(app, req).await;
+        assert_accepted("Referer-only POST /save", status, &headers, &puts(&log));
+    }
+
+    /// `GET /` carries no provenance headers on a plain navigation and must
+    /// stay reachable: the guard belongs on `/save` only.
+    #[tokio::test]
+    async fn index_get_is_not_affected_by_the_save_guard() {
+        let (app, log) = test_app().await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(header::HOST, SITE_HOST)
+            .header("X-Authentik-Username", "alice")
+            .header(PROXY_SECRET_HEADER, PROXY_SECRET)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = send(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("pair your library"),
+            "unpaired page rendered: {body}"
+        );
+        assert!(puts(&log).is_empty());
+    }
+}
