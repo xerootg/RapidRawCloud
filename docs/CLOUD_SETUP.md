@@ -341,5 +341,7 @@ the web admin UI, build/flash instructions and the host test-suite.
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — the normative design (sync
   protocol, version vectors, journals/manifests, smart-preview fidelity,
   Android platform integration).
+- [`protocol/README.md`](../protocol/README.md) — the machine-readable protocol
+  definition and the generated Rust / C / C++ SDKs (+ JSON Schema).
 - [`docs/UPSTREAM_TOUCHES.md`](UPSTREAM_TOUCHES.md) — every upstream
   RapidRAW file this fork modifies, for rebase safety.

@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "rrc_proto.h"
+#include "rrcloud_proto.h"
 static int fails = 0;
 #define CHECK(c, ...) do { if (!(c)) { fails++; printf("FAIL %s:%d ", __FILE__, __LINE__); printf(__VA_ARGS__); printf("\n"); } } while (0)
 #define STREQ(a, b) CHECK(!strcmp((a), (b)), "\n  got  %s\n  want %s", (a), (b))
@@ -42,6 +43,12 @@ int main(int argc, char **argv) {
     CHECK(rrc_relkey_validate("a\xff/x") == RRC_RELKEY_INVALID_UTF8, "bad utf8");
     CHECK(rrc_relkey_validate("a\tb") == RRC_RELKEY_CONTROL, "control");
     CHECK(rrc_relkey_validate("\xe5\x86\x99\xe7\x9c\x9f/x.NEF") == RRC_RELKEY_OK, "CJK ok");
+    /* the firmware validator and the generated SDK validator must agree */
+    { const char *cases[] = {"2026/10/IMG_0042.NEF", "", "/a", "a\\b", "C:/x", "a/../b", "a/./b", "a//b", "a/b/", "a./b", "a /b", "x/CON", "x/Com1.txt", "x/lpt9",
+                             "x/COM\xc2\xb9.jpg", "x/com0", "x/com10", "x/console.log", "a/.rr.part-foo.NEF", "a/x.rr.y", "caf\xc3\xa9/x.jpg", "cafe\xcc\x81/x.jpg", "a\xff/x", "a\tb"};
+      for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+          bool a = rrc_relkey_validate(cases[i]) == RRC_RELKEY_OK, b = rrcp_validate_rel_key(cases[i]) == RRCP_OK;
+          CHECK(a == b, "validator disagreement on %s (firmware %d, sdk %d)", cases[i], a, b); } }
     /* sanitize */
     rrc_relkey_err e = rrc_relkey_sanitize("/DCIM//100NIKON/DSC_0001.NEF. ", out, sizeof out); CHECK(e == RRC_RELKEY_OK, "san1 %s", rrc_relkey_err_str(e)); STREQ(out, "DCIM/100NIKON/DSC_0001.NEF");
     rrc_relkey_sanitize("a:b\\c\x01" "d/x", out, sizeof out); STREQ(out, "a_b_c_d/x");

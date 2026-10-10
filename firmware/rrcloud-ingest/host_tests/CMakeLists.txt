@@ -7,6 +7,7 @@ set(CMAKE_C_EXTENSIONS ON)
 add_compile_options(-Wall -Wextra -O2 -g)
 set(COMP ${CMAKE_CURRENT_SOURCE_DIR}/../components)
 set(VEC ${CMAKE_CURRENT_SOURCE_DIR}/vectors)
+set(GEN ${CMAKE_CURRENT_SOURCE_DIR}/../../../protocol/gen/c)
 
 add_library(rrc_pure STATIC
     ${COMP}/rrc_hash/rrc_sha256.c ${COMP}/rrc_hash/rrc_md5.c ${COMP}/rrc_hash/rrc_hmac.c ${COMP}/rrc_hash/rrc_crc32.c ${COMP}/rrc_hash/rrc_b64.c
@@ -15,9 +16,10 @@ add_library(rrc_pure STATIC
     ${COMP}/rrc_glob/rrc_glob.c
     ${COMP}/rrc_proto/rrc_relkey.c ${COMP}/rrc_proto/rrc_keys.c ${COMP}/rrc_proto/rrc_jsonw.c ${COMP}/rrc_proto/rrc_journal.c
     ${COMP}/rrc_proto/rrc_manifest.c ${COMP}/rrc_proto/rrc_gzip_store.c ${COMP}/rrc_proto/rrc_timefmt.c ${COMP}/rrc_proto/rrc_ledger.c
-    ${COMP}/rrc_ptp/rrc_ptp_codec.c)
+    ${COMP}/rrc_ptp/rrc_ptp_codec.c
+    ${GEN}/rrcloud_proto.c ${COMP}/rrcloud_proto/rrcp_blake3_hook.c)
 target_include_directories(rrc_pure PUBLIC
-    ${COMP}/rrc_hash/include ${COMP}/rrc_blake3/include ${COMP}/rrc_s3/include ${COMP}/rrc_glob/include ${COMP}/rrc_proto/include ${COMP}/rrc_ptp/include)
+    ${COMP}/rrc_hash/include ${COMP}/rrc_blake3/include ${COMP}/rrc_s3/include ${COMP}/rrc_glob/include ${COMP}/rrc_proto/include ${COMP}/rrc_ptp/include ${GEN})
 
 enable_testing()
 foreach(t test_hash test_sigv4 test_glob test_proto test_ptp_codec)

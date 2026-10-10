@@ -8,6 +8,12 @@ This revision incorporates the adversarial review. The headline protocol changes
 
 ---
 
+> **Machine-readable definition.** Every document, key and constant in §1–§2 is also
+> defined in [`protocol/rrcloud.protocol.toml`](../protocol/rrcloud.protocol.toml), from
+> which `protocol/rrcgen` generates the Rust, C and C++ SDKs and JSON Schema
+> (`protocol/gen/`). The engine's constants alias the generated crate and
+> `rrcloud-core/tests/proto_conformance.rs` keeps the hand-written types in lockstep.
+
 ## 1. Bucket layout
 
 ### 1.1 Library-relative key mapping

@@ -123,7 +123,8 @@ cmake -S . -B build && cmake --build build && ctest --test-dir build --output-on
 components/rrc_hash     SHA-256, MD5, HMAC, CRC-32, Base64 (pure C)
 components/rrc_blake3   portable BLAKE3 (pure C)
 components/rrc_s3       SigV4 signer (pure) + S3 client over esp_http_client (PUT/HEAD/GET/DELETE/multipart/probe)
-components/rrc_proto    relkey rules, key schema, journal/device/manifest encoders, stored-deflate gzip, templates, ledger codec
+components/rrcloud_proto the generated protocol SDK (protocol/gen/c) as an IDF component
+components/rrc_proto    firmware conveniences over it: relkey sanitizer, templates, stored-deflate gzip, ledger codec
 components/rrc_glob     case-insensitive glob matcher
 components/rrc_ptp      PTP codec (pure) + USB still-image-class host driver
 main/                   app_config (NVS), store (LittleFS ledger/segments), net, sync engine, camera sources, pairing, web UI

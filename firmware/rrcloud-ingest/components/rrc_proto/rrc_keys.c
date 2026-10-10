@@ -1,29 +1,19 @@
+/* Key schema: delegates to the generated SDK so templates live in one place. */
 #include "rrc_proto.h"
-#include <stdarg.h>
+#include "rrcloud_proto.h"
 #include <stdio.h>
 #include <string.h>
 
-static int fmt(char *out, size_t cap, const char *f, ...) __attribute__((format(printf, 3, 4)));
-static int fmt(char *out, size_t cap, const char *f, ...)
+static int ret(int n) { return n < 0 ? -1 : n; }
+
+int rrc_key_library(const char *relkey, char *out, size_t cap) { return ret(rrcp_key_library_original(relkey, out, cap)); }
+
+int rrc_segment_filename(uint64_t seq, char out[32])
 {
-    va_list ap;
-    va_start(ap, f);
-    int n = vsnprintf(out, cap, f, ap);
-    va_end(ap);
-    return (n < 0 || (size_t)n >= cap) ? -1 : n;
+    int n = snprintf(out, 32, "%016llx.v%d.ndjson", (unsigned long long)seq, RRCP_JOURNAL_VERSION);
+    return (n < 0 || n >= 32) ? -1 : n;
 }
 
-int rrc_key_library(const char *relkey, char *out, size_t cap) { return fmt(out, cap, RRC_LIBRARY_PREFIX "%s", relkey); }
-
-int rrc_segment_filename(uint64_t seq, char out[32]) { return fmt(out, 32, "%016llx.v%d.ndjson", (unsigned long long)seq, RRC_JOURNAL_VERSION); }
-
-int rrc_key_journal_segment(const char *device, uint64_t seq, char *out, size_t cap)
-{
-    char fn[32];
-    rrc_segment_filename(seq, fn);
-    return fmt(out, cap, RRC_CONTROL_PREFIX "journal/%s/%s", device, fn);
-}
-
-int rrc_key_manifest(const char *device, char *out, size_t cap) { return fmt(out, cap, RRC_CONTROL_PREFIX "manifests/%s.json.gz", device); }
-
-int rrc_key_device_registry(const char *device, char *out, size_t cap) { return fmt(out, cap, RRC_CONTROL_PREFIX "devices/%s.json", device); }
+int rrc_key_journal_segment(const char *device, uint64_t seq, char *out, size_t cap) { return ret(rrcp_key_journal_segment(device, seq, out, cap)); }
+int rrc_key_manifest(const char *device, char *out, size_t cap) { return ret(rrcp_key_manifest(device, out, cap)); }
+int rrc_key_device_registry(const char *device, char *out, size_t cap) { return ret(rrcp_key_device_registry(device, out, cap)); }

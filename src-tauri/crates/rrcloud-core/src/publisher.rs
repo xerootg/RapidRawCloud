@@ -34,17 +34,17 @@ use crate::state::{StateError, StateTxn, SyncDb};
 
 /// The protocol versions this build can read, advertised in the device
 /// registry entry (§2.2 min-reader rule).
-pub const PROTO_READ: &[u32] = &[1];
+pub const PROTO_READ: &[u32] = rrcloud_proto::PROTO_READ;
 
 /// The protocol version this build writes.
-pub const PROTO_WRITE: u32 = 1;
+pub const PROTO_WRITE: u32 = rrcloud_proto::PROTO_WRITE;
 
 /// Cap on a fetched `devices/<id>.json` object, bounding the
 /// [`get_device_entry`] network-lane buffer (fail-closed allocation
 /// stance, like the journal segment and manifest fetch caps). A
 /// conforming registry entry is a few hundred bytes even with many peers
 /// in `applied`; 64 KiB is orders of magnitude of headroom.
-pub const DEVICE_ENTRY_MAX_BYTES: usize = 64 * 1024;
+pub const DEVICE_ENTRY_MAX_BYTES: usize = rrcloud_proto::DEVICE_ENTRY_MAX_BYTES;
 
 /// Error from the outbound journal lane.
 #[derive(Debug, thiserror::Error)]

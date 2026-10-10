@@ -48,7 +48,7 @@ use crate::state::{ItemRecord, ItemState, StateError, SyncDb};
 
 /// The manifest format version this build reads and writes (the header's
 /// `proto` field).
-pub const MANIFEST_PROTO: u32 = 1;
+pub const MANIFEST_PROTO: u32 = rrcloud_proto::MANIFEST_PROTO;
 
 /// Cap on a manifest's **decompressed** NDJSON size. Generous —
 /// proportional to the largest plausible library (at the §2.3 ballpark of
@@ -57,12 +57,12 @@ pub const MANIFEST_PROTO: u32 = 1;
 /// single ~1 MiB corrupt or hostile object decompresses to a phone-OOMing
 /// gigabyte before the first row parses. Same fail-closed stance as
 /// [`crate::journal::decode_segment`]'s read-side cap.
-pub const MANIFEST_MAX_DECODED_BYTES: usize = 256 * 1024 * 1024;
+pub const MANIFEST_MAX_DECODED_BYTES: usize = rrcloud_proto::MANIFEST_MAX_DECODED_BYTES;
 
 /// Cap on a manifest's **compressed** (on-the-wire) size, bounding the
 /// [`get_manifest`] network-lane buffer. NDJSON compresses well, so this
 /// comfortably carries [`MANIFEST_MAX_DECODED_BYTES`] of real rows.
-pub const MANIFEST_MAX_FETCH_BYTES: usize = 64 * 1024 * 1024;
+pub const MANIFEST_MAX_FETCH_BYTES: usize = rrcloud_proto::MANIFEST_MAX_FETCH_BYTES;
 
 /// Error from manifest build/encode/decode/transfer/merge.
 #[derive(Debug, thiserror::Error)]

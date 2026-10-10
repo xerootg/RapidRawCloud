@@ -17,13 +17,13 @@ use crate::keys::RelKey;
 use crate::semhash::{Blake3Hex, ContentId, SemHash};
 
 /// The journal entry/segment format version this reader+writer supports.
-pub const JOURNAL_VERSION: u32 = 1;
+pub const JOURNAL_VERSION: u32 = rrcloud_proto::JOURNAL_VERSION;
 
 /// Maximum entries per segment (§2.2).
-pub const SEGMENT_MAX_ENTRIES: usize = 1000;
+pub const SEGMENT_MAX_ENTRIES: usize = rrcloud_proto::SEGMENT_MAX_ENTRIES;
 
 /// Maximum encoded segment size in bytes (§2.2: 1 MiB).
-pub const SEGMENT_MAX_BYTES: usize = 1024 * 1024;
+pub const SEGMENT_MAX_BYTES: usize = rrcloud_proto::SEGMENT_MAX_BYTES;
 
 /// Error from journal entry/segment encoding or decoding.
 #[derive(Debug, thiserror::Error)]

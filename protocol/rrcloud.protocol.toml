@@ -1,0 +1,529 @@
+# RapidRawCloud sync protocol — the single source of truth for every document,
+# key and constant that implementations exchange through a plain S3 bucket
+# (docs/ARCHITECTURE.md §1–§2) and through the pairing service (docs/CLOUD_SETUP.md §6).
+#
+# `protocol/rrcgen.py` turns this file into:
+#   gen/rust/rrcloud-proto/   a Rust crate (serde types, validated newtypes, keys, codecs)
+#   gen/c/                    C99 types + self-contained JSON encode/decode + keys (+ C++17 header)
+#   gen/schema/               JSON Schema (draft 2020-12), one per record — the input for other
+#                             language generators (e.g. Java via jsonschema2pojo) and for fixture validation
+#   gen/PROTOCOL.md           a human-readable reference
+#
+# Field order in a record is normative for encoders (deterministic bytes, §2.1.5). Decoders
+# ignore unknown optional fields (min-reader rule, §2.2) and fail closed on a version they
+# do not support.
+
+[protocol]
+name = "rrcloud"
+idl_version = 1
+wire_version = 1
+description = "RapidRawCloud multi-device library sync over plain S3"
+
+# ----------------------------------------------------------------------------- constants
+[constants.JOURNAL_VERSION]
+type = "u32"
+value = 1
+doc = "Journal entry/segment format version this definition describes (entry field `v`, segment filename `.v1.ndjson`)."
+
+[constants.MANIFEST_PROTO]
+type = "u32"
+value = 1
+doc = "Manifest header `proto` for manifests written to this definition."
+
+[constants.PROTO_READ]
+type = "[u32]"
+value = [1]
+doc = "Journal versions a conforming implementation reads (advertised in the device registry)."
+
+[constants.PROTO_WRITE]
+type = "u32"
+value = 1
+doc = "Journal version a conforming implementation writes."
+
+[constants.SEGMENT_MAX_ENTRIES]
+type = "usize"
+value = 1000
+doc = "Maximum entries per journal segment (§2.2)."
+
+[constants.SEGMENT_MAX_BYTES]
+type = "usize"
+value = 1048576
+doc = "Maximum encoded journal segment size (1 MiB, §2.2)."
+
+[constants.DEVICE_ENTRY_MAX_BYTES]
+type = "usize"
+value = 65536
+doc = "Readers reject a device registry entry larger than this."
+
+[constants.MANIFEST_MAX_FETCH_BYTES]
+type = "usize"
+value = 67108864
+doc = "Readers reject a gzip manifest object larger than this (64 MiB)."
+
+[constants.MANIFEST_MAX_DECODED_BYTES]
+type = "usize"
+value = 268435456
+doc = "Readers stop inflating a manifest past this (256 MiB)."
+
+[constants.LIBRARY_PREFIX]
+type = "str"
+value = "library/"
+doc = "Byte-faithful mirror of the on-disk library tree (§1.2)."
+
+[constants.CONTROL_PREFIX]
+type = "str"
+value = ".rrcloud/v1/"
+doc = "Control plane; dot-prefixed so library scanners ignore it (§1.2)."
+
+[constants.ENGINE_TEMP_PREFIX]
+type = "str"
+value = ".rr."
+doc = "Reserved local temp-file namespace; never a valid relkey segment prefix (§1.1)."
+
+[constants.ALBUMS_META_KEY]
+type = "str"
+value = ".rrcloud/v1/meta/albums.json"
+doc = "Shared albums meta document (§2.9)."
+
+[constants.PRESETS_META_KEY]
+type = "str"
+value = ".rrcloud/v1/meta/presets.json"
+doc = "Shared presets meta document (§2.9)."
+
+[constants.SINGLE_PUT_MAX_BYTES]
+type = "u64"
+value = 16777216
+doc = "Objects below this are uploaded with a single PUT + Content-MD5; larger ones use multipart (§2.4)."
+
+[constants.MULTIPART_PART_SIZE]
+type = "u64"
+value = 16777216
+doc = "Reference multipart part size (16 MiB; any size ≥ MULTIPART_MIN_PART_SIZE is valid)."
+
+[constants.MULTIPART_MIN_PART_SIZE]
+type = "u64"
+value = 5242880
+doc = "S3 minimum part size (5 MiB) for all parts but the last."
+
+[constants.ACTIVE_WINDOW_SECS]
+type = "i64"
+value = 2592000
+doc = "A device is active when last_seen_server_ts is within 30 days (§2.10)."
+
+[constants.COMPACTION_RECONFIRM_SECS]
+type = "i64"
+value = 86400
+doc = "Own manifest must be ≥ 24 h old (server time) before segments it covers may be deleted (§2.10 rule 2)."
+
+[constants.LAGGARD_CAP_SECS]
+type = "i64"
+value = 1209600
+doc = "Segments older than 14 days (server time) may be compacted even if a laggard has not applied them (§2.10 rule 3)."
+
+[constants.RECENTLY_DELETED_GRACE_SECS]
+type = "i64"
+value = 2592000
+doc = "Tombstoned data keys survive ≥ 30 days (the user-facing Recently Deleted window, §2.10)."
+
+[constants.AUTO_RETIRE_SECS]
+type = "i64"
+value = 7776000
+doc = "Devices silent for 90 days are auto-retired by GC (§2.10)."
+
+[constants.DELETED_SET_RETENTION_SECS]
+type = "i64"
+value = 31536000
+doc = "Manifest deleted-set rows are retained 12 months (§2.3)."
+
+[constants.PAIRING_INFO_PATH]
+type = "str"
+value = "/api/pairing-info"
+doc = "Pairing service: public discovery document (PairingInfo)."
+
+[constants.PAIRING_CONFIG_PATH]
+type = "str"
+value = "/api/config"
+doc = "Pairing service: per-user config document (PairingConfigDoc), `Authorization: Bearer <oidc access token>`."
+
+[constants.PAIRING_REDIRECT_URI]
+type = "str"
+value = "rapidraw://auth-callback"
+doc = "OAuth redirect URI of the app's PKCE flow."
+
+[constants.PAIRING_OIDC_SCOPE]
+type = "str"
+value = "openid profile email"
+doc = "OIDC scopes requested by both the PKCE (app) and device-code (headless) pairing flows."
+
+[constants.OAUTH_DEVICE_CODE_GRANT]
+type = "str"
+value = "urn:ietf:params:oauth:grant-type:device_code"
+doc = "RFC 8628 grant type used by headless devices to pair."
+
+# ----------------------------------------------------------------------------- scalars
+# `format` drives generated validation. Strings carry `max_length` (bytes) for fixed-buffer targets.
+
+[scalars.DeviceId]
+kind = "string"
+format = "uuid4-lower"
+max_length = 36
+doc = "Sync participant identity: canonical lowercase hyphenated UUIDv4, minted once per device (§1.2). Compared lexicographically as the §2.6 tiebreak."
+
+[scalars.RelKey]
+kind = "string"
+format = "relkey"
+max_length = 768
+doc = "Library-relative path, `/`-separated, NFC, no leading slash, with the §1.1 rejection rules. Wire decoders reject non-NFC input instead of normalizing it."
+
+[scalars.Blake3Hex]
+kind = "string"
+format = "lower-hex"
+length = 64
+doc = "Lowercase hex BLAKE3-256 of object bytes."
+
+[scalars.ContentId]
+kind = "string"
+format = "lower-hex"
+length = 64
+doc = "Content identity of an original: blake3(original bytes), lowercase hex (§1.2)."
+
+[scalars.SemHash]
+kind = "string"
+format = "lower-hex"
+length = 64
+doc = "Semantic sidecar hash (§2.5)."
+
+[scalars.BucketKey]
+kind = "string"
+format = "any"
+max_length = 1024
+doc = "A full bucket key. Deliberately unvalidated on decode; consumers classify it before acting (keys.rs classify_key)."
+
+[scalars.UnixSeconds]
+kind = "i64"
+doc = "Seconds since the Unix epoch. Fields named *_server_ts carry server time (S3 Date header); `ts` is device wall clock."
+
+[scalars.Seq]
+kind = "u64"
+doc = "Per-device monotonic journal sequence number."
+
+# ----------------------------------------------------------------------------- enums
+[enums.Op]
+doc = "Journal operation (§2.2)."
+values = [
+  { name = "Put", wire = "put", doc = "A new version of a key was uploaded." },
+  { name = "Del", wire = "del", doc = "The key was deleted (paired with a tombstone, §2.7)." },
+  { name = "Move", wire = "move", doc = "The key was moved/renamed; `from_key` carries the old key." },
+  { name = "Attest", wire = "attest", doc = "A device fully downloaded an advertised object and verified its blake3 (gates eviction, §3.5)." },
+]
+
+[enums.Kind]
+doc = "What kind of object an entry describes (§2.2)."
+values = [
+  { name = "Original", wire = "original", doc = "RAW/JPEG/derived original under library/." },
+  { name = "Sidecar", wire = "sidecar", doc = ".rrdata sidecar." },
+  { name = "Xmp", wire = "xmp", doc = "Interop .xmp projection of the sidecar (§2.8)." },
+  { name = "Preview", wire = "preview", doc = "Smart preview (§4)." },
+  { name = "Thumb", wire = "thumb", doc = "Thumbnail." },
+  { name = "Thumbpack", wire = "thumbpack", doc = "Per-folder thumb pack (§4.3)." },
+  { name = "Albums", wire = "albums", doc = "Albums meta document (§2.9)." },
+  { name = "Presets", wire = "presets", doc = "Presets meta document (§2.9)." },
+]
+
+[enums.ThumbSize]
+doc = "Thumb flavour in thumb keys (§1.2)."
+values = [
+  { name = "Small", wire = "small", doc = "480 px long edge." },
+  { name = "Medium", wire = "medium", doc = "1280 px long edge." },
+]
+
+# ----------------------------------------------------------------------------- maps
+[maps.VersionVector]
+key = "DeviceId"
+value = "u32"
+drop_zero = true
+max_items = 32
+doc = "Per-relkey version vector {device_id: counter} (§2.6). Missing components read as 0; zero components are never stored — decoders drop them so `{a:1,b:0}` equals `{a:1}`."
+
+[maps.AppliedCursors]
+key = "DeviceId"
+value = "u64"
+drop_zero = false
+max_items = 64
+doc = "Highest contiguously-applied journal seq per peer device."
+
+# ----------------------------------------------------------------------------- records
+[records.JournalEntry]
+doc = "One journal entry (one NDJSON line of a segment), v1 schema (§2.2)."
+version_field = "v"
+supported_versions = [1]
+fields = [
+  { name = "v", type = "u32", doc = "Format version; JOURNAL_VERSION." },
+  { name = "seq", type = "Seq", doc = "Per-device monotonic sequence number." },
+  { name = "ts", type = "UnixSeconds", doc = "Device wall clock at entry creation; used only by the §2.6 concurrent-winner rule and GC age heuristics." },
+  { name = "device", type = "DeviceId", doc = "Authoring device." },
+  { name = "op", type = "Op" },
+  { name = "kind", type = "Kind" },
+  { name = "key", type = "BucketKey", doc = "Full bucket key the entry is about (classify before use)." },
+  { name = "vv", type = "VersionVector", doc = "Per-relkey version vector snapshot; required on every entry including attest." },
+  { name = "size", type = "u64", optional = true, doc = "Uploaded object size (put)." },
+  { name = "blake3", type = "Blake3Hex", optional = true, doc = "blake3 of the uploaded/verified bytes." },
+  { name = "sem_hash", type = "SemHash", optional = true, doc = "Semantic hash (sidecar)." },
+  { name = "rating", type = "u8", optional = true, doc = "Star rating (sidecar badge, §3.5)." },
+  { name = "color_label", type = "string", max_length = 32, optional = true, doc = "Color label (sidecar badge)." },
+  { name = "content_id", type = "ContentId", optional = true, doc = "Content identity (original)." },
+  { name = "w", type = "u32", optional = true, doc = "Final displayed width, measured never EXIF-derived (original)." },
+  { name = "h", type = "u32", optional = true, doc = "Final displayed height (original)." },
+  { name = "mtime", type = "UnixSeconds", optional = true, doc = "Local file mtime (original)." },
+  { name = "from_key", type = "BucketKey", optional = true, doc = "Previous bucket key (move)." },
+]
+
+[records.Tombstone]
+doc = "Deletion marker at the tombstone key (§2.7). Idempotent under concurrent write."
+fields = [
+  { name = "relkey", type = "RelKey", doc = "Deleted library-relative key (strict wire decode)." },
+  { name = "vv", type = "VersionVector", doc = "Deletion version vector, bumped past the deleted version." },
+  { name = "device", type = "DeviceId", doc = "Deleting device." },
+  { name = "server_ts", type = "UnixSeconds", doc = "Server time of the deletion." },
+  { name = "kinds", type = "[Kind]", max_items = 8, doc = "Which kinds existed for the relkey and are covered." },
+]
+
+[records.ManifestHeader]
+doc = "First line of a per-writer manifest (§2.3)."
+fields = [
+  { name = "written_server_ts", type = "UnixSeconds" },
+  { name = "cursors", type = "AppliedCursors", doc = "Writer's applied cursors plus its own published cursor." },
+  { name = "proto", type = "u32", doc = "MANIFEST_PROTO." },
+]
+
+[records.ManifestRow]
+doc = "One live row of a manifest: the writer's knowledge of one live relkey (§2.3)."
+fields = [
+  { name = "key", type = "RelKey" },
+  { name = "kind", type = "Kind" },
+  { name = "size", type = "u64" },
+  { name = "blake3", type = "Blake3Hex", optional = true },
+  { name = "sem_hash", type = "SemHash", optional = true },
+  { name = "vv", type = "VersionVector" },
+  { name = "device", type = "DeviceId", optional = true, doc = "Authoring device of the current version, when known." },
+  { name = "content_id", type = "ContentId", optional = true },
+  { name = "w", type = "u32", optional = true },
+  { name = "h", type = "u32", optional = true },
+  { name = "mtime", type = "UnixSeconds", optional = true },
+  { name = "ts", type = "UnixSeconds", optional = true, doc = "The head version's journal ts (§2.6 tiebreak input)." },
+  { name = "rating", type = "u8", optional = true },
+  { name = "color_label", type = "string", max_length = 32, optional = true },
+]
+
+[records.DeletedRow]
+doc = "One deleted-set row of a manifest (§2.3); retained 12 months."
+fields = [
+  { name = "del", type = "RelKey", doc = "Deleted relkey (strict wire decode)." },
+  { name = "vv", type = "VersionVector" },
+  { name = "server_ts", type = "UnixSeconds" },
+]
+
+[records.ProtoSupport]
+doc = "Journal format support advertisement (§2.2 min-reader rule)."
+fields = [
+  { name = "read", type = "[u32]", max_items = 8, doc = "Versions this device reads." },
+  { name = "write", type = "u32", doc = "Version this device writes." },
+]
+
+[records.DeviceEntry]
+doc = "Device registry entry at the device_registry key (§1.2); heartbeat-written by its owner only."
+fields = [
+  { name = "name", type = "string", max_length = 128 },
+  { name = "platform", type = "string", max_length = 32, doc = "e.g. linux, android, esp32." },
+  { name = "created", type = "UnixSeconds" },
+  { name = "last_seen_server_ts", type = "UnixSeconds", doc = "Server time of the last heartbeat, never the device clock." },
+  { name = "applied", type = "AppliedCursors" },
+  { name = "proto", type = "ProtoSupport" },
+]
+
+[records.PairingInfo]
+doc = "Pairing service discovery document (GET PAIRING_INFO_PATH, unauthenticated)."
+naming = "camel"
+fields = [
+  { name = "version", type = "u32" },
+  { name = "issuer", type = "string", max_length = 256, doc = "OIDC issuer; its .well-known/openid-configuration gives the authorize/token/device endpoints." },
+  { name = "client_id", type = "string", max_length = 128, doc = "Public OAuth client id (no secret)." },
+  { name = "config_endpoint", type = "string", max_length = 128, default = "/api/config", doc = "Path of the config endpoint on the service." },
+  { name = "redirect_uri", type = "string", max_length = 128, optional = true, doc = "PAIRING_REDIRECT_URI for the app flow." },
+]
+
+[records.PairingSyncSettings]
+doc = "The `sync` object of a pairing config document: the app's SyncSettings shape (camelCase). Device-local fields (autoWatchDcim, watchedMediaBuckets) are never applied by pairing."
+naming = "camel"
+fields = [
+  { name = "enabled", type = "bool", default = false },
+  { name = "endpoint", type = "string", max_length = 256, default = "" },
+  { name = "bucket", type = "string", max_length = 128, default = "" },
+  { name = "region", type = "string", max_length = 64, default = "" },
+  { name = "force_path_style", type = "bool", default = true },
+  { name = "cache_size_gb", type = "u32", default = 8 },
+  { name = "preview_budget_gb", type = "u32", default = 10 },
+  { name = "preview_prefetch_months", type = "u32", default = 12 },
+  { name = "auto_watch_dcim", type = "bool", default = false },
+  { name = "watched_media_buckets", type = "[string]", max_items = 16, max_length = 64, default = [] },
+  { name = "worker_backfill", type = "bool", default = false },
+]
+
+[records.PairingCredentials]
+doc = "S3 credentials for the user's own library bucket."
+naming = "camel"
+fields = [
+  { name = "access_key_id", type = "string", max_length = 128 },
+  { name = "secret_access_key", type = "string", max_length = 256 },
+]
+
+[records.PairingConfigDoc]
+doc = "Per-user config document stored by the pairing service (admin bucket `users/<username>/config.json`) and returned by GET PAIRING_CONFIG_PATH."
+naming = "camel"
+fields = [
+  { name = "version", type = "u32", default = 1 },
+  { name = "updated_at", type = "string", max_length = 32, default = "", doc = "ISO-8601 UTC." },
+  { name = "sync", type = "PairingSyncSettings" },
+  { name = "credentials", type = "PairingCredentials" },
+]
+
+# ----------------------------------------------------------------------------- bucket keys
+# Templates: {param} is substituted verbatim after validation; {param:hex16} zero-padded 16-char
+# lowercase hex; {blake3_32(param)} first 32 hex chars of blake3(param bytes).
+
+[keys.library_original]
+template = "library/{relkey}"
+params = { relkey = "RelKey" }
+doc = "Original (RAW/JPEG/derived) or .xmp file, byte-identical to local."
+
+[keys.sidecar]
+template = "library/{relkey}.rrdata"
+params = { relkey = "RelKey" }
+doc = "Primary sidecar."
+
+[keys.vc_sidecar]
+template = "library/{relkey}.{vc6}.rrdata"
+params = { relkey = "RelKey", vc6 = "hex6" }
+doc = "Virtual-copy sidecar (6 lowercase hex); conflict losers use blake3(canonical loser)[..6] (§2.6)."
+
+[keys.journal_segment]
+template = ".rrcloud/v1/journal/{device}/{seq:hex16}.v1.ndjson"
+params = { device = "DeviceId", seq = "Seq" }
+doc = "Append-only per-device journal segment; filename = seq of its first entry (§2.2)."
+
+[keys.manifest]
+template = ".rrcloud/v1/manifests/{device}.json.gz"
+params = { device = "DeviceId" }
+doc = "Per-writer manifest, gzip NDJSON (§2.3)."
+
+[keys.device_registry]
+template = ".rrcloud/v1/devices/{device}.json"
+params = { device = "DeviceId" }
+doc = "Device registry entry (DeviceEntry)."
+
+[keys.device_retired]
+template = ".rrcloud/v1/devices/{device}.retired"
+params = { device = "DeviceId" }
+doc = "Retirement marker; empty body (§2.10)."
+
+[keys.tombstone]
+template = ".rrcloud/v1/tombstones/{blake3_32(relkey)}.json"
+params = { relkey = "RelKey" }
+doc = "Deletion marker (Tombstone)."
+
+[keys.preview]
+template = ".rrcloud/v1/previews/{content_id}.pxy.dng"
+params = { content_id = "ContentId" }
+doc = "Smart preview: linear LJPEG DNG proxy (§4)."
+
+[keys.thumb]
+template = ".rrcloud/v1/thumbs/{content_id}_{size}.jpg"
+params = { content_id = "ContentId", size = "ThumbSize" }
+doc = "480/1280 px JPEG thumb, q75."
+
+[keys.thumbpack]
+template = ".rrcloud/v1/thumbpacks/{blake3_32(folder)}.tar"
+params = { folder = "RelKey" }
+doc = "Per-folder pack of _small thumbs (§4.3)."
+
+[keys.pairing_user_config]
+template = "users/{username}/config.json"
+params = { username = "username" }
+doc = "Admin bucket: one PairingConfigDoc per user. username ∈ [A-Za-z0-9._-]{1,128}, not `.`/`..`."
+
+# ----------------------------------------------------------------------------- documents
+[documents.journal_segment]
+key = "journal_segment"
+encoding = "ndjson"
+record = "JournalEntry"
+writer = "owner-only"
+limits = ["SEGMENT_MAX_ENTRIES", "SEGMENT_MAX_BYTES"]
+doc = "Segment bytes are frozen in durable local state before the PUT so a crash replays byte-identical content; readers dedupe by (device, seq)."
+
+[documents.tombstone]
+key = "tombstone"
+encoding = "json"
+record = "Tombstone"
+writer = "any (idempotent)"
+
+[documents.manifest]
+key = "manifest"
+encoding = "gzip-ndjson"
+header = "ManifestHeader"
+rows = ["ManifestRow", "DeletedRow"]
+writer = "owner-only"
+limits = ["MANIFEST_MAX_FETCH_BYTES", "MANIFEST_MAX_DECODED_BYTES"]
+doc = "Header line, then live rows, then deleted rows. Row kind is distinguished by the presence of `key` (live) vs `del` (deleted)."
+
+[documents.device_entry]
+key = "device_registry"
+encoding = "json"
+record = "DeviceEntry"
+writer = "owner-only"
+limits = ["DEVICE_ENTRY_MAX_BYTES"]
+
+[documents.device_retired]
+key = "device_retired"
+encoding = "empty"
+writer = "any"
+
+[documents.pairing_info]
+http = "GET /api/pairing-info"
+encoding = "json"
+record = "PairingInfo"
+auth = "none"
+
+[documents.pairing_config]
+http = "GET /api/config"
+encoding = "json"
+record = "PairingConfigDoc"
+auth = "Bearer OIDC access token (validated by the service against the issuer's userinfo endpoint)"
+
+# ----------------------------------------------------------------------------- S3 operations an implementation needs
+[[operations]]
+name = "PutObject"
+notes = "Always with Content-MD5 (server-verified). Opportunistic If-None-Match: * on the first-publisher meta PUT (§2.9); correctness never depends on it."
+
+[[operations]]
+name = "HeadObject"
+notes = "Verification after upload (size, single-part ETag == MD5); strongly consistent on all supported backends."
+
+[[operations]]
+name = "GetObject"
+notes = "Ranged GETs for resumable hydration (§3.5) and read-back verification."
+
+[[operations]]
+name = "DeleteObject"
+notes = "Only by GC/compaction acting on a durable protocol record, never on absence (§2.1 principle 3)."
+
+[[operations]]
+name = "CopyObject"
+notes = "Server-side copy for moves (§2.7)."
+
+[[operations]]
+name = "ListObjectsV2"
+notes = "Paging journal/manifest prefixes and additive-only reconciliation; never a source of absence."
+
+[[operations]]
+name = "CreateMultipartUpload / UploadPart / CompleteMultipartUpload / AbortMultipartUpload / ListMultipartUploads / ListParts"
+notes = "Objects ≥ SINGLE_PUT_MAX_BYTES; every UploadPart carries Content-MD5; parts may be signed UNSIGNED-PAYLOAD."

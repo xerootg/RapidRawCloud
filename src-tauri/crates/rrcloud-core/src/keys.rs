@@ -20,17 +20,17 @@ use crate::hexutil::is_lower_hex;
 use crate::semhash::ContentId;
 
 /// Prefix of the byte-faithful mirror of the on-disk library tree (§1.2).
-pub const LIBRARY_PREFIX: &str = "library/";
+pub const LIBRARY_PREFIX: &str = rrcloud_proto::LIBRARY_PREFIX;
 
 /// Prefix of the control plane (§1.2). Dot-prefixed so `scan_dir_lazy`
 /// ignores it if the bucket is ever FUSE-mounted into a library.
-pub const CONTROL_PREFIX: &str = ".rrcloud/v1/";
+pub const CONTROL_PREFIX: &str = rrcloud_proto::CONTROL_PREFIX;
 
 /// Key of the relativized albums document (§2.9).
-pub const ALBUMS_META_KEY: &str = ".rrcloud/v1/meta/albums.json";
+pub const ALBUMS_META_KEY: &str = rrcloud_proto::ALBUMS_META_KEY;
 
 /// Key of the relativized presets document (§2.9).
-pub const PRESETS_META_KEY: &str = ".rrcloud/v1/meta/presets.json";
+pub const PRESETS_META_KEY: &str = rrcloud_proto::PRESETS_META_KEY;
 
 /// Segment prefix of the engine's reserved local temp namespace. The
 /// §3.5 download engine streams into `.rr.part-<name>` next to the final
@@ -40,7 +40,7 @@ pub const PRESETS_META_KEY: &str = ".rrcloud/v1/meta/presets.json";
 /// re-open the hole. This is what makes an engine temp path
 /// non-expressible as a relkey (see the variant doc for the collision it
 /// prevents).
-pub const ENGINE_TEMP_PREFIX: &str = ".rr.";
+pub const ENGINE_TEMP_PREFIX: &str = rrcloud_proto::ENGINE_TEMP_PREFIX;
 
 /// Error from relkey mapping or key construction.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

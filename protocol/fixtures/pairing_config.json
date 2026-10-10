@@ -1,0 +1,1 @@
+{"version":1,"updatedAt":"2026-10-07T00:00:00Z","sync":{"enabled":true,"endpoint":"https://garage.example","bucket":"my-photos","region":"garage","forcePathStyle":true,"cacheSizeGb":8,"previewBudgetGb":10,"previewPrefetchMonths":12,"autoWatchDcim":false,"watchedMediaBuckets":[],"workerBackfill":true},"credentials":{"accessKeyId":"GK1","secretAccessKey":"s3cr3t"}}

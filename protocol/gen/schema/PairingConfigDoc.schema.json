@@ -1,0 +1,671 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://rapidrawcloud.dev/schema/PairingConfigDoc.json",
+  "$ref": "#/$defs/PairingConfigDoc",
+  "$defs": {
+    "DeviceId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 36,
+      "description": "Sync participant identity: canonical lowercase hyphenated UUIDv4, minted once per device (§1.2). Compared lexicographically as the §2.6 tiebreak."
+    },
+    "RelKey": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(^|/)\\.\\.?(/|$))[^\\\\:\\u0000-\\u001f]+$",
+      "x-rrcloud-rules": "NFC; segments not '.'/'..'; no trailing dot/space; not Windows-reserved; no '.rr.' prefix (full rules in generated code)",
+      "maxLength": 768,
+      "description": "Library-relative path, `/`-separated, NFC, no leading slash, with the §1.1 rejection rules. Wire decoders reject non-NFC input instead of normalizing it."
+    },
+    "Blake3Hex": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex BLAKE3-256 of object bytes."
+    },
+    "ContentId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Content identity of an original: blake3(original bytes), lowercase hex (§1.2)."
+    },
+    "SemHash": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Semantic sidecar hash (§2.5)."
+    },
+    "BucketKey": {
+      "type": "string",
+      "maxLength": 1024,
+      "description": "A full bucket key. Deliberately unvalidated on decode; consumers classify it before acting (keys.rs classify_key)."
+    },
+    "UnixSeconds": {
+      "type": "integer",
+      "description": "Seconds since the Unix epoch. Fields named *_server_ts carry server time (S3 Date header); `ts` is device wall clock."
+    },
+    "Seq": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Per-device monotonic journal sequence number."
+    },
+    "Op": {
+      "type": "string",
+      "enum": [
+        "put",
+        "del",
+        "move",
+        "attest"
+      ],
+      "description": "Journal operation (§2.2)."
+    },
+    "Kind": {
+      "type": "string",
+      "enum": [
+        "original",
+        "sidecar",
+        "xmp",
+        "preview",
+        "thumb",
+        "thumbpack",
+        "albums",
+        "presets"
+      ],
+      "description": "What kind of object an entry describes (§2.2)."
+    },
+    "ThumbSize": {
+      "type": "string",
+      "enum": [
+        "small",
+        "medium"
+      ],
+      "description": "Thumb flavour in thumb keys (§1.2)."
+    },
+    "VersionVector": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/DeviceId"
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "description": "Per-relkey version vector {device_id: counter} (§2.6). Missing components read as 0; zero components are never stored — decoders drop them so `{a:1,b:0}` equals `{a:1}`.",
+      "x-rrcloud-drop-zero": true
+    },
+    "AppliedCursors": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/DeviceId"
+      },
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": 0
+      },
+      "description": "Highest contiguously-applied journal seq per peer device.",
+      "x-rrcloud-drop-zero": false
+    },
+    "JournalEntry": {
+      "type": "object",
+      "description": "One journal entry (one NDJSON line of a segment), v1 schema (§2.2).",
+      "properties": {
+        "v": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Format version; JOURNAL_VERSION.",
+          "enum": [
+            1
+          ]
+        },
+        "seq": {
+          "$ref": "#/$defs/Seq",
+          "description": "Per-device monotonic sequence number."
+        },
+        "ts": {
+          "$ref": "#/$defs/UnixSeconds",
+          "description": "Device wall clock at entry creation; used only by the §2.6 concurrent-winner rule and GC age heuristics."
+        },
+        "device": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "Authoring device."
+        },
+        "op": {
+          "$ref": "#/$defs/Op"
+        },
+        "kind": {
+          "$ref": "#/$defs/Kind"
+        },
+        "key": {
+          "$ref": "#/$defs/BucketKey",
+          "description": "Full bucket key the entry is about (classify before use)."
+        },
+        "vv": {
+          "$ref": "#/$defs/VersionVector",
+          "description": "Per-relkey version vector snapshot; required on every entry including attest."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Uploaded object size (put)."
+        },
+        "blake3": {
+          "$ref": "#/$defs/Blake3Hex",
+          "description": "blake3 of the uploaded/verified bytes."
+        },
+        "sem_hash": {
+          "$ref": "#/$defs/SemHash",
+          "description": "Semantic hash (sidecar)."
+        },
+        "rating": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "Star rating (sidecar badge, §3.5)."
+        },
+        "color_label": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "Color label (sidecar badge)."
+        },
+        "content_id": {
+          "$ref": "#/$defs/ContentId",
+          "description": "Content identity (original)."
+        },
+        "w": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Final displayed width, measured never EXIF-derived (original)."
+        },
+        "h": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Final displayed height (original)."
+        },
+        "mtime": {
+          "$ref": "#/$defs/UnixSeconds",
+          "description": "Local file mtime (original)."
+        },
+        "from_key": {
+          "$ref": "#/$defs/BucketKey",
+          "description": "Previous bucket key (move)."
+        }
+      },
+      "required": [
+        "v",
+        "seq",
+        "ts",
+        "device",
+        "op",
+        "kind",
+        "key",
+        "vv"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "v",
+        "seq",
+        "ts",
+        "device",
+        "op",
+        "kind",
+        "key",
+        "vv",
+        "size",
+        "blake3",
+        "sem_hash",
+        "rating",
+        "color_label",
+        "content_id",
+        "w",
+        "h",
+        "mtime",
+        "from_key"
+      ],
+      "x-rrcloud-version-field": "v",
+      "x-rrcloud-supported-versions": [
+        1
+      ]
+    },
+    "Tombstone": {
+      "type": "object",
+      "description": "Deletion marker at the tombstone key (§2.7). Idempotent under concurrent write.",
+      "properties": {
+        "relkey": {
+          "$ref": "#/$defs/RelKey",
+          "description": "Deleted library-relative key (strict wire decode)."
+        },
+        "vv": {
+          "$ref": "#/$defs/VersionVector",
+          "description": "Deletion version vector, bumped past the deleted version."
+        },
+        "device": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "Deleting device."
+        },
+        "server_ts": {
+          "$ref": "#/$defs/UnixSeconds",
+          "description": "Server time of the deletion."
+        },
+        "kinds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Kind"
+          },
+          "maxItems": 8,
+          "description": "Which kinds existed for the relkey and are covered."
+        }
+      },
+      "required": [
+        "relkey",
+        "vv",
+        "device",
+        "server_ts",
+        "kinds"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "relkey",
+        "vv",
+        "device",
+        "server_ts",
+        "kinds"
+      ]
+    },
+    "ManifestHeader": {
+      "type": "object",
+      "description": "First line of a per-writer manifest (§2.3).",
+      "properties": {
+        "written_server_ts": {
+          "$ref": "#/$defs/UnixSeconds"
+        },
+        "cursors": {
+          "$ref": "#/$defs/AppliedCursors",
+          "description": "Writer's applied cursors plus its own published cursor."
+        },
+        "proto": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "MANIFEST_PROTO."
+        }
+      },
+      "required": [
+        "written_server_ts",
+        "cursors",
+        "proto"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "written_server_ts",
+        "cursors",
+        "proto"
+      ]
+    },
+    "ManifestRow": {
+      "type": "object",
+      "description": "One live row of a manifest: the writer's knowledge of one live relkey (§2.3).",
+      "properties": {
+        "key": {
+          "$ref": "#/$defs/RelKey"
+        },
+        "kind": {
+          "$ref": "#/$defs/Kind"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "blake3": {
+          "$ref": "#/$defs/Blake3Hex"
+        },
+        "sem_hash": {
+          "$ref": "#/$defs/SemHash"
+        },
+        "vv": {
+          "$ref": "#/$defs/VersionVector"
+        },
+        "device": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "Authoring device of the current version, when known."
+        },
+        "content_id": {
+          "$ref": "#/$defs/ContentId"
+        },
+        "w": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "h": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "mtime": {
+          "$ref": "#/$defs/UnixSeconds"
+        },
+        "ts": {
+          "$ref": "#/$defs/UnixSeconds",
+          "description": "The head version's journal ts (§2.6 tiebreak input)."
+        },
+        "rating": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255
+        },
+        "color_label": {
+          "type": "string",
+          "maxLength": 32
+        }
+      },
+      "required": [
+        "key",
+        "kind",
+        "size",
+        "vv"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "key",
+        "kind",
+        "size",
+        "blake3",
+        "sem_hash",
+        "vv",
+        "device",
+        "content_id",
+        "w",
+        "h",
+        "mtime",
+        "ts",
+        "rating",
+        "color_label"
+      ]
+    },
+    "DeletedRow": {
+      "type": "object",
+      "description": "One deleted-set row of a manifest (§2.3); retained 12 months.",
+      "properties": {
+        "del": {
+          "$ref": "#/$defs/RelKey",
+          "description": "Deleted relkey (strict wire decode)."
+        },
+        "vv": {
+          "$ref": "#/$defs/VersionVector"
+        },
+        "server_ts": {
+          "$ref": "#/$defs/UnixSeconds"
+        }
+      },
+      "required": [
+        "del",
+        "vv",
+        "server_ts"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "del",
+        "vv",
+        "server_ts"
+      ]
+    },
+    "ProtoSupport": {
+      "type": "object",
+      "description": "Journal format support advertisement (§2.2 min-reader rule).",
+      "properties": {
+        "read": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 4294967295
+          },
+          "maxItems": 8,
+          "description": "Versions this device reads."
+        },
+        "write": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "description": "Version this device writes."
+        }
+      },
+      "required": [
+        "read",
+        "write"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "read",
+        "write"
+      ]
+    },
+    "DeviceEntry": {
+      "type": "object",
+      "description": "Device registry entry at the device_registry key (§1.2); heartbeat-written by its owner only.",
+      "properties": {
+        "name": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "platform": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "e.g. linux, android, esp32."
+        },
+        "created": {
+          "$ref": "#/$defs/UnixSeconds"
+        },
+        "last_seen_server_ts": {
+          "$ref": "#/$defs/UnixSeconds",
+          "description": "Server time of the last heartbeat, never the device clock."
+        },
+        "applied": {
+          "$ref": "#/$defs/AppliedCursors"
+        },
+        "proto": {
+          "$ref": "#/$defs/ProtoSupport"
+        }
+      },
+      "required": [
+        "name",
+        "platform",
+        "created",
+        "last_seen_server_ts",
+        "applied",
+        "proto"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "name",
+        "platform",
+        "created",
+        "last_seen_server_ts",
+        "applied",
+        "proto"
+      ]
+    },
+    "PairingInfo": {
+      "type": "object",
+      "description": "Pairing service discovery document (GET PAIRING_INFO_PATH, unauthenticated).",
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "issuer": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "OIDC issuer; its .well-known/openid-configuration gives the authorize/token/device endpoints."
+        },
+        "clientId": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Public OAuth client id (no secret)."
+        },
+        "configEndpoint": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "Path of the config endpoint on the service.",
+          "default": "/api/config"
+        },
+        "redirectUri": {
+          "type": "string",
+          "maxLength": 128,
+          "description": "PAIRING_REDIRECT_URI for the app flow."
+        }
+      },
+      "required": [
+        "version",
+        "issuer",
+        "clientId"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "version",
+        "issuer",
+        "clientId",
+        "configEndpoint",
+        "redirectUri"
+      ]
+    },
+    "PairingSyncSettings": {
+      "type": "object",
+      "description": "The `sync` object of a pairing config document: the app's SyncSettings shape (camelCase). Device-local fields (autoWatchDcim, watchedMediaBuckets) are never applied by pairing.",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "default": false
+        },
+        "endpoint": {
+          "type": "string",
+          "maxLength": 256,
+          "default": ""
+        },
+        "bucket": {
+          "type": "string",
+          "maxLength": 128,
+          "default": ""
+        },
+        "region": {
+          "type": "string",
+          "maxLength": 64,
+          "default": ""
+        },
+        "forcePathStyle": {
+          "type": "boolean",
+          "default": true
+        },
+        "cacheSizeGb": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 8
+        },
+        "previewBudgetGb": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10
+        },
+        "previewPrefetchMonths": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 12
+        },
+        "autoWatchDcim": {
+          "type": "boolean",
+          "default": false
+        },
+        "watchedMediaBuckets": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 64
+          },
+          "maxItems": 16,
+          "default": []
+        },
+        "workerBackfill": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "enabled",
+        "endpoint",
+        "bucket",
+        "region",
+        "forcePathStyle",
+        "cacheSizeGb",
+        "previewBudgetGb",
+        "previewPrefetchMonths",
+        "autoWatchDcim",
+        "watchedMediaBuckets",
+        "workerBackfill"
+      ]
+    },
+    "PairingCredentials": {
+      "type": "object",
+      "description": "S3 credentials for the user's own library bucket.",
+      "properties": {
+        "accessKeyId": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "secretAccessKey": {
+          "type": "string",
+          "maxLength": 256
+        }
+      },
+      "required": [
+        "accessKeyId",
+        "secretAccessKey"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "accessKeyId",
+        "secretAccessKey"
+      ]
+    },
+    "PairingConfigDoc": {
+      "type": "object",
+      "description": "Per-user config document stored by the pairing service (admin bucket `users/<username>/config.json`) and returned by GET PAIRING_CONFIG_PATH.",
+      "properties": {
+        "version": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 1
+        },
+        "updatedAt": {
+          "type": "string",
+          "maxLength": 32,
+          "description": "ISO-8601 UTC.",
+          "default": ""
+        },
+        "sync": {
+          "$ref": "#/$defs/PairingSyncSettings"
+        },
+        "credentials": {
+          "$ref": "#/$defs/PairingCredentials"
+        }
+      },
+      "required": [
+        "sync",
+        "credentials"
+      ],
+      "additionalProperties": true,
+      "x-rrcloud-field-order": [
+        "version",
+        "updatedAt",
+        "sync",
+        "credentials"
+      ]
+    }
+  }
+}
