@@ -172,17 +172,41 @@ static int grow_sink(void *ctx, const uint8_t *d, size_t n)
     return 0;
 }
 
-typedef struct { rrc_gzip_store *gz; int err; char line[2048]; } manifest_ctx_t;
-static int manifest_row(void *ctx, const rrc_ledger_rec *r)
+/* One live row, copied out of the ledger scan (the scan's strings point into a
+ * reused line buffer) so the rows can be sorted before encoding. §2.3 readers
+ * merge by key, so order is not load-bearing for correctness, but ascending
+ * relkey is what every other writer emits and what makes two manifests of the
+ * same library diff cleanly. */
+typedef struct { char *relkey; char blake3_hex[65]; uint64_t size; int64_t mtime, ts; } mrow_t;
+typedef struct { mrow_t *rows; size_t n, cap; int err; } mrows_t;
+
+static int manifest_collect(void *ctx, const rrc_ledger_rec *r)
 {
-    manifest_ctx_t *m = ctx;
-    rrc_manifest_row_original row = {.relkey = r->relkey, .size = r->size, .blake3_hex = r->blake3_hex, .device = app_device_id(), .vv_self = 1,
-                                     .content_id_hex = r->blake3_hex, .has_mtime = r->mtime > 0, .mtime = r->mtime, .ts = r->ts};
-    int n = rrc_manifest_row_encode(&row, m->line, sizeof m->line);
-    if (n < 0) return 0; /* skip unencodable row */
-    m->line[n++] = '\n';
-    if (rrc_gzip_store_write(m->gz, m->line, (size_t)n)) { m->err = 1; return 1; }
+    mrows_t *m = ctx;
+    if (m->n == m->cap) {
+        size_t nc = m->cap ? m->cap * 2 : 256;
+        mrow_t *nr = heap_caps_realloc(m->rows, nc * sizeof *nr, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!nr) { m->err = 1; return 1; }
+        m->rows = nr; m->cap = nc;
+    }
+    mrow_t *row = &m->rows[m->n];
+    size_t kl = strlen(r->relkey);
+    row->relkey = heap_caps_malloc(kl + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!row->relkey) { m->err = 1; return 1; }
+    memcpy(row->relkey, r->relkey, kl + 1);
+    scpy(row->blake3_hex, sizeof row->blake3_hex, r->blake3_hex);
+    row->size = r->size; row->mtime = r->mtime; row->ts = r->ts;
+    m->n++;
     return 0;
+}
+
+static int mrow_cmp(const void *a, const void *b) { return strcmp(((const mrow_t *)a)->relkey, ((const mrow_t *)b)->relkey); }
+
+static void mrows_free(mrows_t *m)
+{
+    for (size_t i = 0; i < m->n; i++) free(m->rows[i].relkey);
+    free(m->rows);
+    memset(m, 0, sizeof *m);
 }
 
 static esp_err_t publish_manifest(void)
@@ -197,10 +221,27 @@ static esp_err_t publish_manifest(void)
     if (n < 0) { free(gb.buf); set_error("manifest header encode failed"); return ESP_FAIL; }
     line[n++] = '\n';
     rrc_gzip_store_write(&gz, line, (size_t)n);
-    manifest_ctx_t mc = {.gz = &gz};
-    store_ledger_foreach_uploaded(manifest_row, &mc);
+    mrows_t rows = {0};
+    store_ledger_foreach_uploaded(manifest_collect, &rows);
+    if (rows.err) { mrows_free(&rows); free(gb.buf); set_error("manifest: out of memory collecting %u rows", (unsigned)rows.n); return ESP_ERR_NO_MEM; }
+    qsort(rows.rows, rows.n, sizeof *rows.rows, mrow_cmp);
+    char *rline = heap_caps_malloc(2048, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rline) { mrows_free(&rows); free(gb.buf); return ESP_ERR_NO_MEM; }
+    int werr = 0;
+    for (size_t i = 0; i < rows.n && !werr; i++) {
+        const mrow_t *r = &rows.rows[i];
+        rrc_manifest_row_original row = {.relkey = r->relkey, .size = r->size, .blake3_hex = r->blake3_hex, .device = app_device_id(), .vv_self = 1,
+                                         .content_id_hex = r->blake3_hex, .has_mtime = r->mtime > 0, .mtime = r->mtime, .ts = r->ts};
+        int rn = rrc_manifest_row_encode(&row, rline, 2048);
+        if (rn < 0) continue; /* skip unencodable row */
+        rline[rn++] = '\n';
+        if (rrc_gzip_store_write(&gz, rline, (size_t)rn)) werr = 1;
+    }
+    free(rline);
+    size_t nrows = rows.n;
+    mrows_free(&rows);
     rrc_gzip_store_end(&gz);
-    if (gz.err || mc.err) { free(gb.buf); return ESP_ERR_NO_MEM; }
+    if (gz.err || werr) { free(gb.buf); return ESP_ERR_NO_MEM; }
     char key[160];
     rrc_key_manifest(app_device_id(), key, sizeof key);
     rrc_s3_result_t res;
@@ -215,7 +256,7 @@ static esp_err_t publish_manifest(void)
     store_kv_set_str("manifest", rec);
     store_kv_set_u64("manifest_dirty", 0);
     ST_LOCK(); st.last_manifest_ts = ts; ST_UNLOCK();
-    log_ring_printf("manifest published (%u rows, %u bytes gz, cursor %llu)", (unsigned)store_ledger_uploaded_count(), (unsigned)gb.len, (unsigned long long)cursor);
+    log_ring_printf("manifest published (%u rows, %u bytes gz, cursor %llu)", (unsigned)nrows, (unsigned)gb.len, (unsigned long long)cursor);
     return ESP_OK;
 }
 
@@ -461,19 +502,15 @@ static void sync_run(cam_source_t *src)
             continue;
         }
         /* journal (§2.1.5 order: object verified → journal entry → ledger commit) */
-        uint64_t seq = store_journal_alloc_seq();
-        if (seq == 0) {
-            set_error("%s: cannot reserve a journal seq (flash full?) — object is in the bucket and will be adopted by the worker", relkey);
-            ST_LOCK(); st.run_failed++; ST_UNLOCK();
-            consecutive_failures++;
-            continue;
-        }
+        /* Peek, encode, append: the seq is committed by the append (store.h), so
+         * an encode/append failure leaves no gap and a reboot cannot reuse it. */
+        uint64_t seq = store_journal_next_seq();
         int64_t ts = rrc_s3_server_now(&s3);
         rrc_journal_put_original je = {.seq = seq, .ts = ts, .device = app_device_id(), .bucket_key = key, .vv_self = 1, .size = size,
                                        .blake3_hex = b3hex, .content_id_hex = b3hex, .has_mtime = o->mtime > 0, .mtime = o->mtime};
         char line[1200];
         if (rrc_journal_encode_put_original(&je, line, sizeof line) < 0 || store_journal_append_pending(line) != ESP_OK) {
-            set_error("%s: journal append failed", relkey);
+            set_error("%s: journal append failed (flash full?) — object is in the bucket and will be adopted by the worker", relkey);
             ST_LOCK(); st.run_failed++; ST_UNLOCK();
             continue;
         }

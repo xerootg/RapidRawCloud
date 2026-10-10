@@ -1,0 +1,54 @@
+name: 'Reusable: ESP-IDF build of rrcloud-ingest (esp32p4)'
+
+# The one definition of "build the firmware": the CI workflow (firmware.yml) and the release
+# workflow (firmware-release.yml) both call it, so the container image, target and the set of
+# artifacts cannot drift between a PR check and a release.
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: Name of the uploaded build artifact
+        type: string
+        default: rrcloud-ingest-esp32p4
+      idf-image:
+        description: espressif/idf container tag
+        type: string
+        default: v5.5
+    outputs:
+      version:
+        description: firmware/rrcloud-ingest/version.txt as built
+        value: ${{ jobs.build.outputs.version }}
+
+jobs:
+  build:
+    name: ESP-IDF build (esp32p4)
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:${{ inputs.idf-image }}
+    outputs:
+      version: ${{ steps.build.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: idf.py build
+        id: build
+        shell: bash
+        run: |
+          git config --global --add safe.directory '*'
+          . $IDF_PATH/export.sh
+          cd firmware/rrcloud-ingest
+          idf.py set-target esp32p4
+          idf.py build
+          idf.py size
+          echo "version=$(tr -d ' \n\r' < version.txt)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          # Paths are kept relative to build/ so flash_args stays valid for merge_bin.
+          path: |
+            firmware/rrcloud-ingest/build/rrcloud-ingest.bin
+            firmware/rrcloud-ingest/build/bootloader/bootloader.bin
+            firmware/rrcloud-ingest/build/partition_table/partition-table.bin
+            firmware/rrcloud-ingest/build/ota_data_initial.bin
+            firmware/rrcloud-ingest/build/flasher_args.json
+            firmware/rrcloud-ingest/build/flash_args
+          if-no-files-found: error

@@ -38,6 +38,7 @@ static struct {
     usb_host_client_handle_t client;
     rrc_ptp_event_cb_t cb;
     void *cb_arg;
+    rrc_ptp_describe_cb_t describe;   /* optional: dumps every enumerated device */
     rrc_ptp_dev_t dev;           /* single camera */
     bool in_use;
 } g;
@@ -249,7 +250,12 @@ esp_err_t rrc_ptp_get_storage_ids(rrc_ptp_dev_t *d, uint32_t *ids, size_t cap, s
 
 esp_err_t rrc_ptp_get_object_handles(rrc_ptp_dev_t *d, uint32_t storage_id, uint32_t **handles, size_t *count)
 {
-    uint32_t p[3] = {storage_id, 0x00000000, 0x00000000}; /* all formats, all parents */
+    return rrc_ptp_get_object_handles_in(d, storage_id, 0x00000000, handles, count);
+}
+
+esp_err_t rrc_ptp_get_object_handles_in(rrc_ptp_dev_t *d, uint32_t storage_id, uint32_t parent, uint32_t **handles, size_t *count)
+{
+    uint32_t p[3] = {storage_id, 0x00000000, parent}; /* all formats; parent 0 = every object, 0xFFFFFFFF = root */
     collector_t c = {0};
     esp_err_t err = transact(d, PTP_OC_GetObjectHandles, p, 3, collect, &c, NULL, NULL);
     if (err != ESP_OK) { free(c.buf); return err; }
@@ -341,6 +347,7 @@ static void handle_new_device(uint8_t addr)
     const usb_device_desc_t *dd;
     const usb_config_desc_t *cfg;
     if (usb_host_get_device_descriptor(d->hdl, &dd) != ESP_OK || usb_host_get_active_config_descriptor(d->hdl, &cfg) != ESP_OK) goto close;
+    if (g.describe) g.describe(d->hdl);
     d->vid = dd->idVendor; d->pid = dd->idProduct;
     if (dd->bDeviceClass == 0x08) goto close; /* mass storage: the MSC driver's */
     if (!match_interface(cfg, d)) { ESP_LOGD(TAG, "addr %u (%04x:%04x) is not a PTP device", addr, d->vid, d->pid); goto close; }
@@ -401,6 +408,11 @@ static void client_task(void *arg)
 {
     (void)arg;
     for (;;) usb_host_client_handle_events(g.client, portMAX_DELAY);
+}
+
+void rrc_ptp_set_describe_cb(rrc_ptp_describe_cb_t cb)
+{
+    g.describe = cb;
 }
 
 esp_err_t rrc_ptp_host_install(rrc_ptp_event_cb_t cb, void *arg)

@@ -133,6 +133,61 @@ www/index.html          the admin page (embedded)
 host_tests/             gcc/ctest suite + reference vectors + Rust interop fixtures
 ```
 
+## Troubleshooting the web UI
+
+When the dock gets an address it prints the URL on the console and in the log panel:
+
+```
+I rrc: ethernet ip 192.168.128.131 — web ui: http://192.168.128.131/ (http://rrcloud-ingest.local/)
+```
+
+Every accepted connection and request is logged (`I web: http: connection from 192.168.128.20`,
+`I web: http: GET /api/status`), so the console settles the first question when a browser
+times out: **did any packet reach the dock?**
+
+| Console shows | Meaning | What to do |
+|---|---|---|
+| link up, an IP, SNTP synced, but no `http: connection from` line while the browser spins | The TCP SYN (or the dock's SYN-ACK) never made it. Typical in a segmented homelab: the dock landed in another VLAN and a *stateless* switch ACL drops the return traffic, or client isolation is on. DHCP, DNS and SNTP are UDP and unaffected, which is why the rest of the log looks healthy. | `ping` the address, then try from a device in the dock's own subnet. Check inter-VLAN rules (stateless L2/L3 switch ACLs need the reverse rule; a gateway/firewall rule is stateful). Confirm the browser is not forcing `https://`. |
+| `http: connection from …` but no request line | The TCP connection opened and the browser sent nothing we parsed — almost always a TLS ClientHello to port 80 (an HTTPS-only browser setting). | Open `http://` explicitly. |
+| request lines appear, page still blank | The HTML loaded but an `/api/*` call failed. | The log panel is `/api/log`; open `/api/status` directly in the browser. |
+| no IP line at all, `ethernet link up` missing | No link partner: cable, switch port, or the PoE injector's data pass-through. | The RMII pins are fixed by the board (MDC 31, MDIO 52, PHY reset 51, REF_CLK in on 50). |
+
+`rrcloud-ingest.local` needs an mDNS resolver on the client (macOS, iOS, Windows 10+, Linux
+with Avahi); on Android use the IP address.
+
+## Troubleshooting camera detection
+
+Watch the serial console (`idf.py monitor`, 115200 baud on the Type-C UART port) or the
+**Log** panel of the web UI — every `E`/`W`/`I` line of the USB host stack is mirrored
+there. With **Verbose USB host logging** on (the pre-release default; Device section of
+the UI) the stack's `HUB`, `HCD DWC`, `USBH`, `ENUM` and `USB HOST` tags log at DEBUG on
+the serial console, so a plug-in shows the connection, debounce, reset, speed negotiation
+and every descriptor fetch.
+
+What a healthy plug-in looks like:
+
+```
+D HUB: Root port reset
+I usb: addr 1 high-speed 1003:c432 usb2.00 class 00/00/00 "SIGMA" "SIGMA fp" sn "…"
+I usb:   intf 0: class 08/06/50, 2 endpoints (mass storage)
+I rrc: camera attached: SIGMA fp via MSC
+```
+
+Every enumerated device is dumped like this whether or not a class driver claims it, so a
+camera in the wrong USB mode is still visible (a Nikon exposing `06/01/01` is PTP; a
+Sigma fp exposing `08/06/50` is mass storage; `ff/..` with three endpoints is MTP-shaped).
+
+| Symptom | Meaning | What to do |
+|---|---|---|
+| `E HUB: Root port reset failed` and nothing else | The port saw a connection but the device did not come back enabled after the bus reset (it dropped off, or never answered the speed handshake). In the IDF host library this is terminal until the device is unplugged or the port is power-cycled. | The dock now power-cycles the root port itself whenever nothing has enumerated for 15 s, and **Retry USB** in the web UI does it on demand; check that the camera is **on** and that its USB mode is right (Sigma fp: *System → USB Mode → Mass Storage*; Nikon Z: the camera must not be in *Charging only*), then try a different cable (some USB-C cables are power-only). If it never enumerates, capture the DEBUG serial log around the plug-in — the `HCD DWC` lines say which state the port fell out of. |
+| Device dumped, no `camera attached` | Enumerated, but neither driver matched the interface classes. | Compare the `intf` lines with the table above and switch the camera's USB mode. |
+| `W rrc_ptp: … is not a PTP device` at DEBUG only | Normal for the mass-storage path (the MSC driver owns it). | — |
+| `I usb: addr … full-speed` for a Sigma fp | The card reader fell back to USB 1.1 (12 Mbit/s): a bad cable or hub. | Use a direct USB 2.0 cable. |
+
+The root-port timings are set above the IDF defaults in `sdkconfig.defaults`
+(debounce 500 ms, reset hold 50 ms, recovery 100 ms) because cameras are slow to settle
+compared with flash drives.
+
 ## Known limitations
 
 - Write-only participant: deletions made elsewhere are not observed. A file already
@@ -145,4 +200,6 @@ host_tests/             gcc/ctest suite + reference vectors + Rust interop fixtu
 - Objects ≥ 4 GiB (PTP reports `0xFFFFFFFF`) are skipped.
 - One camera at a time; USB hubs are not supported. A camera re-attached while the previous session is still
   being torn down is queued and attached once the sync task has released the old source.
-- Manifest rows are emitted in ledger order rather than sorted by relkey (readers merge by key, so order is not load-bearing).
+- A vendor-specific (`0xFF`) interface with three endpoints is treated as MTP-shaped and
+  claimed as a camera; a non-camera device with that shape fails at `OpenSession` and is
+  logged, nothing else happens to it.

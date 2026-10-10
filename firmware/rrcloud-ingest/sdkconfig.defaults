@@ -35,6 +35,13 @@ CONFIG_ESP_HOSTED_HOST=y
 
 # ---- USB host (USB 2.0 OTG HS on the Type-A port)
 CONFIG_USB_HOST_CONTROL_TRANSFER_MAX_SIZE=1024
+# Cameras can take a moment to settle on the bus after plug-in and after a reset
+# (the IDF defaults are 250/30/30 ms). Longer debounce, reset hold and recovery
+# cost nothing on a dock and avoid "HUB: Root port reset failed" on slow devices.
+CONFIG_USB_HOST_DEBOUNCE_DELAY_MS=500
+CONFIG_USB_HOST_RESET_HOLD_MS=50
+CONFIG_USB_HOST_RESET_RECOVERY_MS=100
+CONFIG_USB_HOST_SET_ADDR_RECOVERY_MS=20
 
 # ---- FATFS (camera cards: long names, UTF-8)
 CONFIG_FATFS_LFN_HEAP=y

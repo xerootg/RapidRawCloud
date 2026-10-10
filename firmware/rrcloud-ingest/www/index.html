@@ -35,6 +35,7 @@
 <main>
   <h1>RapidRawCloud camera dock</h1>
   <div class="sub" id="sub">loading…</div>
+  <div id="authwarn" class="note" style="display:none; color:var(--warn); margin:6px 0 10px">This page and the S3 credentials it holds are open to everyone on your network. Set a password under Device below.</div>
 
   <div class="grid">
     <section class="card">
@@ -56,6 +57,7 @@
       <div id="lasterr" class="note" style="color:var(--err)"></div>
       <button id="syncnow">Sync now</button>
       <button id="synccancel" class="secondary">Cancel</button>
+      <button id="usbreset" class="secondary" title="Power-cycle the USB-A port so the camera is re-detected">Retry USB</button>
     </section>
 
     <section class="card">
@@ -114,6 +116,7 @@
     </div>
     <label class="check"><input type="checkbox" id="admin_auth"> Require a password for this page (user <code>admin</code>)</label>
     <input id="admin_password" type="password" autocomplete="new-password" placeholder="admin password (leave blank to keep)">
+    <label class="check"><input type="checkbox" id="usb_debug"> Verbose USB host logging on the serial console (debugging camera detection)</label>
     <div>
       <button id="save">Save</button>
       <button id="reboot" class="secondary">Reboot</button>
@@ -135,7 +138,7 @@ let toastT; function toast(m){ const t=$('toast'); t.textContent=m; t.style.disp
 async function api(path, body){ const r = await fetch(path, body!==undefined ? {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)} : {}); const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||('HTTP '+r.status)); return j; }
 
 const strFields = ['include_globs','exclude_globs','msc_root','key_template','s3_endpoint','s3_bucket','s3_region','s3_access_key','device_name','hostname','wifi_ssid'];
-const boolFields = ['auto_sync','upload_videos','s3_tls_insecure','admin_auth'];
+const boolFields = ['auto_sync','upload_videos','s3_tls_insecure','admin_auth','usb_debug'];
 async function loadConfig(){
   const c = await api('/api/config');
   strFields.forEach(f => $(f).value = c[f] ?? '');
@@ -145,6 +148,7 @@ async function loadConfig(){
   $('secrethint').textContent = c.has_s3_secret ? '(stored)' : '(not set)';
   $('mdns').textContent = c.hostname || 'rrcloud-ingest';
   $('devid').textContent = 'Device id: ' + c.device_id;
+  $('authwarn').style.display = (c.admin_auth && c.has_admin_password) ? 'none' : 'block';
 }
 $('save').onclick = async () => {
   const c = {}; strFields.forEach(f => c[f] = $(f).value.trim()); boolFields.forEach(f => c[f] = $(f).checked);
@@ -158,6 +162,7 @@ $('save').onclick = async () => {
 $('reboot').onclick = async () => { if (confirm('Reboot the dock?')) { try { await api('/api/reboot', {}); toast('Rebooting…'); } catch(e){} } };
 $('syncnow').onclick = () => api('/api/sync/now', {}).then(()=>toast('Sync requested')).catch(e=>toast(e.message));
 $('synccancel').onclick = () => api('/api/sync/cancel', {}).then(()=>toast('Cancelling')).catch(e=>toast(e.message));
+$('usbreset').onclick = () => api('/api/usb/reset', {}).then(()=>toast('USB port power-cycled')).catch(e=>toast(e.message));
 $('pairbegin').onclick = async () => { try { await api('/api/pair/begin', {url: $('pairurl').value.trim()}); $('pairbox').style.display='block'; pollPair(); } catch(e) { toast(e.message); } };
 $('paircancel').onclick = () => api('/api/pair/cancel', {}).catch(()=>{});
 
@@ -182,7 +187,7 @@ async function refresh(){
     const s = await api('/api/status'); const y = s.sync;
     $('sub').textContent = `${s.hostname} · firmware ${s.version} · up ${Math.floor(s.uptime_s/3600)}h${Math.floor(s.uptime_s%3600/60)}m · heap ${fmtBytes(s.heap_free)} / psram ${fmtBytes(s.psram_free)} · ledger ${fmtBytes(s.storage_used)} of ${fmtBytes(s.storage_total)}`;
     const ph = $('phase'); ph.textContent = y.phase; ph.className = 'pill ' + (phaseClass[y.phase]||'');
-    $('camera').textContent = y.camera_attached ? `${y.camera_model}${y.camera_serial? ' (sn '+y.camera_serial+')':''} via ${y.camera_kind.toUpperCase()}` : 'none attached';
+    $('camera').textContent = y.camera_attached ? `${y.camera_model}${y.camera_serial? ' (sn '+y.camera_serial+')':''} via ${y.camera_kind.toUpperCase()}` : (s.usb_devices > 0 ? `${s.usb_devices} USB device enumerated but not recognised as a camera — see the log` : 'none attached');
     $('cloud').textContent = y.s3_ready ? ('configured' + (y.digest_check_known ? (y.backend_rejects_bad_md5 ? ', backend verifies Content-MD5' : ', read-back verification') : '')) : 'not configured — pair or enter S3 settings';
     $('network').textContent = s.network + (s.eth_link ? '' : ' (no ethernet link)');
     $('clock').textContent = s.time_synced ? s.time : 'not synchronized';

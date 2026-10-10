@@ -18,6 +18,7 @@
 #include "web.h"
 #include "camera_source.h"
 #include "log_ring.h"
+#include "usb_diag.h"
 
 static const char *TAG = "main";
 
@@ -41,9 +42,14 @@ void app_main(void)
 
     ESP_ERROR_CHECK(net_init());
 
-    const usb_host_config_t host_cfg = {.skip_phy_setup = false, .intr_flags = ESP_INTR_FLAG_LEVEL1};
+    /* peripheral_map 0 = BIT0 = the USB 2.0 High-Speed OTG controller (UTMI PHY),
+     * which is what the board's USB-A port is wired to; BIT1 would be the
+     * Full-Speed OTG 1.1 controller on GPIO 26/27. */
+    usb_diag_set_verbose(app_config_get()->usb_debug);
+    const usb_host_config_t host_cfg = {.skip_phy_setup = false, .intr_flags = ESP_INTR_FLAG_LEVEL1, .peripheral_map = BIT0};
     ESP_ERROR_CHECK(usb_host_install(&host_cfg));
     xTaskCreate(usb_lib_task, "usb_lib", 4096, NULL, 7, NULL);
+    ESP_ERROR_CHECK(usb_diag_start_watchdog());
 
     ESP_ERROR_CHECK(sync_init());
     ESP_ERROR_CHECK(source_msc_install(sync_on_camera_event, NULL));

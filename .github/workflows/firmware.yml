@@ -8,12 +8,14 @@ on:
       - 'protocol/**'
       - 'src-tauri/crates/rrcloud-core/tests/firmware_interop.rs'
       - '.github/workflows/firmware.yml'
+      - '.github/workflows/firmware-build.yml'
   pull_request:
     paths:
       - 'firmware/rrcloud-ingest/**'
       - 'protocol/**'
       - 'src-tauri/crates/rrcloud-core/tests/firmware_interop.rs'
       - '.github/workflows/firmware.yml'
+      - '.github/workflows/firmware-build.yml'
   workflow_dispatch:
 
 jobs:
@@ -43,25 +45,4 @@ jobs:
           cargo test --test firmware_interop
 
   esp-idf-build:
-    name: ESP-IDF v5.5 build (esp32p4)
-    runs-on: ubuntu-latest
-    container:
-      image: espressif/idf:v5.5
-    steps:
-      - uses: actions/checkout@v4
-      - name: idf.py build
-        shell: bash
-        run: |
-          . $IDF_PATH/export.sh
-          cd firmware/rrcloud-ingest
-          idf.py set-target esp32p4
-          idf.py build
-      - uses: actions/upload-artifact@v4
-        with:
-          name: rrcloud-ingest-esp32p4
-          path: |
-            firmware/rrcloud-ingest/build/rrcloud-ingest.bin
-            firmware/rrcloud-ingest/build/bootloader/bootloader.bin
-            firmware/rrcloud-ingest/build/partition_table/partition-table.bin
-            firmware/rrcloud-ingest/build/ota_data_initial.bin
-            firmware/rrcloud-ingest/build/flasher_args.json
+    uses: ./.github/workflows/firmware-build.yml

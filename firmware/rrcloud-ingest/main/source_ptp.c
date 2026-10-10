@@ -1,4 +1,5 @@
 #include "camera_source.h"
+#include "usb_diag.h"
 #include "util.h"
 #include <string.h>
 #include <stdio.h>
@@ -65,6 +66,49 @@ static esp_err_t ensure_session(ptp_impl_t *p)
     return e;
 }
 
+/* Fallback for bodies that reject GetObjectHandles(storage, all, parent=0): walk
+ * the association tree from the root, one GetObjectHandles per folder. Costs one
+ * extra GetObjectInfo per object (to tell folders from files); bounded. */
+#define RECURSIVE_MAX_OBJECTS 20000
+static esp_err_t collect_handles_recursive(ptp_impl_t *p, uint32_t storage, uint32_t **out, size_t *out_n)
+{
+    size_t cap = 1024, n = 0, scan = 0;
+    uint32_t *all = heap_caps_malloc(cap * 4, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!all) return ESP_ERR_NO_MEM;
+    uint32_t *kids = NULL; size_t nk = 0;
+    esp_err_t e = rrc_ptp_get_object_handles_in(p->dev, storage, 0xFFFFFFFFu, &kids, &nk);
+    if (e != ESP_OK) { free(all); return e; }
+    for (;;) {
+        if (n + nk > cap) {
+            while (n + nk > cap) cap *= 2;
+            uint32_t *na = heap_caps_realloc(all, cap * 4, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+            if (!na) { free(kids); free(all); return ESP_ERR_NO_MEM; }
+            all = na;
+        }
+        memcpy(all + n, kids, nk * 4); n += nk;
+        free(kids); kids = NULL; nk = 0;
+        if (n > RECURSIVE_MAX_OBJECTS) { ESP_LOGW(TAG, "recursive enumeration capped at %u objects", (unsigned)n); break; }
+        /* find the next unexpanded association */
+        bool found = false;
+        for (; scan < n; scan++) {
+            ptp_object_info oi;
+            if (rrc_ptp_get_object_info(p->dev, all[scan], &oi) != ESP_OK) {
+                if (!rrc_ptp_is_connected(p->dev)) { free(all); return ESP_ERR_NOT_FOUND; }
+                continue;
+            }
+            if (oi.object_format != PTP_OFC_Association) continue;
+            e = rrc_ptp_get_object_handles_in(p->dev, storage, all[scan], &kids, &nk);
+            scan++;
+            if (e != ESP_OK) { ESP_LOGW(TAG, "GetObjectHandles(parent 0x%08x) rc=0x%04x; folder skipped", all[scan - 1], rrc_ptp_last_response(p->dev)); kids = NULL; nk = 0; continue; }
+            found = true;
+            break;
+        }
+        if (!found) break;
+    }
+    *out = all; *out_n = n;
+    return ESP_OK;
+}
+
 static esp_err_t ptp_enumerate(cam_source_t *s, cam_enum_cb_t cb, void *ctx)
 {
     ptp_impl_t *p = s->impl;
@@ -80,7 +124,12 @@ static esp_err_t ptp_enumerate(cam_source_t *s, cam_enum_cb_t cb, void *ctx)
         uint32_t *handles = NULL;
         size_t nh = 0;
         e = rrc_ptp_get_object_handles(p->dev, stores[si], &handles, &nh);
-        if (e != ESP_OK) { ESP_LOGW(TAG, "GetObjectHandles(0x%08x) failed rc=0x%04x", stores[si], rrc_ptp_last_response(p->dev)); continue; }
+        if (e != ESP_OK) {
+            if (!rrc_ptp_is_connected(p->dev)) return ESP_ERR_NOT_FOUND;
+            ESP_LOGW(TAG, "GetObjectHandles(0x%08x, all) rc=0x%04x; walking folders from the root instead", stores[si], rrc_ptp_last_response(p->dev));
+            e = collect_handles_recursive(p, stores[si], &handles, &nh);
+            if (e != ESP_OK) { ESP_LOGW(TAG, "recursive enumeration of 0x%08x failed: %s", stores[si], esp_err_to_name(e)); continue; }
+        }
         node_t *nodes = heap_caps_calloc(nh ? nh : 1, sizeof *nodes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!nodes) nodes = calloc(nh ? nh : 1, sizeof *nodes);
         if (!nodes) { free(handles); return ESP_ERR_NO_MEM; }
@@ -226,5 +275,6 @@ esp_err_t source_ptp_identify(cam_source_t *s)
 esp_err_t source_ptp_install(cam_event_cb_t cb, void *arg)
 {
     g.cb = cb; g.arg = arg;
+    rrc_ptp_set_describe_cb(usb_diag_log_device);
     return rrc_ptp_host_install(ptp_event, NULL);
 }

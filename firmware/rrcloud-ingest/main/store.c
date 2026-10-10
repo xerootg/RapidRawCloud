@@ -32,6 +32,8 @@ static SemaphoreHandle_t mtx;
 static uint64_t *idx;
 static size_t idx_cap, idx_len;
 static size_t ledger_count, uploaded_count, pending_entries_cache;
+static void recover_last_seq(void);
+static uint64_t last_seq;   /* high-water mark of every seq ever written (see store.h) */
 static uint64_t uploaded_bytes;
 
 static uint64_t fnv1a64(const char *s, uint64_t h) { while (*s) { h ^= (uint8_t)*s++; h *= 1099511628211ull; } return h; }
@@ -95,6 +97,7 @@ esp_err_t store_init(void)
     if (e != ESP_OK) { ESP_LOGE(TAG, "littlefs mount failed: %s", esp_err_to_name(e)); return e; }
     mkdir(JDIR, 0777);
     { size_t e2, b2; pending_stats(&e2, &b2); pending_entries_cache = e2; }
+    recover_last_seq();
     size_t total, used;
     store_usage(&total, &used);
     ESP_LOGI(TAG, "littlefs mounted: %u/%u KiB used", (unsigned)(used / 1024), (unsigned)(total / 1024));
@@ -241,18 +244,56 @@ size_t store_ledger_uploaded_count(void) { return uploaded_count; }
 uint64_t store_ledger_uploaded_bytes(void) { return uploaded_bytes; }
 
 /* ---- journal ------------------------------------------------------------ */
-uint64_t store_journal_alloc_seq(void)
+static uint64_t line_seq(const char *line);
+
+/* Highest "seq":N in an NDJSON file (0 when absent/empty). */
+static uint64_t file_max_seq(const char *path)
+{
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char *line = malloc(2048);
+    uint64_t mx = 0;
+    if (line) {
+        while (fgets(line, 2048, f)) { uint64_t s = line_seq(line); if (s > mx) mx = s; }
+        free(line);
+    }
+    fclose(f);
+    return mx;
+}
+
+/* Boot: the seq high-water mark is the max over every durable trace of a seq.
+ * Readers dedupe by (device, seq), so handing a used seq out again would make
+ * two different entries collide; a gap, by contrast, is harmless. */
+static void recover_last_seq(void)
+{
+    char b[32];
+    uint64_t mx = kv_get("last_seq", b, sizeof b) ? strtoull(b, NULL, 10) : 0;
+    uint64_t cur = kv_get("published_cursor", b, sizeof b) ? strtoull(b, NULL, 10) : 0;
+    if (cur > mx) mx = cur;
+    uint64_t p = file_max_seq(PENDING);
+    if (p > mx) mx = p;
+    DIR *d = opendir(JDIR);
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (strlen(de->d_name) != 26 || strcmp(de->d_name + 16, ".v1.ndjson")) continue;
+            char name[96];
+            snprintf(name, sizeof name, JDIR "/%s", de->d_name);
+            uint64_t s = file_max_seq(name);
+            if (s > mx) mx = s;
+        }
+        closedir(d);
+    }
+    last_seq = mx;
+    ESP_LOGI(TAG, "journal seq high-water mark %llu", (unsigned long long)last_seq);
+}
+
+uint64_t store_journal_next_seq(void)
 {
     LOCK();
-    char b[32];
-    uint64_t last = kv_get("last_seq", b, sizeof b) ? strtoull(b, NULL, 10) : 0;
-    uint64_t next = last + 1;
-    snprintf(b, sizeof b, "%llu", (unsigned long long)next);
-    esp_err_t e = kv_set("last_seq", b);
+    uint64_t n = last_seq + 1;
     UNLOCK();
-    /* A seq that was not durably reserved must never be used: a reboot would
-     * hand it out again and readers dedupe by (device, seq). */
-    return e == ESP_OK ? next : 0;
+    return n;
 }
 
 esp_err_t store_journal_append_pending(const char *json_line)
@@ -263,7 +304,11 @@ esp_err_t store_journal_append_pending(const char *json_line)
     bool ok = fputs(json_line, f) >= 0 && fputc('\n', f) == '\n';
     fsync_file(f);
     fclose(f);
-    if (ok) pending_entries_cache++;
+    if (ok) {
+        pending_entries_cache++;
+        uint64_t s = line_seq(json_line);
+        if (s > last_seq) last_seq = s;
+    }
     UNLOCK();
     return ok ? ESP_OK : ESP_FAIL;
 }
@@ -307,7 +352,14 @@ esp_err_t store_journal_freeze(uint64_t *first_seq_out)
     rrc_segment_filename(first, fn);
     snprintf(name, sizeof name, JDIR "/%s", fn);
     int rc = rename(PENDING, name);
-    if (rc == 0) pending_entries_cache = 0;
+    if (rc == 0) {
+        pending_entries_cache = 0;
+        /* Cheap boot shortcut for recover_last_seq(); the segment file is the
+         * authority until it is published, then published_cursor is. */
+        char b[32];
+        snprintf(b, sizeof b, "%llu", (unsigned long long)last_seq);
+        kv_set("last_seq", b);
+    }
     UNLOCK();
     if (rc != 0) return ESP_FAIL;
     if (first_seq_out) *first_seq_out = first;

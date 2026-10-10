@@ -47,9 +47,16 @@ size_t store_ledger_uploaded_count(void);
 uint64_t store_ledger_uploaded_bytes(void);
 
 /* --- journal ------------------------------------------------------------- */
-/* Allocates the next seq (persisted) — call BEFORE encoding the entry. */
-uint64_t store_journal_alloc_seq(void);
-/* Appends one encoded entry line (no trailing newline needed) to `pending`. */
+/* The seq the next entry must carry (gap-free, never reused). Peeking costs no
+ * flash write: a seq is COMMITTED by store_journal_append_pending() succeeding
+ * with a line that carries it. Recovery at boot derives the high-water mark
+ * from what is durable — kv `last_seq` (written at freeze), the published
+ * cursor, the frozen segment files and `pending` — so a crash between peek and
+ * append simply hands the same seq out again, and a crash after append sees
+ * it in `pending`. */
+uint64_t store_journal_next_seq(void);
+/* Appends one encoded entry line (no trailing newline needed) to `pending`
+ * (fsync) and advances the in-RAM seq high-water mark to the line's seq. */
 esp_err_t store_journal_append_pending(const char *json_line);
 size_t store_journal_pending_entries(void);
 size_t store_journal_pending_bytes(void);

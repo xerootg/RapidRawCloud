@@ -74,28 +74,32 @@ jobs:
         run: cd src-tauri/crates/rrcloud-core && cargo test --test firmware_interop --test proto_conformance
 
   build:
-    name: ESP-IDF build (esp32p4)
     needs: meta
+    uses: ./.github/workflows/firmware-build.yml
+    with:
+      artifact-name: rrcloud-ingest-build-${{ needs.meta.outputs.version }}
+
+  package:
+    name: Package flashable zip
+    needs: [meta, build]
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5
     steps:
-      - uses: actions/checkout@v4
-      - name: Build
-        shell: bash
-        run: |
-          git config --global --add safe.directory '*'
-          . $IDF_PATH/export.sh
-          cd firmware/rrcloud-ingest
-          idf.py set-target esp32p4
-          idf.py build
-          idf.py size
+      - uses: actions/download-artifact@v4
+        with:
+          name: rrcloud-ingest-build-${{ needs.meta.outputs.version }}
+          path: build
       - name: Package
         shell: bash
         run: |
           . $IDF_PATH/export.sh
-          cd firmware/rrcloud-ingest/build
+          cd build
           VERSION="${{ needs.meta.outputs.version }}"
+          if [ "$VERSION" != "${{ needs.build.outputs.version }}" ]; then
+            echo "::error::built version ${{ needs.build.outputs.version }} differs from resolved ${VERSION}"
+            exit 1
+          fi
           OUT=../dist/rrcloud-ingest-${VERSION}-esp32p4
           mkdir -p "$OUT"
           # One image flashable at offset 0 (bootloader, partition table, OTA data, app)…
@@ -118,19 +122,17 @@ jobs:
           MD
           cd ../dist && zip -r "rrcloud-ingest-${VERSION}-esp32p4.zip" "rrcloud-ingest-${VERSION}-esp32p4"
           sha256sum *.zip > SHA256SUMS
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-        id: pkg
       - uses: actions/upload-artifact@v4
         with:
-          name: rrcloud-ingest-${{ steps.pkg.outputs.version }}-esp32p4
+          name: rrcloud-ingest-${{ needs.meta.outputs.version }}-esp32p4
           path: |
-            firmware/rrcloud-ingest/dist/*.zip
-            firmware/rrcloud-ingest/dist/SHA256SUMS
+            dist/*.zip
+            dist/SHA256SUMS
 
   release:
     name: Publish GitHub release
     if: needs.meta.outputs.release == 'true'
-    needs: [meta, tests, build]
+    needs: [meta, tests, package]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -138,8 +140,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          name: rrcloud-ingest-${{ needs.meta.outputs.version }}-esp32p4
           path: dist
-          merge-multiple: true
       - name: Release notes
         run: |
           VERSION="${{ needs.meta.outputs.version }}"

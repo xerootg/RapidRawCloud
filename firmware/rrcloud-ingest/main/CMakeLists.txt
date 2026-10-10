@@ -1,7 +1,7 @@
 idf_component_register(
     SRCS
         "app_main.c" "app_config.c" "store.c" "log_ring.c" "net.c" "sync.c" "pairing.c" "web.c"
-        "source_msc.c" "source_ptp.c"
+        "source_msc.c" "source_ptp.c" "usb_diag.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         rrc_hash rrc_blake3 rrc_s3 rrc_glob rrc_proto rrc_ptp

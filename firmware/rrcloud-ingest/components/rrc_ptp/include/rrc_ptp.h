@@ -13,6 +13,7 @@
 #include <stdbool.h>
 #include "esp_err.h"
 #include "rrc_ptp_codec.h"
+#include "usb/usb_host.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -26,6 +27,11 @@ typedef void (*rrc_ptp_event_cb_t)(rrc_ptp_event_t ev, rrc_ptp_dev_t *dev, void 
 /* usb_host_install() must already have been called by the application. */
 esp_err_t rrc_ptp_host_install(rrc_ptp_event_cb_t cb, void *arg);
 
+/* Diagnostics hook: called with every newly enumerated device (PTP or not)
+ * before class matching, so the application can log what the camera presented. */
+typedef void (*rrc_ptp_describe_cb_t)(usb_device_handle_t hdl);
+void rrc_ptp_set_describe_cb(rrc_ptp_describe_cb_t cb);
+
 /* Opens a PTP session and reads DeviceInfo (call once after CONNECTED, from the sync task). */
 esp_err_t rrc_ptp_open(rrc_ptp_dev_t *dev);
 esp_err_t rrc_ptp_close(rrc_ptp_dev_t *dev);
@@ -37,6 +43,9 @@ uint16_t rrc_ptp_pid(const rrc_ptp_dev_t *dev);
 esp_err_t rrc_ptp_get_storage_ids(rrc_ptp_dev_t *dev, uint32_t *ids, size_t cap, size_t *count);
 /* Returns a heap array (free() it) of every object handle on `storage_id`. */
 esp_err_t rrc_ptp_get_object_handles(rrc_ptp_dev_t *dev, uint32_t storage_id, uint32_t **handles, size_t *count);
+/* GetObjectHandles restricted to one association: parent 0xFFFFFFFF is the storage root. Some
+ * bodies refuse the all-objects query (parent 0) and only answer per folder. */
+esp_err_t rrc_ptp_get_object_handles_in(rrc_ptp_dev_t *dev, uint32_t storage_id, uint32_t parent, uint32_t **handles, size_t *count);
 esp_err_t rrc_ptp_get_object_info(rrc_ptp_dev_t *dev, uint32_t handle, ptp_object_info *oi);
 /* GetPartialObject: reads up to `want` bytes at `offset` into `out`. */
 esp_err_t rrc_ptp_read_partial(rrc_ptp_dev_t *dev, uint32_t handle, uint32_t offset, uint8_t *out, size_t want, size_t *got);

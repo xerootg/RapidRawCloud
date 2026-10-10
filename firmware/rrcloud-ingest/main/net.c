@@ -42,12 +42,12 @@ static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         ip_event_got_ip_t *e = data;
         snprintf(eth_ip_str, sizeof eth_ip_str, IPSTR, IP2STR(&e->ip_info.ip));
         eth_ip = true;
-        log_ring_printf("ethernet ip %s", eth_ip_str);
+        log_ring_printf("ethernet ip %s — web ui: http://%s/ (http://%s.local/)", eth_ip_str, eth_ip_str, app_config_get()->hostname);
     } else if (id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = data;
         snprintf(wifi_ip_str, sizeof wifi_ip_str, IPSTR, IP2STR(&e->ip_info.ip));
         wifi_ip = true;
-        log_ring_printf("wifi ip %s", wifi_ip_str);
+        log_ring_printf("wifi ip %s — web ui: http://%s/ (http://%s.local/)", wifi_ip_str, wifi_ip_str, app_config_get()->hostname);
     } else if (id == IP_EVENT_ETH_LOST_IP) {
         eth_ip = false;
     } else if (id == IP_EVENT_STA_LOST_IP) {
