@@ -32,6 +32,7 @@ use rrcloud_core::engine::{
     restore_item, sidecar_item_relkey, vc_item_relkey, ChangeOutcome, EngineConsumer, EngineError,
     EnginePut, LocalScan, ResurrectionIncompleteEvent,
 };
+use rrcloud_core::journal::JournalEntryExt as _;
 use rrcloud_core::journal::{JournalEntry, Kind, Op, Tombstone, JOURNAL_VERSION};
 use rrcloud_core::keys::{
     classify_key, library_key, local_path, sidecar_key, tombstone_key, vc_sidecar_key, KeyClass,

@@ -1,0 +1,12 @@
+# Conformance tests for the generated Rust SDK against the shared fixtures in protocol/fixtures.
+[package]
+name = "rrcloud-proto-conformance"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rrcloud-proto = { path = "../../gen/rust/rrcloud-proto" }
+serde_json = "1"
+blake3 = "1"
+flate2 = "1"

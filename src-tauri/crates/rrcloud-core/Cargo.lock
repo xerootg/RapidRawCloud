@@ -2296,6 +2296,7 @@ dependencies = [
  "jni 0.21.1",
  "jni 0.22.4",
  "libc",
+ "log",
  "md-5",
  "ndk-context",
  "percent-encoding",
@@ -2305,6 +2306,7 @@ dependencies = [
  "redb",
  "reqwest",
  "rrcloud-core",
+ "rrcloud-proto",
  "rustls",
  "rustls-platform-verifier",
  "serde",
@@ -2316,6 +2318,18 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "webpki-roots",
+]
+
+[[package]]
+name = "rrcloud-proto"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "flate2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "unicode-normalization",
 ]
 
 [[package]]

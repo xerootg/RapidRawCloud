@@ -3176,24 +3176,13 @@ mod imp {
             Ok(out)
         }
 
-        /// The §3.5 app-layer download POLICY: turn every unpinned
-        /// `PendingDown` ORIGINAL the poll just learned about into a cloud STUB
-        /// — a browsable 0-byte placeholder that hydrates on demand
-        /// (`ensure_local` at the open/edit/export guard sites) — instead of
-        /// letting `pump_downloads` fetch its full bytes. This is the per-user
-        /// "single library of all S3 images" model: a photo another device
-        /// uploaded shows up here as a placeholder, and its bytes land only when
-        /// the user opens it. Runs AFTER poll and BEFORE `pump_downloads` in the
-        /// cycle. Sidecars (small, §3.5 "never stubbed"), xmp, and *pinned*
-        /// originals are left in the download queue and fetched eagerly.
-        ///
-        /// For each candidate it writes the 0-byte file (mtime replayed from the
-        /// record so the thumbnail cache key is stable), flips the record
-        /// `PendingDown → Stub`, and `queue_remove`s it from the Down queue so
-        /// the pump skips it. Per-item isolated + best-effort (one failure logs
-        /// and continues); a path that somehow already holds real bytes is never
-        /// truncated. `ensure_local`'s hydrate uses `download_item` directly
-        /// (not this queue), so on-demand download is unaffected.
+        /// The §3.5 client download POLICY (unpinned `PendingDown` originals
+        /// become 0-byte cloud stubs that hydrate on demand), run AFTER poll
+        /// and BEFORE `pump_downloads` in the cycle. The policy itself — the
+        /// candidate rules, the CAS commit, the never-truncate guard — is
+        /// `rrcloud_core::transfer::stub_pending_originals`, shared with the
+        /// Android bridge cycle so both clients stub identically; this is only
+        /// the desktop call site.
         pub fn stub_pending_originals(&self) {
             // Delegates to the shared core policy so the desktop app cycle and
             // the Android `rrcloud_core::android` bridge cycle stub received

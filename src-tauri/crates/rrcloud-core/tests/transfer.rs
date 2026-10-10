@@ -19,6 +19,7 @@ use common::garage;
 use common::sync::{dev, entry, open_db, rel, DEV_B};
 use common::transfer as h;
 use common::transfer::CountingS3;
+use rrcloud_core::journal::JournalEntryExt as _;
 use rrcloud_core::journal::{JournalEntry, Kind, Op, SEGMENT_MAX_BYTES};
 use rrcloud_core::keys::{library_key, sidecar_key};
 use rrcloud_core::publisher::{enqueue_entry, enqueue_entry_in, PublisherError};
@@ -31,9 +32,9 @@ use rrcloud_core::state::{ItemState, MultipartUploadState, Queue, StateError, Sy
 use rrcloud_core::transfer::{
     abort_stale_uploads, bucket_key_for, commit_verified, download_item, local_target_path,
     partial_path, probe_backend, pump_downloads, pump_uploads, recover_interrupted,
-    recover_interrupted_with, stored_backend_profile, upload_item, upload_item_from,
-    BackendProfile, CancelFlag, ChunkSource, ExpectedDownload, SourceStream, TransferConfig,
-    TransferError, PROBE_KEY,
+    recover_interrupted_with, stored_backend_profile, stub_pending_originals,
+    stub_pending_originals_bounded, upload_item, upload_item_from, BackendProfile, CancelFlag,
+    ChunkSource, ExpectedDownload, SourceStream, TransferConfig, TransferError, PROBE_KEY,
 };
 
 /// Decodes every staged outbound journal entry.
@@ -3767,4 +3768,117 @@ async fn a_mis_ranged_206_resume_is_rescued_by_the_hash_backstop_and_scratch_ret
         ],
         "the mis-served resume is followed by exactly one clean full GET"
     );
+}
+
+// ---------------------------------------------------------------------------
+// §3.5 client download policy: stub_pending_originals
+// ---------------------------------------------------------------------------
+
+/// Stages `rk` as a freshly polled `PendingDown` item of `kind` with a Down
+/// queue entry, exactly as the engine's apply path leaves it.
+fn stage_pending_down(db: &SyncDb, rk: &rrcloud_core::keys::RelKey, kind: Kind, pinned: bool) {
+    let mut rec = h::item_record(
+        kind,
+        ItemState::PendingDown,
+        4096,
+        1_700_000_000_000_000_000,
+        &dev(DEV_B),
+    );
+    rec.pinned = pinned;
+    assert!(db.insert_item(rk, &rec).unwrap());
+    assert!(db.queue_push(Queue::Down, rk, 0).unwrap());
+}
+
+#[test]
+fn stub_pass_turns_unpinned_pending_originals_into_empty_stubs_and_dequeues_them() {
+    let (_tmp, _path, db) = open_db(&dev(DEV_B));
+    let root = tempfile::tempdir().unwrap();
+    let orig = rel("2026/10/IMG_0001.NEF");
+    let pinned = rel("2026/10/IMG_0002.NEF");
+    let sidecar = rel("2026/10/IMG_0001.NEF.rrdata");
+    stage_pending_down(&db, &orig, Kind::Original, false);
+    stage_pending_down(&db, &pinned, Kind::Original, true);
+    stage_pending_down(&db, &sidecar, Kind::Sidecar, false);
+
+    let n = stub_pending_originals(&db, root.path()).unwrap();
+    assert_eq!(n, 1, "only the unpinned original is a stub candidate");
+
+    let stub_path = local_target_path(root.path(), &orig, Kind::Original);
+    let meta = std::fs::metadata(&stub_path).expect("placeholder written");
+    assert_eq!(meta.len(), 0);
+    assert_eq!(
+        filetime::FileTime::from_last_modification_time(&meta).unix_seconds(),
+        1_700_000_000,
+        "mtime replayed from the record so the thumbnail cache key is stable"
+    );
+    let rec = db.get_item(&orig).unwrap().unwrap();
+    assert_eq!(rec.state, ItemState::Stub);
+    assert!(rec.verified_remote);
+    assert!(!rec.attested);
+    // Pinned originals and sidecars stay queued for the eager pump.
+    assert_eq!(
+        db.get_item(&pinned).unwrap().unwrap().state,
+        ItemState::PendingDown
+    );
+    assert_eq!(
+        db.get_item(&sidecar).unwrap().unwrap().state,
+        ItemState::PendingDown
+    );
+    assert_eq!(db.queue_len(Queue::Down).unwrap(), 2);
+    assert!(!local_target_path(root.path(), &pinned, Kind::Original).exists());
+
+    // Idempotent: a second pass finds nothing to do.
+    assert_eq!(stub_pending_originals(&db, root.path()).unwrap(), 0);
+}
+
+#[test]
+fn stub_pass_never_truncates_a_path_that_already_holds_bytes() {
+    let (_tmp, _path, db) = open_db(&dev(DEV_B));
+    let root = tempfile::tempdir().unwrap();
+    let rk = rel("2026/10/IMG_0003.NEF");
+    stage_pending_down(&db, &rk, Kind::Original, false);
+    let path = local_target_path(root.path(), &rk, Kind::Original);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"real bytes that arrived some other way").unwrap();
+
+    assert_eq!(stub_pending_originals(&db, root.path()).unwrap(), 0);
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        b"real bytes that arrived some other way"
+    );
+    assert_eq!(
+        db.get_item(&rk).unwrap().unwrap().state,
+        ItemState::PendingDown
+    );
+    assert_eq!(
+        db.queue_len(Queue::Down).unwrap(),
+        1,
+        "left for the pump to reconcile"
+    );
+}
+
+#[test]
+fn stub_pass_stops_between_items_when_cancelled_and_leaves_the_rest_pending() {
+    let (_tmp, _path, db) = open_db(&dev(DEV_B));
+    let root = tempfile::tempdir().unwrap();
+    for i in 0..5 {
+        stage_pending_down(
+            &db,
+            &rel(&format!("2026/10/IMG_{i:04}.NEF")),
+            Kind::Original,
+            false,
+        );
+    }
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    assert_eq!(
+        stub_pending_originals_bounded(&db, root.path(), &cancel).unwrap(),
+        0,
+        "an already-expired budget stubs nothing"
+    );
+    assert_eq!(db.queue_len(Queue::Down).unwrap(), 5);
+    assert!(db.items_in_state(ItemState::Stub).unwrap().is_empty());
+    // An un-cancelled pass finishes the job.
+    assert_eq!(stub_pending_originals(&db, root.path()).unwrap(), 5);
+    assert_eq!(db.queue_len(Queue::Down).unwrap(), 0);
 }

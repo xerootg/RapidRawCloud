@@ -44,6 +44,11 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
         .invoke_handler(tauri::generate_handler![
             commands::sync_start_foreground_sync,
             commands::sync_dcim_access_status,
+            commands::dock_scan_start,
+            commands::dock_scan_stop,
+            commands::dock_connect,
+            commands::dock_disconnect,
+            commands::dock_rpc,
         ])
         .setup(|app, api| {
             #[cfg(mobile)]

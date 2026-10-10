@@ -1,0 +1,8 @@
+# The webview subscribes to the plugin's Android-emitted events (`dock-found`,
+# `dock-scan`, `dock-state`) through `addPluginListener`, which invokes the
+# mobile plugin's built-in `registerListener` / `removeListener` commands. They
+# are not part of this crate's command list, so the ACL needs them spelled out.
+[[permission]]
+identifier = "allow-plugin-events"
+description = "Lets the webview subscribe to and unsubscribe from the plugin's events (camera dock scan results and connection state)."
+commands.allow = ["registerListener", "removeListener"]

@@ -5830,6 +5830,7 @@ dependencies = [
  "image",
  "jni 0.21.1",
  "jni 0.22.4",
+ "log",
  "md-5",
  "ndk-context",
  "percent-encoding",
@@ -5838,6 +5839,7 @@ dependencies = [
  "rayon",
  "redb",
  "reqwest 0.13.4",
+ "rrcloud-proto",
  "rustls",
  "rustls-platform-verifier",
  "serde",
@@ -5848,6 +5850,18 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "webpki-roots",
+]
+
+[[package]]
+name = "rrcloud-proto"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "flate2",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "unicode-normalization",
 ]
 
 [[package]]
@@ -7085,7 +7099,9 @@ dependencies = [
 name = "tauri-plugin-rrcloud"
 version = "0.1.0"
 dependencies = [
+ "rrcloud-proto",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-plugin",
  "thiserror 2.0.20",

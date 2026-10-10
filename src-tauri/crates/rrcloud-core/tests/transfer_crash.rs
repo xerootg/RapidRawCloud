@@ -41,7 +41,7 @@ mod linux {
     use bytes::Bytes;
     use futures::stream::BoxStream;
     use rrcloud_core::clock::DeviceId;
-    use rrcloud_core::journal::{JournalEntry, Kind};
+    use rrcloud_core::journal::{JournalEntry, JournalEntryExt as _, Kind};
     use rrcloud_core::keys::{library_key, RelKey};
     use rrcloud_core::s3::{
         ByteRange, CompleteMultipartUploadOutput, CompletedPart, CreateMultipartUploadOutput,

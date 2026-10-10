@@ -1,0 +1,48 @@
+name: 'Firmware: rrcloud-ingest (ESP32-P4)'
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'firmware/rrcloud-ingest/**'
+      - 'protocol/**'
+      - 'src-tauri/crates/rrcloud-core/tests/firmware_interop.rs'
+      - '.github/workflows/firmware.yml'
+      - '.github/workflows/firmware-build.yml'
+  pull_request:
+    paths:
+      - 'firmware/rrcloud-ingest/**'
+      - 'protocol/**'
+      - 'src-tauri/crates/rrcloud-core/tests/firmware_interop.rs'
+      - '.github/workflows/firmware.yml'
+      - '.github/workflows/firmware-build.yml'
+  workflow_dispatch:
+
+jobs:
+  host-tests:
+    name: Host tests (gcc) + Rust interop
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run the pure-component test-suite
+        run: |
+          cd firmware/rrcloud-ingest/host_tests
+          cmake -S . -B build
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+      - name: Regenerate interop fixtures and check they are committed
+        run: |
+          cd firmware/rrcloud-ingest/host_tests
+          ./build/test_proto /tmp/manifest_test.gz fixtures
+          git diff --exit-code -- fixtures
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri/crates/rrcloud-core
+      - name: rrcloud-core decodes the firmware's documents
+        run: |
+          cd src-tauri/crates/rrcloud-core
+          cargo test --test firmware_interop
+
+  esp-idf-build:
+    uses: ./.github/workflows/firmware-build.yml

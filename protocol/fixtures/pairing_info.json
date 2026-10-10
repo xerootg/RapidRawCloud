@@ -1,0 +1,1 @@
+{"version":1,"issuer":"https://authentik.example/application/o/rapidraw-cloud/","clientId":"X1EdWXMGIBeLqx0ZA8VSguMFiIqaqM8drSueng17","configEndpoint":"/api/config","redirectUri":"rapidraw://auth-callback","redirectUris":["rapidraw://auth-callback","raw2dng://auth-callback"]}

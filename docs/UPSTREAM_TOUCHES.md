@@ -11,6 +11,7 @@ Status legend: [ ] planned (phase) · [x] landed
 | File | Change | Status |
 |---|---|---|
 | `src-tauri/Cargo.toml` | optional path dep `crates/rrcloud-core` + `sync` feature (default on) + `dashmap` (P1); pairing: optional `tauri-plugin-deep-link` added to the `sync` feature (receives the rapidraw://auth-callback OIDC redirect; absent from a `--no-default-features` build) | [x] P1 · [x] pairing |
+| `src-tauri/tauri.conf.json` | dropped the explicit `app.security.capabilities` list (`["default", "desktop-cloud"]`): with a list, only the named capabilities are enabled, so the `sync`-feature capability (`capabilities/sync/sync.json`, `rrcloud:default`) that `build.rs` loads for sync builds was never applied and every `plugin:rrcloud` command was denied from the webview. Without the list every loaded capability applies — identical set for a `--no-default-features` build (`default` + `desktop-cloud` are the only files its glob reads), plus `sync` when the feature is on | [x] dock (BLE) |
 | `src-tauri/src/lib.rs` | `pub mod sync;` + `#[cfg(sync)] pub use ::rrcloud_core;` + SyncManager start in `setup()` + `RunEvent::ExitRequested` exit flush (P1); `ensure_local` guards in `get_image_dimensions`, `generate_preview_for_path`, and the `merge_hdr` merge command (P2); U8: the 13 `#[cfg(feature="sync")] sync::commands::sync_*` entries in `generate_handler!` (cfg-gated per entry — none register on `--no-default-features`); pairing: `tauri_plugin_deep_link::init()` + a `setup()` `on_open_url` forwarder (emits `rrcloud-pair-callback` to the webview) + the two `sync::pairing::sync_pair_*` handler entries — all under `#[cfg(feature = "sync")]`; per-device DCIM: the `sync::commands::sync_list_media_buckets` handler entry (same cfg gate) | [x] P1/P2 · [x] U8 · [x] pairing |
 | `src-tauri/src/app_state.rs` | `sync_manager` field + sidecar lock map (P1); P3: `proxy_scale: Mutex<Option<f32>>` (set on the §4.4 proxy-edit-mode load, `None` for a full-resolution original) + its `Mutex::new(None)` init in `lib.rs` `.manage(AppState { .. })` | [x] P1/P3 |
 | `src-tauri/src/app_settings.rs` | `sync: SyncSettings` field (`#[serde(default)]`; credentials excluded) | [x] P1 |
@@ -76,7 +77,7 @@ Notes:
   `DcimContentObserver` (the §5.2 live-path debounce), `SyncForegroundService` (§5.1 point 2's
   `FOREGROUND_SERVICE_DATA_SYNC`), `DirtyWatch` (§5.4's 24h "N edits not backed up" notification,
   piggybacked on `SyncCycleWorker`'s own run), and `NotificationChannels`/`SyncSettingsReader`.
-- `tauri.conf.json` is deliberately untouched — thumbnail seeding hard-links into the existing
+- `tauri.conf.json` is otherwise untouched (its one fork change is the capabilities list, see the table) — thumbnail seeding hard-links into the existing
   `$APPCACHE/thumbnails` asset-protocol scope (ARCHITECTURE.md §3.5).
 - P0 keeps `crates/rrcloud-core` standalone (own lockfile, no workspace membership) so the
   upstream manifest stays untouched until the first real consumer lands in P1.

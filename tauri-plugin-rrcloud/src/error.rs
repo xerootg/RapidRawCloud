@@ -9,6 +9,10 @@ pub enum Error {
     #[cfg(mobile)]
     #[error(transparent)]
     PluginInvoke(#[from] tauri::plugin::mobile::PluginInvokeError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error("the camera dock is configured over Bluetooth LE from the Android app only")]
+    DockUnsupported,
 }
 
 impl Serialize for Error {

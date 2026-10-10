@@ -13,6 +13,10 @@ publish = false
 [workspace]
 
 [dependencies]
+# The protocol definition (protocol/rrcloud.protocol.toml) compiled to Rust: the
+# constants below are aliases of it so the engine and every generated SDK agree by
+# construction; tests/proto_conformance.rs checks the hand-written wire types too.
+rrcloud-proto = { path = "../../../protocol/gen/rust/rrcloud-proto" }
 # Promoted from dev-dependency by the transfer-engine unit (P1-U4): the §2.4
 # integrity backbone sends a `Content-MD5` header (base64 of the MD5) on
 # every single PUT and every multipart part, so the engine itself computes
@@ -40,6 +44,7 @@ flate2 = "1"
 # (blake3(abs path, mtime, adjustments)) stays stable across hydration.
 # Named by the architecture explicitly ("mtime set ... via `filetime`").
 filetime = "0.2"
+log = "0.4"
 futures = "0.3"
 hex = "0.4"
 # See the base64 note above (P1-U4 Content-MD5 computation).

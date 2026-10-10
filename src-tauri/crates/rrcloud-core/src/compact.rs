@@ -59,28 +59,28 @@ const DAY: i64 = 86_400;
 /// Default: a device is **active** only if its last heartbeat is within
 /// this window (§2.10). Past it, the device stops gating horizons even
 /// without an explicit retirement.
-pub const ACTIVE_WINDOW_SECS: i64 = 30 * DAY;
+pub const ACTIVE_WINDOW_SECS: i64 = rrcloud_proto::ACTIVE_WINDOW_SECS;
 
 /// Default: a segment's covering manifest must have been durably present at
 /// least this long — and be re-confirmed present — before any DELETE
 /// (§2.10 segment-compaction rule 2, the 24 h insurance against a transient
 /// PUT anomaly).
-pub const COMPACTION_RECONFIRM_SECS: i64 = DAY;
+pub const COMPACTION_RECONFIRM_SECS: i64 = rrcloud_proto::COMPACTION_RECONFIRM_SECS;
 
 /// Default: the 14-day pressure-valve cap (§2.10 rule 3 / D3). A laggard
 /// that has not applied a segment still lets it be compacted once the
 /// segment is older than this, because the laggard catches up losslessly by
 /// manifest merge (rows carry vv + the deleted set).
-pub const LAGGARD_CAP_SECS: i64 = 14 * DAY;
+pub const LAGGARD_CAP_SECS: i64 = rrcloud_proto::LAGGARD_CAP_SECS;
 
 /// Default: the user-facing "Recently Deleted" grace window (§2.7/§2.10
 /// (b)). A tombstone younger than this is never GC'd, even when every
 /// active device has applied past it.
-pub const RECENTLY_DELETED_GRACE_SECS: i64 = 30 * DAY;
+pub const RECENTLY_DELETED_GRACE_SECS: i64 = rrcloud_proto::RECENTLY_DELETED_GRACE_SECS;
 
 /// Default: a device with no heartbeat for this long is auto-retired by the
 /// GC sweep (§2.10 device lifecycle), server time.
-pub const AUTO_RETIRE_SECS: i64 = 90 * DAY;
+pub const AUTO_RETIRE_SECS: i64 = rrcloud_proto::AUTO_RETIRE_SECS;
 
 /// Default: the deleted-set retention window (§2.3): a GC runner's manifest
 /// retains a destroyed tombstone's `del` row this long so a bootstrapping or
@@ -88,7 +88,7 @@ pub const AUTO_RETIRE_SECS: i64 = 90 * DAY;
 /// is gone. Also the §2.3 pre-upload quarantine horizon: a device whose
 /// deletion-knowledge predates this window cannot prove a local-only key was
 /// not deleted.
-pub const DELETED_SET_RETENTION_SECS: i64 = 365 * DAY;
+pub const DELETED_SET_RETENTION_SECS: i64 = rrcloud_proto::DELETED_SET_RETENTION_SECS;
 
 /// The server-time thresholds this unit evaluates, all defaulting to the
 /// §2.10 constants. A caller may shrink them (tests, aggressive homelab

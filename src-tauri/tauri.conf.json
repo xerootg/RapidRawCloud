@@ -29,7 +29,6 @@
     ],
     "security": {
       "csp": null,
-      "capabilities": ["default", "desktop-cloud"],
       "assetProtocol": {
         "enable": true,
         "scope": ["$APPCACHE/thumbnails/*"]
