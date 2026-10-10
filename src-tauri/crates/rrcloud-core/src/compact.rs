@@ -47,7 +47,9 @@ use crate::keys::{
 };
 use crate::manifest::{build_manifest, get_manifest, put_manifest, ManifestError};
 use crate::publisher::{get_device_entry, DeviceEntry, PublisherError};
-use crate::s3::{ListObjectsV2Request, PutObjectOptions, S3Api, S3Error, S3TransferApi};
+use crate::s3::{
+    ListObjectsV2Request, ObjectSummary, PutObjectOptions, S3Api, S3Error, S3TransferApi,
+};
 use crate::semhash::ContentId;
 use crate::state::{DeletedRecord, ItemRecord, ItemState, StateError, StateTxn, SyncDb};
 
@@ -587,7 +589,8 @@ pub async fn compact_own_segments(
 pub enum GcSkipReason {
     /// (b) Younger than the 30-day Recently-Deleted grace window.
     WithinGrace {
-        /// Its server-time age in seconds.
+        /// Its server-asserted age in seconds (see `tombstone_age`): `0`
+        /// when the listing carried no parsable `LastModified`.
         age_secs: i64,
     },
     /// (a) Not every active device has applied past it and the 14-day cap
@@ -640,7 +643,9 @@ pub struct GcSummary {
 ///   14-day cap has elapsed. (Once (b)'s 30-day grace holds, the 14-day cap
 ///   trivially holds too, so a laggard never blocks a 30-day-old tombstone.)
 /// - **(b) grace** — it is ≥ `grace_secs` (30 days) old in server time
-///   ([`GcSkipReason::WithinGrace`] otherwise).
+///   ([`GcSkipReason::WithinGrace`] otherwise). Age (for (a) too) is the
+///   **server-asserted** `min(now - server_ts, now - LastModified)` — the
+///   body's `server_ts` can only make a tombstone look younger, never older.
 /// - **(c) deleted-set fold, first** — its `{del, vv, server_ts}` row is
 ///   folded into the **runner's** manifest and that manifest is PUT and
 ///   **read-back verified present** *before* any data key is destroyed
@@ -679,15 +684,25 @@ pub async fn tombstone_gc(
     // (read from the runner's local item record, which carries the original's
     // content_id — needed for the content-id liveness check).
     let prefix = format!("{CONTROL_PREFIX}tombstones/");
-    let keys = list_keys_under(s3, bucket, &prefix).await?;
+    let objects = list_objects_under(s3, bucket, &prefix).await?;
     struct TombCandidate {
         tomb: Tombstone,
         content_id: Option<ContentId>,
+        /// The tombstone object's server-asserted write instant (the
+        /// listing's `LastModified`, unix seconds); `None` when the listing
+        /// carried none or it did not parse.
+        last_modified_unix: Option<i64>,
     }
     let mut candidates: Vec<TombCandidate> = Vec::new();
-    for key in &keys {
+    let mut unstamped = 0usize;
+    for obj in &objects {
+        let key = &obj.key;
         if !matches!(classify_key(key), KeyClass::Tombstone { .. }) {
             continue;
+        }
+        let last_modified_unix = obj.last_modified.as_deref().and_then(parse_last_modified);
+        if last_modified_unix.is_none() {
+            unstamped += 1;
         }
         let body = match s3.get_object(bucket, key, None).await {
             Ok(output) => output.body.collect_capped(TOMBSTONE_MAX_BYTES).await?,
@@ -702,7 +717,21 @@ pub async fn tombstone_gc(
             continue;
         };
         let content_id = db.get_item(&tomb.relkey)?.and_then(|r| r.content_id);
-        candidates.push(TombCandidate { tomb, content_id });
+        candidates.push(TombCandidate {
+            tomb,
+            content_id,
+            last_modified_unix,
+        });
+    }
+    if unstamped > 0 {
+        // Once per pass, not per key: a listing without a usable
+        // `LastModified` only ever delays GC (those tombstones are retained
+        // as age 0 below), so this is a diagnostic, never an error.
+        eprintln!(
+            "rrcloud-worker: warning: {unstamped} tombstone listing entr{} under {prefix:?} \
+             carried no parsable LastModified; retaining them this pass (age treated as 0)",
+            if unstamped == 1 { "y" } else { "ies" }
+        );
     }
 
     let active = active_devices(s3, bucket, clock, cfg).await?;
@@ -726,7 +755,14 @@ pub async fn tombstone_gc(
     }
     let mut classes: Vec<Class> = Vec::with_capacity(candidates.len());
     for c in &candidates {
-        let age = now.saturating_sub(c.tomb.server_ts);
+        // Server-asserted age for BOTH (b) grace and (a) cap: the body's
+        // `server_ts` can only make a tombstone look younger, never older.
+        // No usable `LastModified` -> retained within grace as age 0 (a
+        // stale/missing listing field delays GC, never causes destruction).
+        let Some(age) = tombstone_age(now, c.tomb.server_ts, c.last_modified_unix) else {
+            classes.push(Class::Retained(GcSkipReason::WithinGrace { age_secs: 0 }));
+            continue;
+        };
         // (b) grace.
         if age < cfg.grace_secs {
             classes.push(Class::Retained(GcSkipReason::WithinGrace { age_secs: age }));
@@ -1353,6 +1389,41 @@ enum Decision {
     Skip(SkipReason),
 }
 
+/// A tombstone's age in server time, for both §2.10 gates — (b) the
+/// Recently-Deleted grace and (a) the laggard cap.
+///
+/// §2.10 evaluates every age threshold in **server time** so that a device's
+/// clock cannot age a tombstone out early — and the tombstone body's
+/// `server_ts` is written by whichever peer created it, so a hostile or
+/// buggy peer could backdate it and have the next GC pass destroy a live
+/// item's data keys, bypassing the grace window that §2.7/§2.10 describe as
+/// the safety net against exactly that device. The bucket's own
+/// `LastModified` for the tombstone object is asserted by the server and
+/// cannot be backdated by the writer, so the age is
+/// `min(now - server_ts, now - last_modified)`, saturated at 0: the body can
+/// only ever make a tombstone look *younger* (a re-PUT by a late writer
+/// resets `LastModified` and merely delays GC — §2.1 principle 3), never
+/// older. A negative server-asserted age (runner clock behind the server)
+/// is age 0, not a reason to fall back to the body.
+///
+/// Returns `None` when the listing carried no parsable `LastModified`: the
+/// caller must then **retain** the tombstone (treat as age 0), never trust
+/// `server_ts` alone.
+fn tombstone_age(now: i64, server_ts: i64, last_modified_unix: Option<i64>) -> Option<i64> {
+    let asserted = now.saturating_sub(last_modified_unix?);
+    let claimed = now.saturating_sub(server_ts);
+    Some(claimed.min(asserted).max(0))
+}
+
+/// Parses a `ListObjectsV2` `LastModified` (RFC 3339 / ISO 8601, e.g.
+/// `2026-10-10T12:34:56.000Z` on Garage and AWS) to unix seconds; `None`
+/// when it does not parse.
+fn parse_last_modified(s: &str) -> Option<i64> {
+    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .ok()
+        .map(|dt| dt.unix_timestamp())
+}
+
 /// Lists every object key under `prefix` (paginated), bounded like the
 /// reader's journal-listing lane so a hostile bucket cannot force unbounded
 /// key buffering on phone-class targets.
@@ -1361,6 +1432,21 @@ async fn list_keys_under(
     bucket: &str,
     prefix: &str,
 ) -> Result<Vec<String>, CompactError> {
+    Ok(list_objects_under(s3, bucket, prefix)
+        .await?
+        .into_iter()
+        .map(|o| o.key)
+        .collect())
+}
+
+/// Lists every object under `prefix` (paginated) with its listing metadata
+/// — notably the server-asserted `LastModified` that [`tombstone_gc`] ages
+/// tombstones by — bounded like [`list_keys_under`].
+async fn list_objects_under(
+    s3: &impl S3Api,
+    bucket: &str,
+    prefix: &str,
+) -> Result<Vec<ObjectSummary>, CompactError> {
     const MAX_PAGES: u32 = 10_000;
     const MAX_KEYS: usize = 1_000_000;
     let mut keys = Vec::new();
@@ -1384,7 +1470,7 @@ async fn list_keys_under(
                 },
             )
             .await?;
-        keys.extend(page.objects.into_iter().map(|o| o.key));
+        keys.extend(page.objects);
         if keys.len() > MAX_KEYS {
             return Err(S3Error::InvalidResponse(format!(
                 "ListObjectsV2 returned more than {MAX_KEYS} keys under {prefix:?}"

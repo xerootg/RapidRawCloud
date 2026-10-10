@@ -60,6 +60,27 @@ const NOW: i64 = 1_769_904_000;
 
 const DAY: i64 = 86_400;
 
+/// The real wall clock in unix seconds — the shared Garage runs on this host,
+/// so it is (to within a second) what the bucket stamps on a freshly PUT
+/// object's `LastModified`.
+fn real_now() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_secs(),
+    )
+    .expect("fits i64")
+}
+
+/// The pinned "server now" for the tombstone-GC test: 31 days after the real
+/// write instant, because GC ages a tombstone by the server-asserted
+/// `LastModified` of its object as well as its body's `server_ts` (`min` of
+/// the two) — same convention as `tests/compact.rs`'s `gc_now`.
+fn gc_now() -> i64 {
+    real_now() + 31 * DAY
+}
+
 // ---------------------------------------------------------------------------
 // Config / small helpers
 // ---------------------------------------------------------------------------
@@ -565,11 +586,12 @@ async fn worker_cycle_gc_destroys_tombstone_past_grace_and_folds_deleted_set() {
     let state = tempfile::tempdir().expect("state dir");
     let cfg = worker_cfg(g, &bucket, Some(state.path().to_path_buf()));
     let worker = Worker::open(&cfg).expect("open worker");
+    let now = gc_now();
 
     let image = rel("gc/old.NEF");
     let content = ContentId::from_bytes(b"gc-old-image-bytes");
     let del_vv = vv(&[(worker.device_id(), 5)]);
-    let server_ts = NOW - 31 * DAY; // past grace (and the cap)
+    let server_ts = now - 31 * DAY; // past grace (and the cap)
 
     put_raw(&client, &bucket, &library_key(&image), b"orig").await;
     put_raw(&client, &bucket, &sidecar_key(&image), b"{}").await;
@@ -613,7 +635,7 @@ async fn worker_cycle_gc_destroys_tombstone_past_grace_and_folds_deleted_set() {
         .expect("deleted row");
 
     let opts = CycleOptions {
-        clock: Some(ServerClock::pinned(NOW)),
+        clock: Some(ServerClock::pinned(now)),
         ..Default::default()
     };
     let report = worker::run_cycle(&worker, &opts).await.expect("cycle");
