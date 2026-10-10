@@ -317,6 +317,25 @@ others.
 
 ---
 
+## 9. Camera ingest dock (ESP32-P4, optional)
+
+`firmware/rrcloud-ingest/` is an ESP-IDF project for the Waveshare
+ESP32-P4-WIFI6-POE-ETH: a PoE-powered dock with a USB-A port. Plug in a
+Nikon Z f / Z 7II (MTP/PTP mode) or a Sigma fp (mass storage) and new
+photos matching your configured globs are uploaded straight into the
+library bucket as journaled originals — the dock speaks the same §2
+protocol as the app (device registry, per-device journal segments,
+per-writer manifest, own-prefix compaction), so phones see the files on
+their next poll and the worker (§8) backfills previews.
+
+It pairs with the service from §6 using the OAuth device-authorization
+grant (the dock shows a code; you approve it in a browser), which needs a
+*device code flow* configured on the Authentik brand — see the firmware's
+[README](../firmware/rrcloud-ingest/README.md) for that one-time step,
+the web admin UI, build/flash instructions and the host test-suite.
+
+---
+
 ## See also
 
 - [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — the normative design (sync

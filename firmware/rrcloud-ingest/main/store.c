@@ -1,0 +1,407 @@
+#include "store.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <dirent.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <errno.h>
+#include "esp_log.h"
+#include "esp_littlefs.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
+static const char *TAG = "store";
+#define LEDGER STORE_BASE "/ledger.tsv"
+#define JDIR STORE_BASE "/journal"
+#define PENDING JDIR "/pending"
+#define SEGMENTS STORE_BASE "/segments.tsv"
+#define KV STORE_BASE "/state.kv"
+
+static SemaphoreHandle_t mtx;
+#define LOCK() xSemaphoreTake(mtx, portMAX_DELAY)
+#define UNLOCK() xSemaphoreGive(mtx)
+
+/* ---- ledger index: open-addressing hash of (source_id, path, size) -> status */
+typedef struct { uint32_t hash; uint8_t status; } idx_slot_t;
+static idx_slot_t *idx;
+static size_t idx_cap, idx_len;
+static size_t ledger_count, uploaded_count;
+static uint64_t uploaded_bytes;
+
+static uint32_t fnv1a(const char *s, uint32_t h) { while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; } return h; }
+static uint32_t key_hash(const char *sid, const char *path, uint64_t size)
+{
+    uint32_t h = fnv1a(sid, 2166136261u);
+    h = fnv1a("\x1f", h);
+    h = fnv1a(path, h);
+    char sz[24]; snprintf(sz, sizeof sz, "\x1f%llu", (unsigned long long)size);
+    return fnv1a(sz, h) | 1u; /* never 0 (0 = empty slot) */
+}
+
+static bool idx_grow(void)
+{
+    size_t ncap = idx_cap ? idx_cap * 2 : 4096;
+    idx_slot_t *n = heap_caps_calloc(ncap, sizeof *n, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!n) n = calloc(ncap, sizeof *n);
+    if (!n) return false;
+    for (size_t i = 0; i < idx_cap; i++) {
+        if (!idx[i].hash) continue;
+        size_t p = idx[i].hash & (ncap - 1);
+        while (n[p].hash) p = (p + 1) & (ncap - 1);
+        n[p] = idx[i];
+    }
+    free(idx); idx = n; idx_cap = ncap;
+    return true;
+}
+
+static void idx_put(uint32_t h, char status)
+{
+    if ((idx_len + 1) * 10 > idx_cap * 7 && !idx_grow()) return;
+    size_t p = h & (idx_cap - 1);
+    while (idx[p].hash && idx[p].hash != h) p = (p + 1) & (idx_cap - 1);
+    if (!idx[p].hash) idx_len++;
+    idx[p].hash = h; idx[p].status = (uint8_t)status;
+}
+
+static char idx_get(uint32_t h)
+{
+    if (!idx_cap) return 0;
+    size_t p = h & (idx_cap - 1);
+    while (idx[p].hash) { if (idx[p].hash == h) return (char)idx[p].status; p = (p + 1) & (idx_cap - 1); }
+    return 0;
+}
+
+static void fsync_file(FILE *f) { fflush(f); fsync(fileno(f)); }
+
+esp_err_t store_init(void)
+{
+    mtx = xSemaphoreCreateMutex();
+    esp_vfs_littlefs_conf_t conf = {
+        .base_path = STORE_BASE,
+        .partition_label = "storage",
+        .format_if_mount_failed = true,
+        .dont_mount = false,
+    };
+    esp_err_t e = esp_vfs_littlefs_register(&conf);
+    if (e != ESP_OK) { ESP_LOGE(TAG, "littlefs mount failed: %s", esp_err_to_name(e)); return e; }
+    mkdir(JDIR, 0777);
+    size_t total, used;
+    store_usage(&total, &used);
+    ESP_LOGI(TAG, "littlefs mounted: %u/%u KiB used", (unsigned)(used / 1024), (unsigned)(total / 1024));
+    return ESP_OK;
+}
+
+void store_usage(size_t *total, size_t *used)
+{
+    size_t t = 0, u = 0;
+    esp_littlefs_info("storage", &t, &u);
+    if (total) *total = t;
+    if (used) *used = u;
+}
+
+/* ---- kv: rewrite-whole-file key=value lines ----------------------------- */
+static bool kv_get(const char *key, char *out, size_t cap)
+{
+    FILE *f = fopen(KV, "r");
+    if (!f) return false;
+    char line[320];
+    bool found = false;
+    size_t kl = strlen(key);
+    while (fgets(line, sizeof line, f)) {
+        if (!strncmp(line, key, kl) && line[kl] == '=') {
+            line[strcspn(line, "\r\n")] = 0;
+            strncpy(out, line + kl + 1, cap - 1); out[cap - 1] = 0;
+            found = true;
+        }
+    }
+    fclose(f);
+    return found;
+}
+
+static esp_err_t kv_set(const char *key, const char *val)
+{
+    char *buf = malloc(4096);
+    if (!buf) return ESP_ERR_NO_MEM;
+    size_t len = 0;
+    FILE *f = fopen(KV, "r");
+    size_t kl = strlen(key);
+    if (f) {
+        char line[320];
+        while (fgets(line, sizeof line, f)) {
+            if (!strncmp(line, key, kl) && line[kl] == '=') continue;
+            size_t n = strlen(line);
+            if (len + n < 4096) { memcpy(buf + len, line, n); len += n; }
+        }
+        fclose(f);
+    }
+    int n = snprintf(buf + len, 4096 - len, "%s=%s\n", key, val);
+    if (n < 0 || (size_t)n >= 4096 - len) { free(buf); return ESP_ERR_NO_MEM; }
+    len += (size_t)n;
+    f = fopen(KV ".tmp", "w");
+    if (!f) { free(buf); return ESP_FAIL; }
+    fwrite(buf, 1, len, f);
+    fsync_file(f);
+    fclose(f);
+    free(buf);
+    if (rename(KV ".tmp", KV) != 0) return ESP_FAIL;
+    return ESP_OK;
+}
+
+esp_err_t store_kv_set_u64(const char *key, uint64_t v) { char b[24]; snprintf(b, sizeof b, "%llu", (unsigned long long)v); LOCK(); esp_err_t e = kv_set(key, b); UNLOCK(); return e; }
+uint64_t store_kv_get_u64(const char *key, uint64_t def) { char b[64]; LOCK(); bool ok = kv_get(key, b, sizeof b); UNLOCK(); return ok ? strtoull(b, NULL, 10) : def; }
+esp_err_t store_kv_set_i64(const char *key, int64_t v) { char b[24]; snprintf(b, sizeof b, "%lld", (long long)v); LOCK(); esp_err_t e = kv_set(key, b); UNLOCK(); return e; }
+int64_t store_kv_get_i64(const char *key, int64_t def) { char b[64]; LOCK(); bool ok = kv_get(key, b, sizeof b); UNLOCK(); return ok ? strtoll(b, NULL, 10) : def; }
+esp_err_t store_kv_set_str(const char *key, const char *v) { LOCK(); esp_err_t e = kv_set(key, v); UNLOCK(); return e; }
+bool store_kv_get_str(const char *key, char *out, size_t cap) { LOCK(); bool ok = kv_get(key, out, cap); UNLOCK(); return ok; }
+
+/* ---- ledger ------------------------------------------------------------- */
+esp_err_t store_ledger_load(void)
+{
+    LOCK();
+    FILE *f = fopen(LEDGER, "r");
+    if (!f) { UNLOCK(); return ESP_OK; }
+    char *line = malloc(2048);
+    if (!line) { fclose(f); UNLOCK(); return ESP_ERR_NO_MEM; }
+    while (fgets(line, 2048, f)) {
+        rrc_ledger_rec r;
+        if (rrc_ledger_parse(line, &r) != 0) continue;
+        idx_put(key_hash(r.source_id, r.source_path, r.size), r.status);
+        ledger_count++;
+        if (r.status == RRC_LEDGER_UPLOADED) { uploaded_count++; uploaded_bytes += r.size; }
+    }
+    free(line);
+    fclose(f);
+    UNLOCK();
+    ESP_LOGI(TAG, "ledger: %u records (%u uploaded)", (unsigned)ledger_count, (unsigned)uploaded_count);
+    return ESP_OK;
+}
+
+char store_ledger_lookup(const char *sid, const char *path, uint64_t size)
+{
+    LOCK();
+    char s = idx_get(key_hash(sid, path, size));
+    UNLOCK();
+    return s;
+}
+
+esp_err_t store_ledger_append(const rrc_ledger_rec *r)
+{
+    char line[2048];
+    int n = rrc_ledger_format(r, line, sizeof line);
+    if (n < 0) return ESP_ERR_INVALID_ARG;
+    LOCK();
+    FILE *f = fopen(LEDGER, "a");
+    if (!f) { UNLOCK(); return ESP_FAIL; }
+    bool ok = fwrite(line, 1, (size_t)n, f) == (size_t)n;
+    fsync_file(f);
+    fclose(f);
+    if (ok) {
+        idx_put(key_hash(r->source_id, r->source_path, r->size), r->status);
+        ledger_count++;
+        if (r->status == RRC_LEDGER_UPLOADED) { uploaded_count++; uploaded_bytes += r->size; }
+    }
+    UNLOCK();
+    return ok ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t store_ledger_foreach_uploaded(store_ledger_cb cb, void *ctx)
+{
+    LOCK();
+    FILE *f = fopen(LEDGER, "r");
+    if (!f) { UNLOCK(); return ESP_OK; }
+    char *line = malloc(2048);
+    if (!line) { fclose(f); UNLOCK(); return ESP_ERR_NO_MEM; }
+    while (fgets(line, 2048, f)) {
+        rrc_ledger_rec r;
+        if (rrc_ledger_parse(line, &r) != 0 || r.status != RRC_LEDGER_UPLOADED) continue;
+        if (cb(ctx, &r)) break;
+    }
+    free(line);
+    fclose(f);
+    UNLOCK();
+    return ESP_OK;
+}
+
+size_t store_ledger_count(void) { return ledger_count; }
+size_t store_ledger_uploaded_count(void) { return uploaded_count; }
+uint64_t store_ledger_uploaded_bytes(void) { return uploaded_bytes; }
+
+/* ---- journal ------------------------------------------------------------ */
+uint64_t store_journal_alloc_seq(void)
+{
+    LOCK();
+    char b[32];
+    uint64_t last = kv_get("last_seq", b, sizeof b) ? strtoull(b, NULL, 10) : 0;
+    uint64_t next = last + 1;
+    snprintf(b, sizeof b, "%llu", (unsigned long long)next);
+    kv_set("last_seq", b);
+    UNLOCK();
+    return next;
+}
+
+esp_err_t store_journal_append_pending(const char *json_line)
+{
+    LOCK();
+    FILE *f = fopen(PENDING, "a");
+    if (!f) { UNLOCK(); return ESP_FAIL; }
+    bool ok = fputs(json_line, f) >= 0 && fputc('\n', f) == '\n';
+    fsync_file(f);
+    fclose(f);
+    UNLOCK();
+    return ok ? ESP_OK : ESP_FAIL;
+}
+
+static void pending_stats(size_t *entries, size_t *bytes)
+{
+    *entries = 0; *bytes = 0;
+    struct stat st;
+    if (stat(PENDING, &st) != 0) return;
+    *bytes = (size_t)st.st_size;
+    FILE *f = fopen(PENDING, "r");
+    if (!f) return;
+    int c;
+    while ((c = fgetc(f)) != EOF) if (c == '\n') (*entries)++;
+    fclose(f);
+}
+
+size_t store_journal_pending_entries(void) { size_t e, b; LOCK(); pending_stats(&e, &b); UNLOCK(); return e; }
+size_t store_journal_pending_bytes(void) { size_t e, b; LOCK(); pending_stats(&e, &b); UNLOCK(); return b; }
+
+/* "seq":N from an entry line */
+static uint64_t line_seq(const char *line)
+{
+    const char *p = strstr(line, "\"seq\":");
+    return p ? strtoull(p + 6, NULL, 10) : 0;
+}
+
+esp_err_t store_journal_freeze(uint64_t *first_seq_out)
+{
+    LOCK();
+    FILE *f = fopen(PENDING, "r");
+    if (!f) { UNLOCK(); return ESP_ERR_NOT_FOUND; }
+    char *line = malloc(2048);
+    uint64_t first = 0;
+    if (line && fgets(line, 2048, f)) first = line_seq(line);
+    free(line);
+    fclose(f);
+    if (!first) { UNLOCK(); return ESP_ERR_NOT_FOUND; }
+    char name[96];
+    char fn[32];
+    rrc_segment_filename(first, fn);
+    snprintf(name, sizeof name, JDIR "/%s", fn);
+    int rc = rename(PENDING, name);
+    UNLOCK();
+    if (rc != 0) return ESP_FAIL;
+    if (first_seq_out) *first_seq_out = first;
+    return ESP_OK;
+}
+
+int store_journal_frozen_list(uint64_t *seqs, size_t cap)
+{
+    LOCK();
+    DIR *d = opendir(JDIR);
+    int n = 0;
+    if (d) {
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL && (size_t)n < cap) {
+            if (strlen(de->d_name) == 26 && !strcmp(de->d_name + 16, ".v1.ndjson")) seqs[n++] = strtoull(de->d_name, NULL, 16);
+        }
+        closedir(d);
+    }
+    UNLOCK();
+    /* insertion sort ascending */
+    for (int i = 1; i < n; i++) { uint64_t v = seqs[i]; int j = i - 1; while (j >= 0 && seqs[j] > v) { seqs[j + 1] = seqs[j]; j--; } seqs[j + 1] = v; }
+    return n;
+}
+
+esp_err_t store_journal_frozen_read(uint64_t first_seq, uint8_t **bytes, size_t *len, uint64_t *max_seq)
+{
+    char name[96], fn[32];
+    rrc_segment_filename(first_seq, fn);
+    snprintf(name, sizeof name, JDIR "/%s", fn);
+    LOCK();
+    FILE *f = fopen(name, "r");
+    if (!f) { UNLOCK(); return ESP_ERR_NOT_FOUND; }
+    struct stat st;
+    stat(name, &st);
+    uint8_t *buf = heap_caps_malloc((size_t)st.st_size + 1, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) buf = malloc((size_t)st.st_size + 1);
+    if (!buf) { fclose(f); UNLOCK(); return ESP_ERR_NO_MEM; }
+    size_t got = fread(buf, 1, (size_t)st.st_size, f);
+    fclose(f);
+    UNLOCK();
+    buf[got] = 0;
+    /* max seq = seq of the last line */
+    uint64_t mx = first_seq;
+    const char *p = (const char *)buf;
+    for (;;) {
+        const char *nl = strchr(p, '\n');
+        uint64_t s = line_seq(p);
+        if (s > mx) mx = s;
+        if (!nl || !nl[1]) break;
+        p = nl + 1;
+    }
+    *bytes = buf; *len = got; if (max_seq) *max_seq = mx;
+    return ESP_OK;
+}
+
+esp_err_t store_journal_mark_published(uint64_t first_seq, uint64_t max_seq, int64_t server_ts)
+{
+    char name[96], fn[32];
+    rrc_segment_filename(first_seq, fn);
+    snprintf(name, sizeof name, JDIR "/%s", fn);
+    LOCK();
+    FILE *f = fopen(SEGMENTS, "a");
+    if (!f) { UNLOCK(); return ESP_FAIL; }
+    fprintf(f, "%llu\t%llu\t%lld\n", (unsigned long long)first_seq, (unsigned long long)max_seq, (long long)server_ts);
+    fsync_file(f);
+    fclose(f);
+    char b[32];
+    uint64_t cur = kv_get("published_cursor", b, sizeof b) ? strtoull(b, NULL, 10) : 0;
+    if (max_seq > cur) { snprintf(b, sizeof b, "%llu", (unsigned long long)max_seq); kv_set("published_cursor", b); }
+    unlink(name);
+    UNLOCK();
+    return ESP_OK;
+}
+
+uint64_t store_journal_published_cursor(void) { return store_kv_get_u64("published_cursor", 0); }
+
+int store_segments_list(store_segment_t *out, size_t cap)
+{
+    LOCK();
+    FILE *f = fopen(SEGMENTS, "r");
+    int n = 0;
+    if (f) {
+        char line[96];
+        while (fgets(line, sizeof line, f) && (size_t)n < cap) {
+            unsigned long long a, b; long long c;
+            if (sscanf(line, "%llu\t%llu\t%lld", &a, &b, &c) == 3) { out[n].first_seq = a; out[n].max_seq = b; out[n].published_server_ts = c; n++; }
+        }
+        fclose(f);
+    }
+    UNLOCK();
+    return n;
+}
+
+esp_err_t store_segments_remove(uint64_t first_seq)
+{
+    LOCK();
+    FILE *f = fopen(SEGMENTS, "r");
+    if (!f) { UNLOCK(); return ESP_OK; }
+    FILE *t = fopen(SEGMENTS ".tmp", "w");
+    if (!t) { fclose(f); UNLOCK(); return ESP_FAIL; }
+    char line[96];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long long a;
+        if (sscanf(line, "%llu", &a) == 1 && a == first_seq) continue;
+        fputs(line, t);
+    }
+    fclose(f);
+    fsync_file(t);
+    fclose(t);
+    int rc = rename(SEGMENTS ".tmp", SEGMENTS);
+    UNLOCK();
+    return rc == 0 ? ESP_OK : ESP_FAIL;
+}

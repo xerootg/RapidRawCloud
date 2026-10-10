@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RapidRawCloud dock</title>
+<style>
+  :root { color-scheme: light dark; --bg:#fff; --fg:#1b1b1b; --muted:#666; --card:#f4f4f6; --accent:#2b6cb0; --ok:#1a7f37; --warn:#b7791f; --err:#c53030; --border:#ddd; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#121214; --fg:#eaeaea; --muted:#9a9a9a; --card:#1d1d21; --accent:#63a4ff; --ok:#4ade80; --warn:#f6ad55; --err:#fc8181; --border:#333; } }
+  body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--fg); margin: 0; padding: 0 16px 48px; line-height: 1.45; }
+  main { max-width: 860px; margin: 0 auto; }
+  h1 { font-size: 1.35rem; margin: 20px 0 4px; } h2 { font-size: 1.05rem; margin: 0 0 10px; }
+  .sub { color: var(--muted); font-size: .9rem; margin-bottom: 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+  .kv { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; font-size: .92rem; } .kv div:nth-child(odd) { color: var(--muted); }
+  label { display: block; margin: 10px 0 3px; font-weight: 600; font-size: .9rem; }
+  input[type=text], input[type=password], input[type=number], input[type=url] { width: 100%; box-sizing: border-box; padding: 8px; font-size: .95rem; border: 1px solid var(--border); border-radius: 6px; background: var(--bg); color: var(--fg); }
+  .check { font-weight: 400; display: flex; align-items: center; gap: 8px; }
+  button { padding: 8px 14px; font-size: .95rem; border-radius: 6px; border: 1px solid var(--border); background: var(--accent); color: #fff; cursor: pointer; margin: 8px 8px 0 0; }
+  button.secondary { background: transparent; color: var(--fg); }
+  button:disabled { opacity: .5; cursor: default; }
+  .note { color: var(--muted); font-size: .85rem; }
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: .8rem; font-weight: 600; background: var(--border); }
+  .pill.ok { background: var(--ok); color: #fff; } .pill.warn { background: var(--warn); color: #fff; } .pill.err { background: var(--err); color: #fff; }
+  progress { width: 100%; height: 10px; }
+  pre { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px; max-height: 320px; overflow: auto; font-size: .8rem; white-space: pre-wrap; }
+  code { background: rgba(127,127,127,.15); padding: 1px 4px; border-radius: 3px; }
+  .row { display: flex; gap: 12px; } .row > div { flex: 1; }
+  #toast { position: fixed; bottom: 16px; left: 50%; transform: translateX(-50%); background: var(--fg); color: var(--bg); padding: 8px 14px; border-radius: 8px; display: none; }
+  .bigcode { font-size: 1.6rem; letter-spacing: .12em; font-weight: 700; }
+</style>
+</head>
+<body>
+<main>
+  <h1>RapidRawCloud camera dock</h1>
+  <div class="sub" id="sub">loading…</div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Status <span id="phase" class="pill">…</span></h2>
+      <div class="kv">
+        <div>Camera</div><div id="camera">—</div>
+        <div>Cloud</div><div id="cloud">—</div>
+        <div>Network</div><div id="network">—</div>
+        <div>Clock</div><div id="clock">—</div>
+        <div>Uploaded (lifetime)</div><div id="lifetime">—</div>
+        <div>Journal</div><div id="journal">—</div>
+        <div>Last run</div><div id="lastrun">—</div>
+      </div>
+      <div id="progwrap" style="display:none; margin-top:10px">
+        <div id="curfile" class="note"></div>
+        <progress id="prog" max="100" value="0"></progress>
+        <div id="runstats" class="note"></div>
+      </div>
+      <div id="lasterr" class="note" style="color:var(--err)"></div>
+      <button id="syncnow">Sync now</button>
+      <button id="synccancel" class="secondary">Cancel</button>
+    </section>
+
+    <section class="card">
+      <h2>Pair with cloud</h2>
+      <p class="note">Type your pairing service address once; the dock signs in with a device code and configures its bucket itself (same account as your RapidRAW app).</p>
+      <label for="pairurl">Pairing service</label>
+      <input id="pairurl" type="text" placeholder="rrc.example.com">
+      <button id="pairbegin">Pair</button>
+      <button id="paircancel" class="secondary">Cancel</button>
+      <div id="pairbox" style="display:none; margin-top:10px">
+        <div class="note" id="pairmsg"></div>
+        <div id="paircodewrap" style="display:none">
+          <p>Open <a id="pairlink" href="#" target="_blank" rel="noopener">this link</a> and enter the code:</p>
+          <div class="bigcode" id="paircode"></div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <form id="cfg" class="card" style="margin-top:14px" onsubmit="return false">
+    <h2>What to sync</h2>
+    <label class="check"><input type="checkbox" id="auto_sync"> Start a sync automatically when a camera is plugged in</label>
+    <label for="include_globs">Include patterns</label>
+    <input id="include_globs" type="text" placeholder="*.nef *.dng *.jpg">
+    <div class="note">Space/comma separated globs, case-insensitive. <code>*</code> within a folder, <code>**</code> across folders, <code>?</code>, <code>[abc]</code>. A pattern without <code>/</code> matches the file name; with <code>/</code> it matches the camera-relative path (e.g. <code>DCIM/100NIKON/*.NEF</code>).</div>
+    <label for="exclude_globs">Exclude patterns</label>
+    <input id="exclude_globs" type="text" placeholder="*_small.jpg">
+    <label class="check"><input type="checkbox" id="upload_videos"> Also upload videos (<code>*.mov *.mp4</code>)</label>
+    <div class="row">
+      <div><label for="min_size_kb">Skip files smaller than (KB)</label><input id="min_size_kb" type="number" min="0"></div>
+      <div><label for="msc_root">Card folder to scan (mass-storage cameras)</label><input id="msc_root" type="text" placeholder="DCIM"></div>
+    </div>
+    <label for="key_template">Library path template</label>
+    <input id="key_template" type="text" placeholder="Camera Import/{model}/{yyyy}/{mm}/{dd}/{name}">
+    <div class="note">Where files land under <code>library/</code>. Placeholders: <code>{name}</code> <code>{stem}</code> <code>{ext}</code> <code>{path}</code> (camera folder) <code>{model}</code> <code>{serial}</code> <code>{yyyy}</code> <code>{mm}</code> <code>{dd}</code> <code>{hh}</code> from the capture time.</div>
+
+    <h2 style="margin-top:22px">Cloud (manual)</h2>
+    <div class="note">Filled in automatically by pairing. Edit only for a bucket without a pairing service.</div>
+    <label for="s3_endpoint">S3 endpoint</label><input id="s3_endpoint" type="text" placeholder="https://s3.example.com">
+    <div class="row">
+      <div><label for="s3_bucket">Bucket</label><input id="s3_bucket" type="text"></div>
+      <div><label for="s3_region">Region</label><input id="s3_region" type="text" placeholder="garage"></div>
+    </div>
+    <label for="s3_access_key">Access key ID</label><input id="s3_access_key" type="text" autocomplete="off">
+    <label for="s3_secret_key">Secret access key <span class="note" id="secrethint"></span></label><input id="s3_secret_key" type="password" autocomplete="off" placeholder="leave blank to keep">
+    <label class="check"><input type="checkbox" id="s3_tls_insecure"> Skip TLS certificate verification (self-signed endpoint)</label>
+
+    <h2 style="margin-top:22px">Device</h2>
+    <div class="row">
+      <div><label for="device_name">Name in the device registry</label><input id="device_name" type="text"></div>
+      <div><label for="hostname">Hostname (mDNS <span id="mdns">rrcloud-ingest</span>.local)</label><input id="hostname" type="text"></div>
+    </div>
+    <div class="row">
+      <div><label for="wifi_ssid">Wi-Fi SSID (optional; Ethernet is always on)</label><input id="wifi_ssid" type="text"></div>
+      <div><label for="wifi_password">Wi-Fi password</label><input id="wifi_password" type="password" autocomplete="off" placeholder="leave blank to keep"></div>
+    </div>
+    <label class="check"><input type="checkbox" id="admin_auth"> Require a password for this page (user <code>admin</code>)</label>
+    <input id="admin_password" type="password" autocomplete="new-password" placeholder="admin password (leave blank to keep)">
+    <div>
+      <button id="save">Save</button>
+      <button id="reboot" class="secondary">Reboot</button>
+    </div>
+    <div class="note" id="devid"></div>
+  </form>
+
+  <section class="card" style="margin-top:14px">
+    <h2>Log</h2>
+    <pre id="log">…</pre>
+  </section>
+</main>
+<div id="toast"></div>
+<script>
+const $ = id => document.getElementById(id);
+const fmtBytes = n => { n = Number(n||0); const u=['B','KiB','MiB','GiB','TiB']; let i=0; while (n>=1024 && i<u.length-1) { n/=1024; i++; } return n.toFixed(i?1:0)+' '+u[i]; };
+const fmtTs = t => t ? new Date(t*1000).toLocaleString() : 'never';
+let toastT; function toast(m){ const t=$('toast'); t.textContent=m; t.style.display='block'; clearTimeout(toastT); toastT=setTimeout(()=>t.style.display='none', 3500); }
+async function api(path, body){ const r = await fetch(path, body!==undefined ? {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)} : {}); const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||('HTTP '+r.status)); return j; }
+
+const strFields = ['include_globs','exclude_globs','msc_root','key_template','s3_endpoint','s3_bucket','s3_region','s3_access_key','device_name','hostname','wifi_ssid'];
+const boolFields = ['auto_sync','upload_videos','s3_tls_insecure','admin_auth'];
+async function loadConfig(){
+  const c = await api('/api/config');
+  strFields.forEach(f => $(f).value = c[f] ?? '');
+  boolFields.forEach(f => $(f).checked = !!c[f]);
+  $('min_size_kb').value = c.min_size_kb ?? 0;
+  $('pairurl').value = $('pairurl').value || c.pairing_url || '';
+  $('secrethint').textContent = c.has_s3_secret ? '(stored)' : '(not set)';
+  $('mdns').textContent = c.hostname || 'rrcloud-ingest';
+  $('devid').textContent = 'Device id: ' + c.device_id;
+}
+$('save').onclick = async () => {
+  const c = {}; strFields.forEach(f => c[f] = $(f).value.trim()); boolFields.forEach(f => c[f] = $(f).checked);
+  c.min_size_kb = Number($('min_size_kb').value||0);
+  if ($('s3_secret_key').value) c.s3_secret_key = $('s3_secret_key').value;
+  if ($('wifi_password').value) c.wifi_password = $('wifi_password').value;
+  if ($('admin_password').value) c.admin_password = $('admin_password').value;
+  try { await api('/api/config', c); toast('Saved'); $('s3_secret_key').value=''; $('wifi_password').value=''; $('admin_password').value=''; await loadConfig(); }
+  catch (e) { toast('Save failed: ' + e.message); }
+};
+$('reboot').onclick = async () => { if (confirm('Reboot the dock?')) { try { await api('/api/reboot', {}); toast('Rebooting…'); } catch(e){} } };
+$('syncnow').onclick = () => api('/api/sync/now', {}).then(()=>toast('Sync requested')).catch(e=>toast(e.message));
+$('synccancel').onclick = () => api('/api/sync/cancel', {}).then(()=>toast('Cancelling')).catch(e=>toast(e.message));
+$('pairbegin').onclick = async () => { try { await api('/api/pair/begin', {url: $('pairurl').value.trim()}); $('pairbox').style.display='block'; pollPair(); } catch(e) { toast(e.message); } };
+$('paircancel').onclick = () => api('/api/pair/cancel', {}).catch(()=>{});
+
+let pairTimer;
+async function pollPair(){
+  clearTimeout(pairTimer);
+  try {
+    const p = await api('/api/pair/status');
+    $('pairbox').style.display = p.state==='idle' ? 'none' : 'block';
+    $('pairmsg').textContent = p.state + (p.message ? ' — ' + p.message : '');
+    const show = (p.state==='waiting_user' || p.state==='polling') && p.user_code;
+    $('paircodewrap').style.display = show ? 'block' : 'none';
+    if (show) { $('paircode').textContent = p.user_code; $('pairlink').href = p.verification_uri_complete || p.verification_uri; $('pairlink').textContent = p.verification_uri || 'this link'; }
+    if (p.state==='done') { toast('Paired'); loadConfig(); }
+    if (p.state!=='done' && p.state!=='failed' && p.state!=='idle') pairTimer = setTimeout(pollPair, 2000);
+  } catch(e) {}
+}
+
+const phaseClass = { idle:'ok', uploading:'ok', publishing:'ok', enumerating:'ok', error:'err', unconfigured:'warn', waiting_network:'warn' };
+async function refresh(){
+  try {
+    const s = await api('/api/status'); const y = s.sync;
+    $('sub').textContent = `${s.hostname} · firmware ${s.version} · up ${Math.floor(s.uptime_s/3600)}h${Math.floor(s.uptime_s%3600/60)}m · heap ${fmtBytes(s.heap_free)} / psram ${fmtBytes(s.psram_free)} · ledger ${fmtBytes(s.storage_used)} of ${fmtBytes(s.storage_total)}`;
+    const ph = $('phase'); ph.textContent = y.phase; ph.className = 'pill ' + (phaseClass[y.phase]||'');
+    $('camera').textContent = y.camera_attached ? `${y.camera_model}${y.camera_serial? ' (sn '+y.camera_serial+')':''} via ${y.camera_kind.toUpperCase()}` : 'none attached';
+    $('cloud').textContent = y.s3_ready ? ('configured' + (y.digest_check_known ? (y.backend_rejects_bad_md5 ? ', backend verifies Content-MD5' : ', read-back verification') : '')) : 'not configured — pair or enter S3 settings';
+    $('network').textContent = s.network + (s.eth_link ? '' : ' (no ethernet link)');
+    $('clock').textContent = s.time_synced ? s.time : 'not synchronized';
+    $('lifetime').textContent = `${y.lifetime_uploaded} files, ${fmtBytes(y.lifetime_bytes)}`;
+    $('journal').textContent = `published seq ${y.published_cursor}, ${y.pending_entries} pending, manifest ${fmtTs(y.last_manifest_ts)}, heartbeat ${fmtTs(y.last_heartbeat_ts)}`;
+    $('lastrun').textContent = fmtTs(y.last_run_ts);
+    const active = y.phase==='uploading' || y.phase==='enumerating' || y.phase==='publishing';
+    $('progwrap').style.display = active ? 'block' : 'none';
+    if (active) { $('curfile').textContent = y.current_file ? `${y.current_file} — ${fmtBytes(y.current_done)} / ${fmtBytes(y.current_size)}` : (y.phase==='enumerating' ? 'scanning camera…' : 'publishing journal…'); $('prog').value = y.current_size ? 100*y.current_done/y.current_size : 0; $('runstats').textContent = `${y.run_done} uploaded · ${y.run_skipped} skipped · ${y.run_failed} failed · ${y.run_total} queued · ${fmtBytes(y.run_bytes)}`; }
+    $('lasterr').textContent = y.last_error ? 'Last error: ' + y.last_error : '';
+    $('syncnow').disabled = !y.camera_attached || active; $('synccancel').disabled = !active;
+    const log = await api('/api/log'); $('log').textContent = log.join('\n'); 
+  } catch (e) { $('sub').textContent = 'connection lost… ' + e.message; }
+}
+loadConfig().then(pollPair); refresh(); setInterval(refresh, 2000);
+</script>
+</body>
+</html>

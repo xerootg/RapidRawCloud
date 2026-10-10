@@ -1,0 +1,128 @@
+CASE put_simple_https
+METHOD PUT
+REGION garage
+HOST garage.example.com
+PATH /rapidraw-cloud/library/Camera Import/NIKON Z f/2026/10/10/DSC_0001.NEF
+HDR content-md5	Xy8Ouv1/kNkgkBzWyOqTXA==
+HDR content-type	application/octet-stream
+HDR x-amz-meta-rrc-device	0f6b2a1e-1111-4222-8333-944444444444
+DATE 20261010T045435Z
+PAYLOAD 547860ac8de4d10e2869ea8c7dd30c19dbe6160740fd42c31565124e9856ea82
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/garage/s3/aws4_request, SignedHeaders=content-md5;content-type;host;x-amz-content-sha256;x-amz-date;x-amz-meta-rrc-device, Signature=333c3d58dbf667a4fa61a3ba9cdb2f82ae2372d8931d02dcf59552acead6a667
+END
+CASE put_simple_http_signed_payload
+METHOD PUT
+REGION garage
+HOST 192.168.1.50:3900
+PATH /bucket/library/a+b c/x & y.jpg
+HDR content-md5	Xy8Ouv1/kNkgkBzWyOqTXA==
+HDR content-type	image/jpeg
+DATE 20261010T045435Z
+PAYLOAD 547860ac8de4d10e2869ea8c7dd30c19dbe6160740fd42c31565124e9856ea82
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/garage/s3/aws4_request, SignedHeaders=content-md5;content-type;host;x-amz-content-sha256;x-amz-date, Signature=9d53f79e719b43c58de4e94c2a2a61b33a6984d22264642b3183e2a9d27ec771
+END
+CASE head
+METHOD HEAD
+REGION garage
+HOST 192.168.1.50:3900
+PATH /bucket/library/a+b c/x.jpg
+DATE 20261010T045435Z
+PAYLOAD e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/garage/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=00189b03d0ef6d638fef0774da585cef382e7382437226629d1aa6ec7c0ec1e3
+END
+CASE get_range
+METHOD GET
+REGION garage
+HOST garage.example.com
+PATH /bucket/.rrcloud/v1/manifests/x.json.gz
+HDR range	bytes=0-1023
+DATE 20261010T045435Z
+PAYLOAD e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/garage/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=dff91fe4db4c6a3ba51709358c72dfabd50d674f44ad0a0aa6e7c53c569c9cc2
+END
+CASE create_multipart
+METHOD POST
+REGION garage
+HOST garage.example.com
+PATH /bucket/library/big.NEF
+QUERY uploads	
+HDR content-type	application/octet-stream
+DATE 20261010T045435Z
+PAYLOAD e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/garage/s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=27b0157ff56034e2411c30f66d2ccfd2c0bda1b0bed825d786741270331264d1
+END
+CASE upload_part
+METHOD PUT
+REGION garage
+HOST garage.example.com
+PATH /bucket/library/big.NEF
+QUERY partNumber	3
+QUERY uploadId	abc+def==
+HDR content-md5	Xy8Ouv1/kNkgkBzWyOqTXA==
+DATE 20261010T045435Z
+PAYLOAD 547860ac8de4d10e2869ea8c7dd30c19dbe6160740fd42c31565124e9856ea82
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/garage/s3/aws4_request, SignedHeaders=content-md5;host;x-amz-content-sha256;x-amz-date, Signature=d72b11b831d665f5d9209d41335caf245638623902d13919f2bed9a7cbfbdc84
+END
+CASE complete_multipart
+METHOD POST
+REGION garage
+HOST garage.example.com
+PATH /bucket/library/big.NEF
+QUERY uploadId	abc
+HDR content-type	application/xml
+DATE 20261010T045435Z
+PAYLOAD 6e842b84ed8c34f3a66be9ed68a3e53471da531989f7efd4dbaf7bc54b0e1f31
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/garage/s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=4594a4543aec528c397a8bbdad6c56d674463d508589e20f60e965999ad99714
+END
+CASE delete
+METHOD DELETE
+REGION garage
+HOST garage.example.com
+PATH /bucket/.rrcloud/v1/journal/dev/0000000000000001.v1.ndjson
+DATE 20261010T045435Z
+PAYLOAD e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/garage/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=548a5448391613e15ea404a4b7a66b24e15d50caa2d52be0470a3771067a2302
+END
+CASE list
+METHOD GET
+REGION garage
+HOST garage.example.com
+PATH /bucket/
+QUERY list-type	2
+QUERY prefix	.rrcloud/v1/journal/
+QUERY max-keys	1000
+DATE 20261010T045435Z
+PAYLOAD e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/garage/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=97739a9a635758a9f00b85db873db5d601db9fc3cff4a6938ae8edf569df9a12
+END
+CASE unicode_key
+METHOD PUT
+REGION garage
+HOST garage.example.com
+PATH /bucket/library/café/写真 (1).JPG
+HDR content-type	image/jpeg
+DATE 20261010T045435Z
+PAYLOAD 547860ac8de4d10e2869ea8c7dd30c19dbe6160740fd42c31565124e9856ea82
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/garage/s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date, Signature=6af47953ac812941b79acbaea17c285ebd7965e8f37829a53f57482875e1b22f
+END
+CASE header_whitespace
+METHOD PUT
+REGION us-east-1
+HOST s3.us-east-1.amazonaws.com
+PATH /bucket/k
+HDR content-type	  text/plain   
+HDR x-amz-meta-note	a   b  c
+DATE 20261010T045435Z
+PAYLOAD 547860ac8de4d10e2869ea8c7dd30c19dbe6160740fd42c31565124e9856ea82
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/us-east-1/s3/aws4_request, SignedHeaders=content-type;host;x-amz-content-sha256;x-amz-date;x-amz-meta-note, Signature=3846ffb5bc008855a411b7ba94e5ff10163193fe7071c74db1f3b1ebd0d22b4d
+END
+CASE abort_multipart
+METHOD DELETE
+REGION garage
+HOST garage.example.com
+PATH /bucket/library/big.NEF
+QUERY uploadId	zz
+DATE 20261010T045435Z
+PAYLOAD e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+AUTH AWS4-HMAC-SHA256 Credential=GKexampleaccesskey/20261010/garage/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=8a664a91bd0579bba962a99ee2b4fe232e84e88470eff0eb417822223d78a318
+END
