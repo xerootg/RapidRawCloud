@@ -206,6 +206,22 @@ self-hosters who already run [Authentik](https://goauthentik.io/), the
     a browser, not on the phone); the service writes your `config.json`.
     Return visits show a "paired" page and let you edit the settings — your
     "knobs and dials" are managed here, in the cloud.
+
+    The service requires the env `BROWSER_PROXY_SECRET` (≥16 bytes; it
+    refuses to start without one) and only serves `/` and `/save` when the
+    request carries `X-Rrcloud-Proxy-Secret` equal to it. That header is
+    injected at the edge by a Traefik `headers` middleware chained *after*
+    forward-auth, so the pod is useless to in-cluster callers and to an
+    ingress without forward-auth (a request without the secret gets a
+    `401`, whatever `X-Authentik-Username` it forges). See
+    `deploy/helm/rapidraw-cloud/README.md` for the Secret key
+    `browser-proxy-secret` and the matching
+    `pairing.ingressRoute.browserProxySecret` value. `POST /save`
+    additionally refuses cross-site posts with a `403` (Fetch Metadata
+    `Sec-Fetch-Site`, else an `Origin`/`Referer` host check; this runs
+    before the proxy-secret check, so a post with no provenance headers at
+    all is a `403`), and the fleet worker only accepts public `https://`
+    library endpoints.
   - **App** route `/api/config` validates an OIDC/PKCE bearer token
     (Authentik) and returns your stored config so the app configures
     itself — zero typing on the device.
