@@ -408,7 +408,14 @@ async fn api_pairing_info(State(state): State<Arc<AppState>>) -> Response {
         "issuer": state.config.oidc_issuer_url,
         "clientId": state.config.oidc_client_id,
         "configEndpoint": "/api/config",
+        // Kept for older clients; `redirectUris` is the full list.
         "redirectUri": "rapidraw://auth-callback",
+        // Every app that pairs through this service, each with its own
+        // scheme so two apps on one phone never fight over a callback. The
+        // Authentik provider must list all of them as allowed redirect URIs.
+        //  - RapidRAW (the editor):            rapidraw://auth-callback
+        //  - Raw2DNG (RawImageSnapseedBridge): raw2dng://auth-callback
+        "redirectUris": ["rapidraw://auth-callback", "raw2dng://auth-callback"],
     }))
     .into_response()
 }
