@@ -4536,3 +4536,209 @@ pub fn sync_metadata_to_xmp(source_path: &Path, metadata: &ImageMetadata, create
         let _ = fs::write(&xmp_file, content);
     }
 }
+
+#[cfg(all(test, any(windows, target_os = "linux")))]
+mod import_date_format_tests {
+    //! Regression: `import_files` hands the webview-supplied
+    //! `ImportSettings::date_folder_format` straight to chrono
+    //! (`file_date.format(&date_format_str).to_string()`). chrono 0.4.45 panics
+    //! in `to_string()` on an invalid specifier such as `%Q` ("a Display
+    //! implementation returned an error unexpectedly"). The panic happens
+    //! inside the `spawn_blocking` task the command never awaits, so the
+    //! process survives, `import_files` has already returned `Ok(())`, and
+    //! neither `import-error` nor `import-complete` is ever emitted: the UI
+    //! hangs on the import dialog.
+    //!
+    //! Expected behavior: the format string is validated up front and the
+    //! command returns `Err(..)` naming the format, before any file is
+    //! touched. The positive control proves a valid `%Y/%m` still lands the
+    //! file in `<dest>/<YYYY>/<MM>/`.
+    //!
+    //! Harness: `import_files` takes the concrete `tauri::AppHandle`
+    //! (`AppHandle<Wry>`), so `tauri::test::mock_builder()` (MockRuntime)
+    //! cannot drive it. A real `Wry` app is built headless on a parked helper
+    //! thread (`Builder::any_thread`, the app's own `generate_context!()`,
+    //! whose only window is `create: false`, so no webview is made) and shared
+    //! by the tests; on Linux that needs a display, so run under
+    //! `xvfb-run -a cargo test --lib import_date_format_tests`. Without a
+    //! display the tests print `SKIP` and return, mirroring the Garage e2e
+    //! suite. The module lives in-file because `file_management` is private
+    //! and has no `sync::`-style test seam for this command.
+
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Duration;
+
+    use tauri::{AppHandle, Listener};
+
+    use super::{ImportSettings, import_files};
+
+    /// Serializes the tests: they share one `AppHandle`, and a stray
+    /// `import-complete` from a sibling test running in parallel would be
+    /// indistinguishable from this test's own.
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// One headless `Wry` app for the whole test process, kept alive on a
+    /// parked thread. `None` when there is no display to initialize GTK on.
+    fn app_handle() -> Option<AppHandle> {
+        static HANDLE: OnceLock<Option<AppHandle>> = OnceLock::new();
+        HANDLE
+            .get_or_init(|| {
+                if cfg!(target_os = "linux")
+                    && std::env::var_os("DISPLAY").is_none()
+                    && std::env::var_os("WAYLAND_DISPLAY").is_none()
+                {
+                    eprintln!(
+                        "SKIP: no display; run `xvfb-run -a cargo test --lib \
+                         import_date_format_tests` to exercise import_files"
+                    );
+                    return None;
+                }
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let app = tauri::Builder::<tauri::Wry>::default()
+                        .any_thread()
+                        .build(tauri::generate_context!())
+                        .expect("build headless Wry app");
+                    let _ = tx.send(app.handle().clone());
+                    // Keep the app (and its runtime) alive for the whole
+                    // process; `park` may return spuriously, so loop.
+                    loop {
+                        std::thread::park();
+                    }
+                });
+                Some(rx.recv().expect("app thread handed back a handle"))
+            })
+            .clone()
+    }
+
+    /// A small valid JPEG plus a primary `.rrdata` sidecar carrying a fixed
+    /// `DateTimeOriginal`, so the date folder is deterministic
+    /// (`get_creation_date_from_path` reads the sidecar's exif map first).
+    fn source_photo(dir: &Path) -> PathBuf {
+        let jpeg = dir.join("photo.jpg");
+        image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
+            8,
+            8,
+            image::Rgb([200, 120, 40]),
+        ))
+        .save_with_format(&jpeg, image::ImageFormat::Jpeg)
+        .expect("write fixture jpeg");
+        fs::write(
+            dir.join("photo.jpg.rrdata"),
+            r#"{"version":1,"rating":0,"adjustments":{},"exif":{"DateTimeOriginal":"2021:07:15 12:00:00"}}"#,
+        )
+        .expect("write fixture sidecar");
+        jpeg
+    }
+
+    fn settings(date_folder_format: &str) -> ImportSettings {
+        ImportSettings {
+            filename_template: "{original_filename}".to_string(),
+            organize_by_date: true,
+            date_folder_format: date_folder_format.to_string(),
+            delete_after_import: false,
+        }
+    }
+
+    /// Runs one import and reports (command result, first terminal event
+    /// within `wait`, number of entries created under `dest`).
+    fn run_import(
+        app: &AppHandle,
+        date_folder_format: &str,
+        wait: Duration,
+    ) -> (
+        Result<(), String>,
+        Result<&'static str, RecvTimeoutError>,
+        usize,
+        PathBuf,
+    ) {
+        let src = tempfile::tempdir().expect("source dir");
+        let dest = tempfile::tempdir().expect("destination dir");
+        let jpeg = source_photo(src.path());
+
+        let (tx, rx) = mpsc::channel();
+        let tx_complete = tx.clone();
+        let complete = app.listen_any("import-complete", move |_| {
+            let _ = tx_complete.send("import-complete");
+        });
+        let tx_error = tx.clone();
+        let error = app.listen_any("import-error", move |_| {
+            let _ = tx_error.send("import-error");
+        });
+
+        let result = tauri::async_runtime::block_on(import_files(
+            vec![jpeg.to_string_lossy().into_owned()],
+            dest.path().to_string_lossy().into_owned(),
+            settings(date_folder_format),
+            app.clone(),
+        ));
+        let outcome = rx.recv_timeout(wait);
+
+        app.unlisten(complete);
+        app.unlisten(error);
+
+        let created = fs::read_dir(dest.path()).map(Iterator::count).unwrap_or(0);
+        let dest_path = dest.keep();
+        let _ = src;
+        (result, outcome, created, dest_path)
+    }
+
+    #[test]
+    fn invalid_date_folder_format_is_rejected_before_any_file_is_touched() {
+        let _serial = serial();
+        let Some(app) = app_handle() else {
+            return;
+        };
+
+        let (result, outcome, created, dest) = run_import(&app, "%Q", Duration::from_secs(5));
+        let _ = fs::remove_dir_all(&dest);
+
+        match result {
+            Err(e) => {
+                assert!(
+                    e.contains("%Q") || e.to_lowercase().contains("format"),
+                    "error should name the rejected date folder format, got: {e}"
+                );
+                assert_eq!(
+                    created, 0,
+                    "an invalid format must be rejected before anything is written"
+                );
+            }
+            Ok(()) => panic!(
+                "import_files accepted date_folder_format \"%Q\" and returned Ok(()). \
+                 Terminal event within 5s: {outcome:?} (Err(Timeout) = neither \
+                 import-error nor import-complete was emitted: chrono panicked inside \
+                 the un-awaited spawn_blocking task, so the UI would hang). \
+                 Entries created under the destination: {created}. Expected Err(..) \
+                 naming the format, before any file is touched."
+            ),
+        }
+    }
+
+    #[test]
+    fn valid_date_folder_format_imports_into_year_month_subfolder() {
+        let _serial = serial();
+        let Some(app) = app_handle() else {
+            return;
+        };
+
+        let (result, outcome, _created, dest) = run_import(&app, "%Y/%m", Duration::from_secs(10));
+        let imported = dest.join("2021").join("07").join("photo.jpg");
+        let exists = imported.exists();
+        let _ = fs::remove_dir_all(&dest);
+
+        assert_eq!(result, Ok(()), "a valid format must import");
+        assert_eq!(
+            outcome,
+            Ok("import-complete"),
+            "the import task must finish and emit import-complete"
+        );
+        assert!(exists, "expected {} to exist", imported.display());
+    }
+}
