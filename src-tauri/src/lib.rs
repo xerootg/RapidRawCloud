@@ -37,7 +37,7 @@ mod denoising;
 mod effect_maps;
 mod exif_processing;
 mod export_processing;
-mod file_management;
+pub mod file_management;
 mod focus_stacking;
 mod fog;
 mod formats;
