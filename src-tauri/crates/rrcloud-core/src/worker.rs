@@ -78,7 +78,9 @@ use crate::publisher::{
     PublisherError,
 };
 use crate::reader::{poll, ReaderError};
-use crate::s3::{ListObjectsV2Request, PutObjectOptions, S3Client, S3Config, S3Error};
+use crate::s3::{
+    ListObjectsV2Request, ObjectSummary, PutObjectOptions, S3Client, S3Config, S3Error,
+};
 use crate::semhash::{Blake3Hex, ContentId};
 use crate::state::{ItemRecord, ItemState, StateError, SyncDb};
 use crate::transfer::{
@@ -115,6 +117,20 @@ const MAX_ADOPT_ORIGINAL_BYTES: usize = 2 * 1024 * 1024 * 1024;
 /// its creation time) is abandoned and aborted. 24 h is well past any
 /// legitimate single transfer, mobile networks included.
 const STALE_UPLOAD_MAX_AGE_SECS: i64 = 24 * 3600;
+
+/// Page cap for the worker's `ListObjectsV2` loops ([`list_library_keys`],
+/// [`list_preview_content_ids`]): a backend that keeps answering truncated
+/// pages is refused instead of paged forever. Mirrors the function-local
+/// `MAX_PAGES` in `reader::list_journal_keys` and `compact::list_keys_under`.
+const LIST_MAX_PAGES: u32 = 10_000;
+
+/// Buffered-key cap for the same loops. `library/` legitimately holds
+/// originals plus sidecars for large libraries, so this takes the looser of
+/// the sibling bounded listers' caps (`compact::list_keys_under`'s
+/// 1_000_000 for the control-plane prefixes, not `reader::list_journal_keys`'s
+/// 100_000 journal bound); past it the bucket is hostile or badly broken and
+/// we refuse before buffering order-of-GB of key Strings.
+const LIST_MAX_KEYS: usize = 1_000_000;
 
 /// The default `--daemon` interval (§6: "also `--daemon --interval 15m`").
 pub const DEFAULT_DAEMON_INTERVAL: Duration = Duration::from_secs(15 * 60);
@@ -1282,29 +1298,71 @@ async fn list_preview_content_ids(
     bucket: &str,
 ) -> Result<std::collections::HashSet<ContentId>, WorkerError> {
     let mut have = std::collections::HashSet::new();
+    list_objects_bounded(s3, bucket, &format!("{CONTROL_PREFIX}previews/"), |o| {
+        if let KeyClass::Preview { content_id } = classify_key(&o.key) {
+            have.insert(content_id);
+        }
+    })
+    .await?;
+    Ok(have)
+}
+
+/// One paged `ListObjectsV2` under `prefix`, following continuation tokens
+/// and handing every listed object to `on_object`. Bounded like
+/// `reader::list_journal_keys` / `compact::list_keys_under`: at most
+/// [`LIST_MAX_PAGES`] pages and [`LIST_MAX_KEYS`] listed keys, and a
+/// truncated page without a `NextContinuationToken` is a malformed
+/// response — each refused as [`S3Error::InvalidResponse`] so a hostile
+/// endpoint cannot stall the cycle (and, in fleet mode, every other user)
+/// forever or force unbounded key buffering.
+async fn list_objects_bounded(
+    s3: &S3Client,
+    bucket: &str,
+    prefix: &str,
+    mut on_object: impl FnMut(ObjectSummary),
+) -> Result<(), WorkerError> {
     let mut continuation_token: Option<String> = None;
+    let mut pages = 0u32;
+    let mut listed = 0usize;
     loop {
+        if pages >= LIST_MAX_PAGES {
+            return Err(S3Error::InvalidResponse(format!(
+                "ListObjectsV2 still truncated after {LIST_MAX_PAGES} pages under {prefix:?}; \
+                 refusing a runaway paging loop"
+            ))
+            .into());
+        }
+        pages += 1;
         let page = s3
             .list_objects_v2(
                 bucket,
                 &ListObjectsV2Request {
-                    prefix: Some(format!("{CONTROL_PREFIX}previews/")),
+                    prefix: Some(prefix.to_string()),
                     continuation_token: continuation_token.take(),
                     ..Default::default()
                 },
             )
             .await?;
-        for o in page.objects {
-            if let KeyClass::Preview { content_id } = classify_key(&o.key) {
-                have.insert(content_id);
-            }
+        listed += page.objects.len();
+        if listed > LIST_MAX_KEYS {
+            return Err(S3Error::InvalidResponse(format!(
+                "ListObjectsV2 returned more than {LIST_MAX_KEYS} keys under {prefix:?}; \
+                 refusing unbounded key buffering (hostile bucket or runaway writer)"
+            ))
+            .into());
         }
+        page.objects.into_iter().for_each(&mut on_object);
         if !page.is_truncated {
-            return Ok(have);
+            return Ok(());
         }
         match page.next_continuation_token {
             Some(token) => continuation_token = Some(token),
-            None => return Ok(have),
+            None => {
+                return Err(S3Error::InvalidResponse(format!(
+                    "truncated ListObjectsV2 page without a NextContinuationToken under {prefix:?}"
+                ))
+                .into())
+            }
         }
     }
 }
@@ -1359,27 +1417,11 @@ async fn list_library_keys(
     bucket: &str,
 ) -> Result<Vec<(String, Option<String>)>, WorkerError> {
     let mut keys = Vec::new();
-    let mut continuation_token: Option<String> = None;
-    loop {
-        let page = s3
-            .list_objects_v2(
-                bucket,
-                &ListObjectsV2Request {
-                    prefix: Some(LIBRARY_PREFIX.to_string()),
-                    continuation_token: continuation_token.take(),
-                    ..Default::default()
-                },
-            )
-            .await?;
-        keys.extend(page.objects.into_iter().map(|o| (o.key, o.last_modified)));
-        if !page.is_truncated {
-            return Ok(keys);
-        }
-        match page.next_continuation_token {
-            Some(token) => continuation_token = Some(token),
-            None => return Ok(keys),
-        }
-    }
+    list_objects_bounded(s3, bucket, LIBRARY_PREFIX, |o| {
+        keys.push((o.key, o.last_modified));
+    })
+    .await?;
+    Ok(keys)
 }
 
 /// Drive [`run_cycle`] per [`RunMode`]: once (then return) or as a daemon
