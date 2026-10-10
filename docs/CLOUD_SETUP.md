@@ -313,7 +313,10 @@ at the admin bucket with a **read-only** admin key via
 / `RRCLOUD_ADMIN_ACCESS_KEY` / `RRCLOUD_ADMIN_SECRET_KEY`, e.g.
 `rrcloud-worker --fleet --daemon --interval 1h`. Users who set
 `workerBackfill: false` are skipped; one user's failure never aborts the
-others.
+others. Because the worker runs in-cluster and the endpoint is user-typed,
+a user's library endpoint must be a public `https://` host (loopback,
+private/link-local IPs, and `*.local`/`*.internal`/`*.svc.cluster.local`
+names are rejected before any request is made).
 
 ---
 
