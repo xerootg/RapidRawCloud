@@ -582,6 +582,22 @@ pub fn import_luts(
     list_luts(app_handle)
 }
 
+/// Returns `true` when `target` is a regular file (not a symlink) whose
+/// canonical parent is exactly the canonical `dir`. Both sides are resolved
+/// with `canonicalize`, so `..` components and symlinks cannot escape `dir`.
+fn is_direct_child_of(target: &Path, dir: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(target) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let (Ok(target), Ok(dir)) = (target.canonicalize(), dir.canonicalize()) else {
+        return false;
+    };
+    target.parent() == Some(dir.as_path())
+}
+
 #[tauri::command]
 pub fn remove_lut(app_handle: AppHandle, path: String) -> Result<Vec<LutEntry>, String> {
     let data_dir = app_handle
@@ -591,33 +607,33 @@ pub fn remove_lut(app_handle: AppHandle, path: String) -> Result<Vec<LutEntry>, 
     let luts_dir = strip_verbatim(&get_luts_dir(&data_dir).map_err(|e| e.to_string())?);
     let target_path = strip_verbatim(Path::new(&path));
 
+    let canonical_target = target_path
+        .canonicalize()
+        .map_err(|_| "LUT file not found".to_string())?;
+
     if let Some(resource_path) = film_luts_dir(&app_handle)
-        && target_path.starts_with(&resource_path)
+        && (target_path.starts_with(&resource_path)
+            || resource_path
+                .canonicalize()
+                .is_ok_and(|resource| canonical_target.starts_with(resource)))
     {
         return Err("Cannot delete built-in film emulations".to_string());
     }
 
     #[cfg(target_os = "android")]
-    {
+    let allowed = {
         let cache_dir = strip_verbatim(&get_lut_cache_dir().map_err(|e| e.to_string())?);
-        if !target_path.starts_with(&luts_dir) && !target_path.starts_with(&cache_dir) {
-            return Err(
-                "Access denied: Cannot remove files outside the user LUT directory".to_string(),
-            );
-        }
-    }
+        is_direct_child_of(&target_path, &luts_dir) || is_direct_child_of(&target_path, &cache_dir)
+    };
     #[cfg(not(target_os = "android"))]
-    if !target_path.starts_with(&luts_dir) {
+    let allowed = is_direct_child_of(&target_path, &luts_dir);
+    if !allowed {
         return Err(
             "Access denied: Cannot remove files outside the user LUT directory".to_string(),
         );
     }
 
-    if target_path.exists() {
-        std::fs::remove_file(&target_path).map_err(|e| e.to_string())?;
-    } else {
-        return Err("LUT file not found".to_string());
-    }
+    std::fs::remove_file(&target_path).map_err(|e| e.to_string())?;
 
     list_luts(app_handle)
 }
