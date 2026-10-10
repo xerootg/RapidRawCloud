@@ -31,6 +31,7 @@
 //! same admin bucket (read-only key) and backfills each user's library with
 //! that user's credentials.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use axum::{
@@ -483,6 +484,105 @@ fn same_origin_post(headers: &HeaderMap) -> bool {
     allowed.any(|h| h.trim().eq_ignore_ascii_case(&source_host))
 }
 
+/// Offline policy check for the library endpoint a user types into the form.
+///
+/// Copy of `rrcloud-core/src/fleet.rs::validate_library_endpoint` (the
+/// source of truth — keep the two in step; pairing deliberately does not
+/// depend on rrcloud-core, see Cargo.toml). The fleet worker refuses every
+/// endpoint this rejects, so refusing it here gives the user an inline error
+/// instead of a "saved" doc that silently fails each cycle. Purely
+/// syntactic (no DNS): must parse, use `https`, and have a host; an IP
+/// literal must be public unicast (IPv4-mapped/compatible IPv6 is checked
+/// with the IPv4 rules); a name must not be `localhost`, single-label, or
+/// under `.localhost` `.local` `.internal` `.svc` `.cluster.local`.
+fn validate_library_endpoint(endpoint: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(endpoint.trim_end_matches('/'))
+        .map_err(|e| format!("unparsable URL: {e}"))?;
+    if url.scheme() != "https" {
+        return Err(format!(
+            "scheme {:?} is not allowed; library endpoints must use https://",
+            url.scheme()
+        ));
+    }
+    // `host_str()` is the *parsed* host: decimal/hex/short IPv4 spellings
+    // are already folded into dotted-quad form, IPv6 literals bracketed.
+    let host = url.host_str().ok_or_else(|| "no host".to_string())?;
+    if let Some(v6) = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .and_then(|h| h.parse::<Ipv6Addr>().ok())
+    {
+        check_public_v6(v6)
+    } else if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        check_public_v4(v4)
+    } else {
+        check_public_name(host)
+    }
+}
+
+fn check_public_v4(ip: Ipv4Addr) -> Result<(), String> {
+    let [a, b, _, _] = ip.octets();
+    let bad = ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || a == 0 // 0.0.0.0/8 "this network"
+        || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10 shared (CGNAT)
+        || a >= 240; // 240.0.0.0/4 reserved
+    if bad {
+        Err(format!("IP address {ip} is not a public address"))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_public_v6(ip: Ipv6Addr) -> Result<(), String> {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return Err(format!("IP address {ip} is not a public address"));
+    }
+    // IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`)
+    // forms reach an IPv4 host — apply the IPv4 rules to it.
+    if let Some(v4) = ip.to_ipv4() {
+        return check_public_v4(v4).map_err(|e| format!("{e} (embedded in {ip})"));
+    }
+    let seg0 = ip.segments()[0];
+    let bad = (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        || (seg0 & 0xffc0) == 0xfe80; // fe80::/10 link local
+    if bad {
+        Err(format!("IP address {ip} is not a public address"))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_public_name(name: &str) -> Result<(), String> {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() || name == "localhost" {
+        return Err(format!("host {name:?} is not a public host name"));
+    }
+    if !name.contains('.') {
+        return Err(format!(
+            "host {name:?} is a single-label name (not a public host name)"
+        ));
+    }
+    const INTERNAL_SUFFIXES: &[&str] = &[
+        ".localhost",
+        ".local",
+        ".internal",
+        ".svc",
+        ".cluster.local",
+        ".svc.cluster.local",
+    ];
+    if let Some(suffix) = INTERNAL_SUFFIXES.iter().find(|s| name.ends_with(**s)) {
+        return Err(format!(
+            "host {name:?} is under the internal suffix {suffix:?}"
+        ));
+    }
+    Ok(())
+}
+
 async fn save(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -515,6 +615,18 @@ async fn save(
             &user,
             None,
             Some("Secret key is required (it is write-only; re-enter to change it)."),
+            &state.config,
+        ))
+        .into_response();
+    }
+    // Same policy as the fleet worker: refuse up front, write nothing.
+    if let Err(reason) = validate_library_endpoint(&endpoint) {
+        return Html(render_page(
+            &user,
+            None,
+            Some(&format!(
+                "Endpoint rejected: {reason}. Use a public https:// S3 URL."
+            )),
             &state.config,
         ))
         .into_response();
@@ -1131,6 +1243,389 @@ mod tests {
         let token = format!("{}.!!not-base64!!.{}", b64url(b"{}"), b64url(b"sig"));
         let (status, body) = get_config(&token).await;
         assert_creds_leaked_free(status, &body, "JWT with undecodable payload");
+    }
+
+    /// Unit tests for the copied endpoint validator, so it cannot drift
+    /// silently from `rrcloud-core/src/fleet.rs` (same cases, abridged).
+    mod endpoint_validation {
+        use super::*;
+
+        #[test]
+        fn accepts_public_https_hosts() {
+            for ok in [
+                "https://garage.themissing.xyz",
+                "https://garage.themissing.xyz/",
+                "https://s3.eu-central-003.backblazeb2.com",
+                "https://S3.Example.COM:9443",
+                "https://8.8.8.8",
+                "https://[2606:4700:4700::1111]:443",
+                "https://[::ffff:8.8.8.8]",
+                "https://172.15.255.255",
+                "https://172.32.0.1",
+                "https://100.63.255.255",
+                "https://100.128.0.1",
+                "https://localhost.example.com",
+                "https://internal.example.com",
+                "https://svc.example.com",
+                "https://my-local.example.com",
+            ] {
+                assert_eq!(validate_library_endpoint(ok), Ok(()), "{ok}");
+            }
+        }
+
+        #[test]
+        fn rejects_plaintext_garbage_and_non_public_hosts() {
+            for bad in [
+                "http://s3.example.com",
+                "ftp://s3.example.com",
+                "file:///etc/passwd",
+                "s3.example.com",
+                "",
+                "https://",
+                "https:///path-only",
+                "https://127.0.0.1",
+                "https://127.0.0.1:3903",
+                "https://2130706433", // decimal 127.0.0.1
+                "https://0x7f000001", // hex 127.0.0.1
+                "https://127.1",      // short-form 127.0.0.1
+                "https://0.0.0.0",
+                "https://0.1.2.3",
+                "https://10.0.0.5:3903",
+                "https://172.16.0.1",
+                "https://172.31.255.254",
+                "https://192.168.1.1",
+                "https://169.254.169.254",
+                "https://100.64.0.1",
+                "https://100.127.255.255",
+                "https://224.0.0.1",
+                "https://255.255.255.255",
+                "https://240.0.0.1",
+                "https://[::1]",
+                "https://[::]",
+                "https://[fe80::1]",
+                "https://[febf::1]",
+                "https://[fc00::1]",
+                "https://[fd12:3456::1]",
+                "https://[ff02::1]",
+                "https://[::ffff:127.0.0.1]",
+                "https://[::ffff:10.0.0.5]",
+                "https://[::ffff:169.254.169.254]",
+                "https://[::ffff:7f00:1]",
+                "https://[::127.0.0.1]",
+                "https://localhost",
+                "https://LOCALHOST",
+                "https://localhost.",
+                "https://foo.localhost",
+                "https://garage",
+                "https://garage:3900",
+                "https://garage-admin.garage.svc.cluster.local:3903",
+                "https://garage-admin.garage.svc.cluster.local.",
+                "https://garage-admin.garage.svc",
+                "https://thing.cluster.local",
+                "https://printer.local",
+                "https://metadata.google.internal",
+                "https://db.internal",
+            ] {
+                assert!(validate_library_endpoint(bad).is_err(), "{bad}");
+            }
+        }
+    }
+
+    /// `POST /save` endpoint policy.
+    ///
+    /// The browser form stores whatever `endpoint` the user typed, as long
+    /// as it is non-empty. The fleet worker (`rrcloud-core::fleet::
+    /// validate_library_endpoint`) refuses non-public and non-https library
+    /// endpoints — loopback, RFC1918, link-local/metadata, shared 100.64/10,
+    /// multicast/broadcast/unspecified, IPv4-mapped IPv6, `localhost`,
+    /// single-label names, `.local`/`.internal`/`.svc`/`.cluster.local`/
+    /// `.localhost` suffixes, and any `http://` scheme — but only once per
+    /// cycle, as a `Failed` outcome the user never sees. So today a user
+    /// who types an in-cluster or plaintext endpoint gets a "saved" redirect,
+    /// the doc is written, and every paired device (and the worker) tries to
+    /// use it. The form must apply the same policy up front: refuse the
+    /// save, write nothing, and re-render the form with an error that names
+    /// the endpoint (via the same `<p class="err">` path as the other
+    /// validation errors).
+    ///
+    /// Fixture: a fake S3 that records every `PUT` it receives (so a stored
+    /// doc is both detected and shown in the failure message), behind the
+    /// real `save` handler.
+    mod save_endpoint_policy {
+        use super::*;
+        use axum::body::Bytes;
+        use axum::http::{header::LOCATION, Method};
+        use std::sync::Mutex;
+
+        /// One object write the fake admin bucket received.
+        #[derive(Clone, Debug)]
+        struct Put {
+            path: String,
+            body: String,
+        }
+
+        type Recorder = Arc<Mutex<Vec<Put>>>;
+
+        /// `BROWSER_PROXY_SECRET` of the service under test (≥ 16 chars, as
+        /// `Config::from_env` requires); `post_save` presents it.
+        const FORM_PROXY_SECRET: &str = "endpoint-policy-test-proxy-secret";
+
+        /// Fake S3 (path-style) admin bucket that records `PUT`s and holds
+        /// no objects (every `GET` is a 404 → "unpaired"). Returns the
+        /// endpoint URL and the recorder.
+        async fn recording_s3() -> (String, Recorder) {
+            async fn handle(
+                State(rec): State<Recorder>,
+                method: Method,
+                uri: Uri,
+                body: Bytes,
+            ) -> Response {
+                if method == Method::PUT {
+                    rec.lock().unwrap().push(Put {
+                        path: uri.path().to_string(),
+                        body: String::from_utf8_lossy(&body).into_owned(),
+                    });
+                    return StatusCode::OK.into_response();
+                }
+                (
+                    StatusCode::NOT_FOUND,
+                    "<Error><Code>NoSuchKey</Code></Error>",
+                )
+                    .into_response()
+            }
+            let rec: Recorder = Arc::new(Mutex::new(Vec::new()));
+            let base = serve(Router::new().fallback(handle).with_state(rec.clone())).await;
+            (base, rec)
+        }
+
+        /// The real browser routes (`index` + `save`, exactly as `main`
+        /// wires them) on top of the recording admin bucket.
+        async fn pairing_form_service() -> (String, Recorder) {
+            let (s3, rec) = recording_s3().await;
+            let state = Arc::new(AppState {
+                config: Config {
+                    admin_bucket: ADMIN_BUCKET.into(),
+                    admin_s3_endpoint: s3,
+                    admin_s3_region: "garage".into(),
+                    admin_s3_access_key: "GKadmin".into(),
+                    admin_s3_secret_key: "adminsecret".into(),
+                    oidc_userinfo_url: "http://127.0.0.1:9/unused".into(),
+                    oidc_issuer_url: ISSUER.into(),
+                    oidc_client_id: OUR_CLIENT_ID.into(),
+                    default_library_endpoint: String::new(),
+                    default_library_region: "garage".into(),
+                    browser_proxy_secret: Some(FORM_PROXY_SECRET.into()),
+                },
+                http: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+            });
+            let base = serve(
+                Router::new()
+                    .route("/", get(index))
+                    .route("/save", post(save))
+                    .with_state(state),
+            )
+            .await;
+            (base, rec)
+        }
+
+        /// What came back from `POST /save`.
+        struct SaveOutcome {
+            status: StatusCode,
+            location: Option<String>,
+            body: String,
+            puts: Vec<Put>,
+        }
+
+        impl SaveOutcome {
+            /// Text of the `<p class="err">…</p>` the form rendered, if any.
+            fn err_paragraph(&self) -> Option<&str> {
+                let start = self.body.find("<p class=\"err\">")? + "<p class=\"err\">".len();
+                let end = self.body[start..].find("</p>")? + start;
+                Some(&self.body[start..end])
+            }
+            /// `sync.endpoint` of each doc the admin bucket received.
+            fn stored_endpoints(&self) -> Vec<String> {
+                self.puts
+                    .iter()
+                    .map(|p| {
+                        serde_json::from_str::<Value>(&p.body)
+                            .ok()
+                            .and_then(|d| d["sync"]["endpoint"].as_str().map(String::from))
+                            .unwrap_or_else(|| format!("<unparsable body at {}>", p.path))
+                    })
+                    .collect()
+            }
+        }
+
+        /// Submit the pairing form as alice with the given library endpoint
+        /// (all other fields valid) against a fresh service, without
+        /// following redirects, and collect what the admin bucket saw.
+        async fn post_save(endpoint: &str) -> SaveOutcome {
+            let (base, rec) = pairing_form_service().await;
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let resp = client
+                .post(format!("{base}/save"))
+                // The two `/save` guards: proof the request traversed the
+                // trusted proxy (`X-Rrcloud-Proxy-Secret` == the configured
+                // `browser_proxy_secret`) and a same-origin Fetch Metadata
+                // hint for the cross-site check. Both are satisfied here so
+                // only the endpoint policy is under test.
+                .header(PROXY_SECRET_HEADER, FORM_PROXY_SECRET)
+                .header("X-Authentik-Username", "alice")
+                .header("Sec-Fetch-Site", "same-origin")
+                .form(&[
+                    ("endpoint", endpoint),
+                    ("bucket", "alice-photos"),
+                    ("region", "garage"),
+                    ("access_key_id", ALICE_AKID),
+                    ("secret_access_key", ALICE_SECRET),
+                    ("force_path_style", "on"),
+                    ("worker_backfill", "on"),
+                    ("cache_size_gb", "8"),
+                    ("preview_budget_gb", "10"),
+                ])
+                .send()
+                .await
+                .unwrap();
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
+            let location = resp
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let body = resp.text().await.unwrap();
+            let puts = rec.lock().unwrap().clone();
+            SaveOutcome {
+                status,
+                location,
+                body,
+                puts,
+            }
+        }
+
+        // --- positive controls ----------------------------------------------
+
+        /// A public https endpoint is accepted: one doc written for alice,
+        /// carrying that endpoint, then the post-save redirect.
+        #[tokio::test]
+        async fn save_accepts_public_https_endpoints() {
+            for ok in [
+                "https://s3.us-west-002.backblazeb2.com",
+                "https://garage.example.com",
+            ] {
+                let out = post_save(ok).await;
+                assert_eq!(
+                    out.status,
+                    StatusCode::SEE_OTHER,
+                    "{ok}: expected 303, got {} with body: {}",
+                    out.status,
+                    out.body
+                );
+                assert_eq!(out.location.as_deref(), Some("/?saved=1"), "{ok}");
+                assert_eq!(
+                    out.puts.len(),
+                    1,
+                    "{ok}: expected exactly one PUT, got {:?}",
+                    out.puts
+                );
+                assert_eq!(
+                    out.puts[0].path,
+                    format!("/{ADMIN_BUCKET}/{}", config_key("alice")),
+                    "{ok}"
+                );
+                assert_eq!(out.stored_endpoints(), vec![ok.to_string()], "{ok}");
+            }
+        }
+
+        /// Fixture sanity: the existing "required fields" check renders its
+        /// message through `<p class="err">` and writes nothing — the same
+        /// shape the endpoint-policy error must take.
+        #[tokio::test]
+        async fn save_renders_required_field_error_without_writing() {
+            let out = post_save("").await;
+            assert_eq!(out.status, StatusCode::OK, "body: {}", out.body);
+            assert!(out.puts.is_empty(), "wrote {:?}", out.puts);
+            let err = out.err_paragraph().expect("an <p class=\"err\"> paragraph");
+            assert!(
+                err.contains("Endpoint, bucket, and access key are required."),
+                "unexpected error text: {err}"
+            );
+        }
+
+        // --- the gap: non-public / plaintext endpoints are stored ------------
+
+        /// THE GAP. Each of these is refused by the fleet worker's
+        /// `validate_library_endpoint`, so storing it only yields a silent
+        /// per-cycle failure — or, for the in-cluster ones, points every
+        /// device and the worker at a private address. The form must refuse
+        /// them: no S3 write, HTTP 200, and a `<p class="err">` that names
+        /// the endpoint. Today each one is written and redirected.
+        #[tokio::test]
+        async fn save_rejects_non_public_or_plaintext_endpoints() {
+            let cases: &[(&str, &str)] = &[
+                (
+                    "http://garage.garage.svc.cluster.local:3900",
+                    "plaintext http:// to an in-cluster .svc.cluster.local name",
+                ),
+                ("https://10.0.0.5:3903", "RFC1918 private IPv4"),
+                ("https://192.168.1.10:3900", "RFC1918 private IPv4"),
+                (
+                    "https://169.254.169.254",
+                    "link-local / cloud metadata address",
+                ),
+                ("https://localhost", "localhost"),
+                ("https://127.0.0.1:3900", "IPv4 loopback"),
+                ("https://[::ffff:127.0.0.1]", "IPv4-mapped IPv6 loopback"),
+                ("https://garage", "single-label host name"),
+                (
+                    "http://s3.us-west-002.backblazeb2.com",
+                    "plaintext http:// scheme",
+                ),
+            ];
+            let mut failures = Vec::new();
+            for (endpoint, why) in cases {
+                let out = post_save(endpoint).await;
+                let stored = out.stored_endpoints();
+                if !stored.is_empty() {
+                    failures.push(format!(
+                        "{endpoint} ({why}): STORED to the admin bucket as sync.endpoint = {stored:?} \
+                         (status {}, location {:?})",
+                        out.status, out.location
+                    ));
+                    continue;
+                }
+                if out.status != StatusCode::OK {
+                    failures.push(format!(
+                        "{endpoint} ({why}): expected the form re-rendered with 200, got {} \
+                         (location {:?})",
+                        out.status, out.location
+                    ));
+                    continue;
+                }
+                match out.err_paragraph() {
+                    Some(err) if err.to_ascii_lowercase().contains("endpoint") => {}
+                    Some(err) => failures.push(format!(
+                        "{endpoint} ({why}): error paragraph does not mention the endpoint: {err:?}"
+                    )),
+                    None => failures.push(format!(
+                        "{endpoint} ({why}): 200 but no <p class=\"err\"> in the page"
+                    )),
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "{} of {} non-public/plaintext endpoints were not refused by POST /save:\n  {}",
+                failures.len(),
+                cases.len(),
+                failures.join("\n  ")
+            );
+        }
     }
 }
 
