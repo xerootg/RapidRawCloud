@@ -105,13 +105,21 @@
 //! (journal head advanced between attempts) and must not condemn an
 //! intact remote. Only a from-scratch mismatch is the typed
 //! [`TransferError::IntegrityMismatch`]: the partial is deleted and the
-//! item moves to the `corrupt_remote` lane. A sidecar is additionally
-//! **parse-validated** (through the §2.5 semantic parser) and is *never
-//! installed* when invalid. Install is an atomic rename over the
-//! destination, a parent-directory fsync (so a power loss cannot durably
-//! record the terminal state while losing the rename's directory entry —
-//! see `finalize_install`), then an mtime restore (`filetime`) to the
-//! provided remote mtime. A crash *after* the rename but before the
+//! item moves to the `corrupt_remote` lane. The body may never run
+//! **past the advertised size**: the stream is abandoned the moment
+//! `resumed_from + bytes_fetched` would exceed `expected.size` (before
+//! the overflowing chunk is written), as [`TransferError::CorruptRemote`]
+//! — the hash cannot be the backstop here, since a hostile peer can
+//! advertise the true hash of the oversized body it serves. A sidecar is
+//! additionally **parse-validated** (through the §2.5 semantic parser)
+//! and is *never installed* when invalid; because that validation reads
+//! the sidecar into memory, a sidecar record advertising more than
+//! [`MAX_SIDECAR_DOWNLOAD_BYTES`] is refused before anything is fetched.
+//! Install is an atomic rename over the destination, a parent-directory
+//! fsync (so a power loss cannot durably record the terminal state while
+//! losing the rename's directory entry — see `finalize_install`), then an
+//! mtime restore (`filetime`) to the provided remote mtime. A crash
+//! *after* the rename but before the
 //! terminal commit does not cost a re-fetch: a destination file of the
 //! expected size whose re-hash matches the expected blake3 is **adopted
 //! in place** (mtime healed) on the next attempt. The engine does **not**
@@ -252,6 +260,16 @@ pub const DEFAULT_STALE_UPLOAD_MAX_AGE_SECS: i64 = 7 * 24 * 60 * 60;
 /// on either outcome.
 pub const PROBE_KEY: &str = ".rrcloud/v1/probe/digest-check";
 
+/// Hard ceiling on a sidecar download's **advertised** size (§3.5
+/// hostile-input hardening). A sidecar is parse-validated from memory
+/// before it is installed, so its `expected.size` — a peer-supplied
+/// number — bounds an in-memory read; a record advertising more than this
+/// is refused as `corrupt_remote` before anything is fetched. Sidecars
+/// embed base64 mask/patch bitmaps, so the ceiling is generous (it matches
+/// [`crate::manifest::MANIFEST_MAX_DECODED_BYTES`]). Originals are bounded
+/// by `expected.size` alone (the body may never run past it).
+pub const MAX_SIDECAR_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Errors from the transfer engine. Every failure that leaves an item
 /// mid-pipeline also leaves its durable state **resumable** (the §2.4
 /// tables say which state each edge lands in); variants below note the
@@ -354,10 +372,20 @@ pub enum TransferError {
         actual: String,
     },
 
-    /// Upload verification failed against the stored object (HEAD size
-    /// mismatch, or the `requires_readback_verify` re-hash disagreed
-    /// with the streamed hash): the item transitioned to
-    /// `corrupt_remote` and **no journal entry was staged**.
+    /// The stored object disagrees with what the journal says about it.
+    ///
+    /// - **Upload**: verification failed against the stored object (HEAD
+    ///   size mismatch, or the `requires_readback_verify` re-hash
+    ///   disagreed with the streamed hash): the item transitioned to
+    ///   `corrupt_remote` and **no journal entry was staged**.
+    /// - **Download** (§3.5): the GET body ran past the advertised
+    ///   `size` (the blake3 backstop cannot catch this — a hostile peer
+    ///   advertises the true hash of the oversized body it serves), or a
+    ///   sidecar record advertised more than
+    ///   [`MAX_SIDECAR_DOWNLOAD_BYTES`]. The stream was abandoned at
+    ///   once (the partial never exceeds the advertised size on disk),
+    ///   the partial was deleted, nothing was installed, and the item
+    ///   transitioned to `corrupt_remote`.
     #[error("remote object for {relkey} is corrupt: {detail}")]
     CorruptRemote {
         /// The item.
@@ -1978,7 +2006,7 @@ pub fn partial_path(final_path: &Path) -> PathBuf {
 /// per relkey), not retry immediately.
 ///
 /// Terminal states: originals land `hydrated`, everything else `synced`;
-/// integrity/parse failures land `corrupt_remote` (partial deleted,
+/// integrity/size/parse failures land `corrupt_remote` (partial deleted,
 /// destination untouched). A transport failure keeps the partial and
 /// returns the item to `pending_down` (resumable).
 pub async fn download_item(
@@ -2054,14 +2082,17 @@ pub async fn download_item(
     }
     match result {
         Ok(outcome) => Ok(outcome),
-        // Integrity/parse failures are properties of the remote object:
-        // the partial is deleted (it can never verify) and the item moves
-        // to the corrupt_remote lane.
+        // Integrity/size/parse failures are properties of the remote
+        // object: the partial is deleted (it can never verify — an
+        // over-long body will not get shorter on retry) and the item
+        // moves to the corrupt_remote lane.
         Err(
-            e @ (TransferError::IntegrityMismatch { .. } | TransferError::SidecarInvalid { .. }),
+            e @ (TransferError::IntegrityMismatch { .. }
+            | TransferError::SidecarInvalid { .. }
+            | TransferError::CorruptRemote { .. }),
         ) => {
             let _ = tokio::fs::remove_file(&partial).await;
-            // The integrity/parse failure stays primary (demote doc).
+            // The integrity/size/parse failure stays primary (demote doc).
             let _ = demote(db, relkey, ItemState::Downloading, ItemState::CorruptRemote);
             Err(e)
         }
@@ -2093,6 +2124,22 @@ async fn run_download(
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| io_err(parent, e))?;
+    }
+
+    // §3.5 hostile-input hardening: a sidecar is parse-validated from
+    // memory (the adoption re-read below and the post-stream `sem_hash`
+    // read), so its peer-supplied advertised size bounds an in-memory
+    // read. Refuse an implausible record before fetching anything; like
+    // every other disagreement with the stored object this is a property
+    // of the remote and lands `corrupt_remote` (classified by the caller).
+    if kind == Kind::Sidecar && expected.size > MAX_SIDECAR_DOWNLOAD_BYTES {
+        return Err(TransferError::CorruptRemote {
+            relkey: relkey.clone(),
+            detail: format!(
+                "sidecar advertised size {} bytes exceeds the {MAX_SIDECAR_DOWNLOAD_BYTES}-byte sidecar cap",
+                expected.size
+            ),
+        });
     }
 
     // Installed-destination adoption: a crash after the install rename
@@ -2191,6 +2238,27 @@ async fn run_download(
         loop {
             match body.next().await {
                 Some(Ok(chunk)) => {
+                    // §3.5 size cap: the body may never run past the
+                    // advertised size. The blake3 backstop cannot catch
+                    // this (a hostile peer advertises the true hash of
+                    // the oversized body it intends to serve), so the
+                    // check is explicit and runs BEFORE the chunk is
+                    // written: the partial never exceeds `expected.size`
+                    // on disk and the stream is abandoned at once instead
+                    // of filling the disk. A retry cannot make the remote
+                    // shorter than the journal says, so this is the
+                    // terminal `CorruptRemote` (partial deleted by the
+                    // caller), not a resumable transport failure.
+                    let total = resumed_from + bytes_fetched + chunk.len() as u64;
+                    if total > expected.size {
+                        return Err(TransferError::CorruptRemote {
+                            relkey: relkey.clone(),
+                            detail: format!(
+                                "body exceeds the advertised size of {} bytes (received at least {total})",
+                                expected.size
+                            ),
+                        });
+                    }
                     file.write_all(&chunk)
                         .await
                         .map_err(|e| io_err(partial, e))?;
