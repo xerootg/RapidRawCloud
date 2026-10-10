@@ -105,8 +105,10 @@ fn pairing_documents_round_trip_in_camel_case() {
     assert_eq!(info.config_endpoint, "/api/config");
     assert_eq!(info.to_json().unwrap(), pi.trim());
     // Missing default-able field → default applied.
+    assert_eq!(info.redirect_uris, vec![PAIRING_REDIRECT_URI, PAIRING_REDIRECT_URI_RAW2DNG]);
     let min = PairingInfo::from_json(r#"{"version":1,"issuer":"https://i","clientId":"c"}"#).unwrap();
     assert_eq!(min.config_endpoint, "/api/config");
+    assert!(min.redirect_uris.is_empty(), "older services omit the list");
     let pc = fixture("pairing_config.json");
     let doc = PairingConfigDoc::from_json(pc.trim()).unwrap();
     assert_eq!(doc.sync.bucket, "my-photos");

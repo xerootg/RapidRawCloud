@@ -33,7 +33,8 @@ Definition v1, wire version 1. Normative design: `docs/ARCHITECTURE.md`.
 | `DELETED_SET_RETENTION_SECS` | `i64` | `31536000` | Manifest deleted-set rows are retained 12 months (§2.3). |
 | `PAIRING_INFO_PATH` | `str` | `/api/pairing-info` | Pairing service: public discovery document (PairingInfo). |
 | `PAIRING_CONFIG_PATH` | `str` | `/api/config` | Pairing service: per-user config document (PairingConfigDoc), `Authorization: Bearer <oidc access token>`. |
-| `PAIRING_REDIRECT_URI` | `str` | `rapidraw://auth-callback` | OAuth redirect URI of the app's PKCE flow. |
+| `PAIRING_REDIRECT_URI` | `str` | `rapidraw://auth-callback` | OAuth redirect URI of the RapidRAW editor's PKCE flow (PairingInfo.redirectUri, kept for older clients). |
+| `PAIRING_REDIRECT_URI_RAW2DNG` | `str` | `raw2dng://auth-callback` | OAuth redirect URI of the Raw2DNG (RawImageSnapseedBridge) PKCE flow. Each app owns a scheme so two apps on one phone never fight over a callback; the OIDC provider must allow every URI in PairingInfo.redirectUris. |
 | `PAIRING_OIDC_SCOPE` | `str` | `openid profile email` | OIDC scopes requested by both the PKCE (app) and device-code (headless) pairing flows. |
 | `OAUTH_DEVICE_CODE_GRANT` | `str` | `urn:ietf:params:oauth:grant-type:device_code` | RFC 8628 grant type used by headless devices to pair. |
 
@@ -214,7 +215,8 @@ Wire names are camelCase.
 | `issuer` | `issuer` | `string` | required | OIDC issuer; its .well-known/openid-configuration gives the authorize/token/device endpoints. |
 | `client_id` | `clientId` | `string` | required | Public OAuth client id (no secret). |
 | `config_endpoint` | `configEndpoint` | `string` | default `'/api/config'` | Path of the config endpoint on the service. |
-| `redirect_uri` | `redirectUri` | `string` | optional | PAIRING_REDIRECT_URI for the app flow. |
+| `redirect_uri` | `redirectUri` | `string` | optional | PAIRING_REDIRECT_URI; kept for older clients, `redirectUris` is the full list. |
+| `redirect_uris` | `redirectUris` | `[string]` | default `[]` | Every app that pairs through this service, each with its own scheme (PAIRING_REDIRECT_URI, PAIRING_REDIRECT_URI_RAW2DNG, ...). |
 
 ### `PairingSyncSettings`
 

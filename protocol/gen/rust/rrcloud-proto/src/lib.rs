@@ -89,8 +89,11 @@ pub const PAIRING_INFO_PATH: &str = "/api/pairing-info";
 /// Pairing service: per-user config document (PairingConfigDoc), `Authorization: Bearer <oidc access token>`.
 pub const PAIRING_CONFIG_PATH: &str = "/api/config";
 
-/// OAuth redirect URI of the app's PKCE flow.
+/// OAuth redirect URI of the RapidRAW editor's PKCE flow (PairingInfo.redirectUri, kept for older clients).
 pub const PAIRING_REDIRECT_URI: &str = "rapidraw://auth-callback";
+
+/// OAuth redirect URI of the Raw2DNG (RawImageSnapseedBridge) PKCE flow. Each app owns a scheme so two apps on one phone never fight over a callback; the OIDC provider must allow every URI in PairingInfo.redirectUris.
+pub const PAIRING_REDIRECT_URI_RAW2DNG: &str = "raw2dng://auth-callback";
 
 /// OIDC scopes requested by both the PKCE (app) and device-code (headless) pairing flows.
 pub const PAIRING_OIDC_SCOPE: &str = "openid profile email";
@@ -1105,13 +1108,19 @@ pub struct PairingInfo {
     /// Path of the config endpoint on the service.
     #[serde(default = "default_pairing_info_config_endpoint")]
     pub config_endpoint: String,
-    /// PAIRING_REDIRECT_URI for the app flow.
+    /// PAIRING_REDIRECT_URI; kept for older clients, `redirectUris` is the full list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub redirect_uri: Option<String>,
+    /// Every app that pairs through this service, each with its own scheme (PAIRING_REDIRECT_URI, PAIRING_REDIRECT_URI_RAW2DNG, ...).
+    #[serde(default = "default_pairing_info_redirect_uris")]
+    pub redirect_uris: Vec<String>,
 }
 
 fn default_pairing_info_config_endpoint() -> String {
     "/api/config".to_string()
+}
+fn default_pairing_info_redirect_uris() -> Vec<String> {
+    vec![]
 }
 
 impl PairingInfo {

@@ -37,6 +37,7 @@ use axum::{
 use rrcloud_proto::{
     key_pairing_user_config, PairingConfigDoc, PairingCredentials, PairingInfo,
     PairingSyncSettings, PAIRING_CONFIG_PATH, PAIRING_INFO_PATH, PAIRING_REDIRECT_URI,
+    PAIRING_REDIRECT_URI_RAW2DNG,
 };
 use s3::{creds::Credentials, Bucket, Region};
 use serde::Deserialize;
@@ -364,7 +365,17 @@ async fn api_pairing_info(State(state): State<Arc<AppState>>) -> Response {
         issuer: state.config.oidc_issuer_url.clone(),
         client_id: state.config.oidc_client_id.clone(),
         config_endpoint: PAIRING_CONFIG_PATH.to_string(),
+        // Kept for older clients; `redirect_uris` is the full list.
         redirect_uri: Some(PAIRING_REDIRECT_URI.to_string()),
+        // Every app that pairs through this service, each with its own
+        // scheme so two apps on one phone never fight over a callback. The
+        // Authentik provider must list all of them as allowed redirect URIs.
+        //  - RapidRAW (the editor):            rapidraw://auth-callback
+        //  - Raw2DNG (RawImageSnapseedBridge): raw2dng://auth-callback
+        redirect_uris: vec![
+            PAIRING_REDIRECT_URI.to_string(),
+            PAIRING_REDIRECT_URI_RAW2DNG.to_string(),
+        ],
     })
     .into_response()
 }

@@ -520,7 +520,17 @@
         "redirectUri": {
           "type": "string",
           "maxLength": 128,
-          "description": "PAIRING_REDIRECT_URI for the app flow."
+          "description": "PAIRING_REDIRECT_URI; kept for older clients, `redirectUris` is the full list."
+        },
+        "redirectUris": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128
+          },
+          "maxItems": 8,
+          "description": "Every app that pairs through this service, each with its own scheme (PAIRING_REDIRECT_URI, PAIRING_REDIRECT_URI_RAW2DNG, ...).",
+          "default": []
         }
       },
       "required": [
@@ -534,7 +544,8 @@
         "issuer",
         "clientId",
         "configEndpoint",
-        "redirectUri"
+        "redirectUri",
+        "redirectUris"
       ]
     },
     "PairingSyncSettings": {

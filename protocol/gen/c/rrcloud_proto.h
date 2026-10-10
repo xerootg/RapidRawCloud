@@ -61,8 +61,10 @@ static const uint32_t RRCP_PROTO_READ[1] = {1};
 #define RRCP_PAIRING_INFO_PATH "/api/pairing-info"
 /** Pairing service: per-user config document (PairingConfigDoc), `Authorization: Bearer <oidc access token>`. */
 #define RRCP_PAIRING_CONFIG_PATH "/api/config"
-/** OAuth redirect URI of the app's PKCE flow. */
+/** OAuth redirect URI of the RapidRAW editor's PKCE flow (PairingInfo.redirectUri, kept for older clients). */
 #define RRCP_PAIRING_REDIRECT_URI "rapidraw://auth-callback"
+/** OAuth redirect URI of the Raw2DNG (RawImageSnapseedBridge) PKCE flow. Each app owns a scheme so two apps on one phone never fight over a callback; the OIDC provider must allow every URI in PairingInfo.redirectUris. */
+#define RRCP_PAIRING_REDIRECT_URI_RAW2DNG "raw2dng://auth-callback"
 /** OIDC scopes requested by both the PKCE (app) and device-code (headless) pairing flows. */
 #define RRCP_PAIRING_OIDC_SCOPE "openid profile email"
 /** RFC 8628 grant type used by headless devices to pair. */
@@ -353,9 +355,12 @@ typedef struct {
     char client_id[128 + 1];
     /** Path of the config endpoint on the service. */
     char config_endpoint[128 + 1];
-    /** PAIRING_REDIRECT_URI for the app flow. */
+    /** PAIRING_REDIRECT_URI; kept for older clients, `redirectUris` is the full list. */
     bool has_redirect_uri;
     char redirect_uri[128 + 1];
+    /** Every app that pairs through this service, each with its own scheme (PAIRING_REDIRECT_URI, PAIRING_REDIRECT_URI_RAW2DNG, ...). */
+    size_t redirect_uris_len;
+    char redirect_uris[8][128 + 1];
 } rrcp_pairing_info_t;
 /** Resets to defaults (zeroed, IDL defaults applied). */
 void rrcp_pairing_info_init(rrcp_pairing_info_t *v);

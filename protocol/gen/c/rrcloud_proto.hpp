@@ -51,6 +51,7 @@ inline constexpr int64_t DELETED_SET_RETENTION_SECS = RRCP_DELETED_SET_RETENTION
 inline constexpr std::string_view PAIRING_INFO_PATH = RRCP_PAIRING_INFO_PATH;
 inline constexpr std::string_view PAIRING_CONFIG_PATH = RRCP_PAIRING_CONFIG_PATH;
 inline constexpr std::string_view PAIRING_REDIRECT_URI = RRCP_PAIRING_REDIRECT_URI;
+inline constexpr std::string_view PAIRING_REDIRECT_URI_RAW2DNG = RRCP_PAIRING_REDIRECT_URI_RAW2DNG;
 inline constexpr std::string_view PAIRING_OIDC_SCOPE = RRCP_PAIRING_OIDC_SCOPE;
 inline constexpr std::string_view OAUTH_DEVICE_CODE_GRANT = RRCP_OAUTH_DEVICE_CODE_GRANT;
 
@@ -566,6 +567,7 @@ struct PairingInfo {
     std::string client_id{};
     std::string config_endpoint{};
     std::optional<std::string> redirect_uri{};
+    std::vector<std::string> redirect_uris{};
 
     void to_c(rrcp_pairing_info_t &c) const {
         rrcp_pairing_info_init(&c);
@@ -577,6 +579,11 @@ struct PairingInfo {
             c.has_redirect_uri = true;
         detail::copy_str(c.redirect_uri, sizeof c.redirect_uri, (*redirect_uri));
         }
+        if (redirect_uris.size() > 8) throw Error(RRCP_E_OVERFLOW);
+        c.redirect_uris_len = redirect_uris.size();
+        for (size_t i = 0; i < redirect_uris.size(); i++) {
+            detail::copy_str(c.redirect_uris[i], sizeof c.redirect_uris[i], redirect_uris[i]);
+        }
     }
     static PairingInfo from_c(const rrcp_pairing_info_t &c) {
         PairingInfo v;
@@ -586,6 +593,11 @@ struct PairingInfo {
         v.config_endpoint = std::string(c.config_endpoint);
         if (c.has_redirect_uri) {
             v.redirect_uri = std::string(c.redirect_uri);
+        }
+        {
+            std::vector<std::string> tmp;
+            for (size_t i = 0; i < c.redirect_uris_len; i++) tmp.push_back(std::string(c.redirect_uris[i]));
+            v.redirect_uris = std::move(tmp);
         }
         return v;
     }

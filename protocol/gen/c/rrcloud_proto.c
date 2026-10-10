@@ -1301,6 +1301,13 @@ static rrcp_err_t pairing_info_write(w_t *w, const rrcp_pairing_info_t *v)
         w_key(w, "redirectUri", &first);
         w_str(w, v->redirect_uri);
     }
+    w_key(w, "redirectUris", &first);
+    w_putc(w, '[');
+    for (size_t i = 0; i < v->redirect_uris_len; i++) {
+        if (i) w_putc(w, ',');
+        w_str(w, v->redirect_uris[i]);
+    }
+    w_putc(w, ']');
     w_putc(w, '}');
     return RRCP_OK;
 }
@@ -1345,6 +1352,23 @@ static rrcp_err_t pairing_info_read(r_t *r, rrcp_pairing_info_t *v)
             e = r_string_ex(r, v->redirect_uri, sizeof v->redirect_uri, true);
             if (e) return e;
             v->has_redirect_uri = true;
+        } else if (!strcmp(key, "redirectUris")) {
+            {
+                bool aempty;
+                e = r_arr_begin(r, &aempty);
+                if (e) return e;
+                v->redirect_uris_len = 0;
+                if (!aempty) for (;;) {
+                    if (v->redirect_uris_len >= 8) return RRCP_E_OVERFLOW;
+                    e = r_string_ex(r, v->redirect_uris[v->redirect_uris_len], sizeof v->redirect_uris[v->redirect_uris_len], true);
+                    if (e) return e;
+                    v->redirect_uris_len++;
+                    int amore = r_arr_sep(r);
+                    if (amore < 0) return (rrcp_err_t)amore;
+                    if (!amore) break;
+                }
+            }
+            seen |= 1u << 5;
         } else {
             e = r_skip(r, 0);
             if (e) return e;
