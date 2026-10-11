@@ -105,6 +105,8 @@ static void configure_s3(void)
     snprintf(key, sizeof key, "digest_%08x", (unsigned)h);
     char v[8];
     if (store_kv_get_str(key, v, sizeof v)) { s3.digest_check_known = true; s3.backend_rejects_bad_md5 = v[0] == '1'; }
+    snprintf(key, sizeof key, "sha256_%08x", (unsigned)h);
+    if (store_kv_get_str(key, v, sizeof v)) { s3.sha256_check_known = true; s3.backend_checks_sha256 = v[0] == '1'; }
     ST_LOCK();
     st.s3_ready = s3_ready;
     st.digest_check_known = s3.digest_check_known;
@@ -116,6 +118,13 @@ static void configure_s3(void)
 
 static void run_digest_probe_if_needed(void)
 {
+    if (s3_ready && !s3.sha256_check_known && rrc_s3_probe_sha256_check(&s3, app_device_id()) == ESP_OK) {
+        char key[80];
+        uint32_t h = rrc_crc32(s3.cfg.endpoint, strlen(s3.cfg.endpoint)) ^ rrc_crc32(s3.cfg.bucket, strlen(s3.cfg.bucket));
+        snprintf(key, sizeof key, "sha256_%08x", (unsigned)h);
+        store_kv_set_str(key, s3.backend_checks_sha256 ? "1" : "0");
+        log_ring_printf("backend %s a wrong x-amz-checksum-sha256%s", s3.backend_checks_sha256 ? "rejects" : "ACCEPTS", s3.backend_checks_sha256 ? "; parts use the hardware SHA engine" : "; parts use Content-MD5");
+    }
     if (!s3_ready || s3.digest_check_known) return;
     if (rrc_s3_probe_digest_check(&s3, app_device_id()) == ESP_OK) {
         char key[80];
@@ -348,7 +357,8 @@ typedef struct {
     size_t len;      /* bytes in the buffer */
     esp_err_t err;   /* read error; len bytes before it are still valid */
     bool last;       /* nothing follows (EOF, short part, or error) */
-    uint8_t md5[16]; /* filled by the hasher: Content-MD5 / single-PUT ETag */
+    uint8_t md5[16]; /* filled by the checksum stage: Content-MD5 / single-PUT ETag */
+    uint8_t sha[32]; /* ... or, for multipart parts on a backend that verifies it, SHA-256 on the hardware engine */
 } part_msg_t;
 
 /* Where the last upload_object spent its time, per stage (microseconds). The
@@ -367,6 +377,7 @@ typedef struct {
     TaskHandle_t reader_h, hasher_h, md5_h, h2_h;
     QueueHandle_t h2_q, h2_out;   /* helper hashing the second half of each full part */
     uint64_t hashed;              /* bytes already folded into b3 */
+    bool use_sha;                 /* per-part checksum is SHA-256 (hardware) instead of MD5 (software) */
     volatile bool abort;   /* uploader gave up; stop reading */
     uint64_t fail_at;
     esp_err_t fail_err;
@@ -474,7 +485,7 @@ static void hasher_task(void *arg)
     for (;;) vTaskSuspend(NULL);
 }
 
-/* MD5 is its own stage: BLAKE3 and MD5 in one task capped the pipeline at ~6 MB/s. */
+/* The per-part checksum is its own stage: BLAKE3 and MD5 in one task capped the pipeline at ~6 MB/s. */
 static void md5_task(void *arg)
 {
     reader_job_t *j = arg;
@@ -483,7 +494,8 @@ static void md5_task(void *arg)
         xQueueReceive(j->md5_q, &m, portMAX_DELAY);
         if (m.err == ESP_OK && !j->abort) {
             int64_t t0 = esp_timer_get_time();
-            rrc_md5(part_bufs[m.slot], m.len, m.md5);
+            if (j->use_sha) rrc_sha256(part_bufs[m.slot], m.len, m.sha);   /* SHA engine, DMA */
+            else rrc_md5(part_bufs[m.slot], m.len, m.md5);
             pipe_stats.md5_us += esp_timer_get_time() - t0;
         }
         xQueueSend(j->full_q, &m, portMAX_DELAY);
@@ -534,7 +546,7 @@ static void reader_join(reader_job_t *j, bool *done, int held)
 typedef struct {
     const char *key, *upload_id;
     int part_no, slot;
-    const uint8_t *data, *md5;
+    const uint8_t *data, *md5, *sha;
     size_t len;
     char *etag;
     QueueHandle_t free_q;
@@ -551,7 +563,8 @@ static struct { rrc_s3_t *conn; QueueHandle_t q; volatile bool busy; } up[N_UPLO
 static volatile esp_err_t w_err;
 static char w_errmsg[96];
 static bool worker_ready;
-static uint8_t pj_md5[PART_SLOTS][16];   /* the MD5 must outlive the message that carried it */
+static uint8_t pj_md5[PART_SLOTS][16];   /* the checksums must outlive the message that carried them */
+static uint8_t pj_sha[PART_SLOTS][32];
 
 static void upload_worker(void *arg)
 {
@@ -564,7 +577,7 @@ static void upload_worker(void *arg)
         rrc_s3_result_t res = {0};
         int64_t t0 = esp_timer_get_time();
         if (j.part_no <= 16) { part_tl[j.part_no - 1].start = t0 - tl_t0; part_tl[j.part_no - 1].who = (char)('0' + idx); }
-        esp_err_t e = rrc_s3_upload_part(c, j.key, j.upload_id, j.part_no, j.data, j.len, j.md5, j.etag, 40, &res);
+        esp_err_t e = rrc_s3_upload_part(c, j.key, j.upload_id, j.part_no, j.data, j.len, j.md5, j.sha, j.etag, 40, &res);
         pipe_stats.upload_us += esp_timer_get_time() - t0;
         if (j.part_no <= 16) part_tl[j.part_no - 1].end = esp_timer_get_time() - tl_t0;
         if (e != ESP_OK && w_err == ESP_OK) {
@@ -662,6 +675,7 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     rrc_blake3_ctx b3;
     rrc_blake3_init(&b3);
     bool multipart = o->size > PART_BUF_BYTES;
+    bool use_sha = multipart && s3.sha256_check_known && s3.backend_checks_sha256;
     char upload_id[160] = "";
     char (*etags)[40] = NULL;
     int parts = 0;
@@ -689,7 +703,7 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     direct_selfcheck(src, o, fh);
     job = calloc(1, sizeof *job);
     if (!job) { e = ESP_ERR_NO_MEM; goto fail; }
-    job->src = src; job->fh = fh; job->size = o->size; job->b3 = &b3;
+    job->src = src; job->fh = fh; job->size = o->size; job->b3 = &b3; job->use_sha = use_sha;
     job->free_q = xQueueCreate(PART_SLOTS, sizeof(int));
     job->hash_q = xQueueCreate(PART_SLOTS, sizeof(part_msg_t));
     job->md5_q = xQueueCreate(PART_SLOTS, sizeof(part_msg_t));
@@ -732,7 +746,9 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
                 part_job_t pj = {.key = key, .upload_id = upload_id, .part_no = parts + 1, .slot = m.slot, .data = buf, .len = m.len,
                                  .etag = etags[parts], .free_q = job->free_q, .slots = slots};
                 memcpy(pj_md5[m.slot], m.md5, 16);
+                memcpy(pj_sha[m.slot], m.sha, 32);
                 pj.md5 = pj_md5[m.slot];
+                pj.sha = use_sha ? pj_sha[m.slot] : NULL;
                 if (parts < 16) part_tl[parts].ready = esp_timer_get_time() - tl_t0;
                 up[u].busy = true;
                 xQueueSend(up[u].q, &pj, 0);
@@ -743,7 +759,7 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
                 xSemaphoreTake(slots, portMAX_DELAY);   /* wait for the next free uploader before taking the next part */
                 continue;
             }
-            e = rrc_s3_upload_part(&s3, key, upload_id, parts + 1, buf, m.len, m.md5, etags[parts], 40, &res);
+            e = rrc_s3_upload_part(&s3, key, upload_id, parts + 1, buf, m.len, m.md5, use_sha ? m.sha : NULL, etags[parts], 40, &res);
             if (parts < 16) part_tl[parts].end = esp_timer_get_time() - tl_t0;
             if (e != ESP_OK) { char b[96]; set_error("part %d failed: %s", parts + 1, rrc_s3_result_str(&res, b, sizeof b)); goto fail; }
             parts++;
@@ -782,7 +798,7 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     if (h.content_length >= 0 && (uint64_t)h.content_length != total) { set_error("verify size mismatch %lld != %llu", (long long)h.content_length, (unsigned long long)total); e = ESP_FAIL; goto fail_nomp; }
     if (!multipart) {
         if (strcasecmp(h.etag, single_md5_hex) != 0) { set_error("verify ETag != MD5 (%s vs %s)", h.etag, single_md5_hex); e = ESP_FAIL; goto fail_nomp; }
-    } else if (!s3.digest_check_known || !s3.backend_rejects_bad_md5) {
+    } else if (!use_sha && (!s3.digest_check_known || !s3.backend_rejects_bad_md5)) {   /* a backend that verified every part's SHA-256 needs no read-back */
         hash_sink_t hs = {0};
         rrc_blake3_init(&hs.b3);
         rrc_s3_result_t gr;
@@ -1176,10 +1192,12 @@ static void debug_pipe(int mb, int rate_mb_s)
 static void debug_netpar(int nparts, int nup)
 {
     if (!s3_ready || !worker_ready) { printf("cloud not configured\n"); return; }
+    run_digest_probe_if_needed();
     if (nparts < 1) nparts = 8;
     if (nup < 1 || nup > N_UPLOADERS) nup = N_UPLOADERS;
     for (size_t i = 0; i < PART_BUF_BYTES; i += 4096) memset(part_bufs[0] + i, (int)(0x30 + (i / 4096) % 64), 4096);
-    uint8_t md5[16]; rrc_md5(part_bufs[0], PART_BUF_BYTES, md5);
+    uint8_t md5[16], sha[32]; rrc_md5(part_bufs[0], PART_BUF_BYTES, md5); rrc_sha256(part_bufs[0], PART_BUF_BYTES, sha);
+    bool use_sha = s3.sha256_check_known && s3.backend_checks_sha256;
     char key[160], upload_id[160] = "";
     snprintf(key, sizeof key, ".rrcloud/tmp/%s-netpar", app_device_id());
     rrc_s3_result_t res;
@@ -1195,7 +1213,7 @@ static void debug_netpar(int nparts, int nup)
         xSemaphoreTake(slots, portMAX_DELAY);
         int u = !up[0].busy ? 0 : 1;
         if (nup == 1) u = 0;
-        part_job_t pj = {.key = key, .upload_id = upload_id, .part_no = i + 1, .slot = 0, .data = part_bufs[0], .md5 = md5, .len = PART_BUF_BYTES, .etag = etags[i], .free_q = fq, .slots = slots};
+        part_job_t pj = {.key = key, .upload_id = upload_id, .part_no = i + 1, .slot = 0, .data = part_bufs[0], .md5 = md5, .sha = use_sha ? sha : NULL, .len = PART_BUF_BYTES, .etag = etags[i], .free_q = fq, .slots = slots};
         if (i < 16) part_tl[i].ready = esp_timer_get_time() - tl_t0;
         up[u].busy = true;
         xQueueSend(up[u].q, &pj, 0);
@@ -1214,6 +1232,7 @@ static void debug_netpar(int nparts, int nup)
 static void debug_campipe(const char *arg, uint64_t size)
 {
     if (!s3_ready) { printf("cloud not configured\n"); return; }
+    run_digest_probe_if_needed();
     if (!cam || !cam->connected(cam)) { printf("no camera attached\n"); return; }
     cam_object_t o = {0};
     o.handle = (uint32_t)strtoul(arg, NULL, 16);

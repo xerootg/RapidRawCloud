@@ -208,6 +208,19 @@ The upload path is tuned so one TLS stream can fill the 100 Mbit Ethernet port:
   subtrees that both cores hash, then appended in order (`rrc_blake3_add_subtree`;
   host-tested against the sequential digest). Four 6 MiB part buffers keep both uploads
   fed: the shorter a buffer's read-hash-upload cycle, the fewer buffers idle.
+- **Hardware SHA-256 instead of software MD5 for parts.** Multipart parts used to carry a
+  Content-MD5 (about 21 MB/s on the CPU, 5 core-seconds for a 58 MB file). The dock now
+  probes the backend once, with a deliberately wrong `x-amz-checksum-sha256`, and if it
+  rejects it, parts carry a SHA-256 computed on the SHA engine with DMA (about 77 MB/s, 1
+  core-second) and the multipart upload declares `x-amz-checksum-algorithm: SHA256`. A
+  backend that verifies every part this way needs no read-back. Objects that fit in one
+  part still use Content-MD5, because their ETag is that MD5. Garage verifies the checksum.
+- **BLAKE3 stays scalar.** The P4's 128-bit vector unit (PIE) looks like a fit, but it
+  has no wrapping 32-bit add: both `esp.vadd.s32` and `esp.vadd.u32` saturate (verified on
+  silicon: `ffffffff + 1` stays `ffffffff`, despite what the manual's prose says), and
+  BLAKE3 does six modular adds per mixing step. Emulating one takes about ten vector
+  ops, so a four-lane kernel is slower than the scalar code. The shifts, XOR and OR are
+  fine; only the add is the blocker.
 - **Internal RAM is the scarce resource.** The hardware AES driver, both TLS sessions
   and every task stack compete for it, and "esp-aes: Failed to allocate memory" shows up
   as TLS write errors. lwIP and Wi-Fi hot paths are therefore not placed in IRAM,

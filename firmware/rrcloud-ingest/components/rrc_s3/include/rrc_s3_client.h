@@ -43,6 +43,9 @@ typedef struct {
     /* set at configure time by rrc_s3_probe_digest_check (§2.4 backend probe) */
     bool digest_check_known;
     bool backend_rejects_bad_md5;
+    /* Backend verifies an x-amz-checksum-sha256 header (probed like Content-MD5). Parts then carry a
+     * SHA-256, computed on the hardware engine, instead of an MD5 computed on the CPU. */
+    bool sha256_check_known, backend_checks_sha256;
     /* Persistent connection (rrc_s3_client.c): one TLS session or TCP socket is
      * reused across requests; reopened transparently when the server drops it. */
     void *conn_tls;         /* esp_tls_t* for https, NULL for http */
@@ -90,14 +93,16 @@ esp_err_t rrc_s3_get_stream(rrc_s3_t *s3, const char *key, rrc_s3_sink_t sink, v
 esp_err_t rrc_s3_delete(rrc_s3_t *s3, const char *key, rrc_s3_result_t *res);
 
 /* Multipart (§2.4). Parts are buffered (one part in PSRAM at a time). */
+/* `sha256_parts`: declare x-amz-checksum-algorithm SHA256 for the parts that will follow. */
 esp_err_t rrc_s3_multipart_create(rrc_s3_t *s3, const char *key, const char *content_type, const rrc_kv *meta, size_t n_meta,
                                   char *upload_id, size_t upload_id_cap, rrc_s3_result_t *res);
 /* Like rrc_s3_put with the body's MD5 already known (16 raw bytes; NULL = compute here). */
 esp_err_t rrc_s3_put_md5(rrc_s3_t *s3, const char *key, const void *body, size_t len, const char *content_type,
                          const rrc_kv *meta, size_t n_meta, const uint8_t *md5_digest, rrc_s3_result_t *res);
-/* `md5_digest`: the part's MD5 (16 raw bytes) if the caller already has it, else NULL. */
+/* `sha256_digest` (32 raw bytes), when given, replaces Content-MD5 with x-amz-checksum-sha256;
+ * otherwise `md5_digest` is the part's MD5 (16 raw bytes) if the caller already has it, else NULL. */
 esp_err_t rrc_s3_upload_part(rrc_s3_t *s3, const char *key, const char *upload_id, int part_number, const void *data, size_t len,
-                             const uint8_t *md5_digest,
+                             const uint8_t *md5_digest, const uint8_t *sha256_digest,
                              char *etag, size_t etag_cap, rrc_s3_result_t *res);
 esp_err_t rrc_s3_multipart_complete(rrc_s3_t *s3, const char *key, const char *upload_id, const char *const *etags, int n_parts,
                                     rrc_s3_result_t *res);
@@ -106,6 +111,8 @@ esp_err_t rrc_s3_multipart_abort(rrc_s3_t *s3, const char *key, const char *uplo
 /* §2.4 backend probe: PUT a tiny object with a deliberately wrong Content-MD5 and
  * record whether the backend rejects it (400 BadDigest). Probe object key is
  * ".rrcloud/v1/probe/<device>.bin" and is deleted afterwards. */
+/* Does the backend reject a wrong x-amz-checksum-sha256? Sets sha256_check_known / backend_checks_sha256. */
+esp_err_t rrc_s3_probe_sha256_check(rrc_s3_t *s3, const char *device_id);
 esp_err_t rrc_s3_probe_digest_check(rrc_s3_t *s3, const char *device_id);
 
 /* Human-readable summary of a result for logs. */

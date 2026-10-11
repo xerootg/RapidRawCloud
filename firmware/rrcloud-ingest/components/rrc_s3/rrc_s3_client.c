@@ -599,6 +599,7 @@ esp_err_t rrc_s3_multipart_create(rrc_s3_t *s3, const char *key, const char *con
     char names[RRC_SIGV4_MAX_HEADERS][64];
     size_t n = 0;
     h[n++] = (rrc_kv){"content-type", content_type ? content_type : "application/octet-stream"};
+    if (s3->sha256_check_known && s3->backend_checks_sha256) h[n++] = (rrc_kv){"x-amz-checksum-algorithm", "SHA256"};
     n = meta_headers(meta, n_meta, h, names, n);
     char body[2048];
     req_ctx_t ctx = {.res = res, .buf = (uint8_t *)body, .cap = sizeof body - 1};
@@ -612,14 +613,20 @@ esp_err_t rrc_s3_multipart_create(rrc_s3_t *s3, const char *key, const char *con
 }
 
 esp_err_t rrc_s3_upload_part(rrc_s3_t *s3, const char *key, const char *upload_id, int part_number, const void *data, size_t len,
-                             const uint8_t *md5_digest, char *etag, size_t etag_cap, rrc_s3_result_t *res)
+                             const uint8_t *md5_digest, const uint8_t *sha256_digest, char *etag, size_t etag_cap, rrc_s3_result_t *res)
 {
     char pn[8];
     snprintf(pn, sizeof pn, "%d", part_number);
     rrc_kv q[2] = {{"partNumber", pn}, {"uploadId", upload_id}};
-    char md5[32];
-    md5_b64(data, len, md5_digest, md5);
-    rrc_kv h[1] = {{"content-md5", md5}};
+    char md5[48];
+    rrc_kv h[1];
+    if (sha256_digest) {
+        rrc_base64_encode(sha256_digest, 32, md5);
+        h[0] = (rrc_kv){"x-amz-checksum-sha256", md5};
+    } else {
+        md5_b64(data, len, md5_digest, md5);
+        h[0] = (rrc_kv){"content-md5", md5};
+    }
     req_ctx_t ctx = {.res = res};
     /* UNSIGNED-PAYLOAD like the Rust transfer lane (§3.9): Content-MD5 carries integrity. */
     esp_err_t err = with_retries(s3, "PUT", key, q, 2, h, 1, data, len, RRC_SIGV4_UNSIGNED_PAYLOAD, &ctx, true);
@@ -702,6 +709,33 @@ esp_err_t rrc_s3_probe_digest_check(rrc_s3_t *s3, const char *device_id)
         return ESP_FAIL;
     }
     s3->digest_check_known = true;
+    return ESP_OK;
+}
+
+esp_err_t rrc_s3_probe_sha256_check(rrc_s3_t *s3, const char *device_id)
+{
+    char key[160];
+    snprintf(key, sizeof key, ".rrcloud/v1/probe/%s.sha", device_id);
+    static const char payload[] = "rrcloud-ingest sha256 probe";
+    uint8_t wrong[32] = {0};                       /* a digest of nothing in particular */
+    char b64[48];
+    rrc_base64_encode(wrong, 32, b64);
+    rrc_kv h[2] = {{"x-amz-checksum-sha256", b64}, {"content-type", "application/octet-stream"}};
+    rrc_s3_result_t res;
+    req_ctx_t ctx = {.res = &res};
+    esp_err_t err = with_retries(s3, "PUT", key, NULL, 0, h, 2, payload, sizeof payload - 1, NULL, &ctx, true);
+    if (err != ESP_OK) return err;
+    if (res.status == 400 || !strcmp(res.error_code, "InvalidDigest") || !strcmp(res.error_code, "BadDigest")) {
+        s3->backend_checks_sha256 = true;
+    } else if (res.status >= 200 && res.status < 300) {
+        s3->backend_checks_sha256 = false;
+        rrc_s3_result_t d;
+        rrc_s3_delete(s3, key, &d);
+    } else {
+        ESP_LOGW(TAG, "sha256 probe inconclusive: status %d code %s", res.status, res.error_code);
+        return ESP_FAIL;
+    }
+    s3->sha256_check_known = true;
     return ESP_OK;
 }
 
