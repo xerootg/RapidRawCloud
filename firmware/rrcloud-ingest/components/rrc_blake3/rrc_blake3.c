@@ -157,6 +157,20 @@ static void compress(const uint32_t cv[8], const uint8_t block[BLOCK_LEN], uint6
     out[12] = v12 ^ cv[4]; out[13] = v13 ^ cv[5]; out[14] = v14 ^ cv[6]; out[15] = v15 ^ cv[7];
 }
 
+/* CV of one complete 1024-byte chunk straight from the input: no staging copy, no
+ * per-block bookkeeping. Same result as feeding it through a chunk state. */
+static void chunk_cv_direct(const uint8_t *in, uint64_t counter, uint32_t cv[8])
+{
+    uint32_t state[8], out[16];
+    memcpy(state, IV, sizeof state);
+    for (int b = 0; b < CHUNK_LEN / BLOCK_LEN; b++) {
+        uint32_t flags = (b == 0 ? CHUNK_START : 0) | (b == CHUNK_LEN / BLOCK_LEN - 1 ? CHUNK_END : 0);
+        compress(state, in + (size_t)b * BLOCK_LEN, counter, BLOCK_LEN, flags, out);
+        memcpy(state, out, sizeof state);
+    }
+    memcpy(cv, state, sizeof state);
+}
+
 static void chunk_init(rrc_blake3_chunk_state *c, uint64_t counter)
 {
     memcpy(c->cv, IV, sizeof IV);
@@ -260,11 +274,72 @@ void rrc_blake3_update(rrc_blake3_ctx *h, const void *data, size_t len)
             add_chunk_cv(h, cv, total);
             chunk_init(&h->chunk, total);
         }
+        /* Fresh chunk with more than a whole chunk still to come: hash it in place. (A chunk
+         * is only closed when more data follows it, so the last one always stays pending.) */
+        if (chunk_len(&h->chunk) == 0 && len > CHUNK_LEN) {
+            uint32_t cv[8];
+            chunk_cv_direct(in, h->chunk.chunk_counter, cv);
+            uint64_t total = h->chunk.chunk_counter + 1;
+            add_chunk_cv(h, cv, total);
+            chunk_init(&h->chunk, total);
+            in += CHUNK_LEN; len -= CHUNK_LEN;
+            continue;
+        }
         size_t want = CHUNK_LEN - chunk_len(&h->chunk);
         size_t take = len < want ? len : want;
         chunk_update(&h->chunk, in, take);
         in += take; len -= take;
     }
+}
+
+void rrc_blake3_subtree_cv(const void *data, size_t nchunks, uint64_t first_chunk, uint32_t cv[8])
+{
+    const uint8_t *in = (const uint8_t *)data;
+    uint32_t stack[32][8];
+    int sp = 0;
+    for (size_t i = 0; i < nchunks; i++) {
+        uint32_t c[8];
+        chunk_cv_direct(in + i * CHUNK_LEN, first_chunk + i, c);
+        uint64_t total = i + 1;
+        while ((total & 1) == 0) {
+            output_t o;
+            sp--;
+            parent_output(stack[sp], c, &o);
+            output_cv(&o, c);
+            total >>= 1;
+        }
+        memcpy(stack[sp++], c, 32);
+    }
+    memcpy(cv, stack[0], 32);
+}
+
+int rrc_blake3_add_subtree(rrc_blake3_ctx *h, const uint32_t cv[8], uint64_t nchunks)
+{
+    if (nchunks == 0 || (nchunks & (nchunks - 1)) != 0) return -1;
+    if (chunk_len(&h->chunk) == CHUNK_LEN) {            /* close the pending full chunk first */
+        output_t o;
+        uint32_t c[8];
+        chunk_output(&h->chunk, &o);
+        output_cv(&o, c);
+        uint64_t total = h->chunk.chunk_counter + 1;
+        add_chunk_cv(h, c, total);
+        chunk_init(&h->chunk, total);
+    }
+    uint64_t before = h->chunk.chunk_counter;
+    if (chunk_len(&h->chunk) != 0 || before % nchunks != 0) return -1;
+    uint32_t c[8];
+    memcpy(c, cv, 32);
+    uint64_t units = before / nchunks + 1;
+    while ((units & 1) == 0) {
+        output_t o;
+        h->cv_stack_len--;
+        parent_output(h->cv_stack[h->cv_stack_len], c, &o);
+        output_cv(&o, c);
+        units >>= 1;
+    }
+    memcpy(h->cv_stack[h->cv_stack_len++], c, 32);
+    chunk_init(&h->chunk, before + nchunks);
+    return 0;
 }
 
 void rrc_blake3_final(const rrc_blake3_ctx *h, uint8_t out[RRC_BLAKE3_OUT_LEN])

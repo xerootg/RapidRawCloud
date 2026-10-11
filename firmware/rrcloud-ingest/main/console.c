@@ -273,6 +273,18 @@ static int cmd_cam_read(int argc, char **argv)
     sync_debug_read(argv[1], argc > 2 ? atoi(argv[2]) : 16, argc > 3 ? atoi(argv[3]) : 0);
     return 0;
 }
+static int cmd_tasks(int argc, char **argv)
+{
+    char *buf = heap_caps_malloc(4096, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!buf) return 1;
+    vTaskList(buf);
+    printf("name             state prio  stack-free(words) #\n%s", buf);
+    printf("internal heap: %u free, largest block %u, lowest ever %u\n", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+    free(buf);
+    return 0;
+}
+static int cmd_net_par(int argc, char **argv) { sync_debug_netpar(argc > 1 ? atoi(argv[1]) : 8, argc > 2 ? atoi(argv[2]) : 2); return 0; }
 static int cmd_cam_pipe(int argc, char **argv)
 {
     if (argc < 3) { printf("usage: cam-pipe <handle> <size bytes>   (see cam-ls)\n"); return 1; }
@@ -332,7 +344,7 @@ esp_err_t console_start(void)
     /* The default 4 KiB REPL stack overflows (stack protection fault) as soon as
      * a command formats a status document or runs a config patch through cJSON
      * and NVS; `status` and `set` both rebooted the dock on 0.1.4. */
-    rc.task_stack_size = 16384;
+    rc.task_stack_size = 8192;   /* measured use: ~1 KB; was 16 KiB before the buffers moved to the heap */
     esp_console_dev_uart_config_t uc = ESP_CONSOLE_DEV_UART_CONFIG_DEFAULT();
     esp_err_t e = esp_console_new_repl_uart(&uc, &rc, &repl);
     if (e != ESP_OK) { ESP_LOGW(TAG, "console unavailable: %s", esp_err_to_name(e)); return e; }
@@ -353,6 +365,8 @@ esp_err_t console_start(void)
         {.command = "ble-forget", .help = "Forget every paired phone (they pair again on next use)", .func = cmd_ble_forget},
         {.command = "crypto-bench", .help = "crypto-bench: throughput of SHA-256, MD5 and AES-GCM on this board (internal RAM vs PSRAM)", .func = cmd_crypto_bench},
         {.command = "cam-read", .help = "cam-read <handle|path> [MiB] [chunk KiB]: raw camera read rate (no hash, no upload), USB DMA straight into PSRAM vs bounce+copy", .func = cmd_cam_read},
+        {.command = "tasks", .help = "tasks: every task with its stack headroom (words), and the internal heap low-water mark", .func = cmd_tasks},
+        {.command = "net-par", .help = "net-par [parts] [uploaders 1|2]: pre-hashed parts through 1 or 2 upload connections, nothing else running (network ceiling)", .func = cmd_net_par},
         {.command = "cam-pipe", .help = "cam-pipe <handle> <size>: one real camera object through the whole pipeline to a scratch key (not the library), verified, then deleted", .func = cmd_cam_pipe},
         {.command = "usb-direct", .help = "usb-direct [on|off]: zero-copy USB DMA reads on/off (A/B for diagnostics)", .func = cmd_usb_direct},
         {.command = "pipe-test", .help = "pipe-test [MiB] [MB/s]: push a synthetic object through the real read-ahead/upload pipeline at an emulated camera rate (0 = unthrottled), verify by read-back", .func = cmd_pipe_test},

@@ -33,6 +33,13 @@ typedef struct {
 
 void rrc_blake3_init(rrc_blake3_ctx *h);
 void rrc_blake3_update(rrc_blake3_ctx *h, const void *data, size_t len);
+/* Parallel hashing: the chaining value of a complete, aligned subtree of `nchunks` (a power of
+ * two) 1024-byte chunks that starts at chunk index `first_chunk` (a multiple of `nchunks`) can be
+ * computed on any thread, then appended in order to the main hasher, which must have consumed
+ * exactly first_chunk * 1024 bytes. Returns 0, or -1 if the hasher is not at such a boundary
+ * (the caller then feeds the bytes through rrc_blake3_update instead). */
+void rrc_blake3_subtree_cv(const void *data, size_t nchunks, uint64_t first_chunk, uint32_t cv[8]);
+int rrc_blake3_add_subtree(rrc_blake3_ctx *h, const uint32_t cv[8], uint64_t nchunks);
 void rrc_blake3_final(const rrc_blake3_ctx *h, uint8_t out[RRC_BLAKE3_OUT_LEN]);
 void rrc_blake3(const void *data, size_t len, uint8_t out[RRC_BLAKE3_OUT_LEN]);
 /* Finalize to lowercase hex (65-byte buffer incl. NUL). */

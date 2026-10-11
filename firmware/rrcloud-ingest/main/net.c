@@ -222,7 +222,7 @@ esp_err_t net_init(void)
     esp_err_t e = eth_init();
     if (e != ESP_OK) log_ring_printf("ethernet init failed: %s", esp_err_to_name(e));
     policy_q = xQueueCreate(8, sizeof(wifi_policy_t));
-    xTaskCreate(policy_task, "net_policy", 6144, NULL, 3, NULL);
+    xTaskCreate(policy_task, "net_policy", 4096, NULL, 3, NULL);
     /* No cable within ten seconds of boot: bring Wi-Fi up (link detection takes ~2 s). */
     const esp_timer_create_args_t ta = {.callback = boot_policy_cb, .name = "wifi_boot"};
     esp_timer_handle_t t;

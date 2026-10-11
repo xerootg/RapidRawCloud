@@ -54,6 +54,8 @@ void sync_debug_read(const char *handle_or_path, int mb, int chunk_kib);
 /* Persistent state of the zero-copy USB read check: 0 ok/unknown, 1 running, 2 disabled. */
 void sync_usb_direct_state_set(uint8_t v);
 /* Pushes one real camera object (handle, size in bytes) through the real pipeline to a scratch key and verifies it. */
+/* Pre-hashed parts through 1 or 2 uploaders, nothing else running: the network ceiling. */
+void sync_debug_netpar(int nparts, int uploaders);
 void sync_debug_campipe(const char *handle, int size_bytes);
 /* Camera event hook (registered with the source installers). */
 void sync_on_camera_event(cam_event_t ev, cam_source_t *src, void *arg);

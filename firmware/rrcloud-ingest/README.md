@@ -197,17 +197,24 @@ The upload path is tuned so one TLS stream can fill the 100 Mbit Ethernet port:
   `pipe-test [MiB] [MB/s]` drives the real pipeline from a synthetic camera at an
   emulated rate; `cam-pipe <handle> <size>` pushes one real camera object through the
   whole thing to a scratch key outside the library, verifies it and deletes it.
-- **Two upload connections.** One TCP stream over a ~40 ms WAN path tops out near 6 MB/s
-  (the laptop shows the same: 9 MB/s on one stream, 12-13 on two or more), so multipart
-  parts alternate between the sync task and a persistent worker with its own TLS
-  connection. The worker keeps an internal-RAM stack: the hardware AES-GCM engine only
-  takes DMA-capable buffers and mbedTLS keeps its AAD on the stack.
+- **Two upload connections.** One TCP stream over a ~40 ms WAN path carries about
+  6.3 MB/s, two carry about 8.1 MB/s (`net-par [parts] [1|2]` measures this with
+  pre-hashed parts and nothing else running). Multipart parts alternate between two
+  upload tasks, one on its own TLS connection and one borrowing the sync task's, so the
+  sync task is a pure dispatcher. The upload tasks keep internal-RAM stacks (about 21 KB
+  used of 24 KB): the hardware AES-GCM engine only takes DMA-capable buffers and mbedTLS
+  keeps its AAD on the stack.
+- **Parallel BLAKE3.** BLAKE3 is a tree, so each 6 MiB part is split into aligned 1 MiB
+  subtrees that both cores hash, then appended in order (`rrc_blake3_add_subtree`;
+  host-tested against the sequential digest). Four 6 MiB part buffers keep both uploads
+  fed: the shorter a buffer's read-hash-upload cycle, the fewer buffers idle.
 - **Internal RAM is the scarce resource.** The hardware AES driver, both TLS sessions
   and every task stack compete for it, and "esp-aes: Failed to allocate memory" shows up
   as TLS write errors. lwIP and Wi-Fi hot paths are therefore not placed in IRAM,
-  NimBLE's pools live in PSRAM, the PTP bounce buffer is 16 KiB, and the camera reader
-  and hash tasks use PSRAM stacks. Keep an eye on the "internal heap free" line that
-  `cam-pipe` prints (about 97 KB with everything running).
+  NimBLE's pools live in PSRAM, the PTP bounce buffer is 16 KiB, the camera reader and
+  hash tasks use PSRAM stacks, and the other stacks are sized from the `tasks` command's
+  high-water marks. Keep an eye on the "internal heap free" line that `cam-pipe` prints
+  (about 91 KB with everything running).
 - **Big camera requests.** The Z 7II pays a fixed latency per `GetPartialObject`:
   256 KiB requests top out at 8 MB/s, 4 MiB requests reach 25 MB/s, so the sync reads
   4 MiB at a time.
@@ -227,9 +234,10 @@ The upload path is tuned so one TLS stream can fill the 100 Mbit Ethernet port:
 
 Measured on the bench with the bucket one WAN hop away: raw TCP 10.3 MB/s; an 8 MiB TLS
 PUT 1.8 s end to end (socket send at wire rate, 0.4 s of TLS CPU); BLAKE3 11 MB/s and
-MD5 21 MB/s in software. A 58 MB NEF from a Z 7II to the bucket, verified: 12.8 s
-(4.4 MB/s) with camera read 2.3 s, BLAKE3 7 s, MD5 3.7 s, upload 10.3 s, so a sync is
-upload-bound. The raw camera read alone is 27 MB/s with USB DMA into PSRAM (21 MB/s with
+MD5 21 MB/s in software. A 58 MB NEF from a Z 7II to the bucket, verified: 10.8 s
+(5.2 MB/s) with camera read 2.5 s, BLAKE3 5.4 s, MD5 5.3 s and about 9 s of uploading
+on two connections, so a sync is upload-bound; the hashing shares the two cores with TLS
+and lwIP and costs the uploads about 2 MB/s against the network-only figure. The raw camera read alone is 27 MB/s with USB DMA into PSRAM (21 MB/s with
 the copying path).
 
 ## Bluetooth LE setup from the RapidRAW app

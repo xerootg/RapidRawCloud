@@ -55,6 +55,29 @@ int main(int argc, char **argv) {
         CHECK(!strcmp(g2, want), "blake3 oneshot len=%lu", n);
         free(buf); count++; }
       fclose(f); printf("blake3 vectors checked: %d\n", count); }
+    /* Parallel-hashing primitives: aligned power-of-two subtrees computed independently and appended in
+     * order must give exactly the sequential digest, for any mix of subtree and plain updates. */
+    { const size_t sub = 64;                       /* chunks per subtree (64 KiB) */
+      const size_t total = sub * 1024 * 5 + 777;    /* 5 subtrees and a ragged tail */
+      uint8_t *buf = malloc(total); for (size_t i = 0; i < total; i++) buf[i] = (uint8_t)((i * 2654435761u) >> 13);
+      uint8_t want[32], got[32]; rrc_blake3(buf, total, want);
+      for (int variant = 0; variant < 3; variant++) {
+        rrc_blake3_ctx h; rrc_blake3_init(&h);
+        size_t off = 0; int ok = 1;
+        if (variant == 1) { rrc_blake3_update(&h, buf, 3 * 1024); off = 3 * 1024; }   /* unaligned start: must refuse */
+        if (variant == 2) { rrc_blake3_update(&h, buf, sub * 1024); off = sub * 1024; } /* aligned after a plain update (pending full chunk) */
+        while (off + sub * 1024 <= total && ok) {
+            uint32_t cv[8]; rrc_blake3_subtree_cv(buf + off, sub, off / 1024, cv);
+            int r = rrc_blake3_add_subtree(&h, cv, sub);
+            if (r != 0) { ok = 0; CHECK(variant == 1 && off == 3 * 1024, "subtree refused at the wrong place (variant %d off %zu)", variant, off); break; }
+            off += sub * 1024;
+        }
+        if (!ok) { rrc_blake3_update(&h, buf + off, total - off); }   /* what the firmware does when a subtree is refused */
+        else rrc_blake3_update(&h, buf + off, total - off);
+        rrc_blake3_final(&h, got);
+        CHECK(!memcmp(got, want, 32), "blake3 subtree merge, variant %d", variant);
+      }
+      free(buf); }
     printf(fails ? "FAILED (%d)\n" : "ALL OK\n", fails);
     return fails ? 1 : 0;
 }

@@ -29,11 +29,14 @@
 
 static const char *TAG = "sync";
 
-#define PART_BUF_BYTES   (8u * 1024u * 1024u)   /* one multipart part / max single PUT */
+/* One multipart part / max single PUT. Smaller and more numerous beats fewer and bigger in the same
+ * PSRAM: a buffer slot cycles read -> hash -> upload, so a shorter cycle keeps both upload connections
+ * fed (3 x 8 MiB left them idle ~25% of the time). 6 MiB stays above the 5 MiB S3 multipart minimum. */
+#define PART_BUF_BYTES   (6u * 1024u * 1024u)
 /* The sync task runs the S3 client and its TLS session (mbedTLS handshake and
  * record buffers on the stack) under several KiB of path/key/journal-line locals;
  * 24 KiB overflowed by ~6 KiB on hardware (stack protection fault in "sync"). */
-#define SYNC_TASK_STACK  (48u * 1024u)
+#define SYNC_TASK_STACK  (40u * 1024u)   /* measured peak use ~30 KB (TLS handshake included) */
 /* One GetPartialObject per READ_CHUNK. The Z 7II pays a fixed latency per request: 256 KiB requests
  * top out at 8 MB/s, 4 MiB requests reach 25 MB/s. Cancel latency is one chunk (~0.15 s). */
 #define READ_CHUNK       (4u * 1024u * 1024u)
@@ -45,7 +48,7 @@ static const char *TAG = "sync";
 #define MANIFEST_RECONFIRM_S (24 * 3600)   /* §2.10 rule 2 */
 #define LAGGARD_CAP_S       (14 * 24 * 3600) /* §2.10 rule 3 */
 
-typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG, CMD_DEBUG_LS, CMD_DEBUG_HASH, CMD_DEBUG_SPEED, CMD_DEBUG_TCP, CMD_DEBUG_PIPE, CMD_DEBUG_READ, CMD_DEBUG_CAMPIPE } cmd_t;
+typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG, CMD_DEBUG_LS, CMD_DEBUG_HASH, CMD_DEBUG_SPEED, CMD_DEBUG_TCP, CMD_DEBUG_PIPE, CMD_DEBUG_READ, CMD_DEBUG_CAMPIPE, CMD_DEBUG_NETPAR } cmd_t;
 typedef struct { cmd_t cmd; cam_source_t *src; char *arg; int repeat; int port; } msg_t;
 
 static QueueHandle_t q;
@@ -56,7 +59,7 @@ static rrc_s3_t s3b;                  /* second connection, see upload_worker */
 static bool s3_ready;
 static cam_source_t *cam;             /* attached camera (or NULL) */
 static volatile bool cancel_flag;
-#define PART_SLOTS 3
+#define PART_SLOTS 4
 static uint8_t *part_bufs[PART_SLOTS];   /* read-ahead pipeline buffers, PSRAM */
 static uint8_t *part_buf;                /* = part_bufs[0]; scratch for the diagnostics */
 static esp_timer_handle_t tick_timer;
@@ -351,6 +354,9 @@ typedef struct {
 /* Where the last upload_object spent its time, per stage (microseconds). The
  * stages overlap, so the sum exceeds the wall time; pipe-test prints them. */
 static struct { int64_t read_us, hash_us, md5_us, upload_us; } pipe_stats;
+/* Per-part timeline of the last upload (microseconds since upload_object began), printed by cam-pipe. */
+static struct { int64_t t0, ready, start, end; char who; } part_tl[16];
+static int64_t tl_t0;
 
 typedef struct {
     cam_source_t *src;
@@ -358,7 +364,9 @@ typedef struct {
     uint64_t size;
     rrc_blake3_ctx *b3;
     QueueHandle_t free_q, hash_q, md5_q, full_q;
-    TaskHandle_t reader_h, hasher_h, md5_h;
+    TaskHandle_t reader_h, hasher_h, md5_h, h2_h;
+    QueueHandle_t h2_q, h2_out;   /* helper hashing the second half of each full part */
+    uint64_t hashed;              /* bytes already folded into b3 */
     volatile bool abort;   /* uploader gave up; stop reading */
     uint64_t fail_at;
     esp_err_t fail_err;
@@ -399,20 +407,70 @@ static void reader_task(void *arg)
 
 #define HASHER_TASK_STACK 4096
 
+/* BLAKE3 is a tree, so a full part, which starts on a part-size boundary, splits into aligned 1 MiB
+ * (1024-chunk) subtrees. Both cores pull subtrees off a shared counter, then the results are
+ * appended to the running hash in order. Anything else (the short last part) goes through the
+ * plain streaming update. */
+#define SUB_CHUNKS 1024u
+#define SUB_BYTES  (SUB_CHUNKS * 1024u)
+#define MAX_SUBS   (PART_BUF_BYTES / SUB_BYTES)
+typedef struct { const uint8_t *buf; uint64_t first_chunk; size_t nsub; volatile int next; uint32_t cv[MAX_SUBS][8]; } h2_work_t;
+
+static void h2_run(h2_work_t *w)
+{
+    for (;;) {
+        int i = __atomic_fetch_add(&w->next, 1, __ATOMIC_RELAXED);
+        if (i >= (int)w->nsub) return;
+        rrc_blake3_subtree_cv(w->buf + (size_t)i * SUB_BYTES, SUB_CHUNKS, w->first_chunk + (uint64_t)i * SUB_CHUNKS, w->cv[i]);
+    }
+}
+
+static void hash2_task(void *arg)
+{
+    reader_job_t *j = arg;
+    for (;;) {
+        h2_work_t *w;
+        xQueueReceive(j->h2_q, &w, portMAX_DELAY);
+        h2_run(w);
+        uint32_t done = 1;
+        xQueueSend(j->h2_out, &done, portMAX_DELAY);
+    }
+}
+
 static void hasher_task(void *arg)
 {
     reader_job_t *j = arg;
+    h2_work_t *w = heap_caps_malloc(sizeof *w, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     for (;;) {
         part_msg_t m;
         xQueueReceive(j->hash_q, &m, portMAX_DELAY);
         if (m.err == ESP_OK && m.len && !j->abort) {
             int64_t t0 = esp_timer_get_time();
-            rrc_blake3_update(j->b3, part_bufs[m.slot], m.len);
+            const uint8_t *buf = part_bufs[m.slot];
+            bool split = w && j->h2_h && m.len == PART_BUF_BYTES && j->hashed % PART_BUF_BYTES == 0;
+            if (split) {
+                w->buf = buf; w->first_chunk = j->hashed / 1024; w->nsub = MAX_SUBS; w->next = 0;
+                xQueueSend(j->h2_q, &w, portMAX_DELAY);     /* wake the helper, then work alongside it */
+                h2_run(w);
+                uint32_t done;
+                xQueueReceive(j->h2_out, &done, portMAX_DELAY);
+                bool ok = true;
+                for (size_t i = 0; i < MAX_SUBS && ok; i++) {
+                    if (rrc_blake3_add_subtree(j->b3, w->cv[i], SUB_CHUNKS) != 0) {
+                        if (i == 0) { rrc_blake3_update(j->b3, buf, m.len); ok = false; }   /* refused before consuming anything */
+                        else abort();                                                         /* aligned by construction */
+                    }
+                }
+            } else {
+                rrc_blake3_update(j->b3, buf, m.len);
+            }
+            j->hashed += m.len;
             pipe_stats.hash_us += esp_timer_get_time() - t0;
         }
         xQueueSend(j->md5_q, &m, portMAX_DELAY);
         if (m.last) break;
     }
+    free(w);
     for (;;) vTaskSuspend(NULL);
 }
 
@@ -442,6 +500,9 @@ static void job_destroy(reader_job_t *j)
     if (j->reader_h) vTaskDeleteWithCaps(j->reader_h);
     if (j->hasher_h) vTaskDeleteWithCaps(j->hasher_h);
     if (j->md5_h) vTaskDeleteWithCaps(j->md5_h);
+    if (j->h2_h) vTaskDeleteWithCaps(j->h2_h);
+    if (j->h2_q) vQueueDelete(j->h2_q);
+    if (j->h2_out) vQueueDelete(j->h2_out);
     if (j->md5_q) vQueueDelete(j->md5_q);
     if (j->free_q) vQueueDelete(j->free_q);
     if (j->hash_q) vQueueDelete(j->hash_q);
@@ -477,44 +538,55 @@ typedef struct {
     size_t len;
     char *etag;
     QueueHandle_t free_q;
+    SemaphoreHandle_t slots;     /* counting: one give per finished part, so the dispatcher knows an uploader is free */
 } part_job_t;
 
 #define WORKER_STACK (24u * 1024u)
-static uint8_t pj_md5[PART_SLOTS][16];   /* the MD5 must outlive the message that carried it */
-static QueueHandle_t wq;
-static SemaphoreHandle_t w_idle;
-static volatile bool w_busy;
+#define N_UPLOADERS 2
+/* Both uploaders are tasks, so the sync task is a pure dispatcher and never sits in an upload
+ * while the other connection idles (measured: a dispatcher that also uploaded left the worker
+ * idle for ~0.8 s per part). Uploader 0 owns the extra connection; uploader 1 borrows the sync
+ * task's own, which it does not touch between multipart create and complete. */
+static struct { rrc_s3_t *conn; QueueHandle_t q; volatile bool busy; } up[N_UPLOADERS];
 static volatile esp_err_t w_err;
 static char w_errmsg[96];
 static bool worker_ready;
+static uint8_t pj_md5[PART_SLOTS][16];   /* the MD5 must outlive the message that carried it */
 
 static void upload_worker(void *arg)
 {
-    (void)arg;
+    int idx = (int)(intptr_t)arg;
     for (;;) {
         part_job_t j;
-        xQueueReceive(wq, &j, portMAX_DELAY);
-        s3b.have_server_offset = s3.have_server_offset;
-        s3b.server_offset_s = s3.server_offset_s;
+        xQueueReceive(up[idx].q, &j, portMAX_DELAY);
+        rrc_s3_t *c = up[idx].conn;
+        if (c != &s3) { c->have_server_offset = s3.have_server_offset; c->server_offset_s = s3.server_offset_s; }
         rrc_s3_result_t res = {0};
         int64_t t0 = esp_timer_get_time();
-        esp_err_t e = rrc_s3_upload_part(&s3b, j.key, j.upload_id, j.part_no, j.data, j.len, j.md5, j.etag, 40, &res);
+        if (j.part_no <= 16) { part_tl[j.part_no - 1].start = t0 - tl_t0; part_tl[j.part_no - 1].who = (char)('0' + idx); }
+        esp_err_t e = rrc_s3_upload_part(c, j.key, j.upload_id, j.part_no, j.data, j.len, j.md5, j.etag, 40, &res);
         pipe_stats.upload_us += esp_timer_get_time() - t0;
+        if (j.part_no <= 16) part_tl[j.part_no - 1].end = esp_timer_get_time() - tl_t0;
         if (e != ESP_OK && w_err == ESP_OK) {
             char b[64];
             snprintf(w_errmsg, sizeof w_errmsg, "part %d failed: %s", j.part_no, rrc_s3_result_str(&res, b, sizeof b));
             w_err = e;
         }
         xQueueSend(j.free_q, &j.slot, 0);
-        w_busy = false;
-        xSemaphoreGive(w_idle);
+        up[idx].busy = false;
+        xSemaphoreGive(j.slots);
     }
 }
 
-/* Waits (bounded by the S3 timeout) until the worker has finished its part. */
+/* Waits (bounded by the S3 timeout) until both uploaders have finished their part. */
 static void worker_quiesce(void)
 {
-    for (int i = 0; w_busy && i < 700; i++) xSemaphoreTake(w_idle, pdMS_TO_TICKS(100));
+    for (int i = 0; i < 700; i++) {
+        bool busy = false;
+        for (int k = 0; k < N_UPLOADERS; k++) busy |= up[k].busy;
+        if (!busy) return;
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
 /* ---- zero-copy USB read self-check ---------------------------------------------
@@ -600,7 +672,14 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     bool reader_done = true;
     int held = -1;
     memset(&pipe_stats, 0, sizeof pipe_stats);
+    memset(part_tl, 0, sizeof part_tl);
+    tl_t0 = esp_timer_get_time();
     w_err = ESP_OK;
+    SemaphoreHandle_t slots = NULL;
+    if (multipart && worker_ready) {
+        slots = xSemaphoreCreateCounting(N_UPLOADERS, N_UPLOADERS);
+        if (!slots) { e = ESP_ERR_NO_MEM; goto fail; }
+    }
     if (multipart) {
         e = rrc_s3_multipart_create(&s3, key, "application/octet-stream", meta, 1, upload_id, sizeof upload_id, &res);
         if (e != ESP_OK) { char b[96]; set_error("multipart create failed: %s", rrc_s3_result_str(&res, b, sizeof b)); goto fail; }
@@ -619,6 +698,10 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     for (int i = 0; i < PART_SLOTS; i++) xQueueSend(job->free_q, &i, 0);
     const uint32_t stack_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     if (xTaskCreatePinnedToCoreWithCaps(md5_task, "cam_md5", HASHER_TASK_STACK, job, 4, &job->md5_h, tskNO_AFFINITY, stack_caps) != pdPASS) { set_error("cannot start the md5 stage"); e = ESP_ERR_NO_MEM; goto fail; }
+    /* optional helper: if any of this fails the hasher simply does the whole part itself */
+    job->h2_q = xQueueCreate(1, sizeof(void *));
+    job->h2_out = xQueueCreate(1, sizeof(uint32_t));
+    if (!job->h2_q || !job->h2_out || xTaskCreatePinnedToCoreWithCaps(hash2_task, "cam_hash2", HASHER_TASK_STACK, job, 4, &job->h2_h, tskNO_AFFINITY, stack_caps) != pdPASS) job->h2_h = NULL;
     reader_done = false; /* from here the stages own a message stream that must end with `last` */
     part_msg_t end = {.slot = 0, .len = 0, .err = ESP_ERR_NO_MEM, .last = true};
     if (xTaskCreatePinnedToCoreWithCaps(hasher_task, "cam_hash", HASHER_TASK_STACK, job, 4, &job->hasher_h, tskNO_AFFINITY, stack_caps) != pdPASS) {
@@ -629,6 +712,7 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
         xQueueSend(job->hash_q, &end, portMAX_DELAY);
         set_error("cannot start the camera reader"); e = ESP_ERR_NO_MEM; goto fail;
     }
+    if (slots) xSemaphoreTake(slots, portMAX_DELAY);   /* uploader token for the first part */
     for (;;) {
         part_msg_t m;
         xQueueReceive(job->full_q, &m, portMAX_DELAY);
@@ -642,22 +726,25 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
         if (multipart) {
             if (parts >= 1024) { e = ESP_ERR_INVALID_SIZE; goto fail; }
             if (w_err != ESP_OK) { set_error("%s", w_errmsg); e = w_err; goto fail; }
-            if (worker_ready && !w_busy) {
-                /* hand this part to the second connection; the worker releases the slot */
-                part_job_t pj = {.key = key, .upload_id = upload_id, .part_no = parts + 1, .slot = m.slot, .data = buf, .md5 = m.md5, .len = m.len,
-                                 .etag = etags[parts], .free_q = job->free_q};
+            if (worker_ready && slots) {
+                /* an uploader is guaranteed free: this was taken before the part arrived */
+                int u = !up[0].busy ? 0 : 1;
+                part_job_t pj = {.key = key, .upload_id = upload_id, .part_no = parts + 1, .slot = m.slot, .data = buf, .len = m.len,
+                                 .etag = etags[parts], .free_q = job->free_q, .slots = slots};
                 memcpy(pj_md5[m.slot], m.md5, 16);
                 pj.md5 = pj_md5[m.slot];
-                w_busy = true;
-                xSemaphoreTake(w_idle, 0);
-                xQueueSend(wq, &pj, 0);
+                if (parts < 16) part_tl[parts].ready = esp_timer_get_time() - tl_t0;
+                up[u].busy = true;
+                xQueueSend(up[u].q, &pj, 0);
                 parts++;
                 total += m.len;
                 held = -1;
                 if (m.last) break;
+                xSemaphoreTake(slots, portMAX_DELAY);   /* wait for the next free uploader before taking the next part */
                 continue;
             }
             e = rrc_s3_upload_part(&s3, key, upload_id, parts + 1, buf, m.len, m.md5, etags[parts], 40, &res);
+            if (parts < 16) part_tl[parts].end = esp_timer_get_time() - tl_t0;
             if (e != ESP_OK) { char b[96]; set_error("part %d failed: %s", parts + 1, rrc_s3_result_str(&res, b, sizeof b)); goto fail; }
             parts++;
         } else {
@@ -707,6 +794,7 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     *out_size = total;
     free(etags);
     job_destroy(job);
+    if (slots) vSemaphoreDelete(slots);
     src->close(src, fh);
     return ESP_OK;
 fail:
@@ -717,6 +805,7 @@ fail_nomp:
         if (!reader_done) reader_join(job, &reader_done, held);
         job_destroy(job);
     }
+    if (slots) { worker_quiesce(); vSemaphoreDelete(slots); }
     free(etags);
     if (fh) src->close(src, fh);
     return e == ESP_OK ? ESP_FAIL : e;
@@ -1081,6 +1170,44 @@ static void debug_pipe(int mb, int rate_mb_s)
     rrc_s3_delete(&s3, key, &dr);
 }
 
+/* Network-only parallel upload test: `nparts` copies of one pre-hashed part through one or both
+ * uploaders, nothing else running. Separates what the WAN path can carry from what the dock's CPUs
+ * can feed it. Aborts the multipart upload afterwards. */
+static void debug_netpar(int nparts, int nup)
+{
+    if (!s3_ready || !worker_ready) { printf("cloud not configured\n"); return; }
+    if (nparts < 1) nparts = 8;
+    if (nup < 1 || nup > N_UPLOADERS) nup = N_UPLOADERS;
+    for (size_t i = 0; i < PART_BUF_BYTES; i += 4096) memset(part_bufs[0] + i, (int)(0x30 + (i / 4096) % 64), 4096);
+    uint8_t md5[16]; rrc_md5(part_bufs[0], PART_BUF_BYTES, md5);
+    char key[160], upload_id[160] = "";
+    snprintf(key, sizeof key, ".rrcloud/tmp/%s-netpar", app_device_id());
+    rrc_s3_result_t res;
+    rrc_kv meta[1] = {{"rrc-device", app_device_id()}};
+    if (rrc_s3_multipart_create(&s3, key, "application/octet-stream", meta, 1, upload_id, sizeof upload_id, &res) != ESP_OK) { printf("multipart create failed\n"); return; }
+    char (*etags)[40] = calloc((size_t)nparts, 40);
+    QueueHandle_t fq = xQueueCreate(nparts + 1, sizeof(int));
+    SemaphoreHandle_t slots = xSemaphoreCreateCounting(nup, nup);
+    w_err = ESP_OK;
+    memset(part_tl, 0, sizeof part_tl); memset(&pipe_stats, 0, sizeof pipe_stats);
+    tl_t0 = esp_timer_get_time();
+    for (int i = 0; i < nparts; i++) {
+        xSemaphoreTake(slots, portMAX_DELAY);
+        int u = !up[0].busy ? 0 : 1;
+        if (nup == 1) u = 0;
+        part_job_t pj = {.key = key, .upload_id = upload_id, .part_no = i + 1, .slot = 0, .data = part_bufs[0], .md5 = md5, .len = PART_BUF_BYTES, .etag = etags[i], .free_q = fq, .slots = slots};
+        if (i < 16) part_tl[i].ready = esp_timer_get_time() - tl_t0;
+        up[u].busy = true;
+        xQueueSend(up[u].q, &pj, 0);
+    }
+    worker_quiesce();
+    double secs = (double)(esp_timer_get_time() - tl_t0) / 1e6;
+    double mb = (double)nparts * PART_BUF_BYTES / 1048576.0;
+    printf("network only, %d uploader%s: %d x %u MiB in %.2f s = %.2f MB/s%s\n", nup, nup > 1 ? "s" : "", nparts, (unsigned)(PART_BUF_BYTES >> 20), secs, mb / secs, w_err != ESP_OK ? " (FAILED)" : "");
+    rrc_s3_multipart_abort(&s3, key, upload_id, &res);
+    vQueueDelete(fq); vSemaphoreDelete(slots); free(etags);
+}
+
 /* One real camera object through the real read/hash/upload pipeline to a scratch key
  * under the control prefix (never the photo library), verified by the same checks a
  * sync uses plus a read-back BLAKE3, then deleted. */
@@ -1107,6 +1234,8 @@ static void debug_campipe(const char *arg, uint64_t size)
            (double)pipe_stats.read_us / 1e6, (double)pipe_stats.hash_us / 1e6, (double)pipe_stats.md5_us / 1e6, (double)pipe_stats.upload_us / 1e6);
     if (e != ESP_OK) { ST_LOCK(); printf("  error: %s\n", st.last_error); ST_UNLOCK(); }
     else printf("  blake3 %s\n", hex);
+    for (int i = 0; i < 16 && part_tl[i].end; i++)
+        printf("  part %d: ready %.2f s, upload %c %.2f-%.2f s\n", i + 1, (double)part_tl[i].ready / 1e6, part_tl[i].who, (double)part_tl[i].start / 1e6, (double)part_tl[i].end / 1e6);
     printf("  sync task stack: %u of %u bytes never used; internal heap free %u, largest block %u\n", (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)SYNC_TASK_STACK,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     rrc_s3_result_t dr;
@@ -1226,6 +1355,7 @@ static void sync_task(void *arg)
         case CMD_DEBUG_HASH: debug_hash(m.arg ? m.arg : "", m.repeat); free(m.arg); break;
         case CMD_DEBUG_SPEED: debug_speed(m.repeat); break;
         case CMD_DEBUG_PIPE: debug_pipe(m.repeat, m.port); break;
+        case CMD_DEBUG_NETPAR: debug_netpar(m.repeat, m.port); break;
         case CMD_DEBUG_CAMPIPE: debug_campipe(m.arg ? m.arg : "", (uint64_t)m.repeat * 1u); free(m.arg); break;
         case CMD_DEBUG_READ: debug_read(m.arg ? m.arg : "", m.repeat, m.port); free(m.arg); break;
         case CMD_DEBUG_TCP: { char *colon = m.arg ? strrchr(m.arg, ':') : NULL; if (colon) { *colon = 0; debug_tcp(m.arg, atoi(colon + 1), m.repeat); } free(m.arg); break; }
@@ -1252,10 +1382,13 @@ esp_err_t sync_init(void)
      * the 12-byte container header precedes the payload in the stream, so the payload
      * starts 12 bytes into a cache-line-aligned block, and the block has slack for the
      * line rounding the USB stack applies to the last transfer. */
-    wq = xQueueCreate(1, sizeof(part_job_t));
-    w_idle = xSemaphoreCreateBinary();
-    worker_ready = wq && w_idle && xTaskCreate(upload_worker, "s3_up2", WORKER_STACK, NULL, 4, NULL) == pdPASS;
-    if (!worker_ready) ESP_LOGW(TAG, "second upload connection unavailable; single stream");
+    worker_ready = true;
+    up[0].conn = &s3b; up[1].conn = &s3;
+    for (int i = 0; i < N_UPLOADERS; i++) {
+        up[i].q = xQueueCreate(1, sizeof(part_job_t));
+        if (!up[i].q || xTaskCreate(upload_worker, i ? "s3_up1" : "s3_up0", WORKER_STACK, (void *)(intptr_t)i, 4, NULL) != pdPASS) worker_ready = false;
+    }
+    if (!worker_ready) ESP_LOGW(TAG, "upload workers unavailable; parts are uploaded inline");
     direct_state_boot();
     size_t al = rrc_ptp_direct_align();
     for (int i = 0; i < PART_SLOTS; i++) {
@@ -1290,6 +1423,7 @@ void sync_debug_read(const char *arg, int mb, int chunk_kib)
     msg_t m = {.cmd = CMD_DEBUG_READ, .arg = a, .repeat = mb, .port = chunk_kib};
     if (xQueueSend(q, &m, 0) != pdTRUE) free(a);
 }
+void sync_debug_netpar(int nparts, int uploaders) { msg_t m = {.cmd = CMD_DEBUG_NETPAR, .repeat = nparts, .port = uploaders}; xQueueSend(q, &m, 0); }
 void sync_debug_campipe(const char *handle, int size_bytes)
 {
     char *a = strdup(handle ? handle : "");

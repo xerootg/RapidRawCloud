@@ -414,7 +414,7 @@ esp_err_t ble_start(void)
     refresh_name();
     LOCK(); st.starting = true; UNLOCK();
     /* API calls (config save, log encode, status) run here, not on the NimBLE host task. */
-    if (xTaskCreate(rpc_task, "ble_rpc", 12288, NULL, 3, NULL) != pdPASS) return ESP_ERR_NO_MEM;
+    if (xTaskCreate(rpc_task, "ble_rpc", 8192, NULL, 3, NULL) != pdPASS) return ESP_ERR_NO_MEM;
     if (xTaskCreate(start_task, "ble_start", 6144, NULL, 3, NULL) != pdPASS) return ESP_ERR_NO_MEM;
     return ESP_OK;
 }
