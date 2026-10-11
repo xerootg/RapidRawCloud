@@ -124,8 +124,15 @@ CONFIG_BT_NIMBLE_SVC_GAP_DEVICE_NAME="rrcloud-ingest"
 # ---- Data path: lwIP hot paths in IRAM, and full-size (16 KiB) outgoing TLS
 # records so an 8 MiB part is 512 records instead of 2048 (each record is a
 # cipher setup, a copy and a socket write).
-CONFIG_LWIP_IRAM_OPTIMIZATION=y
-CONFIG_LWIP_EXTRA_IRAM_OPTIMIZATION=y
+# (lwIP / Wi-Fi hot paths are NOT placed in IRAM: that code is DIRAM, i.e. internal heap, and
+# internal RAM is the scarcest thing on this board. The hardware AES driver and the TLS
+# sessions need it; flash code runs from the 256 KiB L2 cache at no measurable cost here.)
+CONFIG_LWIP_IRAM_OPTIMIZATION=n
+CONFIG_LWIP_EXTRA_IRAM_OPTIMIZATION=n
+CONFIG_ESP_WIFI_IRAM_OPT=n
+CONFIG_ESP_WIFI_RX_IRAM_OPT=n
+# NimBLE's mbuf pools live in PSRAM for the same reason.
+CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
 CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384
 # 256 KiB L2 cache (default 128): part buffers stream through PSRAM.
 CONFIG_CACHE_L2_CACHE_256KB=y

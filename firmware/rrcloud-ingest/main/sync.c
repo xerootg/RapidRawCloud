@@ -52,6 +52,7 @@ static QueueHandle_t q;
 static SemaphoreHandle_t st_mtx;
 static sync_status_t st;
 static rrc_s3_t s3;
+static rrc_s3_t s3b;                  /* second connection, see upload_worker */
 static bool s3_ready;
 static cam_source_t *cam;             /* attached camera (or NULL) */
 static volatile bool cancel_flag;
@@ -91,6 +92,8 @@ static void configure_s3(void)
     bool was = s3_ready;
     bool had_offset = s3.have_server_offset;
     int64_t off = s3.server_offset_s;
+    if (s3_ready) { rrc_s3_disconnect(&s3); rrc_s3_disconnect(&s3b); }
+    rrc_s3_init(&s3b, &cfg);
     s3_ready = rrc_s3_init(&s3, &cfg) == ESP_OK;
     if (s3_ready && had_offset) { s3.have_server_offset = true; s3.server_offset_s = off; }
     /* digest-probe result is per backend; remembered in the store */
@@ -459,6 +462,61 @@ static void reader_join(reader_job_t *j, bool *done, int held)
     }
 }
 
+/* ---- second upload connection ------------------------------------------------
+ * One TCP stream over this ~40 ms WAN path tops out near 6 MB/s (a lone Reno-style
+ * sender loses ground to the occasional drop; the laptop shows the same: 9 MB/s on
+ * one stream, 12-13 on two or more). Multipart parts are independent, so a worker task
+ * with its own connection uploads every other part while the sync task uploads the
+ * rest. The worker is persistent (one TLS handshake, then keep-alive across files)
+ * and has an internal-RAM stack because the hardware AES-GCM engine only takes
+ * DMA-capable buffers and mbedTLS keeps its AAD on the stack. */
+typedef struct {
+    const char *key, *upload_id;
+    int part_no, slot;
+    const uint8_t *data, *md5;
+    size_t len;
+    char *etag;
+    QueueHandle_t free_q;
+} part_job_t;
+
+#define WORKER_STACK (24u * 1024u)
+static uint8_t pj_md5[PART_SLOTS][16];   /* the MD5 must outlive the message that carried it */
+static QueueHandle_t wq;
+static SemaphoreHandle_t w_idle;
+static volatile bool w_busy;
+static volatile esp_err_t w_err;
+static char w_errmsg[96];
+static bool worker_ready;
+
+static void upload_worker(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        part_job_t j;
+        xQueueReceive(wq, &j, portMAX_DELAY);
+        s3b.have_server_offset = s3.have_server_offset;
+        s3b.server_offset_s = s3.server_offset_s;
+        rrc_s3_result_t res = {0};
+        int64_t t0 = esp_timer_get_time();
+        esp_err_t e = rrc_s3_upload_part(&s3b, j.key, j.upload_id, j.part_no, j.data, j.len, j.md5, j.etag, 40, &res);
+        pipe_stats.upload_us += esp_timer_get_time() - t0;
+        if (e != ESP_OK && w_err == ESP_OK) {
+            char b[64];
+            snprintf(w_errmsg, sizeof w_errmsg, "part %d failed: %s", j.part_no, rrc_s3_result_str(&res, b, sizeof b));
+            w_err = e;
+        }
+        xQueueSend(j.free_q, &j.slot, 0);
+        w_busy = false;
+        xSemaphoreGive(w_idle);
+    }
+}
+
+/* Waits (bounded by the S3 timeout) until the worker has finished its part. */
+static void worker_quiesce(void)
+{
+    for (int i = 0; w_busy && i < 700; i++) xSemaphoreTake(w_idle, pdMS_TO_TICKS(100));
+}
+
 /* ---- zero-copy USB read self-check ---------------------------------------------
  * The USB controller DMAs straight into the part buffers and the stack does cache
  * maintenance on line-rounded ranges, so a mistake there would silently corrupt a
@@ -542,6 +600,7 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     bool reader_done = true;
     int held = -1;
     memset(&pipe_stats, 0, sizeof pipe_stats);
+    w_err = ESP_OK;
     if (multipart) {
         e = rrc_s3_multipart_create(&s3, key, "application/octet-stream", meta, 1, upload_id, sizeof upload_id, &res);
         if (e != ESP_OK) { char b[96]; set_error("multipart create failed: %s", rrc_s3_result_str(&res, b, sizeof b)); goto fail; }
@@ -582,6 +641,22 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
         int64_t t_up = esp_timer_get_time();
         if (multipart) {
             if (parts >= 1024) { e = ESP_ERR_INVALID_SIZE; goto fail; }
+            if (w_err != ESP_OK) { set_error("%s", w_errmsg); e = w_err; goto fail; }
+            if (worker_ready && !w_busy) {
+                /* hand this part to the second connection; the worker releases the slot */
+                part_job_t pj = {.key = key, .upload_id = upload_id, .part_no = parts + 1, .slot = m.slot, .data = buf, .md5 = m.md5, .len = m.len,
+                                 .etag = etags[parts], .free_q = job->free_q};
+                memcpy(pj_md5[m.slot], m.md5, 16);
+                pj.md5 = pj_md5[m.slot];
+                w_busy = true;
+                xSemaphoreTake(w_idle, 0);
+                xQueueSend(wq, &pj, 0);
+                parts++;
+                total += m.len;
+                held = -1;
+                if (m.last) break;
+                continue;
+            }
             e = rrc_s3_upload_part(&s3, key, upload_id, parts + 1, buf, m.len, m.md5, etags[parts], 40, &res);
             if (e != ESP_OK) { char b[96]; set_error("part %d failed: %s", parts + 1, rrc_s3_result_str(&res, b, sizeof b)); goto fail; }
             parts++;
@@ -598,6 +673,8 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     }
     if (!reader_done) reader_join(job, &reader_done, held);
     held = -1;
+    worker_quiesce();
+    if (w_err != ESP_OK) { set_error("%s", w_errmsg); e = w_err; goto fail; }
     if (total != o->size) { set_error("short read from camera: %llu of %llu bytes", (unsigned long long)total, (unsigned long long)o->size); e = ESP_FAIL; goto fail; }
     if (multipart) {
         /* Heap, not stack: up to 1024 pointers (4 KiB) on top of the TLS session
@@ -633,6 +710,7 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     src->close(src, fh);
     return ESP_OK;
 fail:
+    worker_quiesce();
     if (multipart && upload_id[0]) { rrc_s3_result_t ar; rrc_s3_multipart_abort(&s3, key, upload_id, &ar); }
 fail_nomp:
     if (job) {
@@ -1174,6 +1252,10 @@ esp_err_t sync_init(void)
      * the 12-byte container header precedes the payload in the stream, so the payload
      * starts 12 bytes into a cache-line-aligned block, and the block has slack for the
      * line rounding the USB stack applies to the last transfer. */
+    wq = xQueueCreate(1, sizeof(part_job_t));
+    w_idle = xSemaphoreCreateBinary();
+    worker_ready = wq && w_idle && xTaskCreate(upload_worker, "s3_up2", WORKER_STACK, NULL, 4, NULL) == pdPASS;
+    if (!worker_ready) ESP_LOGW(TAG, "second upload connection unavailable; single stream");
     direct_state_boot();
     size_t al = rrc_ptp_direct_align();
     for (int i = 0; i < PART_SLOTS; i++) {
