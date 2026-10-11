@@ -13,15 +13,16 @@ mod common;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
+use std::time::Duration;
 
 use bytes::Bytes;
 use common::garage;
-use common::sync::{dev, entry, open_db, rel, DEV_B};
+use common::sync::{dev, entry, open_db, rel, FakeS3, DEV_B};
 use common::transfer as h;
 use common::transfer::CountingS3;
 use rrcloud_core::journal::JournalEntryExt as _;
 use rrcloud_core::journal::{JournalEntry, Kind, Op, SEGMENT_MAX_BYTES};
-use rrcloud_core::keys::{library_key, sidecar_key};
+use rrcloud_core::keys::{library_key, sidecar_key, thumb_key, ThumbSize};
 use rrcloud_core::publisher::{enqueue_entry, enqueue_entry_in, PublisherError};
 use rrcloud_core::s3::{
     ByteRange, CompletedPart, ListMultipartUploadsRequest, ListPartsRequest, PartBody,
@@ -30,11 +31,13 @@ use rrcloud_core::s3::{
 use rrcloud_core::semhash::{sem_hash, Blake3Hex, ContentId};
 use rrcloud_core::state::{ItemState, MultipartUploadState, Queue, StateError, SyncDb, UploadPart};
 use rrcloud_core::transfer::{
-    abort_stale_uploads, bucket_key_for, commit_verified, download_item, local_target_path,
-    partial_path, probe_backend, pump_downloads, pump_uploads, recover_interrupted,
-    recover_interrupted_with, stored_backend_profile, stub_pending_originals,
-    stub_pending_originals_bounded, upload_item, upload_item_from, BackendProfile, CancelFlag,
-    ChunkSource, ExpectedDownload, SourceStream, TransferConfig, TransferError, PROBE_KEY,
+    abort_stale_uploads, bucket_key_for, commit_verified, download_item, fetch_stub_thumbs,
+    fetch_stub_thumbs_with, local_target_path, partial_path, probe_backend, pump_downloads,
+    pump_stub_thumbs, pump_uploads, recover_interrupted, recover_interrupted_with,
+    repair_stub_state_drift, stored_backend_profile, stub_pending_originals,
+    stub_pending_originals_bounded, stub_thumb_path, stub_thumbs_present, upload_item,
+    upload_item_from, BackendProfile, CancelFlag, ChunkSource, ExpectedDownload, SourceStream,
+    ThumbFetch, TransferConfig, TransferError, PROBE_KEY,
 };
 
 /// Decodes every staged outbound journal entry.
@@ -3881,4 +3884,273 @@ fn stub_pass_stops_between_items_when_cancelled_and_leaves_the_rest_pending() {
     // An un-cancelled pass finishes the job.
     assert_eq!(stub_pending_originals(&db, root.path()).unwrap(), 5);
     assert_eq!(db.queue_len(Queue::Down).unwrap(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// §3.5 stub/disk drift repair + stub thumbnails
+// ---------------------------------------------------------------------------
+
+/// Inserts `rk` as a `Stub` original whose record carries the remote truth
+/// (`blake3`/`size`) of `bytes`, exactly as the stub pass leaves it.
+fn stage_stub(db: &SyncDb, rk: &rrcloud_core::keys::RelKey, bytes: &[u8]) {
+    let mut rec = h::item_record(
+        Kind::Original,
+        ItemState::Stub,
+        bytes.len() as u64,
+        1_700_000_000_000_000_000,
+        &dev(DEV_B),
+    );
+    rec.blake3 = Some(h::b3(bytes));
+    rec.verified_remote = true;
+    assert!(db.insert_item(rk, &rec).unwrap());
+}
+
+#[test]
+fn stub_pass_adopts_a_leftover_empty_placeholder() {
+    let (_tmp, _path, db) = open_db(&dev(DEV_B));
+    let root = tempfile::tempdir().unwrap();
+    let rk = rel("2026/10/IMG_0010.NEF");
+    stage_pending_down(&db, &rk, Kind::Original, false);
+    let path = local_target_path(root.path(), &rk, Kind::Original);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, b"").unwrap();
+
+    assert_eq!(
+        stub_pending_originals(&db, root.path()).unwrap(),
+        1,
+        "an empty file left by an interrupted pass is adopted, not a reason to skip"
+    );
+    assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+    assert_eq!(h::state_of(&db, &rk), ItemState::Stub);
+    assert_eq!(db.queue_len(Queue::Down).unwrap(), 0);
+}
+
+#[test]
+fn repair_promotes_a_stub_record_whose_file_holds_its_verified_bytes() {
+    let (_tmp, _path, db) = open_db(&dev(DEV_B));
+    let root = tempfile::tempdir().unwrap();
+    let bytes = h::patterned(64 * 1024, 7);
+    let hydrated_as_stub = rel("2026/10/IMG_0020.NEF");
+    let proper_stub = rel("2026/10/IMG_0021.NEF");
+    let wrong_bytes = rel("2026/10/IMG_0022.NEF");
+    stage_stub(&db, &hydrated_as_stub, &bytes);
+    stage_stub(&db, &proper_stub, &bytes);
+    stage_stub(&db, &wrong_bytes, &bytes);
+    let p = |rk: &rrcloud_core::keys::RelKey| local_target_path(root.path(), rk, Kind::Original);
+    std::fs::create_dir_all(p(&hydrated_as_stub).parent().unwrap()).unwrap();
+    // The dual-cycle race artifact: full verified bytes under a Stub record.
+    std::fs::write(p(&hydrated_as_stub), &bytes).unwrap();
+    std::fs::write(p(&proper_stub), b"").unwrap();
+    // Same length, different content: must never be trusted.
+    let mut flipped = bytes.clone();
+    flipped[0] ^= 0xff;
+    std::fs::write(p(&wrong_bytes), &flipped).unwrap();
+
+    let s = repair_stub_state_drift(&db, root.path(), &CancelFlag::new()).unwrap();
+    assert_eq!(s.promoted, vec![hydrated_as_stub.clone()]);
+    assert!(s.demoted.is_empty());
+    assert_eq!(s.unverified, 1);
+    assert!(s.changed());
+    let rec = db.get_item(&hydrated_as_stub).unwrap().unwrap();
+    assert_eq!(rec.state, ItemState::Hydrated);
+    assert!(rec.verified_remote);
+    assert_eq!(h::state_of(&db, &proper_stub), ItemState::Stub);
+    assert_eq!(h::state_of(&db, &wrong_bytes), ItemState::Stub);
+    assert_eq!(
+        std::fs::read(p(&wrong_bytes)).unwrap(),
+        flipped,
+        "unverified bytes are left exactly as found"
+    );
+
+    // Idempotent: nothing left to repair.
+    let again = repair_stub_state_drift(&db, root.path(), &CancelFlag::new()).unwrap();
+    assert!(!again.changed());
+    assert_eq!(again.unverified, 1);
+}
+
+#[test]
+fn repair_demotes_a_hydrated_record_over_an_empty_file_but_not_a_missing_one() {
+    let (_tmp, _path, db) = open_db(&dev(DEV_B));
+    let root = tempfile::tempdir().unwrap();
+    let bytes = h::patterned(4096, 3);
+    let zeroed = rel("2026/10/IMG_0030.NEF");
+    let missing = rel("2026/10/IMG_0031.NEF");
+    let intact = rel("2026/10/IMG_0032.NEF");
+    for rk in [&zeroed, &missing, &intact] {
+        let mut rec = h::item_record(
+            Kind::Original,
+            ItemState::Hydrated,
+            bytes.len() as u64,
+            1_700_000_000_000_000_000,
+            &dev(DEV_B),
+        );
+        rec.blake3 = Some(h::b3(&bytes));
+        assert!(db.insert_item(rk, &rec).unwrap());
+    }
+    let p = |rk: &rrcloud_core::keys::RelKey| local_target_path(root.path(), rk, Kind::Original);
+    std::fs::create_dir_all(p(&zeroed).parent().unwrap()).unwrap();
+    std::fs::write(p(&zeroed), b"").unwrap();
+    std::fs::write(p(&intact), &bytes).unwrap();
+
+    let s = repair_stub_state_drift(&db, root.path(), &CancelFlag::new()).unwrap();
+    assert_eq!(s.demoted, vec![zeroed.clone()]);
+    assert!(s.promoted.is_empty());
+    assert_eq!(h::state_of(&db, &zeroed), ItemState::Stub);
+    assert_eq!(
+        h::state_of(&db, &missing),
+        ItemState::Hydrated,
+        "a missing file is the local scan's call, never the repair's"
+    );
+    assert_eq!(h::state_of(&db, &intact), ItemState::Hydrated);
+}
+
+#[test]
+fn repair_stops_between_items_when_cancelled() {
+    let (_tmp, _path, db) = open_db(&dev(DEV_B));
+    let root = tempfile::tempdir().unwrap();
+    let bytes = h::patterned(1024, 9);
+    let rk = rel("2026/10/IMG_0040.NEF");
+    stage_stub(&db, &rk, &bytes);
+    let path = local_target_path(root.path(), &rk, Kind::Original);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, &bytes).unwrap();
+
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    let s = repair_stub_state_drift(&db, root.path(), &cancel).unwrap();
+    assert!(!s.changed());
+    assert_eq!(h::state_of(&db, &rk), ItemState::Stub);
+}
+
+#[tokio::test]
+async fn stub_thumb_pump_fetches_published_thumbs_and_throttles_unpublished_ones() {
+    let Some(g) = garage::shared() else {
+        eprintln!("SKIP: garage not available");
+        return;
+    };
+    let bucket = g.create_unique_bucket("stub-thumbs");
+    let s3 = FakeS3::new(g.client());
+    let (_tmp, _path, db) = open_db(&dev(DEV_B));
+    let thumbs = tempfile::tempdir().unwrap();
+
+    let published = rel("2026/10/IMG_0050.NEF");
+    let unpublished = rel("2026/10/IMG_0051.NEF");
+    let bytes_a = h::patterned(2048, 1);
+    let bytes_b = h::patterned(2048, 2);
+    stage_stub(&db, &published, &bytes_a);
+    stage_stub(&db, &unpublished, &bytes_b);
+    // The records carry no journaled content_id (a stub minted from the
+    // blake3 alone): the derived id must key the same bucket objects.
+    let cid_a = ContentId::from_blake3(&h::b3(&bytes_a));
+    let cid_b = ContentId::from_blake3(&h::b3(&bytes_b));
+    let small = Bytes::from_static(b"small-jpeg-bytes");
+    let medium = Bytes::from_static(b"medium-jpeg-bytes");
+    let opts = PutObjectOptions::default();
+    s3.inner
+        .put_object(
+            &bucket,
+            &thumb_key(&cid_a, ThumbSize::Small),
+            small.clone(),
+            &opts,
+        )
+        .await
+        .unwrap();
+    s3.inner
+        .put_object(
+            &bucket,
+            &thumb_key(&cid_a, ThumbSize::Medium),
+            medium.clone(),
+            &opts,
+        )
+        .await
+        .unwrap();
+
+    let s = pump_stub_thumbs(&db, &s3, &bucket, thumbs.path(), &CancelFlag::new(), 10)
+        .await
+        .unwrap();
+    assert_eq!(s.fetched, vec![published.clone()]);
+    assert_eq!(s.not_published, 1);
+    assert!(s.failed.is_empty());
+    assert!(!s.cancelled);
+    assert_eq!(
+        std::fs::read(stub_thumb_path(thumbs.path(), &cid_a, ThumbSize::Small)).unwrap(),
+        small
+    );
+    assert_eq!(
+        std::fs::read(stub_thumb_path(thumbs.path(), &cid_a, ThumbSize::Medium)).unwrap(),
+        medium
+    );
+    assert!(stub_thumbs_present(thumbs.path(), &cid_a));
+    assert!(!stub_thumbs_present(thumbs.path(), &cid_b));
+    let gets_after_first = s3.get_keys().len();
+    assert_eq!(
+        gets_after_first, 3,
+        "two GETs for the published pair, one NoSuchKey for the other"
+    );
+
+    // Second pass: present thumbs cost nothing; the unpublished one is
+    // inside its negative-cache window.
+    let s = pump_stub_thumbs(&db, &s3, &bucket, thumbs.path(), &CancelFlag::new(), 10)
+        .await
+        .unwrap();
+    assert!(s.fetched.is_empty());
+    assert_eq!(s.not_published, 0);
+    assert_eq!(
+        s3.get_keys().len(),
+        gets_after_first,
+        "no network for present or throttled stubs"
+    );
+    assert_eq!(
+        fetch_stub_thumbs(&s3, &bucket, thumbs.path(), &cid_b)
+            .await
+            .unwrap(),
+        ThumbFetch::Throttled
+    );
+
+    // Once the worker publishes them, an expired window fetches them.
+    s3.inner
+        .put_object(
+            &bucket,
+            &thumb_key(&cid_b, ThumbSize::Small),
+            small.clone(),
+            &opts,
+        )
+        .await
+        .unwrap();
+    s3.inner
+        .put_object(
+            &bucket,
+            &thumb_key(&cid_b, ThumbSize::Medium),
+            medium.clone(),
+            &opts,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        fetch_stub_thumbs_with(&s3, &bucket, thumbs.path(), &cid_b, Duration::ZERO)
+            .await
+            .unwrap(),
+        ThumbFetch::Fetched
+    );
+    assert!(stub_thumbs_present(thumbs.path(), &cid_b));
+    let before = s3.get_keys().len();
+    assert_eq!(
+        fetch_stub_thumbs(&s3, &bucket, thumbs.path(), &cid_b)
+            .await
+            .unwrap(),
+        ThumbFetch::Present
+    );
+    assert_eq!(
+        s3.get_keys().len(),
+        before,
+        "present thumbs are never re-fetched"
+    );
+
+    // A cancelled pump admits nothing.
+    let cancel = CancelFlag::new();
+    cancel.cancel();
+    let s = pump_stub_thumbs(&db, &s3, &bucket, thumbs.path(), &cancel, 10)
+        .await
+        .unwrap();
+    assert!(s.cancelled);
 }

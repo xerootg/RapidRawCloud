@@ -1932,8 +1932,28 @@ fn generate_single_thumbnail_and_cache(
         ));
     }
 
-    if is_cloud_placeholder(&source_path) {
-        return None;
+    // §3.5 cloud stub: there are no local bytes to decode, so surface the
+    // bucket's worker-generated thumbs instead (fetched on demand), and the
+    // grid shows the photo under its cloud badge rather than a blank tile.
+    // A 0-byte source is treated the same way even when the in-memory stub
+    // mirror has not caught up yet (a stub the background cycle created
+    // moments ago): the hook consults the durable record, and answers `None`
+    // for a genuinely empty non-stub file — which could not be decoded
+    // anyway.
+    let is_empty_source = fs::metadata(&source_path)
+        .map(|m| m.len() == 0)
+        .unwrap_or(false);
+    if is_cloud_placeholder(&source_path) || is_empty_source {
+        return crate::sync::hooks::stub_thumbnails(&source_path, thumb_cache_dir).map(
+            |(small, medium)| {
+                (
+                    small.to_string_lossy().into_owned(),
+                    medium.to_string_lossy().into_owned(),
+                    rating,
+                    is_edited,
+                )
+            },
+        );
     }
 
     let target_width_small = settings.small_thumbnail_resolution.unwrap_or(480);
@@ -2146,6 +2166,26 @@ pub fn increment_thumbnail_progress(state: &AppState, app_handle: &AppHandle) {
             serde_json::json!({ "current": current, "total": total }),
         );
     }
+}
+
+/// `thumbnail-generated` for a thumbnail the sync engine seeded for a cloud
+/// stub (§3.5) rather than one this module generated: carries only the
+/// paths, so the webview keeps whatever rating / edited flag it already
+/// holds for `path` (the handler updates those only when present).
+pub(crate) fn emit_thumbnail_seeded(
+    app_handle: &AppHandle,
+    path: &str,
+    small_thumbnail_path: &str,
+    medium_thumbnail_path: &str,
+) {
+    let _ = app_handle.emit(
+        "thumbnail-generated",
+        serde_json::json!({
+            "path": path,
+            "thumbnailPath": small_thumbnail_path,
+            "previewPath": medium_thumbnail_path,
+        }),
+    );
 }
 
 fn emit_thumbnail_generated(

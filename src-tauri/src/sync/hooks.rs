@@ -149,6 +149,30 @@ pub fn proxy_handle(path: &Path) -> Option<ProxyHandle> {
     }
 }
 
+/// The grid thumbnails for the cloud stub at `image_path`, surfaced into the
+/// webview thumbnail cache under the exact key the generator looks up
+/// (§3.5 thumb seeding): `Some((small, medium))` cache paths when the
+/// bucket's worker-generated `_small`/`_medium` JPEGs are (or could just
+/// now be) fetched for it, `None` when sync is off, the path is not a stub,
+/// the stub's content identity is unknown, or the preview worker has not
+/// published its thumbs yet. May block on two small S3 GETs — it is called
+/// from the thumbnail worker threads, which exist to do exactly this kind
+/// of per-image work off the UI thread.
+pub fn stub_thumbnails(
+    image_path: &Path,
+    cache_thumbnails_dir: &Path,
+) -> Option<(PathBuf, PathBuf)> {
+    #[cfg(feature = "sync")]
+    {
+        imp::stub_thumbnails(image_path, cache_thumbnails_dir)
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = (image_path, cache_thumbnails_dir);
+        None
+    }
+}
+
 /// Ensures the original at `path` is present locally, hydrating a stub if
 /// needed (§3.5). When sync is off this is an identity pass: the real file
 /// is always present upstream, so it returns `path` unchanged.
@@ -271,6 +295,16 @@ mod imp {
         // routes the editor load through the proxy DNG. No configured manager
         // or no proxy ⇒ `None`, so the loader falls through to hydrate.
         global_manager().and_then(|mgr| mgr.proxy_handle(path))
+    }
+
+    pub fn stub_thumbnails(
+        image_path: &Path,
+        cache_thumbnails_dir: &Path,
+    ) -> Option<(PathBuf, PathBuf)> {
+        // §3.5 thumb seeding for cloud stubs: link (fetching on demand) the
+        // bucket's thumbs into the webview cache. No configured manager ⇒
+        // `None`, so the generator's placeholder path is unchanged.
+        global_manager().and_then(|mgr| mgr.stub_thumbnails(image_path, cache_thumbnails_dir))
     }
 
     pub fn ensure_local(path: &Path, reason: &str) -> std::io::Result<PathBuf> {

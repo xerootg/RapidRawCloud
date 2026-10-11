@@ -15,6 +15,10 @@
 //!    forward-auth, which sets `X-Authentik-Username`. A user signs in once
 //!    and fills a form with their *own* library-bucket S3 coordinates; we
 //!    write their `config.json`. Return visits show "already paired".
+//!    Because that header is forgeable by anyone who can reach the pod, the
+//!    browser routes also require `X-Rrcloud-Proxy-Secret` to equal the
+//!    `BROWSER_PROXY_SECRET` env (set at the edge by a Traefik `headers`
+//!    middleware chained after forward-auth); without it they answer 401.
 //!  * **App** (`GET /api/config`): the native app obtains an OIDC/PKCE
 //!    access token and sends it as `Authorization: Bearer …`. We first
 //!    require the token's `aud` claim to name the app's own OIDC client id
@@ -27,6 +31,7 @@
 //! same admin bucket (read-only key) and backfills each user's library with
 //! that user's credentials.
 
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use axum::{
@@ -71,11 +76,27 @@ struct Config {
     /// URL the *app* will use — e.g. https://garage.themissing.xyz).
     default_library_endpoint: String,
     default_library_region: String,
+    /// Shared secret the trusted edge proxy injects as `X-Rrcloud-Proxy-Secret`
+    /// on the browser routes (after forward-auth). Proves the request really
+    /// traversed Authentik, so `X-Authentik-Username` can be believed.
+    /// `None` disables the browser routes entirely (fail closed); `from_env`
+    /// always requires it.
+    browser_proxy_secret: Option<String>,
 }
+
+/// Minimum length of `BROWSER_PROXY_SECRET`, in bytes.
+const MIN_PROXY_SECRET_LEN: usize = 16;
 
 impl Config {
     fn from_env() -> Result<Self, String> {
         let get = |k: &str| std::env::var(k).map_err(|_| format!("missing env var {k}"));
+        let browser_proxy_secret = get("BROWSER_PROXY_SECRET")?;
+        if browser_proxy_secret.len() < MIN_PROXY_SECRET_LEN {
+            return Err(format!(
+                "BROWSER_PROXY_SECRET must be at least {MIN_PROXY_SECRET_LEN} bytes \
+                 (it is the proof that browser requests came through the forward-auth proxy)"
+            ));
+        }
         Ok(Config {
             admin_bucket: get("ADMIN_BUCKET")?,
             admin_s3_endpoint: get("ADMIN_S3_ENDPOINT")?,
@@ -88,6 +109,7 @@ impl Config {
             default_library_endpoint: std::env::var("DEFAULT_LIBRARY_ENDPOINT").unwrap_or_default(),
             default_library_region: std::env::var("DEFAULT_LIBRARY_REGION")
                 .unwrap_or_else(|_| "garage".into()),
+            browser_proxy_secret: Some(browser_proxy_secret),
         })
     }
 }
@@ -293,10 +315,43 @@ async fn healthz() -> &'static str {
     "ok"
 }
 
-/// Browser username from the forward-auth header, sanitized. The route is
-/// only reachable behind Authentik forward-auth (see the IngressRoute), so a
-/// missing header means a misconfiguration, not an anonymous user.
-fn browser_user(headers: &HeaderMap) -> Option<String> {
+/// Header the trusted edge proxy sets (after forward-auth) to prove a browser
+/// request really traversed Authentik. Checked against `BROWSER_PROXY_SECRET`.
+const PROXY_SECRET_HEADER: &str = "X-Rrcloud-Proxy-Secret";
+
+/// Constant-time byte-slice equality: no early exit on the first mismatch, so
+/// the comparison cannot be used as a timing oracle for the secret.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Does this request carry proof that it came through the trusted proxy?
+/// Fail closed: no configured secret or no/mismatched header → `false`.
+fn proxy_verified(state: &AppState, headers: &HeaderMap) -> bool {
+    let Some(secret) = state.config.browser_proxy_secret.as_deref() else {
+        return false;
+    };
+    headers
+        .get(PROXY_SECRET_HEADER)
+        .is_some_and(|v| ct_eq(v.as_bytes(), secret.as_bytes()))
+}
+
+/// Browser username from the forward-auth header, sanitized. Only valid once
+/// `proxy_verified` holds — `X-Authentik-Username` is plain text that anyone
+/// reaching the pod directly could set — so callers check the proxy proof
+/// first; past that, a missing header means a misconfiguration, not an
+/// anonymous user.
+fn browser_user(state: &AppState, headers: &HeaderMap) -> Option<String> {
+    if !proxy_verified(state, headers) {
+        return None;
+    }
     headers
         .get("X-Authentik-Username")
         .and_then(|v| v.to_str().ok())
@@ -304,7 +359,7 @@ fn browser_user(headers: &HeaderMap) -> Option<String> {
 }
 
 async fn index(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let Some(user) = browser_user(&headers) else {
+    let Some(user) = browser_user(&state, &headers) else {
         return (
             StatusCode::UNAUTHORIZED,
             "Not authenticated (this page must be reached through Authentik).",
@@ -338,12 +393,164 @@ struct SaveForm {
     preview_budget_gb: Option<u32>,
 }
 
+/// `host[:port]` of an `Origin`/`Referer`-style URL (`scheme://host[:port]/…`),
+/// lower-cased. `None` for anything that is not an absolute URL (e.g. the
+/// literal `Origin: null`).
+fn url_host(value: &str) -> Option<String> {
+    let rest = value.trim().split_once("://")?.1;
+    let host = rest.split(['/', '?', '#']).next()?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_ascii_lowercase())
+    }
+}
+
+/// Cross-site request guard for the browser form `POST /save`.
+///
+/// The browser session is a cookie (Authentik forward-auth), so a hostile
+/// page could auto-submit the form with the victim's cookie attached and
+/// repoint their library at an attacker bucket. Policy:
+///
+///  * `Sec-Fetch-Site` present → only `same-origin` is accepted
+///    (`cross-site`, `same-site`, `none` are refused).
+///  * Otherwise `Origin` (else `Referer`) must have a host equal to the
+///    request `Host` (or `X-Forwarded-Host`, since we sit behind Traefik),
+///    compared as `host[:port]` case-insensitively.
+///  * No `Sec-Fetch-Site`, `Origin` or `Referer` at all → refused; every
+///    browser sends at least `Referer` on a same-origin form submit, and
+///    non-browser clients use `/api/config`, not `/save`.
+fn same_origin_post(headers: &HeaderMap) -> bool {
+    let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
+
+    if let Some(site) = header("sec-fetch-site") {
+        return site.trim().eq_ignore_ascii_case("same-origin");
+    }
+
+    let Some(source_host) = header("origin")
+        .or_else(|| header("referer"))
+        .and_then(url_host)
+    else {
+        return false;
+    };
+
+    let mut allowed = header("host").into_iter().chain(
+        header("x-forwarded-host")
+            .into_iter()
+            // Traefik may append to an existing list: `a.example, b.example`.
+            .flat_map(|v| v.split(',')),
+    );
+    allowed.any(|h| h.trim().eq_ignore_ascii_case(&source_host))
+}
+
+/// Offline policy check for the library endpoint a user types into the form.
+///
+/// Copy of `rrcloud-core/src/fleet.rs::validate_library_endpoint` (the
+/// source of truth — keep the two in step; pairing deliberately does not
+/// depend on rrcloud-core, see Cargo.toml). The fleet worker refuses every
+/// endpoint this rejects, so refusing it here gives the user an inline error
+/// instead of a "saved" doc that silently fails each cycle. Purely
+/// syntactic (no DNS): must parse, use `https`, and have a host; an IP
+/// literal must be public unicast (IPv4-mapped/compatible IPv6 is checked
+/// with the IPv4 rules); a name must not be `localhost`, single-label, or
+/// under `.localhost` `.local` `.internal` `.svc` `.cluster.local`.
+fn validate_library_endpoint(endpoint: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(endpoint.trim_end_matches('/'))
+        .map_err(|e| format!("unparsable URL: {e}"))?;
+    if url.scheme() != "https" {
+        return Err(format!(
+            "scheme {:?} is not allowed; library endpoints must use https://",
+            url.scheme()
+        ));
+    }
+    // `host_str()` is the *parsed* host: decimal/hex/short IPv4 spellings
+    // are already folded into dotted-quad form, IPv6 literals bracketed.
+    let host = url.host_str().ok_or_else(|| "no host".to_string())?;
+    if let Some(v6) = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .and_then(|h| h.parse::<Ipv6Addr>().ok())
+    {
+        check_public_v6(v6)
+    } else if let Ok(v4) = host.parse::<Ipv4Addr>() {
+        check_public_v4(v4)
+    } else {
+        check_public_name(host)
+    }
+}
+
+fn check_public_v4(ip: Ipv4Addr) -> Result<(), String> {
+    let [a, b, _, _] = ip.octets();
+    let bad = ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_broadcast()
+        || a == 0 // 0.0.0.0/8 "this network"
+        || (a == 100 && (64..=127).contains(&b)) // 100.64.0.0/10 shared (CGNAT)
+        || a >= 240; // 240.0.0.0/4 reserved
+    if bad {
+        Err(format!("IP address {ip} is not a public address"))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_public_v6(ip: Ipv6Addr) -> Result<(), String> {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+        return Err(format!("IP address {ip} is not a public address"));
+    }
+    // IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible (`::a.b.c.d`)
+    // forms reach an IPv4 host — apply the IPv4 rules to it.
+    if let Some(v4) = ip.to_ipv4() {
+        return check_public_v4(v4).map_err(|e| format!("{e} (embedded in {ip})"));
+    }
+    let seg0 = ip.segments()[0];
+    let bad = (seg0 & 0xfe00) == 0xfc00 // fc00::/7 unique local
+        || (seg0 & 0xffc0) == 0xfe80; // fe80::/10 link local
+    if bad {
+        Err(format!("IP address {ip} is not a public address"))
+    } else {
+        Ok(())
+    }
+}
+
+fn check_public_name(name: &str) -> Result<(), String> {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    if name.is_empty() || name == "localhost" {
+        return Err(format!("host {name:?} is not a public host name"));
+    }
+    if !name.contains('.') {
+        return Err(format!(
+            "host {name:?} is a single-label name (not a public host name)"
+        ));
+    }
+    const INTERNAL_SUFFIXES: &[&str] = &[
+        ".localhost",
+        ".local",
+        ".internal",
+        ".svc",
+        ".cluster.local",
+        ".svc.cluster.local",
+    ];
+    if let Some(suffix) = INTERNAL_SUFFIXES.iter().find(|s| name.ends_with(**s)) {
+        return Err(format!(
+            "host {name:?} is under the internal suffix {suffix:?}"
+        ));
+    }
+    Ok(())
+}
+
 async fn save(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Form(form): Form<SaveForm>,
 ) -> Response {
-    let Some(user) = browser_user(&headers) else {
+    if !same_origin_post(&headers) {
+        return (StatusCode::FORBIDDEN, "Cross-site request refused.").into_response();
+    }
+    let Some(user) = browser_user(&state, &headers) else {
         return (StatusCode::UNAUTHORIZED, "Not authenticated.").into_response();
     };
 
@@ -367,6 +574,18 @@ async fn save(
             &user,
             None,
             Some("Secret key is required (it is write-only; re-enter to change it)."),
+            &state.config,
+        ))
+        .into_response();
+    }
+    // Same policy as the fleet worker: refuse up front, write nothing.
+    if let Err(reason) = validate_library_endpoint(&endpoint) {
+        return Html(render_page(
+            &user,
+            None,
+            Some(&format!(
+                "Endpoint rejected: {reason}. Use a public https:// S3 URL."
+            )),
             &state.config,
         ))
         .into_response();
@@ -627,6 +846,22 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
 }
 
 // ---------------------------------------------------------------------------
+// Router
+// ---------------------------------------------------------------------------
+
+/// The service's route table. Shared by `main()` and the tests so the tests
+/// exercise exactly the router that ships.
+fn app(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/", get(index))
+        .route("/save", post(save))
+        .route(PAIRING_CONFIG_PATH, get(api_config))
+        .route(PAIRING_INFO_PATH, get(api_pairing_info))
+        .with_state(state)
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
@@ -658,13 +893,7 @@ async fn main() {
             .expect("http client"),
     });
 
-    let app = Router::new()
-        .route("/healthz", get(healthz))
-        .route("/", get(index))
-        .route("/save", post(save))
-        .route(PAIRING_CONFIG_PATH, get(api_config))
-        .route(PAIRING_INFO_PATH, get(api_pairing_info))
-        .with_state(state);
+    let app = app(state);
 
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -809,6 +1038,9 @@ mod tests {
                 oidc_client_id: OUR_CLIENT_ID.into(),
                 default_library_endpoint: String::new(),
                 default_library_region: "garage".into(),
+                // These tests only hit `/api/config`, which the proxy guard does
+                // not cover; `None` keeps the browser routes fail-closed.
+                browser_proxy_secret: None,
             },
             http: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(5))
@@ -970,5 +1202,1110 @@ mod tests {
         let token = format!("{}.!!not-base64!!.{}", b64url(b"{}"), b64url(b"sig"));
         let (status, body) = get_config(&token).await;
         assert_creds_leaked_free(status, &body, "JWT with undecodable payload");
+    }
+
+    /// Unit tests for the copied endpoint validator, so it cannot drift
+    /// silently from `rrcloud-core/src/fleet.rs` (same cases, abridged).
+    mod endpoint_validation {
+        use super::*;
+
+        #[test]
+        fn accepts_public_https_hosts() {
+            for ok in [
+                "https://garage.themissing.xyz",
+                "https://garage.themissing.xyz/",
+                "https://s3.eu-central-003.backblazeb2.com",
+                "https://S3.Example.COM:9443",
+                "https://8.8.8.8",
+                "https://[2606:4700:4700::1111]:443",
+                "https://[::ffff:8.8.8.8]",
+                "https://172.15.255.255",
+                "https://172.32.0.1",
+                "https://100.63.255.255",
+                "https://100.128.0.1",
+                "https://localhost.example.com",
+                "https://internal.example.com",
+                "https://svc.example.com",
+                "https://my-local.example.com",
+            ] {
+                assert_eq!(validate_library_endpoint(ok), Ok(()), "{ok}");
+            }
+        }
+
+        #[test]
+        fn rejects_plaintext_garbage_and_non_public_hosts() {
+            for bad in [
+                "http://s3.example.com",
+                "ftp://s3.example.com",
+                "file:///etc/passwd",
+                "s3.example.com",
+                "",
+                "https://",
+                "https:///path-only",
+                "https://127.0.0.1",
+                "https://127.0.0.1:3903",
+                "https://2130706433", // decimal 127.0.0.1
+                "https://0x7f000001", // hex 127.0.0.1
+                "https://127.1",      // short-form 127.0.0.1
+                "https://0.0.0.0",
+                "https://0.1.2.3",
+                "https://10.0.0.5:3903",
+                "https://172.16.0.1",
+                "https://172.31.255.254",
+                "https://192.168.1.1",
+                "https://169.254.169.254",
+                "https://100.64.0.1",
+                "https://100.127.255.255",
+                "https://224.0.0.1",
+                "https://255.255.255.255",
+                "https://240.0.0.1",
+                "https://[::1]",
+                "https://[::]",
+                "https://[fe80::1]",
+                "https://[febf::1]",
+                "https://[fc00::1]",
+                "https://[fd12:3456::1]",
+                "https://[ff02::1]",
+                "https://[::ffff:127.0.0.1]",
+                "https://[::ffff:10.0.0.5]",
+                "https://[::ffff:169.254.169.254]",
+                "https://[::ffff:7f00:1]",
+                "https://[::127.0.0.1]",
+                "https://localhost",
+                "https://LOCALHOST",
+                "https://localhost.",
+                "https://foo.localhost",
+                "https://garage",
+                "https://garage:3900",
+                "https://garage-admin.garage.svc.cluster.local:3903",
+                "https://garage-admin.garage.svc.cluster.local.",
+                "https://garage-admin.garage.svc",
+                "https://thing.cluster.local",
+                "https://printer.local",
+                "https://metadata.google.internal",
+                "https://db.internal",
+            ] {
+                assert!(validate_library_endpoint(bad).is_err(), "{bad}");
+            }
+        }
+    }
+
+    /// `POST /save` endpoint policy.
+    ///
+    /// The browser form stores whatever `endpoint` the user typed, as long
+    /// as it is non-empty. The fleet worker (`rrcloud-core::fleet::
+    /// validate_library_endpoint`) refuses non-public and non-https library
+    /// endpoints — loopback, RFC1918, link-local/metadata, shared 100.64/10,
+    /// multicast/broadcast/unspecified, IPv4-mapped IPv6, `localhost`,
+    /// single-label names, `.local`/`.internal`/`.svc`/`.cluster.local`/
+    /// `.localhost` suffixes, and any `http://` scheme — but only once per
+    /// cycle, as a `Failed` outcome the user never sees. So today a user
+    /// who types an in-cluster or plaintext endpoint gets a "saved" redirect,
+    /// the doc is written, and every paired device (and the worker) tries to
+    /// use it. The form must apply the same policy up front: refuse the
+    /// save, write nothing, and re-render the form with an error that names
+    /// the endpoint (via the same `<p class="err">` path as the other
+    /// validation errors).
+    ///
+    /// Fixture: a fake S3 that records every `PUT` it receives (so a stored
+    /// doc is both detected and shown in the failure message), behind the
+    /// real `save` handler.
+    mod save_endpoint_policy {
+        use super::*;
+        use axum::body::Bytes;
+        use axum::http::{header::LOCATION, Method};
+        use std::sync::Mutex;
+
+        /// One object write the fake admin bucket received.
+        #[derive(Clone, Debug)]
+        struct Put {
+            path: String,
+            body: String,
+        }
+
+        type Recorder = Arc<Mutex<Vec<Put>>>;
+
+        /// `BROWSER_PROXY_SECRET` of the service under test (≥ 16 chars, as
+        /// `Config::from_env` requires); `post_save` presents it.
+        const FORM_PROXY_SECRET: &str = "endpoint-policy-test-proxy-secret";
+
+        /// Fake S3 (path-style) admin bucket that records `PUT`s and holds
+        /// no objects (every `GET` is a 404 → "unpaired"). Returns the
+        /// endpoint URL and the recorder.
+        async fn recording_s3() -> (String, Recorder) {
+            async fn handle(
+                State(rec): State<Recorder>,
+                method: Method,
+                uri: Uri,
+                body: Bytes,
+            ) -> Response {
+                if method == Method::PUT {
+                    rec.lock().unwrap().push(Put {
+                        path: uri.path().to_string(),
+                        body: String::from_utf8_lossy(&body).into_owned(),
+                    });
+                    return StatusCode::OK.into_response();
+                }
+                (
+                    StatusCode::NOT_FOUND,
+                    "<Error><Code>NoSuchKey</Code></Error>",
+                )
+                    .into_response()
+            }
+            let rec: Recorder = Arc::new(Mutex::new(Vec::new()));
+            let base = serve(Router::new().fallback(handle).with_state(rec.clone())).await;
+            (base, rec)
+        }
+
+        /// The real browser routes (`index` + `save`, exactly as `main`
+        /// wires them) on top of the recording admin bucket.
+        async fn pairing_form_service() -> (String, Recorder) {
+            let (s3, rec) = recording_s3().await;
+            let state = Arc::new(AppState {
+                config: Config {
+                    admin_bucket: ADMIN_BUCKET.into(),
+                    admin_s3_endpoint: s3,
+                    admin_s3_region: "garage".into(),
+                    admin_s3_access_key: "GKadmin".into(),
+                    admin_s3_secret_key: "adminsecret".into(),
+                    oidc_userinfo_url: "http://127.0.0.1:9/unused".into(),
+                    oidc_issuer_url: ISSUER.into(),
+                    oidc_client_id: OUR_CLIENT_ID.into(),
+                    default_library_endpoint: String::new(),
+                    default_library_region: "garage".into(),
+                    browser_proxy_secret: Some(FORM_PROXY_SECRET.into()),
+                },
+                http: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .unwrap(),
+            });
+            let base = serve(
+                Router::new()
+                    .route("/", get(index))
+                    .route("/save", post(save))
+                    .with_state(state),
+            )
+            .await;
+            (base, rec)
+        }
+
+        /// What came back from `POST /save`.
+        struct SaveOutcome {
+            status: StatusCode,
+            location: Option<String>,
+            body: String,
+            puts: Vec<Put>,
+        }
+
+        impl SaveOutcome {
+            /// Text of the `<p class="err">…</p>` the form rendered, if any.
+            fn err_paragraph(&self) -> Option<&str> {
+                let start = self.body.find("<p class=\"err\">")? + "<p class=\"err\">".len();
+                let end = self.body[start..].find("</p>")? + start;
+                Some(&self.body[start..end])
+            }
+            /// `sync.endpoint` of each doc the admin bucket received.
+            fn stored_endpoints(&self) -> Vec<String> {
+                self.puts
+                    .iter()
+                    .map(|p| {
+                        serde_json::from_str::<Value>(&p.body)
+                            .ok()
+                            .and_then(|d| d["sync"]["endpoint"].as_str().map(String::from))
+                            .unwrap_or_else(|| format!("<unparsable body at {}>", p.path))
+                    })
+                    .collect()
+            }
+        }
+
+        /// Submit the pairing form as alice with the given library endpoint
+        /// (all other fields valid) against a fresh service, without
+        /// following redirects, and collect what the admin bucket saw.
+        async fn post_save(endpoint: &str) -> SaveOutcome {
+            let (base, rec) = pairing_form_service().await;
+            let client = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let resp = client
+                .post(format!("{base}/save"))
+                // The two `/save` guards: proof the request traversed the
+                // trusted proxy (`X-Rrcloud-Proxy-Secret` == the configured
+                // `browser_proxy_secret`) and a same-origin Fetch Metadata
+                // hint for the cross-site check. Both are satisfied here so
+                // only the endpoint policy is under test.
+                .header(PROXY_SECRET_HEADER, FORM_PROXY_SECRET)
+                .header("X-Authentik-Username", "alice")
+                .header("Sec-Fetch-Site", "same-origin")
+                .form(&[
+                    ("endpoint", endpoint),
+                    ("bucket", "alice-photos"),
+                    ("region", "garage"),
+                    ("access_key_id", ALICE_AKID),
+                    ("secret_access_key", ALICE_SECRET),
+                    ("force_path_style", "on"),
+                    ("worker_backfill", "on"),
+                    ("cache_size_gb", "8"),
+                    ("preview_budget_gb", "10"),
+                ])
+                .send()
+                .await
+                .unwrap();
+            let status = StatusCode::from_u16(resp.status().as_u16()).unwrap();
+            let location = resp
+                .headers()
+                .get(LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let body = resp.text().await.unwrap();
+            let puts = rec.lock().unwrap().clone();
+            SaveOutcome {
+                status,
+                location,
+                body,
+                puts,
+            }
+        }
+
+        // --- positive controls ----------------------------------------------
+
+        /// A public https endpoint is accepted: one doc written for alice,
+        /// carrying that endpoint, then the post-save redirect.
+        #[tokio::test]
+        async fn save_accepts_public_https_endpoints() {
+            for ok in [
+                "https://s3.us-west-002.backblazeb2.com",
+                "https://garage.example.com",
+            ] {
+                let out = post_save(ok).await;
+                assert_eq!(
+                    out.status,
+                    StatusCode::SEE_OTHER,
+                    "{ok}: expected 303, got {} with body: {}",
+                    out.status,
+                    out.body
+                );
+                assert_eq!(out.location.as_deref(), Some("/?saved=1"), "{ok}");
+                assert_eq!(
+                    out.puts.len(),
+                    1,
+                    "{ok}: expected exactly one PUT, got {:?}",
+                    out.puts
+                );
+                assert_eq!(
+                    out.puts[0].path,
+                    format!("/{ADMIN_BUCKET}/{}", config_key("alice")),
+                    "{ok}"
+                );
+                assert_eq!(out.stored_endpoints(), vec![ok.to_string()], "{ok}");
+            }
+        }
+
+        /// Fixture sanity: the existing "required fields" check renders its
+        /// message through `<p class="err">` and writes nothing — the same
+        /// shape the endpoint-policy error must take.
+        #[tokio::test]
+        async fn save_renders_required_field_error_without_writing() {
+            let out = post_save("").await;
+            assert_eq!(out.status, StatusCode::OK, "body: {}", out.body);
+            assert!(out.puts.is_empty(), "wrote {:?}", out.puts);
+            let err = out.err_paragraph().expect("an <p class=\"err\"> paragraph");
+            assert!(
+                err.contains("Endpoint, bucket, and access key are required."),
+                "unexpected error text: {err}"
+            );
+        }
+
+        // --- the gap: non-public / plaintext endpoints are stored ------------
+
+        /// THE GAP. Each of these is refused by the fleet worker's
+        /// `validate_library_endpoint`, so storing it only yields a silent
+        /// per-cycle failure — or, for the in-cluster ones, points every
+        /// device and the worker at a private address. The form must refuse
+        /// them: no S3 write, HTTP 200, and a `<p class="err">` that names
+        /// the endpoint. Today each one is written and redirected.
+        #[tokio::test]
+        async fn save_rejects_non_public_or_plaintext_endpoints() {
+            let cases: &[(&str, &str)] = &[
+                (
+                    "http://garage.garage.svc.cluster.local:3900",
+                    "plaintext http:// to an in-cluster .svc.cluster.local name",
+                ),
+                ("https://10.0.0.5:3903", "RFC1918 private IPv4"),
+                ("https://192.168.1.10:3900", "RFC1918 private IPv4"),
+                (
+                    "https://169.254.169.254",
+                    "link-local / cloud metadata address",
+                ),
+                ("https://localhost", "localhost"),
+                ("https://127.0.0.1:3900", "IPv4 loopback"),
+                ("https://[::ffff:127.0.0.1]", "IPv4-mapped IPv6 loopback"),
+                ("https://garage", "single-label host name"),
+                (
+                    "http://s3.us-west-002.backblazeb2.com",
+                    "plaintext http:// scheme",
+                ),
+            ];
+            let mut failures = Vec::new();
+            for (endpoint, why) in cases {
+                let out = post_save(endpoint).await;
+                let stored = out.stored_endpoints();
+                if !stored.is_empty() {
+                    failures.push(format!(
+                        "{endpoint} ({why}): STORED to the admin bucket as sync.endpoint = {stored:?} \
+                         (status {}, location {:?})",
+                        out.status, out.location
+                    ));
+                    continue;
+                }
+                if out.status != StatusCode::OK {
+                    failures.push(format!(
+                        "{endpoint} ({why}): expected the form re-rendered with 200, got {} \
+                         (location {:?})",
+                        out.status, out.location
+                    ));
+                    continue;
+                }
+                match out.err_paragraph() {
+                    Some(err) if err.to_ascii_lowercase().contains("endpoint") => {}
+                    Some(err) => failures.push(format!(
+                        "{endpoint} ({why}): error paragraph does not mention the endpoint: {err:?}"
+                    )),
+                    None => failures.push(format!(
+                        "{endpoint} ({why}): 200 but no <p class=\"err\"> in the page"
+                    )),
+                }
+            }
+            assert!(
+                failures.is_empty(),
+                "{} of {} non-public/plaintext endpoints were not refused by POST /save:\n  {}",
+                failures.len(),
+                cases.len(),
+                failures.join("\n  ")
+            );
+        }
+    }
+}
+
+/// End-to-end tests against the real router (`app()`), a real listener and a
+/// fake S3 admin bucket. No dev-dependencies: the client is the `reqwest`
+/// we already ship, the fake S3 is a second axum router on 127.0.0.1:0.
+///
+/// The browser routes (`/`, `/save`) identify the user purely from the
+/// `X-Authentik-Username` request header. That header is only trustworthy
+/// if the request provably came through the Traefik forward-auth
+/// middleware — which the service cannot tell today. Anyone who can reach
+/// port 8080 directly (any pod in the cluster — the Service is ClusterIP
+/// with no NetworkPolicy — or the internet when the IngressRoute is enabled
+/// with `forwardAuth.enabled: false`, the chart default) can read and
+/// overwrite ANY user's stored library credentials by forging one header.
+///
+/// Contract these tests encode (see test-report.md for the fix criteria):
+/// the browser routes must reject a request that does not carry proof it
+/// came through the trusted proxy — a `X-Rrcloud-Proxy-Secret` header whose
+/// value equals the service's `BROWSER_PROXY_SECRET` (constant-time compare).
+#[cfg(test)]
+mod proxy_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use axum::{body::Bytes, http::Method, http::Uri};
+
+    const ADMIN_BUCKET: &str = "rapidraw-admin-test";
+    const VICTIM: &str = "alice";
+    /// Distinctive marker so a leak is unmistakable in the failure output.
+    const ALICE_AKID: &str = "GK-ALICE-AKID";
+    const ALICE_SECRET: &str = "alice-secret-access-key-DO-NOT-LEAK";
+    const ALICE_BUCKET: &str = "alice-photos";
+
+    /// Header + value that prove a request came through the trusted proxy.
+    /// TODO(fix): wire `PROXY_SECRET` into `Config` (`browser_proxy_secret`,
+    /// env `BROWSER_PROXY_SECRET`) inside `test_state()` once the field
+    /// exists; the positive-control tests below already send the header.
+    const PROXY_HEADER: &str = "X-Rrcloud-Proxy-Secret";
+    const PROXY_SECRET: &str = "test-proxy-secret-7f3a9c";
+
+    // -- fake S3 -----------------------------------------------------------
+
+    #[derive(Default)]
+    struct FakeS3 {
+        /// Every PUT the service issued: (request path, body).
+        puts: Mutex<Vec<(String, Vec<u8>)>>,
+    }
+
+    fn alice_doc() -> ConfigDoc {
+        ConfigDoc {
+            version: 1,
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            sync: PairingSyncSettings {
+                enabled: true,
+                endpoint: "https://garage.example.test".into(),
+                bucket: ALICE_BUCKET.into(),
+                region: "garage".into(),
+                force_path_style: true,
+                worker_backfill: true,
+                ..PairingSyncSettings::default()
+            },
+            credentials: PairingCredentials {
+                access_key_id: ALICE_AKID.into(),
+                secret_access_key: ALICE_SECRET.into(),
+            },
+        }
+    }
+
+    async fn fake_s3_handler(
+        State(fake): State<Arc<FakeS3>>,
+        method: Method,
+        uri: Uri,
+        body: Bytes,
+    ) -> Response {
+        let alice_key = format!("/{ADMIN_BUCKET}/{}", config_key(VICTIM));
+        let path = uri.path().to_string();
+        match (method, path == alice_key) {
+            (Method::GET, true) => (
+                StatusCode::OK,
+                [("content-type", "application/json")],
+                serde_json::to_vec(&alice_doc()).unwrap(),
+            )
+                .into_response(),
+            (Method::PUT, _) => {
+                fake.puts.lock().unwrap().push((path, body.to_vec()));
+                StatusCode::OK.into_response()
+            }
+            _ => (
+                StatusCode::NOT_FOUND,
+                [("content-type", "application/xml")],
+                "<Error><Code>NoSuchKey</Code></Error>",
+            )
+                .into_response(),
+        }
+    }
+
+    /// Path-style S3 stand-in: `GET /<bucket>/users/alice/config.json`
+    /// serves alice's doc, every `PUT` is recorded, anything else is 404.
+    async fn start_fake_s3() -> (String, Arc<FakeS3>) {
+        let fake = Arc::new(FakeS3::default());
+        let router = Router::new()
+            .fallback(fake_s3_handler)
+            .with_state(fake.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{addr}"), fake)
+    }
+
+    // -- service under test ------------------------------------------------
+
+    fn test_state(s3_endpoint: &str) -> Arc<AppState> {
+        Arc::new(AppState {
+            config: Config {
+                admin_bucket: ADMIN_BUCKET.into(),
+                admin_s3_endpoint: s3_endpoint.into(),
+                admin_s3_region: "garage".into(),
+                admin_s3_access_key: "GKadmintestkey".into(),
+                admin_s3_secret_key: "admin-test-secret".into(),
+                // Unreachable on purpose: the browser path must never need it.
+                oidc_userinfo_url: "http://127.0.0.1:9/application/o/userinfo/".into(),
+                oidc_issuer_url: "http://127.0.0.1:9/application/o/rapidraw-cloud/".into(),
+                oidc_client_id: "test-client-id".into(),
+                default_library_endpoint: "https://garage.example.test".into(),
+                default_library_region: "garage".into(),
+                browser_proxy_secret: Some(PROXY_SECRET.into()),
+            },
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap(),
+        })
+    }
+
+    /// Boots the REAL router (`app()`) on a loopback port; returns base URL
+    /// and the fake S3 recorder.
+    async fn start_service() -> (String, Arc<FakeS3>) {
+        let (s3_url, fake) = start_fake_s3().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = app(test_state(&s3_url));
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (format!("http://{addr}"), fake)
+    }
+
+    fn client() -> reqwest::Client {
+        reqwest::Client::builder()
+            // We assert on the 303 itself; do not follow it.
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap()
+    }
+
+    /// Attacker-chosen library coordinates: if these land in alice's
+    /// config.json, every one of alice's devices (and the worker) starts
+    /// syncing her photos into the attacker's bucket.
+    fn attacker_form() -> Vec<(&'static str, &'static str)> {
+        vec![
+            ("endpoint", "https://attacker.example.test"),
+            ("bucket", "attacker-exfil-bucket"),
+            ("region", "garage"),
+            ("access_key_id", "GK-ATTACKER-AKID"),
+            ("secret_access_key", "attacker-secret"),
+            ("force_path_style", "on"),
+            ("worker_backfill", "on"),
+        ]
+    }
+
+    /// ~160 chars of context around the first occurrence of `needle`.
+    fn excerpt_around(body: &str, needle: &str) -> String {
+        match body.find(needle) {
+            Some(i) => {
+                let start = body[..i]
+                    .char_indices()
+                    .rev()
+                    .nth(80)
+                    .map(|(j, _)| j)
+                    .unwrap_or(0);
+                let end = body[i..]
+                    .char_indices()
+                    .nth(needle.len() + 80)
+                    .map(|(j, _)| i + j)
+                    .unwrap_or(body.len());
+                format!("…{}…", &body[start..end])
+            }
+            None => body.chars().take(240).collect(),
+        }
+    }
+
+    fn is_rejected(status: StatusCode) -> bool {
+        status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN
+    }
+
+    // -- negative tests: these FAIL on the current code ----------------------
+
+    /// (a) A forged `X-Authentik-Username` header, with NO proof the request
+    /// came through the forward-auth proxy, must not reveal alice's config.
+    #[tokio::test]
+    async fn forged_username_header_alone_must_not_reveal_another_users_config() {
+        let (base, _fake) = start_service().await;
+
+        let resp = client()
+            .get(format!("{base}/"))
+            .header("X-Authentik-Username", VICTIM)
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+
+        let leaked = body.contains(ALICE_AKID);
+        assert!(
+            is_rejected(status) && !leaked,
+            "\nGET / carrying only a forged `X-Authentik-Username: {VICTIM}` header (no proxy proof) \
+             was answered HTTP {status} instead of 401/403.\n\
+             alice's stored library access key id `{ALICE_AKID}` {}.\n\
+             body excerpt:\n{}\n",
+            if leaked { "WAS LEAKED to the unauthenticated caller" } else { "did not appear" },
+            excerpt_around(&body, ALICE_AKID),
+        );
+    }
+
+    /// (a') Carrying the proxy header with the WRONG value is just as
+    /// anonymous as not carrying it.
+    #[tokio::test]
+    async fn forged_username_header_with_wrong_proxy_secret_is_rejected() {
+        let (base, _fake) = start_service().await;
+
+        let resp = client()
+            .get(format!("{base}/"))
+            .header("X-Authentik-Username", VICTIM)
+            .header(PROXY_HEADER, "not-the-real-secret")
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+
+        assert!(
+            is_rejected(status) && !body.contains(ALICE_AKID),
+            "\nGET / with a forged `X-Authentik-Username: {VICTIM}` and a WRONG `{PROXY_HEADER}` \
+             was answered HTTP {status} instead of 401/403; `{ALICE_AKID}` in body: {}\n\
+             body excerpt:\n{}\n",
+            body.contains(ALICE_AKID),
+            excerpt_around(&body, ALICE_AKID),
+        );
+    }
+
+    /// (b) A forged header must not let the caller overwrite alice's stored
+    /// credentials / library coordinates. The fake S3 must see NO PUT.
+    #[tokio::test]
+    async fn forged_username_header_alone_must_not_overwrite_another_users_config() {
+        let (base, fake) = start_service().await;
+
+        let resp = client()
+            .post(format!("{base}/save"))
+            .header("X-Authentik-Username", VICTIM)
+            .form(&attacker_form())
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+
+        let puts = fake.puts.lock().unwrap().clone();
+        let put_summary: Vec<String> = puts
+            .iter()
+            .map(|(path, body)| format!("PUT {path}\n{}", String::from_utf8_lossy(body)))
+            .collect();
+
+        assert!(
+            is_rejected(status) && puts.is_empty(),
+            "\nPOST /save carrying only a forged `X-Authentik-Username: {VICTIM}` header (no proxy proof) \
+             was answered HTTP {status}{} instead of 401/403, and the admin bucket received \
+             {} PUT(s) — alice's config.json was overwritten with attacker-chosen coordinates:\n{}\n",
+            if location.is_empty() { String::new() } else { format!(" (Location: {location})") },
+            puts.len(),
+            put_summary.join("\n---\n"),
+        );
+    }
+
+    // -- positive controls: these PASS today and must keep passing ----------
+
+    /// (c) The same requests carrying proof of the trusted proxy
+    /// (`X-Rrcloud-Proxy-Secret` == BROWSER_PROXY_SECRET) keep working:
+    /// GET / renders alice's page (200), POST /save writes and redirects (303).
+    ///
+    /// Today the header is simply ignored, so this passes trivially; after
+    /// the fix it is the contract that the legitimate forward-auth path still
+    /// functions. The fixer must set `browser_proxy_secret` to `PROXY_SECRET`
+    /// in `test_state()` for this to remain green.
+    #[tokio::test]
+    async fn requests_through_trusted_proxy_still_work() {
+        let (base, fake) = start_service().await;
+        let c = client();
+
+        let resp = c
+            .get(format!("{base}/"))
+            .header("X-Authentik-Username", VICTIM)
+            .header(PROXY_HEADER, PROXY_SECRET)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "GET / through the trusted proxy"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("You're paired"),
+            "paired view expected:\n{}",
+            excerpt_around(&body, "<h1>")
+        );
+        assert!(
+            body.contains(ALICE_AKID),
+            "paired view pre-fills the access key id"
+        );
+        assert!(
+            !body.contains(ALICE_SECRET),
+            "the secret key must never be rendered"
+        );
+
+        let resp = c
+            .post(format!("{base}/save"))
+            .header("X-Authentik-Username", VICTIM)
+            .header(PROXY_HEADER, PROXY_SECRET)
+            // What a browser sends on the pairing page's own form submit;
+            // `/save` also refuses cross-site POSTs (see `same_origin_post`).
+            .header("Sec-Fetch-Site", "same-origin")
+            .form(&[
+                ("endpoint", "https://garage.example.test"),
+                ("bucket", "alice-new-bucket"),
+                ("region", "garage"),
+                ("access_key_id", "GK-ALICE-NEW-AKID"),
+                ("secret_access_key", "alice-new-secret"),
+                ("force_path_style", "on"),
+            ])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "POST /save through the trusted proxy"
+        );
+        assert_eq!(
+            resp.headers().get("location").and_then(|v| v.to_str().ok()),
+            Some("/?saved=1")
+        );
+
+        let puts = fake.puts.lock().unwrap().clone();
+        assert_eq!(puts.len(), 1, "exactly one PUT to the admin bucket");
+        assert_eq!(puts[0].0, format!("/{ADMIN_BUCKET}/{}", config_key(VICTIM)));
+        let written: ConfigDoc = serde_json::from_slice(&puts[0].1).expect("valid ConfigDoc");
+        assert_eq!(written.sync.bucket, "alice-new-bucket");
+        assert_eq!(written.credentials.access_key_id, "GK-ALICE-NEW-AKID");
+        assert_eq!(written.credentials.secret_access_key, "alice-new-secret");
+    }
+
+    /// `/healthz` and `/api/*` are not browser routes: they must stay
+    /// reachable without the proxy header (the app API authenticates with its
+    /// own OIDC bearer token; pairing-info is deliberately public).
+    #[tokio::test]
+    async fn healthz_and_api_routes_do_not_require_proxy_proof() {
+        let (base, _fake) = start_service().await;
+        let c = client();
+
+        let resp = c.get(format!("{base}/healthz")).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.text().await.unwrap(), "ok");
+
+        let resp = c
+            .get(format!("{base}/api/pairing-info"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let info: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(info["clientId"], "test-client-id");
+        assert_eq!(info["configEndpoint"], "/api/config");
+
+        // No bearer → 401 from the API's own auth, not from any proxy check.
+        let resp = c
+            .get(format!("{base}/api/config"))
+            .header("X-Authentik-Username", VICTIM)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(resp.text().await.unwrap(), "missing bearer token");
+    }
+}
+
+#[cfg(test)]
+mod csrf_tests {
+    //! CSRF regression tests for `POST /save`.
+    //!
+    //! The browser session is a cookie (Authentik forward-auth); the only
+    //! thing standing between an attacker page and a config overwrite is the
+    //! service itself. These tests drive the real router in-process against
+    //! a fake S3 server that records every `PUT` to the admin bucket, so a
+    //! forged cross-site form submission that "succeeds" is visible as a
+    //! stored `config.json` carrying the attacker's endpoint + credentials.
+    //!
+    //! Expected policy (what a fix must satisfy):
+    //!   * `Sec-Fetch-Site` present: only `same-origin` is accepted
+    //!     (`cross-site`, `same-site` → 403).
+    //!   * No `Sec-Fetch-Site`: `Origin` (else `Referer`) host must equal
+    //!     the request `Host`; neither present → 403.
+    //!   * `GET /` is unaffected.
+
+    use super::*;
+    use axum::{
+        body::{Body, Bytes},
+        http::{header, Method, Request, Uri},
+    };
+    use http_body_util::BodyExt;
+    use std::sync::Mutex;
+    use tower::ServiceExt;
+
+    const ADMIN_BUCKET: &str = "rapidraw-admin";
+    const SITE_HOST: &str = "rrc.example";
+    /// Proof the request traversed the forward-auth proxy (`proxy_verified`).
+    /// Every request below carries it so the CSRF guard, not the proxy-secret
+    /// guard, is what decides the outcome.
+    const PROXY_SECRET: &str = "csrf-test-proxy-secret-0b1d";
+    const ALICE_KEY: &str = "/rapidraw-admin/users/alice/config.json";
+
+    /// Form a legitimate user would submit (her own library bucket).
+    const ALICE_FORM: &str = "endpoint=https%3A%2F%2Fgarage.example&bucket=alice-photos&region=garage\
+        &access_key_id=GKALICE&secret_access_key=alice-secret&force_path_style=on&worker_backfill=on";
+    /// Form an attacker page auto-submits: points the victim's library at
+    /// the attacker's bucket with the attacker's credentials.
+    const EVIL_FORM: &str = "endpoint=https%3A%2F%2Fevil-s3.example&bucket=loot&region=garage\
+        &access_key_id=EVILKEY&secret_access_key=evil-secret&force_path_style=on&worker_backfill=on";
+
+    /// (request path, body) of every PUT the fake admin bucket received.
+    type PutLog = Arc<Mutex<Vec<(String, String)>>>;
+
+    /// Minimal S3 stand-in: records PUTs (200), answers everything else 404
+    /// (→ `read_config` sees "not configured yet").
+    async fn start_fake_s3() -> (String, PutLog) {
+        let log: PutLog = Arc::new(Mutex::new(Vec::new()));
+        let sink = log.clone();
+        let router = Router::new().fallback(move |method: Method, uri: Uri, body: Bytes| {
+            let sink = sink.clone();
+            async move {
+                if method == Method::PUT {
+                    sink.lock().unwrap().push((
+                        uri.path().to_string(),
+                        String::from_utf8_lossy(&body).into_owned(),
+                    ));
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        (format!("http://{addr}"), log)
+    }
+
+    async fn test_app() -> (Router, PutLog) {
+        let (endpoint, log) = start_fake_s3().await;
+        let state = Arc::new(AppState {
+            config: Config {
+                admin_bucket: ADMIN_BUCKET.into(),
+                admin_s3_endpoint: endpoint,
+                admin_s3_region: "garage".into(),
+                admin_s3_access_key: "GKADMIN".into(),
+                admin_s3_secret_key: "admin-secret".into(),
+                oidc_userinfo_url: "http://127.0.0.1:1/userinfo".into(),
+                oidc_issuer_url: "http://127.0.0.1:1/application/o/rrc/".into(),
+                oidc_client_id: "rrc".into(),
+                default_library_endpoint: "https://garage.example".into(),
+                default_library_region: "garage".into(),
+                browser_proxy_secret: Some(PROXY_SECRET.into()),
+            },
+            http: reqwest::Client::new(),
+        });
+        (app(state), log)
+    }
+
+    /// `POST /save` as the logged-in browser user `alice`, with `Host`
+    /// set the way Traefik forwards it, plus the given extra headers.
+    fn save_request(extra: &[(&str, &str)], form: &str) -> Request<Body> {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri("/save")
+            .header(header::HOST, SITE_HOST)
+            .header("X-Authentik-Username", "alice")
+            .header(PROXY_SECRET_HEADER, PROXY_SECRET)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+        for (k, v) in extra {
+            req = req.header(*k, *v);
+        }
+        req.body(Body::from(form.to_string())).unwrap()
+    }
+
+    async fn send(app: Router, req: Request<Body>) -> (StatusCode, HeaderMap, String) {
+        let resp = app.oneshot(req).await.unwrap();
+        let status = resp.status();
+        let headers = resp.headers().clone();
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    fn puts(log: &PutLog) -> Vec<(String, String)> {
+        log.lock().unwrap().clone()
+    }
+
+    fn describe_puts(puts: &[(String, String)]) -> String {
+        if puts.is_empty() {
+            return "(none)".into();
+        }
+        puts.iter()
+            .map(|(path, body)| format!("PUT {path}\n{body}"))
+            .collect::<Vec<_>>()
+            .join("\n---\n")
+    }
+
+    /// A forged submission must be refused (403) AND must leave the admin
+    /// bucket untouched. The failure message prints whatever got stored so
+    /// the overwrite is visible in the test output.
+    fn assert_rejected(label: &str, status: StatusCode, body: &str, puts: &[(String, String)]) {
+        assert!(
+            status == StatusCode::FORBIDDEN && puts.is_empty(),
+            "{label}: expected HTTP 403 and NO write to the admin bucket, got HTTP {status} \
+             (body: {body:?}) and {} PUT(s) to the admin bucket:\n{}",
+            puts.len(),
+            describe_puts(puts),
+        );
+    }
+
+    /// A genuine same-origin submission must still work exactly as today:
+    /// 303 → `/?saved=1` and one `config.json` PUT for alice.
+    fn assert_accepted(
+        label: &str,
+        status: StatusCode,
+        headers: &HeaderMap,
+        puts: &[(String, String)],
+    ) {
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "{label}: expected redirect after save"
+        );
+        assert_eq!(
+            headers.get(header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some("/?saved=1"),
+            "{label}: redirect target"
+        );
+        assert_eq!(
+            puts.len(),
+            1,
+            "{label}: exactly one admin-bucket write, got:\n{}",
+            describe_puts(puts)
+        );
+        assert_eq!(puts[0].0, ALICE_KEY, "{label}: config key");
+        let doc: ConfigDoc = serde_json::from_str(&puts[0].1).expect("stored doc is valid JSON");
+        assert_eq!(
+            doc.sync.endpoint, "https://garage.example",
+            "{label}: stored endpoint"
+        );
+        assert_eq!(doc.sync.bucket, "alice-photos", "{label}: stored bucket");
+        assert_eq!(
+            doc.credentials.access_key_id, "GKALICE",
+            "{label}: stored access key"
+        );
+    }
+
+    // -- negative: forged submissions -------------------------------------
+
+    /// (a) The classic attack: victim is logged in, visits evil.example,
+    /// which auto-submits `<form method=post action=https://rrc.example/save>`.
+    /// Every current browser sends `Sec-Fetch-Site: cross-site` and
+    /// `Origin: https://evil.example` on that request.
+    #[tokio::test]
+    async fn save_rejects_cross_site_form_post() {
+        let (app, log) = test_app().await;
+        let req = save_request(
+            &[
+                ("Sec-Fetch-Site", "cross-site"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Origin", "https://evil.example"),
+                ("Referer", "https://evil.example/"),
+            ],
+            EVIL_FORM,
+        );
+        let (status, _, body) = send(app, req).await;
+        let stored = puts(&log);
+        assert_rejected("cross-site POST /save", status, &body, &stored);
+    }
+
+    /// (b) A sibling subdomain (anything else on *.example that shares the
+    /// Authentik cookie scope) is still not the pairing site. Must be
+    /// rejected too — `same-site` is not `same-origin`.
+    #[tokio::test]
+    async fn save_rejects_same_site_sibling_form_post() {
+        let (app, log) = test_app().await;
+        let req = save_request(
+            &[
+                ("Sec-Fetch-Site", "same-site"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Origin", "https://wiki.example"),
+                ("Referer", "https://wiki.example/page"),
+            ],
+            EVIL_FORM,
+        );
+        let (status, _, body) = send(app, req).await;
+        let stored = puts(&log);
+        assert_rejected("same-site POST /save", status, &body, &stored);
+    }
+
+    /// (a') Browser without Fetch Metadata support: the only cross-site
+    /// signal is `Origin` not matching `Host`. Must be rejected.
+    #[tokio::test]
+    async fn save_rejects_mismatched_origin_without_fetch_metadata() {
+        let (app, log) = test_app().await;
+        let req = save_request(
+            &[
+                ("Origin", "https://evil.example"),
+                ("Referer", "https://evil.example/"),
+            ],
+            EVIL_FORM,
+        );
+        let (status, _, body) = send(app, req).await;
+        let stored = puts(&log);
+        assert_rejected("Origin-mismatch POST /save", status, &body, &stored);
+    }
+
+    /// (c3) Oldest client: no Fetch Metadata, no `Origin`, no `Referer`.
+    /// There is nothing to prove where the form came from, and a
+    /// credential-overwriting POST is not worth guessing on: reject.
+    #[tokio::test]
+    async fn save_rejects_post_with_no_provenance_headers() {
+        let (app, log) = test_app().await;
+        let req = save_request(&[], EVIL_FORM);
+        let (status, _, body) = send(app, req).await;
+        let stored = puts(&log);
+        assert_rejected("header-less POST /save", status, &body, &stored);
+    }
+
+    // -- positive controls: real submissions keep working -----------------
+
+    /// (c1) The pairing page's own form: `same-origin`, matching `Origin`.
+    #[tokio::test]
+    async fn save_accepts_same_origin_form_post() {
+        let (app, log) = test_app().await;
+        let req = save_request(
+            &[
+                ("Sec-Fetch-Site", "same-origin"),
+                ("Sec-Fetch-Mode", "navigate"),
+                ("Sec-Fetch-Dest", "document"),
+                ("Origin", &format!("https://{SITE_HOST}")),
+                ("Referer", &format!("https://{SITE_HOST}/")),
+            ],
+            ALICE_FORM,
+        );
+        let (status, headers, _) = send(app, req).await;
+        assert_accepted("same-origin POST /save", status, &headers, &puts(&log));
+    }
+
+    /// (c2) Browser without Fetch Metadata, but `Origin` host == `Host`.
+    #[tokio::test]
+    async fn save_accepts_matching_origin_without_fetch_metadata() {
+        let (app, log) = test_app().await;
+        let req = save_request(
+            &[
+                ("Origin", &format!("https://{SITE_HOST}")),
+                ("Referer", &format!("https://{SITE_HOST}/")),
+            ],
+            ALICE_FORM,
+        );
+        let (status, headers, _) = send(app, req).await;
+        assert_accepted("Origin-only POST /save", status, &headers, &puts(&log));
+    }
+
+    /// (c2') Browser that sends neither Fetch Metadata nor `Origin` on a
+    /// same-origin form POST, but does send `Referer` with a matching host.
+    #[tokio::test]
+    async fn save_accepts_matching_referer_without_origin() {
+        let (app, log) = test_app().await;
+        let req = save_request(&[("Referer", &format!("https://{SITE_HOST}/"))], ALICE_FORM);
+        let (status, headers, _) = send(app, req).await;
+        assert_accepted("Referer-only POST /save", status, &headers, &puts(&log));
+    }
+
+    /// `GET /` carries no provenance headers on a plain navigation and must
+    /// stay reachable: the guard belongs on `/save` only.
+    #[tokio::test]
+    async fn index_get_is_not_affected_by_the_save_guard() {
+        let (app, log) = test_app().await;
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(header::HOST, SITE_HOST)
+            .header("X-Authentik-Username", "alice")
+            .header(PROXY_SECRET_HEADER, PROXY_SECRET)
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, body) = send(app, req).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("pair your library"),
+            "unpaired page rendered: {body}"
+        );
+        assert!(puts(&log).is_empty());
     }
 }
