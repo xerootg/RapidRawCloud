@@ -7,6 +7,8 @@
 #include <time.h>
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 #include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -15,6 +17,7 @@
 #include "rrc_s3_client.h"
 #include "rrc_blake3.h"
 #include "rrc_hash.h"
+#include "rrc_sigv4.h"
 #include "rrc_glob.h"
 #include "rrc_proto.h"
 #include "app_config.h"
@@ -38,7 +41,7 @@ static const char *TAG = "sync";
 #define MANIFEST_RECONFIRM_S (24 * 3600)   /* §2.10 rule 2 */
 #define LAGGARD_CAP_S       (14 * 24 * 3600) /* §2.10 rule 3 */
 
-typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG, CMD_DEBUG_LS, CMD_DEBUG_HASH } cmd_t;
+typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG, CMD_DEBUG_LS, CMD_DEBUG_HASH, CMD_DEBUG_SPEED, CMD_DEBUG_TCP } cmd_t;
 typedef struct { cmd_t cmd; cam_source_t *src; char *arg; int repeat; } msg_t;
 
 static QueueHandle_t q;
@@ -647,6 +650,78 @@ static void debug_hash(const char *arg, int repeat)
     }
 }
 
+/* Pure cloud-path throughput: PUT `mb` MiB of pattern from the part buffer to a
+ * scratch key under the control prefix, then delete it. Camera reads are not
+ * involved, so this isolates TLS + HTTP + TCP on the dock from the camera. */
+static void debug_speed(int mb)
+{
+    if (!s3_ready) { printf("cloud not configured\n"); return; }
+    size_t len = (size_t)(mb > 0 ? mb : 8) * 1024u * 1024u;
+    if (len > PART_BUF_BYTES) len = PART_BUF_BYTES;
+    for (size_t i = 0; i < len; i += 4096) memset(part_buf + i, (int)(0x30 + (i / 4096) % 64), 4096);
+    char key[160];
+    snprintf(key, sizeof key, ".rrcloud/tmp/%s-speedtest", app_device_id());
+    rrc_s3_result_t res;
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t e = rrc_s3_head(&s3, key, &res);
+    int64_t t1 = esp_timer_get_time();
+    printf("HEAD (connect + TLS handshake + round trip): %lld ms (%s, http %d)\n", (long long)((t1 - t0) / 1000), esp_err_to_name(e), res.status);
+    {   /* the single-object PUT hashes its body twice before the first byte leaves */
+        uint8_t d[32]; char hex[65];
+        t0 = esp_timer_get_time(); rrc_md5(part_buf, len, d); t1 = esp_timer_get_time();
+        printf("  content-md5 over %u MiB: %lld ms\n", (unsigned)(len >> 20), (long long)((t1 - t0) / 1000));
+        t0 = esp_timer_get_time(); rrc_sigv4_sha256_hex(part_buf, len, hex); t1 = esp_timer_get_time();
+        printf("  sigv4 payload sha256 over %u MiB: %lld ms (multipart parts skip this)\n", (unsigned)(len >> 20), (long long)((t1 - t0) / 1000));
+    }
+    t0 = esp_timer_get_time();
+    e = rrc_s3_put(&s3, key, part_buf, len, "application/octet-stream", NULL, 0, &res);
+    t1 = esp_timer_get_time();
+    double secs = (double)(t1 - t0) / 1e6;
+    printf("PUT %u MiB: %s (http %d) in %.2f s = %.2f MB/s\n", (unsigned)(len >> 20), esp_err_to_name(e), res.status, secs, (double)len / 1048576.0 / secs);
+    printf("  of which: in write() %lld ms for %u bytes = %.2f MB/s (socket send %lld ms, TLS cpu %lld ms); waiting for the response %lld ms\n",
+           (long long)(s3.stat_tx_us / 1000), (unsigned)s3.stat_tx_bytes,
+           s3.stat_tx_us > 0 ? (double)s3.stat_tx_bytes / 1048576.0 / ((double)s3.stat_tx_us / 1e6) : 0.0,
+           (long long)(s3.stat_send_us / 1000), (long long)((s3.stat_tx_us - s3.stat_send_us) / 1000), (long long)(s3.stat_wait_us / 1000));
+    if (e == ESP_OK) {
+        t0 = esp_timer_get_time();
+        rrc_s3_delete(&s3, key, &res);
+        t1 = esp_timer_get_time();
+        printf("DELETE: %lld ms\n", (long long)((t1 - t0) / 1000));
+    }
+}
+
+/* Raw TCP: connect, blast `mb` MiB from the part buffer in 64 KiB sends, report.
+ * No HTTP, no TLS — the number is lwIP + EMAC + the wire. */
+static void debug_tcp(const char *host, int port, int mb)
+{
+    size_t len = (size_t)(mb > 0 ? mb : 8) * 1024u * 1024u;
+    if (len > PART_BUF_BYTES) len = PART_BUF_BYTES;
+    struct sockaddr_in sa = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+    if (inet_pton(AF_INET, host, &sa.sin_addr) != 1) { printf("tcp-speed: need a dotted IPv4 address\n"); return; }
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { printf("socket failed\n"); return; }
+    int one = 1; setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
+    if (net_eth_ip()[0]) { /* pin the test to the wire even when Wi-Fi shares the subnet */
+        struct sockaddr_in src = {.sin_family = AF_INET, .sin_port = 0};
+        inet_pton(AF_INET, net_eth_ip(), &src.sin_addr);
+        if (bind(fd, (struct sockaddr *)&src, sizeof src) != 0) printf("bind to %s failed: errno %d\n", net_eth_ip(), errno);
+    }
+    int64_t t0 = esp_timer_get_time();
+    if (connect(fd, (struct sockaddr *)&sa, sizeof sa) != 0) { printf("connect failed: errno %d\n", errno); close(fd); return; }
+    int64_t t1 = esp_timer_get_time();
+    size_t sent = 0; int err = 0;
+    while (sent < len) {
+        size_t n = len - sent > 65536 ? 65536 : len - sent;
+        int w = send(fd, part_buf + sent, n, 0);
+        if (w <= 0) { err = errno; break; }
+        sent += (size_t)w;
+    }
+    int64_t t2 = esp_timer_get_time();
+    close(fd);
+    double secs = (double)(t2 - t1) / 1e6;
+    printf("tcp-speed %s:%d: connect %lld ms, sent %u MiB in %.2f s = %.2f MB/s%s%d\n", host, port, (long long)((t1 - t0) / 1000), (unsigned)(sent >> 20), secs, (double)sent / 1048576.0 / secs, err ? ", errno " : "", err);
+}
+
 /* ---- task ------------------------------------------------------------------- */
 static void sync_task(void *arg)
 {
@@ -686,6 +761,8 @@ static void sync_task(void *arg)
         case CMD_CONFIG: configure_s3(); break;
         case CMD_DEBUG_LS: debug_ls(); break;
         case CMD_DEBUG_HASH: debug_hash(m.arg ? m.arg : "", m.repeat); free(m.arg); break;
+        case CMD_DEBUG_SPEED: debug_speed(m.repeat); break;
+        case CMD_DEBUG_TCP: { char *colon = m.arg ? strrchr(m.arg, ':') : NULL; if (colon) { *colon = 0; debug_tcp(m.arg, atoi(colon + 1), m.repeat); } free(m.arg); break; }
         }
     }
 }
@@ -724,6 +801,15 @@ void sync_request_now(void) { msg_t m = {.cmd = CMD_SYNC_NOW}; xQueueSend(q, &m,
 void sync_cancel(void) { cancel_flag = true; msg_t m = {.cmd = CMD_CANCEL}; xQueueSend(q, &m, 0); }
 void sync_config_changed(void) { msg_t m = {.cmd = CMD_CONFIG}; xQueueSend(q, &m, 0); }
 void sync_debug_list(void) { msg_t m = {.cmd = CMD_DEBUG_LS}; xQueueSend(q, &m, 0); }
+void sync_debug_speed(int mb) { msg_t m = {.cmd = CMD_DEBUG_SPEED, .repeat = mb}; xQueueSend(q, &m, 0); }
+void sync_debug_tcp_speed(const char *host, int port, int mb)
+{
+    char *arg = malloc(80);
+    if (!arg) return;
+    snprintf(arg, 80, "%s:%d", host, port);
+    msg_t m = {.cmd = CMD_DEBUG_TCP, .arg = arg, .repeat = mb};
+    if (xQueueSend(q, &m, 0) != pdTRUE) free(arg);
+}
 void sync_debug_hash(const char *handle_or_path, int repeat)
 {
     msg_t m = {.cmd = CMD_DEBUG_HASH, .arg = strdup(handle_or_path ? handle_or_path : ""), .repeat = repeat};

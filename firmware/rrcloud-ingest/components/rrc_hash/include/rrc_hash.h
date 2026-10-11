@@ -17,12 +17,21 @@ extern "C" {
 #endif
 
 /* ---- SHA-256 -------------------------------------------------------------- */
+#ifdef ESP_PLATFORM
+/* On the dock the hashes ride the SoC engines through mbedTLS (SHA-256 is DMA
+ * driven; MD5 is mbedTLS' optimised software), which is 20x the portable code. */
+#include "mbedtls/sha256.h"
+#include "mbedtls/md5.h"
+typedef struct { mbedtls_sha256_context m; } rrc_sha256_ctx;
+typedef struct { mbedtls_md5_context m; } rrc_md5_ctx;
+#else
 typedef struct {
     uint32_t h[8];
     uint64_t total_len;
     uint8_t buf[64];
     size_t buf_len;
 } rrc_sha256_ctx;
+#endif
 
 void rrc_sha256_init(rrc_sha256_ctx *c);
 void rrc_sha256_update(rrc_sha256_ctx *c, const void *data, size_t len);
@@ -33,12 +42,14 @@ void rrc_sha256(const void *data, size_t len, uint8_t out[32]);
 void rrc_hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_len, uint8_t out[32]);
 
 /* ---- MD5 (Content-MD5 only; not used for any security purpose) ------------ */
+#ifndef ESP_PLATFORM
 typedef struct {
     uint32_t a, b, c, d;
     uint64_t total_len;
     uint8_t buf[64];
     size_t buf_len;
 } rrc_md5_ctx;
+#endif
 
 void rrc_md5_init(rrc_md5_ctx *c);
 void rrc_md5_update(rrc_md5_ctx *c, const void *data, size_t len);

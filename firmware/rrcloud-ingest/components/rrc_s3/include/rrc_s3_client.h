@@ -33,11 +33,27 @@ typedef struct {
     char host_header[96];   /* exactly what esp_http_client puts in Host: */
     bool https;
     /* server minus local clock, seconds; learned from every response's Date header */
+    /* Server clock anchored to the monotonic timer: server time = server_offset_s +
+     * esp_timer seconds. Learned from every response's Date header. Anchoring to the
+     * wall clock instead broke the first sync after boot: a HEAD answered before SNTP
+     * landed taught a 56-year offset, SNTP then jumped the clock, and every signature
+     * after that was dated 2082 (the server closed mid-body). */
     bool have_server_offset;
     int64_t server_offset_s;
     /* set at configure time by rrc_s3_probe_digest_check (§2.4 backend probe) */
     bool digest_check_known;
     bool backend_rejects_bad_md5;
+    /* Persistent connection (rrc_s3_client.c): one TLS session or TCP socket is
+     * reused across requests; reopened transparently when the server drops it. */
+    void *conn_tls;         /* esp_tls_t* for https, NULL for http */
+    int conn_fd;            /* socket (TCP_NODELAY set); -1 when closed */
+    char conn_host[96];
+    int conn_port;
+    /* Timing of the last request, for the speed diagnostics (microseconds). */
+    int64_t stat_tx_us;     /* spent inside the TLS/TCP write calls */
+    size_t stat_tx_bytes;
+    int64_t stat_wait_us;   /* from last byte sent to the response parsed */
+    int64_t stat_send_us;   /* of stat_tx_us: inside the socket send() (TLS only) */
 } rrc_s3_t;
 
 typedef struct {
@@ -52,6 +68,8 @@ typedef struct {
 typedef int (*rrc_s3_sink_t)(void *ctx, const uint8_t *data, size_t len);
 
 esp_err_t rrc_s3_init(rrc_s3_t *s3, const rrc_s3_config_t *cfg);
+/* Drops the persistent connection (e.g. before a long idle period). */
+void rrc_s3_disconnect(rrc_s3_t *s3);
 
 /* Best server-time estimate: local clock + learned offset. */
 int64_t rrc_s3_server_now(const rrc_s3_t *s3);

@@ -10,6 +10,10 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0x8000
 
 # ---- PSRAM: transfer buffers (8 MiB upload parts) live here.
+# 200 MHz hex PSRAM is gated behind IDF_EXPERIMENTAL_FEATURES on IDF 5.5; without
+# the flag the choice silently fell back to 20 MHz (boot log "Speed: 20MHz") and
+# every pass over a part buffer crawled. The board's module is rated for 200 MHz.
+CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_HEX=y
 CONFIG_SPIRAM_SPEED_200M=y
@@ -52,8 +56,8 @@ CONFIG_FATFS_VFS_FSTAT_BLKSIZE=4096
 
 # ---- Networking stack
 CONFIG_LWIP_SNTP_MAX_SERVERS=2
-CONFIG_LWIP_TCP_SND_BUF_DEFAULT=65535
-CONFIG_LWIP_TCP_WND_DEFAULT=65535
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=1024000
+CONFIG_LWIP_TCP_WND_DEFAULT=131072
 CONFIG_LWIP_TCP_RECVMBOX_SIZE=64
 CONFIG_LWIP_TCPIP_RECVMBOX_SIZE=64
 CONFIG_LWIP_IPV6=y
@@ -116,3 +120,20 @@ CONFIG_BT_NIMBLE_MAX_BONDS=8
 CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=517
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=6144
 CONFIG_BT_NIMBLE_SVC_GAP_DEVICE_NAME="rrcloud-ingest"
+
+# ---- Data path: lwIP hot paths in IRAM, and full-size (16 KiB) outgoing TLS
+# records so an 8 MiB part is 512 records instead of 2048 (each record is a
+# cipher setup, a copy and a socket write).
+CONFIG_LWIP_IRAM_OPTIMIZATION=y
+CONFIG_LWIP_EXTRA_IRAM_OPTIMIZATION=y
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384
+# 256 KiB L2 cache (default 128): part buffers stream through PSRAM.
+CONFIG_CACHE_L2_CACHE_256KB=y
+
+# Uploads cross a WAN hop (Garage sits behind a site-to-site tunnel, ~40 ms RTT).
+# Without window scaling lwIP caps a TCP connection at 64 KiB in flight, which is
+# 1.5 MB/s at that RTT. Scale the window and give the sender 1 MiB of PSRAM-backed
+# send buffer so one stream can fill the 100 Mbit wire.
+CONFIG_LWIP_WND_SCALE=y
+CONFIG_LWIP_TCP_RCV_SCALE=2
+CONFIG_LWIP_TCP_SACK_OUT=y

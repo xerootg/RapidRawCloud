@@ -1,4 +1,8 @@
 #include "net.h"
+#include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
 #include "util.h"
 #include <string.h>
 #include <stdio.h>
@@ -24,14 +28,24 @@
 static const char *TAG = "net";
 static esp_netif_t *eth_netif, *wifi_netif;
 static bool eth_link, eth_ip, wifi_up, wifi_ip, wifi_started;
+static esp_eth_handle_t eth_handle;
+static char applied_ssid[33], applied_pw[65];
+/* Wi-Fi is failover only: it carries traffic when the cable is out. Both links
+ * sit in the same subnet, and lwIP routes on-link destinations to whichever
+ * netif it finds first, so an associated Wi-Fi station would silently take
+ * uploads off the wire. Policy changes run on their own task because starting
+ * Wi-Fi waits for the co-processor link. */
+typedef enum { WIFI_POLICY_UP, WIFI_POLICY_DOWN, WIFI_POLICY_REAPPLY } wifi_policy_t;
+static QueueHandle_t policy_q;
+static void policy_post(wifi_policy_t p) { if (policy_q) xQueueSend(policy_q, &p, 0); }
 static char eth_ip_str[16], wifi_ip_str[16];
 
 static void eth_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base; (void)data;
     switch (id) {
-    case ETHERNET_EVENT_CONNECTED: eth_link = true; log_ring_printf("ethernet link up"); break;
-    case ETHERNET_EVENT_DISCONNECTED: eth_link = false; eth_ip = false; eth_ip_str[0] = 0; log_ring_printf("ethernet link down"); break;
+    case ETHERNET_EVENT_CONNECTED: eth_link = true; log_ring_printf("ethernet link up"); policy_post(WIFI_POLICY_DOWN); break;
+    case ETHERNET_EVENT_DISCONNECTED: eth_link = false; eth_ip = false; eth_ip_str[0] = 0; log_ring_printf("ethernet link down"); policy_post(WIFI_POLICY_UP); break;
     default: break;
     }
 }
@@ -91,8 +105,16 @@ static esp_err_t eth_init(void)
     esp_eth_config_t cfg = ETH_DEFAULT_CONFIG(mac, phy);
     esp_eth_handle_t eth = NULL;
     esp_err_t e = esp_eth_driver_install(&cfg, &eth);
+    eth_handle = eth;
     if (e != ESP_OK) { ESP_LOGE(TAG, "eth driver install: %s", esp_err_to_name(e)); return e; }
+    /* IDF ranks a Wi-Fi station netif (route_prio 100) above Ethernet (50), so once
+     * Wi-Fi joins the same subnet every upload would leave over the C6's SDIO link
+     * at a fraction of the wired rate. Wired is the default route whenever it has
+     * link; Wi-Fi only carries traffic when the cable is out. */
+    esp_netif_inherent_config_t eth_base = ESP_NETIF_INHERENT_DEFAULT_ETH();
+    eth_base.route_prio = 200;
     esp_netif_config_t ncfg = ESP_NETIF_DEFAULT_ETH();
+    ncfg.base = &eth_base;
     eth_netif = esp_netif_new(&ncfg);
     esp_netif_set_hostname(eth_netif, app_config_get()->hostname);
     ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth)));
@@ -119,7 +141,6 @@ static esp_err_t wifi_start(void)
         ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event, NULL));
     }
     /* Re-applying identical credentials would bounce a live association. */
-    static char applied_ssid[33], applied_pw[65];
     if (wifi_started && !strcmp(applied_ssid, c->wifi_ssid) && !strcmp(applied_pw, pw)) return ESP_OK;
     wifi_config_t wc = {0};
     /* SSIDs are 1..32 octets and need no terminator in wifi_config_t. */
@@ -149,15 +170,43 @@ static esp_err_t wifi_start(void)
     return ESP_OK;
 }
 
+static void wifi_stop(void)
+{
+    if (!wifi_started) return;
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    wifi_started = false; wifi_up = wifi_ip = false; wifi_ip_str[0] = 0;
+    applied_ssid[0] = applied_pw[0] = 0;
+    log_ring_printf("wifi: off (ethernet carries traffic)");
+}
+
+static void policy_task(void *arg)
+{
+    (void)arg;
+    wifi_policy_t p;
+    for (;;) {
+        if (xQueueReceive(policy_q, &p, portMAX_DELAY) != pdTRUE) continue;
+        const app_config_t *c = app_config_get();
+        switch (p) {
+        case WIFI_POLICY_DOWN: wifi_stop(); break;
+        case WIFI_POLICY_UP: if (!eth_link && c->wifi_ssid[0]) wifi_start(); break;
+        case WIFI_POLICY_REAPPLY:
+            if (!c->wifi_ssid[0] || eth_link) wifi_stop();
+            else { applied_ssid[0] = 0; wifi_start(); }
+            break;
+        }
+    }
+}
+
+static void boot_policy_cb(void *arg) { (void)arg; policy_post(WIFI_POLICY_UP); }
+
 esp_err_t net_wifi_reconfigure(void)
 {
-    const app_config_t *c = app_config_get();
-    if (!c->wifi_ssid[0]) {
-        if (wifi_started) { esp_wifi_disconnect(); esp_wifi_stop(); wifi_started = false; wifi_up = wifi_ip = false; }
-        return ESP_OK;
-    }
-    return wifi_start();
+    policy_post(WIFI_POLICY_REAPPLY);
+    return ESP_OK;
 }
+
+const char *net_eth_ip(void) { return eth_ip ? eth_ip_str : ""; }
 
 static void sntp_synced(struct timeval *tv)
 {
@@ -172,7 +221,12 @@ esp_err_t net_init(void)
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, ip_event, NULL));
     esp_err_t e = eth_init();
     if (e != ESP_OK) log_ring_printf("ethernet init failed: %s", esp_err_to_name(e));
-    wifi_start();
+    policy_q = xQueueCreate(8, sizeof(wifi_policy_t));
+    xTaskCreate(policy_task, "net_policy", 6144, NULL, 3, NULL);
+    /* No cable within ten seconds of boot: bring Wi-Fi up (link detection takes ~2 s). */
+    const esp_timer_create_args_t ta = {.callback = boot_policy_cb, .name = "wifi_boot"};
+    esp_timer_handle_t t;
+    if (esp_timer_create(&ta, &t) == ESP_OK) esp_timer_start_once(t, 10 * 1000 * 1000);
     esp_sntp_config_t sc = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(2, ESP_SNTP_SERVER_LIST("pool.ntp.org", "time.cloudflare.com"));
     sc.start = true;
     sc.sync_cb = sntp_synced;
@@ -187,6 +241,15 @@ esp_err_t net_init(void)
 
 bool net_has_ip(void) { return eth_ip || wifi_ip; }
 bool net_eth_link(void) { return eth_link; }
+
+void net_eth_link_info(int *speed_mbps, bool *full_duplex)
+{
+    *speed_mbps = 0; *full_duplex = false;
+    if (!eth_handle) return;
+    eth_speed_t sp = ETH_SPEED_10M; eth_duplex_t dp = ETH_DUPLEX_HALF;
+    if (esp_eth_ioctl(eth_handle, ETH_CMD_G_SPEED, &sp) == ESP_OK) *speed_mbps = sp == ETH_SPEED_100M ? 100 : 10;
+    if (esp_eth_ioctl(eth_handle, ETH_CMD_G_DUPLEX_MODE, &dp) == ESP_OK) *full_duplex = dp == ETH_DUPLEX_FULL;
+}
 bool net_wifi_connected(void) { return wifi_up; }
 bool net_time_synced(void) { return time(NULL) > 1600000000; }
 

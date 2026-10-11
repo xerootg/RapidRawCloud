@@ -44,5 +44,8 @@ void sync_config_changed(void);
  * list the attached camera's objects; hash one object `repeat` times. */
 void sync_debug_list(void);
 void sync_debug_hash(const char *handle_or_path, int repeat);
+/* Uploads `mb` MiB of pattern to a scratch key and prints the cloud-path throughput. */
+void sync_debug_speed(int mb);
+void sync_debug_tcp_speed(const char *host, int port, int mb);
 /* Camera event hook (registered with the source installers). */
 void sync_on_camera_event(cam_event_t ev, cam_source_t *src, void *arg);

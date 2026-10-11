@@ -159,7 +159,37 @@ Diagnostics: `cam-ls` lists every object the attached camera reports (handle, si
 path — one line per storage, so a dual-slot body shows both cards); `cam-hash <handle> [n]`
 reads one object through the normal sync path `n` times and prints its BLAKE3 each pass
 (identical hashes prove the read path is deterministic; compare with the file on the
-card). `c6` / `c6-update` and `ble` / `ble-forget` are described below.
+card). `net-speed [MiB]` uploads a scratch object to the bucket and prints where the time
+went (hashing, TLS CPU, socket send, server response); `tcp-speed <host> <port> [MiB]`
+blasts raw TCP at a listener (`nc -l -p 8090 > /dev/null` on a laptop) to measure lwIP plus
+the wire with no TLS or HTTP; `crypto-bench` prints the throughput of SHA-256, MD5 and
+AES-GCM on this board. `c6` / `c6-update` and `ble` / `ble-forget` are described below.
+
+### Throughput notes
+
+The upload path is tuned so one TLS stream can fill the 100 Mbit Ethernet port:
+
+- **Ethernet first.** When the link is up, Wi-Fi is kept down. lwIP routes an on-subnet
+  destination through the first interface that matches, and `route_prio` only decides the
+  default route, so a connected Wi-Fi interface would otherwise take traffic the wire
+  should carry (Wi-Fi via the C6 over SDIO manages roughly 0.3 MB/s). Wi-Fi comes up only
+  while Ethernet is down.
+- **TCP window scaling** (`CONFIG_LWIP_WND_SCALE`, 1 MiB PSRAM-backed send buffer). The
+  cloud usually sits a WAN hop away (30–50 ms round trip); without scaling lwIP caps a
+  connection at 64 KiB in flight, which is about 1.5 MB/s at that latency.
+- **One keep-alive connection** per sync. The S3 client speaks HTTP/1.1 on a persistent
+  socket with `TCP_NODELAY`, writes the body in 64 KiB slices and retries once on a stale
+  keep-alive, so each part costs no handshake.
+- **Hardware crypto.** TLS records are 16 KiB; AES-GCM runs on the AES engine with DMA
+  (≈55 MB/s) and only falls back to software when a buffer is not in internal RAM. SHA-256
+  for SigV4 runs on the SHA engine (≈80 MB/s); MD5 (`Content-MD5`) is mbedTLS software
+  (≈20 MB/s). The portable `rrc_hash` sources are only used by the host tests.
+- **PSRAM at 200 MHz** (`CONFIG_SPIRAM_SPEED_200M`, which needs
+  `CONFIG_IDF_EXPERIMENTAL_FEATURES`); at the default 20 MHz the 8 MiB part buffer alone
+  held the whole pipeline back.
+
+Measured on the bench with the bucket one WAN hop away: raw TCP 10.3 MB/s, an 8 MiB TLS
+PUT 1.8 s end to end (socket send at wire rate, 0.4 s of TLS CPU, 0.4 s of MD5).
 
 ## Bluetooth LE setup from the RapidRAW app
 

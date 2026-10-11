@@ -9,3 +9,8 @@ file(STRINGS ${CMAKE_CURRENT_LIST_DIR}/version.txt PROJECT_VER LIMIT_COUNT 1)
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(rrcloud-ingest)
+
+# lwIP derives TCP_SNDLOWAT (the writable-space watermark for select) as TCP_SND_BUF/2,
+# which trips its u16 sanity check once the send buffer passes ~120 KiB. With window
+# scaling and a 1 MiB send buffer (sdkconfig.defaults) pin it to a sane fixed value.
+idf_build_set_property(COMPILE_DEFINITIONS "-DTCP_SNDLOWAT=49152" APPEND)
