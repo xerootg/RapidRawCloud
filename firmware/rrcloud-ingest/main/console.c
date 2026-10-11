@@ -266,6 +266,7 @@ static int cmd_tcp_speed(int argc, char **argv)
 }
 
 static int cmd_net_speed(int argc, char **argv) { sync_debug_speed(argc > 1 ? atoi(argv[1]) : 8); return 0; }
+static int cmd_pipe_test(int argc, char **argv) { sync_debug_pipe(argc > 1 ? atoi(argv[1]) : 24, argc > 2 ? atoi(argv[2]) : 0); return 0; }
 
 static int cmd_net(int argc, char **argv)
 {
@@ -328,6 +329,7 @@ esp_err_t console_start(void)
         {.command = "ble", .help = "Bluetooth LE admin service: state, name, address, link", .func = cmd_ble},
         {.command = "ble-forget", .help = "Forget every paired phone (they pair again on next use)", .func = cmd_ble_forget},
         {.command = "crypto-bench", .help = "crypto-bench: throughput of SHA-256, MD5 and AES-GCM on this board (internal RAM vs PSRAM)", .func = cmd_crypto_bench},
+        {.command = "pipe-test", .help = "pipe-test [MiB] [MB/s]: push a synthetic object through the real read-ahead/upload pipeline at an emulated camera rate (0 = unthrottled), verify by read-back", .func = cmd_pipe_test},
         {.command = "tcp-speed", .help = "tcp-speed <host> <port> [MiB]: raw TCP send test (no HTTP, no TLS) to isolate lwIP + Ethernet", .func = cmd_tcp_speed},
         {.command = "net-speed", .help = "net-speed [MiB]: upload a scratch object to the bucket and print the cloud-path throughput (no camera involved)", .func = cmd_net_speed},
         {.command = "c6", .help = "ESP32-C6 radio co-processor: link state, firmware version, update progress", .func = cmd_c6},

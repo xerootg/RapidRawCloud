@@ -188,8 +188,18 @@ The upload path is tuned so one TLS stream can fill the 100 Mbit Ethernet port:
   `CONFIG_IDF_EXPERIMENTAL_FEATURES`); at the default 20 MHz the 8 MiB part buffer alone
   held the whole pipeline back.
 
-Measured on the bench with the bucket one WAN hop away: raw TCP 10.3 MB/s, an 8 MiB TLS
-PUT 1.8 s end to end (socket send at wire rate, 0.4 s of TLS CPU, 0.4 s of MD5).
+- **Three-stage pipeline.** A sync reads, hashes and uploads at the same time: a reader
+  task fills one of two 8 MiB PSRAM part buffers from the camera, a hasher task runs
+  BLAKE3 and MD5 over the filled buffer on the other core, and the sync task pushes the
+  previous part through TLS. A camera that delivers 3 MB/s therefore syncs at about
+  3 MB/s instead of the sum of read, hash and upload time. `pipe-test [MiB] [MB/s]`
+  drives the real pipeline from a synthetic camera at an emulated rate (0 = as fast as
+  the generator goes), verifies the object by read-back and prints the per-stage times.
+
+Measured on the bench with the bucket one WAN hop away: raw TCP 10.3 MB/s; an 8 MiB TLS
+PUT 1.8 s end to end (socket send at wire rate, 0.4 s of TLS CPU); BLAKE3 11 MB/s and
+MD5 21 MB/s in software; 24 MiB through the pipeline in 6.6 s unthrottled (hash-bound)
+and in 10.8 s from an emulated 3 MB/s camera (8.2 s of which is the camera itself).
 
 ## Bluetooth LE setup from the RapidRAW app
 

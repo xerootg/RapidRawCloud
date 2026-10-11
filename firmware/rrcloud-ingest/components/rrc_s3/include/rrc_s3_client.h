@@ -92,7 +92,12 @@ esp_err_t rrc_s3_delete(rrc_s3_t *s3, const char *key, rrc_s3_result_t *res);
 /* Multipart (§2.4). Parts are buffered (one part in PSRAM at a time). */
 esp_err_t rrc_s3_multipart_create(rrc_s3_t *s3, const char *key, const char *content_type, const rrc_kv *meta, size_t n_meta,
                                   char *upload_id, size_t upload_id_cap, rrc_s3_result_t *res);
+/* Like rrc_s3_put with the body's MD5 already known (16 raw bytes; NULL = compute here). */
+esp_err_t rrc_s3_put_md5(rrc_s3_t *s3, const char *key, const void *body, size_t len, const char *content_type,
+                         const rrc_kv *meta, size_t n_meta, const uint8_t *md5_digest, rrc_s3_result_t *res);
+/* `md5_digest`: the part's MD5 (16 raw bytes) if the caller already has it, else NULL. */
 esp_err_t rrc_s3_upload_part(rrc_s3_t *s3, const char *key, const char *upload_id, int part_number, const void *data, size_t len,
+                             const uint8_t *md5_digest,
                              char *etag, size_t etag_cap, rrc_s3_result_t *res);
 esp_err_t rrc_s3_multipart_complete(rrc_s3_t *s3, const char *key, const char *upload_id, const char *const *etags, int n_parts,
                                     rrc_s3_result_t *res);

@@ -252,13 +252,15 @@ static int read_response(rrc_s3_t *s3, req_ctx_t *ctx, bool is_head, bool *got_a
     ctx->res->status = status;
     bool chunked = false, close_after = false; int64_t clen = -1;
     char *line = strchr(hdr, '\n');
+    if (line) line++;
     while (line && *line) {
-        line++;
-        char *eol = strchr(line, '\n'); if (eol) *eol = 0;
+        char *eol = strchr(line, '\n');
+        char *next = eol ? eol + 1 : NULL;
+        if (eol) *eol = 0;
         char *cr = strchr(line, '\r'); if (cr) *cr = 0;
         char *colon = strchr(line, ':');
         if (colon) { *colon = 0; char *v = colon + 1; while (*v == ' ' || *v == '\t') v++; take_header(ctx, line, v, &chunked, &close_after, &clen); }
-        line = eol;
+        line = next;
     }
     bool ok = status >= 200 && status < 300;
     int rc = 0;
@@ -507,18 +509,26 @@ static size_t meta_headers(const rrc_kv *meta, size_t n_meta, rrc_kv *out, char 
     return start;
 }
 
-static void md5_b64(const void *body, size_t len, char out[32])
+/* Content-MD5 header value; `digest` may be precomputed by the caller (the sync
+ * pipeline hashes parts on another core) or NULL to hash `body` here. */
+static void md5_b64(const void *body, size_t len, const uint8_t *digest, char out[32])
 {
     uint8_t d[16];
-    rrc_md5(body, len, d);
-    rrc_base64_encode(d, 16, out);
+    if (!digest) { rrc_md5(body, len, d); digest = d; }
+    rrc_base64_encode(digest, 16, out);
 }
 
 esp_err_t rrc_s3_put(rrc_s3_t *s3, const char *key, const void *body, size_t len, const char *content_type,
                      const rrc_kv *meta, size_t n_meta, rrc_s3_result_t *res)
 {
+    return rrc_s3_put_md5(s3, key, body, len, content_type, meta, n_meta, NULL, res);
+}
+
+esp_err_t rrc_s3_put_md5(rrc_s3_t *s3, const char *key, const void *body, size_t len, const char *content_type,
+                         const rrc_kv *meta, size_t n_meta, const uint8_t *md5_digest, rrc_s3_result_t *res)
+{
     char md5[32];
-    md5_b64(body, len, md5);
+    md5_b64(body, len, md5_digest, md5);
     rrc_kv h[RRC_SIGV4_MAX_HEADERS];
     char names[RRC_SIGV4_MAX_HEADERS][64];
     size_t n = 0;
@@ -602,13 +612,13 @@ esp_err_t rrc_s3_multipart_create(rrc_s3_t *s3, const char *key, const char *con
 }
 
 esp_err_t rrc_s3_upload_part(rrc_s3_t *s3, const char *key, const char *upload_id, int part_number, const void *data, size_t len,
-                             char *etag, size_t etag_cap, rrc_s3_result_t *res)
+                             const uint8_t *md5_digest, char *etag, size_t etag_cap, rrc_s3_result_t *res)
 {
     char pn[8];
     snprintf(pn, sizeof pn, "%d", part_number);
     rrc_kv q[2] = {{"partNumber", pn}, {"uploadId", upload_id}};
     char md5[32];
-    md5_b64(data, len, md5);
+    md5_b64(data, len, md5_digest, md5);
     rrc_kv h[1] = {{"content-md5", md5}};
     req_ctx_t ctx = {.res = res};
     /* UNSIGNED-PAYLOAD like the Rust transfer lane (§3.9): Content-MD5 carries integrity. */
@@ -674,7 +684,7 @@ esp_err_t rrc_s3_probe_digest_check(rrc_s3_t *s3, const char *device_id)
     static const char payload[] = "rrcloud-ingest digest probe";
     /* Deliberately wrong MD5 (of a different string). */
     char bad_md5[32];
-    md5_b64("not the payload", 15, bad_md5);
+    md5_b64("not the payload", 15, NULL, bad_md5);
     rrc_kv h[2] = {{"content-md5", bad_md5}, {"content-type", "application/octet-stream"}};
     rrc_s3_result_t res;
     req_ctx_t ctx = {.res = &res};

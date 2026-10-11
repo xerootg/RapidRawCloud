@@ -47,5 +47,7 @@ void sync_debug_hash(const char *handle_or_path, int repeat);
 /* Uploads `mb` MiB of pattern to a scratch key and prints the cloud-path throughput. */
 void sync_debug_speed(int mb);
 void sync_debug_tcp_speed(const char *host, int port, int mb);
+/* Pushes a synthetic `mb` MiB object through the real read-ahead/upload pipeline at an emulated camera rate (0 = unthrottled), verifies by read-back. */
+void sync_debug_pipe(int mb, int rate_mb_s);
 /* Camera event hook (registered with the source installers). */
 void sync_on_camera_event(cam_event_t ev, cam_source_t *src, void *arg);
