@@ -196,6 +196,19 @@ The upload path is tuned so one TLS stream can fill the 100 Mbit Ethernet port:
   drives the real pipeline from a synthetic camera at an emulated rate (0 = as fast as
   the generator goes), verifies the object by read-back and prints the per-stage times.
 
+- **USB reads DMA straight into PSRAM.** The P4's USB 2.0 HS controller moves bulk data
+  with its own scatter-gather DMA and can address PSRAM, so a PTP `GetPartialObject`
+  payload lands directly in the upload part buffer: no bounce buffer, no CPU copy.
+  A first 512-byte transfer reveals the exact container length, then the rest streams
+  in 126 KiB transfers with two in flight, so the controller never waits for software.
+  The 12-byte PTP header precedes the payload in the byte stream, so the payload sits
+  12 bytes into a cache-line-aligned block and the 12 bytes it overwrites are saved and
+  restored. Before the first upload after each camera attach the dock reads the start of
+  the first file both ways, compares them byte for byte and checks guard patterns around
+  the buffer; a mismatch (or a reset during the check) switches back to the copying path
+  and says so in the log. `cam-read <handle> [MiB]` times both paths on a real object and
+  `usb-direct on|off` flips between them.
+
 Measured on the bench with the bucket one WAN hop away: raw TCP 10.3 MB/s; an 8 MiB TLS
 PUT 1.8 s end to end (socket send at wire rate, 0.4 s of TLS CPU); BLAKE3 11 MB/s and
 MD5 21 MB/s in software; 24 MiB through the pipeline in 6.6 s unthrottled (hash-bound)

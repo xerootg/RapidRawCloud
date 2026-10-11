@@ -50,6 +50,15 @@ esp_err_t rrc_ptp_get_object_info(rrc_ptp_dev_t *dev, uint32_t handle, ptp_objec
 /* GetPartialObject: reads up to `want` bytes at `offset` into `out`. */
 esp_err_t rrc_ptp_read_partial(rrc_ptp_dev_t *dev, uint32_t handle, uint32_t offset, uint8_t *out, size_t want, size_t *got);
 
+/* Same contract as rrc_ptp_read_partial, but the payload is DMA'd by the USB controller
+ * straight into `out` (no bounce buffer, no CPU copy) with two transfers in flight.
+ * Needs `out` in PSRAM with (out - 12) cache-line aligned (see rrc_ptp_direct_align);
+ * anything else silently takes the copying path. */
+esp_err_t rrc_ptp_read_partial_direct(rrc_ptp_dev_t *dev, uint32_t handle, uint32_t offset, uint8_t *out, size_t want, size_t *got);
+size_t rrc_ptp_direct_align(void);
+void rrc_ptp_set_direct(bool on);   /* A/B switch for diagnostics; default on */
+bool rrc_ptp_direct_enabled(void);
+
 /* Last PTP response code of a failed call (e.g. 0x2019 DeviceBusy). */
 uint16_t rrc_ptp_last_response(const rrc_ptp_dev_t *dev);
 

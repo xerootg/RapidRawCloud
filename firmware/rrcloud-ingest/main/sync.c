@@ -15,6 +15,8 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "rrc_s3_client.h"
+#include "rrc_ptp.h"
+#include "nvs.h"
 #include "rrc_blake3.h"
 #include "rrc_hash.h"
 #include "rrc_sigv4.h"
@@ -41,7 +43,7 @@ static const char *TAG = "sync";
 #define MANIFEST_RECONFIRM_S (24 * 3600)   /* §2.10 rule 2 */
 #define LAGGARD_CAP_S       (14 * 24 * 3600) /* §2.10 rule 3 */
 
-typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG, CMD_DEBUG_LS, CMD_DEBUG_HASH, CMD_DEBUG_SPEED, CMD_DEBUG_TCP, CMD_DEBUG_PIPE } cmd_t;
+typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG, CMD_DEBUG_LS, CMD_DEBUG_HASH, CMD_DEBUG_SPEED, CMD_DEBUG_TCP, CMD_DEBUG_PIPE, CMD_DEBUG_READ } cmd_t;
 typedef struct { cmd_t cmd; cam_source_t *src; char *arg; int repeat; int port; } msg_t;
 
 static QueueHandle_t q;
@@ -422,6 +424,68 @@ static void reader_join(reader_job_t *j, bool *done, int held)
     }
 }
 
+/* ---- zero-copy USB read self-check ---------------------------------------------
+ * The USB controller DMAs straight into the part buffers and the stack does cache
+ * maintenance on line-rounded ranges, so a mistake there would silently corrupt a
+ * photo (the upload verifies the hash of what it read, not what the camera sent).
+ * Once per camera attach, before the first upload, the first part of the first
+ * file is read both ways and compared byte for byte, with guard patterns around
+ * the destination to catch stray writes. A mismatch turns the DMA path off for
+ * the rest of the session and says so in the log. */
+static bool direct_checked;
+
+/* NVS "usb_direct": 0 verified/unknown, 1 a check was running (a crash during it
+ * leaves this at 1, so the next boot treats the path as broken instead of looping),
+ * 2 disabled by a failed or crashed check. `usb-direct on` clears it. */
+static uint8_t direct_state_get(void)
+{
+    nvs_handle_t h; uint8_t v = 0;
+    if (nvs_open("rrc", NVS_READONLY, &h) == ESP_OK) { nvs_get_u8(h, "usb_direct", &v); nvs_close(h); }
+    return v;
+}
+void sync_usb_direct_state_set(uint8_t v)
+{
+    nvs_handle_t h;
+    if (nvs_open("rrc", NVS_READWRITE, &h) == ESP_OK) { nvs_set_u8(h, "usb_direct", v); nvs_commit(h); nvs_close(h); }
+}
+static void direct_state_boot(void)
+{
+    uint8_t v = direct_state_get();
+    if (v == 1) { sync_usb_direct_state_set(2); v = 2; log_ring_printf("usb: the previous zero-copy DMA check did not finish (reset during it); copying path in use until 'usb-direct on'"); }
+    if (v == 2) rrc_ptp_set_direct(false);
+}
+
+static void direct_selfcheck(cam_source_t *src, const cam_object_t *o, void *fh)
+{
+    if (direct_checked || strcmp(src->kind, "ptp") != 0 || !rrc_ptp_direct_enabled() || o->size < 256 * 1024) return;
+    direct_checked = true;
+    sync_usb_direct_state_set(1);
+    const size_t n = (size_t)(o->size < 1024 * 1024 + 4100 ? o->size : 1024 * 1024 + 4100);   /* ends mid cache line on purpose */
+    uint8_t *a = part_bufs[0], *b = part_bufs[1];
+    memset(a - 12, 0xA5, 12 + n + 192); memset(b - 12, 0x5A, 12 + n + 192);
+    size_t ga = 0, gb = 0;
+    rrc_ptp_set_direct(true);
+    esp_err_t ea = src->read(src, fh, 0, a, n, &ga);
+    rrc_ptp_set_direct(false);
+    esp_err_t eb = src->read(src, fh, 0, b, n, &gb);
+    rrc_ptp_set_direct(true);
+    bool guards = true;
+    for (int i = -12; i < 0; i++) guards &= a[i] == 0xA5;       /* the 12 bytes the container header lands on */
+    for (size_t i = n; i < n + 192; i++) guards &= a[i] == 0xA5; /* nothing past the end */
+    bool same = ea == ESP_OK && eb == ESP_OK && ga == n && gb == n && memcmp(a, b, n) == 0;
+    if (same && guards) {
+        sync_usb_direct_state_set(0);
+        log_ring_printf("usb: zero-copy DMA read verified against the copying path (%u bytes identical)", (unsigned)n);
+        return;
+    }
+    size_t first = 0;
+    if (ea == ESP_OK && eb == ESP_OK) while (first < n && a[first] == b[first]) first++;
+    rrc_ptp_set_direct(false);
+    sync_usb_direct_state_set(2);
+    log_ring_printf("usb: zero-copy DMA read FAILED its check (%s/%s, got %u/%u of %u, first diff at %u, guards %s); using the copying path",
+                    esp_err_to_name(ea), esp_err_to_name(eb), (unsigned)ga, (unsigned)gb, (unsigned)n, (unsigned)first, guards ? "ok" : "corrupted");
+}
+
 /* Uploads one camera object to `key`; fills blake3 hex. Returns ESP_OK when the
  * object is verified in the bucket. */
 static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const char *key, char blake3_hex[65], uint64_t *out_size)
@@ -449,6 +513,7 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
         etags = heap_caps_malloc(1024 * 40, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (!etags) { e = ESP_ERR_NO_MEM; goto fail; }
     }
+    direct_selfcheck(src, o, fh);
     job = calloc(1, sizeof *job);
     if (!job) { e = ESP_ERR_NO_MEM; goto fail; }
     job->src = src; job->fh = fh; job->size = o->size; job->b3 = &b3;
@@ -773,6 +838,51 @@ static void debug_hash(const char *arg, int repeat)
     }
 }
 
+/* Raw camera read rate with no hashing and no upload: reads `mb` MiB of one object
+ * through the real read path into the part buffer, once with the zero-copy USB
+ * DMA path and once with the copying path, so the difference is the DMA win. */
+static void debug_read(const char *arg, int mb)
+{
+    if (!cam || !cam->connected(cam)) { printf("no camera attached\n"); return; }
+    cam_object_t o = {0};
+    char *end = NULL;
+    unsigned long h = strtoul(arg, &end, 16);
+    if (end && *end == 0 && h) o.handle = (uint32_t)h;
+    scpy(o.path, sizeof o.path, arg);
+    const char *slash = strrchr(arg, '/');
+    scpy(o.name, sizeof o.name, slash ? slash + 1 : arg);
+    o.size = 0xFFFFFFFFFFFFFFFFull;
+    uint64_t limit = (uint64_t)(mb > 0 ? mb : 16) * 1024u * 1024u;
+    bool was = rrc_ptp_direct_enabled();
+    for (int mode = 1; mode >= 0; mode--) {
+        rrc_ptp_set_direct(mode == 1);
+        void *fh = NULL;
+        esp_err_t e = cam->open(cam, &o, &fh);
+        if (e != ESP_OK) { printf("open failed: %s\n", esp_err_to_name(e)); break; }
+        uint64_t total = 0; uint32_t crc = 0;
+        int64_t t0 = esp_timer_get_time();
+        while (total < limit) {
+            size_t got = 0;
+            size_t slot_off = (size_t)(total % PART_BUF_BYTES);
+            size_t want = READ_CHUNK;
+            if (want > PART_BUF_BYTES - slot_off) want = PART_BUF_BYTES - slot_off;
+            e = cam->read(cam, fh, total, part_buf + slot_off, want, &got);
+            if (e != ESP_OK) { printf("read failed at %llu: %s\n", (unsigned long long)total, esp_err_to_name(e)); break; }
+            if (got == 0) break;
+            crc = rrc_crc32_update(crc, part_buf + slot_off, got < 64 ? got : 64); /* touches the data, cheap */
+            total += got;
+            if (got < want) break;
+        }
+        int64_t us = esp_timer_get_time() - t0;
+        cam->close(cam, fh);
+        printf("%s: %llu bytes in %.2f s = %.2f MB/s\n", mode ? "usb dma straight into psram" : "bounce buffer + cpu copy ", (unsigned long long)total,
+               (double)us / 1e6, us > 0 ? (double)total / 1048576.0 / ((double)us / 1e6) : 0.0);
+        (void)crc;
+        if (e != ESP_OK) break;
+    }
+    rrc_ptp_set_direct(was);
+}
+
 /* ---- synthetic camera for the pipeline diagnostic ---------------------------
  * Serves a deterministic pattern at an optional emulated rate so the whole
  * read-ahead/upload pipeline can be timed and verified without a camera. */
@@ -969,6 +1079,7 @@ static void sync_task(void *arg)
         case CMD_DEBUG_HASH: debug_hash(m.arg ? m.arg : "", m.repeat); free(m.arg); break;
         case CMD_DEBUG_SPEED: debug_speed(m.repeat); break;
         case CMD_DEBUG_PIPE: debug_pipe(m.repeat, m.port); break;
+        case CMD_DEBUG_READ: debug_read(m.arg ? m.arg : "", m.repeat); free(m.arg); break;
         case CMD_DEBUG_TCP: { char *colon = m.arg ? strrchr(m.arg, ':') : NULL; if (colon) { *colon = 0; debug_tcp(m.arg, atoi(colon + 1), m.repeat); } free(m.arg); break; }
         }
     }
@@ -980,6 +1091,7 @@ void sync_on_camera_event(cam_event_t ev, cam_source_t *src, void *arg)
 {
     (void)arg;
     if (ev == CAM_EV_DETACHED) cancel_flag = true;
+    if (ev == CAM_EV_ATTACHED) direct_checked = false;   /* a new body gets its own check */
     msg_t m = {.cmd = ev == CAM_EV_ATTACHED ? CMD_ATTACH : CMD_DETACH, .src = src};
     xQueueSend(q, &m, pdMS_TO_TICKS(100));
 }
@@ -988,9 +1100,16 @@ esp_err_t sync_init(void)
 {
     st_mtx = xSemaphoreCreateMutex();
     q = xQueueCreate(16, sizeof(msg_t));
+    /* The USB controller DMAs PTP data straight into these (see rrc_ptp_read_partial_direct):
+     * the 12-byte container header precedes the payload in the stream, so the payload
+     * starts 12 bytes into a cache-line-aligned block, and the block has slack for the
+     * line rounding the USB stack applies to the last transfer. */
+    direct_state_boot();
+    size_t al = rrc_ptp_direct_align();
     for (int i = 0; i < PART_SLOTS; i++) {
-        part_bufs[i] = heap_caps_malloc(PART_BUF_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!part_bufs[i]) { ESP_LOGE(TAG, "cannot allocate %u-byte part buffer %d in PSRAM", PART_BUF_BYTES, i); return ESP_ERR_NO_MEM; }
+        uint8_t *base = heap_caps_aligned_alloc(al, PART_BUF_BYTES + 12 + 2 * al + 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!base) { ESP_LOGE(TAG, "cannot allocate %u-byte part buffer %d in PSRAM", PART_BUF_BYTES, i); return ESP_ERR_NO_MEM; }
+        part_bufs[i] = base + 12;
     }
     part_buf = part_bufs[0];
     ST_LOCK();
@@ -1012,6 +1131,13 @@ void sync_cancel(void) { cancel_flag = true; msg_t m = {.cmd = CMD_CANCEL}; xQue
 void sync_config_changed(void) { msg_t m = {.cmd = CMD_CONFIG}; xQueueSend(q, &m, 0); }
 void sync_debug_list(void) { msg_t m = {.cmd = CMD_DEBUG_LS}; xQueueSend(q, &m, 0); }
 void sync_debug_speed(int mb) { msg_t m = {.cmd = CMD_DEBUG_SPEED, .repeat = mb}; xQueueSend(q, &m, 0); }
+void sync_debug_read(const char *arg, int mb)
+{
+    char *a = strdup(arg ? arg : "");
+    if (!a) return;
+    msg_t m = {.cmd = CMD_DEBUG_READ, .arg = a, .repeat = mb};
+    if (xQueueSend(q, &m, 0) != pdTRUE) free(a);
+}
 void sync_debug_pipe(int mb, int rate_mb_s) { msg_t m = {.cmd = CMD_DEBUG_PIPE, .repeat = mb, .port = rate_mb_s}; xQueueSend(q, &m, 0); }
 void sync_debug_tcp_speed(const char *host, int port, int mb)
 {

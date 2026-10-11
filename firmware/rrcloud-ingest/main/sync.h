@@ -49,5 +49,9 @@ void sync_debug_speed(int mb);
 void sync_debug_tcp_speed(const char *host, int port, int mb);
 /* Pushes a synthetic `mb` MiB object through the real read-ahead/upload pipeline at an emulated camera rate (0 = unthrottled), verifies by read-back. */
 void sync_debug_pipe(int mb, int rate_mb_s);
+/* Reads `mb` MiB of one camera object with no hashing or upload, zero-copy USB DMA vs copying, and prints both rates. */
+void sync_debug_read(const char *handle_or_path, int mb);
+/* Persistent state of the zero-copy USB read check: 0 ok/unknown, 1 running, 2 disabled. */
+void sync_usb_direct_state_set(uint8_t v);
 /* Camera event hook (registered with the source installers). */
 void sync_on_camera_event(cam_event_t ev, cam_source_t *src, void *arg);

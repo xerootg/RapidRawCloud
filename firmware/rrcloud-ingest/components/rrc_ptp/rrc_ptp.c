@@ -7,6 +7,8 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "usb/usb_host.h"
+#include "esp_private/esp_cache_private.h"
+#include "esp_memory_utils.h"
 
 static const char *TAG = "rrc_ptp";
 
@@ -30,6 +32,12 @@ struct rrc_ptp_dev {
     ptp_device_info info;
     usb_transfer_t *xfer_in;
     usb_transfer_t *xfer_out;
+    /* Zero-copy reads: two extra IN transfers whose data buffer is pointed straight
+     * at the caller's (PSRAM) destination for the length of one read. */
+    usb_transfer_t *dx[2];
+    void *dx_orig[2];
+    size_t dx_orig_size[2];
+    SemaphoreHandle_t done_q;    /* counting: one give per finished dx transfer */
     SemaphoreHandle_t done;      /* transfer completion */
     SemaphoreHandle_t lock;      /* one transaction at a time */
 };
@@ -171,6 +179,190 @@ static esp_err_t transact(rrc_ptp_dev_t *d, uint16_t code, const uint32_t *param
     }
     if (!have_response && err == ESP_OK) err = ESP_ERR_TIMEOUT;
 out:
+    xSemaphoreGive(d->lock);
+    return err;
+}
+
+/* ---- zero-copy bulk IN into the caller's buffer -------------------------------
+ * The DWC2 controller moves bulk data with its own scatter-gather DMA, and on the
+ * P4 that DMA reaches PSRAM, so a GetPartialObject payload can land directly in
+ * the upload part buffer instead of bouncing through internal RAM and a CPU
+ * memcpy per 64 KiB. Constraints the USB host stack imposes (it invalidates the
+ * whole data_buffer range when a transfer completes and asserts on unaligned
+ * ranges): buffer start and size must be cache-line multiples.
+ *
+ * The PTP data container starts with a 12-byte header that precedes the payload
+ * in the byte stream, so the stream is DMA'd to `dst - 12`; that address must be
+ * line aligned (the caller lays its buffers out so), and the 12 bytes in front
+ * of the payload (the tail of the previous read) are saved and put back.
+ * Transfers are MPS multiples, so every chunk start stays line aligned.
+ *
+ * A first 512-byte transfer reveals the exact container length; only then are
+ * the remaining chunks queued (two in flight, so the controller never idles
+ * waiting for software), sized exactly, so no queued transfer can ever swallow
+ * the response container behind the data. */
+#define PTP_DIRECT_CHUNK   (126 * 1024)   /* multiple of 512; DMA descriptor holds < 128 KiB */
+#define PTP_HDR 12
+static volatile bool g_direct = true;
+void rrc_ptp_set_direct(bool on) { g_direct = on; }
+bool rrc_ptp_direct_enabled(void) { return g_direct; }
+size_t rrc_ptp_direct_align(void)
+{
+    size_t a = 0;
+    if (esp_cache_get_alignment(MALLOC_CAP_SPIRAM, &a) != ESP_OK || a == 0) a = 64;
+    return a;
+}
+
+static void xfer_cb_q(usb_transfer_t *t)
+{
+    rrc_ptp_dev_t *d = t->context;
+    xSemaphoreGive(d->done_q);
+}
+
+/* usb_transfer_t declares data_buffer / data_buffer_size const: the host stack owns them
+ * and frees data_buffer with the transfer. The stack itself documents that class
+ * drivers may point a transfer at their own memory (it syncs unaligned ranges for
+ * that reason), so the original buffer is put back before the transfer is freed. */
+static void dx_set_buffer(usb_transfer_t *t, void *buf, size_t size)
+{
+    *(uint8_t **)&t->data_buffer = buf;
+    *(size_t *)&t->data_buffer_size = size;
+}
+
+static void dx_restore(rrc_ptp_dev_t *d)
+{
+    for (int i = 0; i < 2; i++) {
+        if (d->dx_orig[i]) { dx_set_buffer(d->dx[i], d->dx_orig[i], d->dx_orig_size[i]); d->dx_orig[i] = NULL; }
+    }
+}
+
+static esp_err_t dx_submit(rrc_ptp_dev_t *d, int i, uint8_t *buf, size_t nbytes)
+{
+    usb_transfer_t *t = d->dx[i];
+    if (!d->dx_orig[i]) { d->dx_orig[i] = t->data_buffer; d->dx_orig_size[i] = t->data_buffer_size; }
+    size_t al = rrc_ptp_direct_align();
+    dx_set_buffer(t, buf, (nbytes + al - 1) / al * al);
+    t->num_bytes = (int)nbytes;
+    t->bEndpointAddress = d->ep_in;
+    t->callback = xfer_cb_q;
+    t->context = d;
+    t->device_handle = d->hdl;
+    return usb_host_transfer_submit(t);
+}
+
+static esp_err_t dx_status(rrc_ptp_dev_t *d, usb_transfer_t *t)
+{
+    switch (t->status) {
+    case USB_TRANSFER_STATUS_COMPLETED: return ESP_OK;
+    case USB_TRANSFER_STATUS_STALL:
+        usb_host_endpoint_clear(d->hdl, t->bEndpointAddress);
+        return ESP_ERR_INVALID_RESPONSE;
+    case USB_TRANSFER_STATUS_NO_DEVICE: d->connected = false; return ESP_ERR_NOT_FOUND;
+    default: ESP_LOGW(TAG, "direct transfer status %d", t->status); return ESP_FAIL;
+    }
+}
+
+/* Cancels whatever is queued on the IN endpoint and collects the `inflight` URBs. */
+static void dx_abort(rrc_ptp_dev_t *d, int inflight)
+{
+    usb_host_endpoint_halt(d->hdl, d->ep_in);
+    usb_host_endpoint_flush(d->hdl, d->ep_in);
+    for (int i = 0; i < inflight; i++) xSemaphoreTake(d->done_q, pdMS_TO_TICKS(1000));
+    usb_host_endpoint_clear(d->hdl, d->ep_in);
+}
+
+static uint32_t le32(const uint8_t *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
+
+static esp_err_t read_direct_locked(rrc_ptp_dev_t *d, const uint32_t *params, size_t np, uint8_t *dst, size_t cap, size_t *got)
+{
+    uint8_t *base = dst - PTP_HDR;
+    uint8_t save[PTP_HDR];
+    memcpy(save, base, PTP_HDR);
+    uint32_t tid = d->tid++;
+    uint8_t cmd[PTP_HDR_LEN + 20];
+    size_t clen = ptp_encode_command(cmd, PTP_OC_GetPartialObject, tid, params, np);
+    esp_err_t err = bulk_out(d, cmd, clen);
+    if (err != ESP_OK) return err;
+
+    const size_t mps = d->mps_in ? d->mps_in : 512;
+    const size_t first = (512 + mps - 1) / mps * mps;
+    int inflight = 0;
+    /* 1: the first 512 bytes, to learn the container length */
+    err = dx_submit(d, 0, base, first);
+    if (err != ESP_OK) goto out;
+    inflight = 1;
+    if (xSemaphoreTake(d->done_q, pdMS_TO_TICKS(PTP_DATA_TIMEOUT_MS)) != pdTRUE) { ESP_LOGW(TAG, "direct read: first transfer timed out"); dx_abort(d, inflight); inflight = 0; err = ESP_ERR_TIMEOUT; goto out; }
+    inflight = 0;
+    err = dx_status(d, d->dx[0]);
+    if (err != ESP_OK) goto out;
+    size_t got0 = (size_t)d->dx[0]->actual_num_bytes;
+    ptp_container_hdr h;
+    if (!ptp_decode_hdr(base, got0, &h) || h.transaction_id != tid) { err = ESP_ERR_INVALID_RESPONSE; goto out; }
+    if (h.type == PTP_CT_RESPONSE) { /* no data phase: error response */
+        d->last_rc = h.code;
+        *got = 0;
+        err = h.code == PTP_RC_OK ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+        goto out;
+    }
+    if (h.type != PTP_CT_DATA || h.length == 0xFFFFFFFFu || h.length < PTP_HDR) { err = ESP_ERR_INVALID_RESPONSE; goto out; }
+    const size_t total = h.length;                 /* container length incl. header */
+    if (total - PTP_HDR > cap) { ESP_LOGW(TAG, "direct read: device returned %u bytes for a %u byte buffer", (unsigned)(total - PTP_HDR), (unsigned)cap); err = ESP_ERR_INVALID_SIZE; goto out; }
+    size_t recv = got0;
+    if (recv < total && got0 < first) { err = ESP_ERR_INVALID_RESPONSE; goto out; }  /* short packet before the end */
+    /* 2: the rest, two transfers in flight */
+    size_t to_submit = total > recv ? total - recv : 0, sub_off = recv;
+    size_t exp[2] = {0, 0};
+    int head = 0, tail = 0;
+    while (to_submit > 0 || inflight > 0) {
+        while (inflight < 2 && to_submit > 0) {
+            size_t len = to_submit > PTP_DIRECT_CHUNK ? PTP_DIRECT_CHUNK : to_submit;
+            size_t nb = (len + mps - 1) / mps * mps;
+            err = dx_submit(d, tail, base + sub_off, nb);
+            if (err != ESP_OK) goto out;
+            exp[tail] = len; tail ^= 1; inflight++;
+            to_submit -= len; sub_off += len;
+        }
+        if (xSemaphoreTake(d->done_q, pdMS_TO_TICKS(PTP_DATA_TIMEOUT_MS)) != pdTRUE) { ESP_LOGW(TAG, "direct read: transfer timed out at %u of %u", (unsigned)recv, (unsigned)total); dx_abort(d, inflight); inflight = 0; err = ESP_ERR_TIMEOUT; goto out; }
+        inflight--;
+        err = dx_status(d, d->dx[head]);
+        if (err != ESP_OK) { dx_abort(d, inflight); inflight = 0; goto out; }
+        size_t a = (size_t)d->dx[head]->actual_num_bytes;
+        recv += a;
+        if (a != exp[head]) { dx_abort(d, inflight); inflight = 0; err = ESP_ERR_INVALID_RESPONSE; goto out; }
+        head ^= 1;
+    }
+    *got = total - PTP_HDR;
+    /* 3: the response container (after an optional zero-length packet) */
+    for (int guard = 0; guard < 8; guard++) {
+        size_t n = 0;
+        err = bulk_in(d, 1024, &n, PTP_CMD_TIMEOUT_MS);
+        if (err != ESP_OK) goto out;
+        if (n == 0) continue;
+        const uint8_t *p = d->xfer_in->data_buffer;
+        ptp_container_hdr rh;
+        if (!ptp_decode_hdr(p, n, &rh) || rh.transaction_id != tid || rh.type != PTP_CT_RESPONSE) { err = ESP_ERR_INVALID_RESPONSE; goto out; }
+        d->last_rc = rh.code;
+        err = rh.code == PTP_RC_OK ? ESP_OK : ESP_ERR_INVALID_RESPONSE;
+        goto out;
+    }
+    err = ESP_ERR_TIMEOUT;
+out:
+    dx_restore(d);
+    memcpy(base, save, PTP_HDR);
+    return err;
+}
+
+esp_err_t rrc_ptp_read_partial_direct(rrc_ptp_dev_t *d, uint32_t handle, uint32_t offset, uint8_t *out, size_t want, size_t *got)
+{
+    size_t al = rrc_ptp_direct_align();
+    if (!g_direct || !d->dx[0] || !d->dx[1] || !d->done_q || want < 2048 || (((uintptr_t)out - PTP_HDR) & (al - 1)) != 0 || !esp_ptr_external_ram(out)) {
+        return rrc_ptp_read_partial(d, handle, offset, out, want, got);
+    }
+    if (!d->connected) return ESP_ERR_NOT_FOUND;
+    uint32_t p[3] = {handle, offset, (uint32_t)want};
+    xSemaphoreTake(d->lock, portMAX_DELAY);
+    *got = 0;
+    esp_err_t err = read_direct_locked(d, p, 3, out, want, got);
     xSemaphoreGive(d->lock);
     return err;
 }
@@ -342,6 +534,7 @@ static void handle_new_device(uint8_t addr)
     rrc_ptp_dev_t *d = &g.dev;
     memset(d, 0, sizeof *d);
     d->done = xSemaphoreCreateBinary();
+    d->done_q = xSemaphoreCreateCounting(4, 0);
     d->lock = xSemaphoreCreateMutex();
     if (usb_host_device_open(g.client, addr, &d->hdl) != ESP_OK) { ESP_LOGE(TAG, "device_open failed"); goto fail; }
     const usb_device_desc_t *dd;
@@ -355,6 +548,9 @@ static void handle_new_device(uint8_t addr)
     if (usb_host_transfer_alloc(PTP_IN_BUF, 0, &d->xfer_in) != ESP_OK || usb_host_transfer_alloc(PTP_OUT_BUF, 0, &d->xfer_out) != ESP_OK) {
         ESP_LOGE(TAG, "transfer_alloc failed"); goto release;
     }
+    /* optional: without these the reads simply take the copying path */
+    for (int i = 0; i < 2; i++) if (usb_host_transfer_alloc(64, 0, &d->dx[i]) != ESP_OK) { d->dx[i] = NULL; }
+    if (!d->dx[0] || !d->dx[1]) { if (d->dx[0]) usb_host_transfer_free(d->dx[0]); if (d->dx[1]) usb_host_transfer_free(d->dx[1]); d->dx[0] = d->dx[1] = NULL; }
     d->dev_addr = addr;
     d->connected = true;
     g.in_use = true;
@@ -368,7 +564,9 @@ close:
 fail:
     if (d->xfer_in) usb_host_transfer_free(d->xfer_in);
     if (d->xfer_out) usb_host_transfer_free(d->xfer_out);
+    for (int i = 0; i < 2; i++) if (d->dx[i]) usb_host_transfer_free(d->dx[i]);
     if (d->done) vSemaphoreDelete(d->done);
+    if (d->done_q) vSemaphoreDelete(d->done_q);
     if (d->lock) vSemaphoreDelete(d->lock);
     memset(d, 0, sizeof *d);
 }
@@ -387,9 +585,11 @@ static void handle_device_gone(usb_device_handle_t hdl)
     usb_host_device_close(g.client, d->hdl);
     usb_host_transfer_free(d->xfer_in);
     usb_host_transfer_free(d->xfer_out);
+    for (int i = 0; i < 2; i++) if (d->dx[i]) usb_host_transfer_free(d->dx[i]);
     xSemaphoreGive(d->lock);
     vSemaphoreDelete(d->lock);
     vSemaphoreDelete(d->done);
+    vSemaphoreDelete(d->done_q);
     memset(d, 0, sizeof *d);
     g.in_use = false;
 }

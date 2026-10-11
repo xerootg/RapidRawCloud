@@ -2,4 +2,4 @@
 idf_component_register(
     SRCS "rrc_ptp_codec.c" "rrc_ptp.c"
     INCLUDE_DIRS "include"
-    PRIV_REQUIRES usb)
+    PRIV_REQUIRES usb esp_mm esp_hw_support)

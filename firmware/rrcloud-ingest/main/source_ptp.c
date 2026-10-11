@@ -199,7 +199,7 @@ static esp_err_t ptp_read(cam_source_t *s, void *fh, uint64_t offset, uint8_t *b
         size_t g2 = 0;
         esp_err_t e = ESP_OK;
         for (int attempt = 0; attempt < 3; attempt++) {
-            e = rrc_ptp_read_partial(p->dev, h->handle, (uint32_t)(offset + total), buf + total, chunk, &g2);
+            e = rrc_ptp_read_partial_direct(p->dev, h->handle, (uint32_t)(offset + total), buf + total, chunk, &g2);
             if (e == ESP_OK) break;
             if (!rrc_ptp_is_connected(p->dev)) return ESP_ERR_NOT_FOUND;
             if (rrc_ptp_last_response(p->dev) == PTP_RC_DeviceBusy) { vTaskDelay(pdMS_TO_TICKS(300)); continue; }
