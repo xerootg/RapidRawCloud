@@ -269,8 +269,14 @@ static int cmd_tcp_speed(int argc, char **argv)
 static int cmd_net_speed(int argc, char **argv) { sync_debug_speed(argc > 1 ? atoi(argv[1]) : 8); return 0; }
 static int cmd_cam_read(int argc, char **argv)
 {
-    if (argc < 2) { printf("usage: cam-read <handle|path> [MiB]\n"); return 1; }
-    sync_debug_read(argv[1], argc > 2 ? atoi(argv[2]) : 16);
+    if (argc < 2) { printf("usage: cam-read <handle|path> [MiB] [chunk KiB]\n"); return 1; }
+    sync_debug_read(argv[1], argc > 2 ? atoi(argv[2]) : 16, argc > 3 ? atoi(argv[3]) : 0);
+    return 0;
+}
+static int cmd_cam_pipe(int argc, char **argv)
+{
+    if (argc < 3) { printf("usage: cam-pipe <handle> <size bytes>   (see cam-ls)\n"); return 1; }
+    sync_debug_campipe(argv[1], atoi(argv[2]));
     return 0;
 }
 static int cmd_usb_direct(int argc, char **argv)
@@ -346,7 +352,8 @@ esp_err_t console_start(void)
         {.command = "ble", .help = "Bluetooth LE admin service: state, name, address, link", .func = cmd_ble},
         {.command = "ble-forget", .help = "Forget every paired phone (they pair again on next use)", .func = cmd_ble_forget},
         {.command = "crypto-bench", .help = "crypto-bench: throughput of SHA-256, MD5 and AES-GCM on this board (internal RAM vs PSRAM)", .func = cmd_crypto_bench},
-        {.command = "cam-read", .help = "cam-read <handle|path> [MiB]: raw camera read rate (no hash, no upload), USB DMA straight into PSRAM vs bounce+copy", .func = cmd_cam_read},
+        {.command = "cam-read", .help = "cam-read <handle|path> [MiB] [chunk KiB]: raw camera read rate (no hash, no upload), USB DMA straight into PSRAM vs bounce+copy", .func = cmd_cam_read},
+        {.command = "cam-pipe", .help = "cam-pipe <handle> <size>: one real camera object through the whole pipeline to a scratch key (not the library), verified, then deleted", .func = cmd_cam_pipe},
         {.command = "usb-direct", .help = "usb-direct [on|off]: zero-copy USB DMA reads on/off (A/B for diagnostics)", .func = cmd_usb_direct},
         {.command = "pipe-test", .help = "pipe-test [MiB] [MB/s]: push a synthetic object through the real read-ahead/upload pipeline at an emulated camera rate (0 = unthrottled), verify by read-back", .func = cmd_pipe_test},
         {.command = "tcp-speed", .help = "tcp-speed <host> <port> [MiB]: raw TCP send test (no HTTP, no TLS) to isolate lwIP + Ethernet", .func = cmd_tcp_speed},

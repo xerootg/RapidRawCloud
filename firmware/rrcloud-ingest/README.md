@@ -188,13 +188,18 @@ The upload path is tuned so one TLS stream can fill the 100 Mbit Ethernet port:
   `CONFIG_IDF_EXPERIMENTAL_FEATURES`); at the default 20 MHz the 8 MiB part buffer alone
   held the whole pipeline back.
 
-- **Three-stage pipeline.** A sync reads, hashes and uploads at the same time: a reader
-  task fills one of two 8 MiB PSRAM part buffers from the camera, a hasher task runs
-  BLAKE3 and MD5 over the filled buffer on the other core, and the sync task pushes the
-  previous part through TLS. A camera that delivers 3 MB/s therefore syncs at about
-  3 MB/s instead of the sum of read, hash and upload time. `pipe-test [MiB] [MB/s]`
-  drives the real pipeline from a synthetic camera at an emulated rate (0 = as fast as
-  the generator goes), verifies the object by read-back and prints the per-stage times.
+- **Four-stage pipeline.** A sync reads, hashes and uploads at the same time: a reader
+  task fills one of three 8 MiB PSRAM part buffers from the camera, a BLAKE3 task and an
+  MD5 task each pass over the filled buffer, and the sync task pushes the previous part
+  through TLS. A camera that delivers 3 MB/s therefore syncs at about 3 MB/s instead of
+  the sum of read, hash and upload time. The reader and hash tasks run on PSRAM stacks
+  (internal RAM is short: the hardware AES driver fails to allocate without the 16 KiB).
+  `pipe-test [MiB] [MB/s]` drives the real pipeline from a synthetic camera at an
+  emulated rate; `cam-pipe <handle> <size>` pushes one real camera object through the
+  whole thing to a scratch key outside the library, verifies it and deletes it.
+- **Big camera requests.** The Z 7II pays a fixed latency per `GetPartialObject`:
+  256 KiB requests top out at 8 MB/s, 4 MiB requests reach 25 MB/s, so the sync reads
+  4 MiB at a time.
 
 - **USB reads DMA straight into PSRAM.** The P4's USB 2.0 HS controller moves bulk data
   with its own scatter-gather DMA and can address PSRAM, so a PTP `GetPartialObject`
@@ -211,8 +216,10 @@ The upload path is tuned so one TLS stream can fill the 100 Mbit Ethernet port:
 
 Measured on the bench with the bucket one WAN hop away: raw TCP 10.3 MB/s; an 8 MiB TLS
 PUT 1.8 s end to end (socket send at wire rate, 0.4 s of TLS CPU); BLAKE3 11 MB/s and
-MD5 21 MB/s in software; 24 MiB through the pipeline in 6.6 s unthrottled (hash-bound)
-and in 10.8 s from an emulated 3 MB/s camera (8.2 s of which is the camera itself).
+MD5 21 MB/s in software. A 58 MB NEF from a Z 7II to the bucket, verified: 12.8 s
+(4.4 MB/s) with camera read 2.3 s, BLAKE3 7 s, MD5 3.7 s, upload 10.3 s, so a sync is
+upload-bound. The raw camera read alone is 27 MB/s with USB DMA into PSRAM (21 MB/s with
+the copying path).
 
 ## Bluetooth LE setup from the RapidRAW app
 

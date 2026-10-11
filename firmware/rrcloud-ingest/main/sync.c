@@ -34,7 +34,9 @@ static const char *TAG = "sync";
  * record buffers on the stack) under several KiB of path/key/journal-line locals;
  * 24 KiB overflowed by ~6 KiB on hardware (stack protection fault in "sync"). */
 #define SYNC_TASK_STACK  (48u * 1024u)
-#define READ_CHUNK       (256u * 1024u)
+/* One GetPartialObject per READ_CHUNK. The Z 7II pays a fixed latency per request: 256 KiB requests
+ * top out at 8 MB/s, 4 MiB requests reach 25 MB/s. Cancel latency is one chunk (~0.15 s). */
+#define READ_CHUNK       (4u * 1024u * 1024u)
 #define SEGMENT_FREEZE_ENTRIES 900
 #define SEGMENT_FREEZE_BYTES   (900u * 1024u)
 #define HEARTBEAT_ACTIVE_S  (15 * 60)
@@ -43,7 +45,7 @@ static const char *TAG = "sync";
 #define MANIFEST_RECONFIRM_S (24 * 3600)   /* §2.10 rule 2 */
 #define LAGGARD_CAP_S       (14 * 24 * 3600) /* §2.10 rule 3 */
 
-typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG, CMD_DEBUG_LS, CMD_DEBUG_HASH, CMD_DEBUG_SPEED, CMD_DEBUG_TCP, CMD_DEBUG_PIPE, CMD_DEBUG_READ } cmd_t;
+typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG, CMD_DEBUG_LS, CMD_DEBUG_HASH, CMD_DEBUG_SPEED, CMD_DEBUG_TCP, CMD_DEBUG_PIPE, CMD_DEBUG_READ, CMD_DEBUG_CAMPIPE } cmd_t;
 typedef struct { cmd_t cmd; cam_source_t *src; char *arg; int repeat; int port; } msg_t;
 
 static QueueHandle_t q;
@@ -53,7 +55,7 @@ static rrc_s3_t s3;
 static bool s3_ready;
 static cam_source_t *cam;             /* attached camera (or NULL) */
 static volatile bool cancel_flag;
-#define PART_SLOTS 2
+#define PART_SLOTS 3
 static uint8_t *part_bufs[PART_SLOTS];   /* read-ahead pipeline buffers, PSRAM */
 static uint8_t *part_buf;                /* = part_bufs[0]; scratch for the diagnostics */
 static esp_timer_handle_t tick_timer;
@@ -345,20 +347,21 @@ typedef struct {
 
 /* Where the last upload_object spent its time, per stage (microseconds). The
  * stages overlap, so the sum exceeds the wall time; pipe-test prints them. */
-static struct { int64_t read_us, hash_us, upload_us; } pipe_stats;
+static struct { int64_t read_us, hash_us, md5_us, upload_us; } pipe_stats;
 
 typedef struct {
     cam_source_t *src;
     void *fh;
     uint64_t size;
     rrc_blake3_ctx *b3;
-    QueueHandle_t free_q, hash_q, full_q;
+    QueueHandle_t free_q, hash_q, md5_q, full_q;
+    TaskHandle_t reader_h, hasher_h, md5_h;
     volatile bool abort;   /* uploader gave up; stop reading */
     uint64_t fail_at;
     esp_err_t fail_err;
 } reader_job_t;
 
-#define READER_TASK_STACK 12288
+#define READER_TASK_STACK 16384
 
 static void reader_task(void *arg)
 {
@@ -388,7 +391,7 @@ static void reader_task(void *arg)
         xQueueSend(j->hash_q, &m, portMAX_DELAY);
         if (m.last) break;
     }
-    vTaskDelete(NULL);
+    for (;;) vTaskSuspend(NULL);   /* the uploader deletes this task (its stack is a caps allocation) */
 }
 
 #define HASHER_TASK_STACK 4096
@@ -399,16 +402,48 @@ static void hasher_task(void *arg)
     for (;;) {
         part_msg_t m;
         xQueueReceive(j->hash_q, &m, portMAX_DELAY);
+        if (m.err == ESP_OK && m.len && !j->abort) {
+            int64_t t0 = esp_timer_get_time();
+            rrc_blake3_update(j->b3, part_bufs[m.slot], m.len);
+            pipe_stats.hash_us += esp_timer_get_time() - t0;
+        }
+        xQueueSend(j->md5_q, &m, portMAX_DELAY);
+        if (m.last) break;
+    }
+    for (;;) vTaskSuspend(NULL);
+}
+
+/* MD5 is its own stage: BLAKE3 and MD5 in one task capped the pipeline at ~6 MB/s. */
+static void md5_task(void *arg)
+{
+    reader_job_t *j = arg;
+    for (;;) {
+        part_msg_t m;
+        xQueueReceive(j->md5_q, &m, portMAX_DELAY);
         if (m.err == ESP_OK && !j->abort) {
             int64_t t0 = esp_timer_get_time();
-            if (m.len) rrc_blake3_update(j->b3, part_bufs[m.slot], m.len);
             rrc_md5(part_bufs[m.slot], m.len, m.md5);
-            pipe_stats.hash_us += esp_timer_get_time() - t0;
+            pipe_stats.md5_us += esp_timer_get_time() - t0;
         }
         xQueueSend(j->full_q, &m, portMAX_DELAY);
         if (m.last) break;
     }
-    vTaskDelete(NULL);
+    for (;;) vTaskSuspend(NULL);
+}
+
+/* The reader and hasher run on PSRAM stacks: they never touch flash, and 16 KiB of
+ * internal RAM matters (the hardware AES driver and TLS fail to allocate without it).
+ * The sync task itself keeps an internal stack because it writes NVS and LittleFS. */
+static void job_destroy(reader_job_t *j)
+{
+    if (j->reader_h) vTaskDeleteWithCaps(j->reader_h);
+    if (j->hasher_h) vTaskDeleteWithCaps(j->hasher_h);
+    if (j->md5_h) vTaskDeleteWithCaps(j->md5_h);
+    if (j->md5_q) vQueueDelete(j->md5_q);
+    if (j->free_q) vQueueDelete(j->free_q);
+    if (j->hash_q) vQueueDelete(j->hash_q);
+    if (j->full_q) vQueueDelete(j->full_q);
+    free(j);
 }
 
 /* Stops the reader (if still running) and waits for its final message. `held`
@@ -519,14 +554,19 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     job->src = src; job->fh = fh; job->size = o->size; job->b3 = &b3;
     job->free_q = xQueueCreate(PART_SLOTS, sizeof(int));
     job->hash_q = xQueueCreate(PART_SLOTS, sizeof(part_msg_t));
+    job->md5_q = xQueueCreate(PART_SLOTS, sizeof(part_msg_t));
     job->full_q = xQueueCreate(PART_SLOTS, sizeof(part_msg_t));
-    if (!job->free_q || !job->hash_q || !job->full_q) { e = ESP_ERR_NO_MEM; goto fail; }
+    if (!job->free_q || !job->hash_q || !job->md5_q || !job->full_q) { e = ESP_ERR_NO_MEM; goto fail; }
     for (int i = 0; i < PART_SLOTS; i++) xQueueSend(job->free_q, &i, 0);
-    if (xTaskCreate(hasher_task, "cam_hash", HASHER_TASK_STACK, job, 4, NULL) != pdPASS) { set_error("cannot start the hasher"); e = ESP_ERR_NO_MEM; goto fail; }
-    reader_done = false; /* the hasher now owns a message stream that must end with `last` */
-    if (xTaskCreate(reader_task, "cam_read", READER_TASK_STACK, job, 4, NULL) != pdPASS) {
-        /* let the hasher drain and exit: feed it the terminal message itself */
-        part_msg_t end = {.slot = 0, .len = 0, .err = ESP_ERR_NO_MEM, .last = true};
+    const uint32_t stack_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    if (xTaskCreatePinnedToCoreWithCaps(md5_task, "cam_md5", HASHER_TASK_STACK, job, 4, &job->md5_h, tskNO_AFFINITY, stack_caps) != pdPASS) { set_error("cannot start the md5 stage"); e = ESP_ERR_NO_MEM; goto fail; }
+    reader_done = false; /* from here the stages own a message stream that must end with `last` */
+    part_msg_t end = {.slot = 0, .len = 0, .err = ESP_ERR_NO_MEM, .last = true};
+    if (xTaskCreatePinnedToCoreWithCaps(hasher_task, "cam_hash", HASHER_TASK_STACK, job, 4, &job->hasher_h, tskNO_AFFINITY, stack_caps) != pdPASS) {
+        xQueueSend(job->md5_q, &end, portMAX_DELAY);
+        set_error("cannot start the hasher"); e = ESP_ERR_NO_MEM; goto fail;
+    }
+    if (xTaskCreatePinnedToCoreWithCaps(reader_task, "cam_read", READER_TASK_STACK, job, 4, &job->reader_h, tskNO_AFFINITY, stack_caps) != pdPASS) {
         xQueueSend(job->hash_q, &end, portMAX_DELAY);
         set_error("cannot start the camera reader"); e = ESP_ERR_NO_MEM; goto fail;
     }
@@ -589,7 +629,7 @@ static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const c
     }
     *out_size = total;
     free(etags);
-    vQueueDelete(job->free_q); vQueueDelete(job->hash_q); vQueueDelete(job->full_q); free(job);
+    job_destroy(job);
     src->close(src, fh);
     return ESP_OK;
 fail:
@@ -597,10 +637,7 @@ fail:
 fail_nomp:
     if (job) {
         if (!reader_done) reader_join(job, &reader_done, held);
-        if (job->free_q) vQueueDelete(job->free_q);
-        if (job->hash_q) vQueueDelete(job->hash_q);
-        if (job->full_q) vQueueDelete(job->full_q);
-        free(job);
+        job_destroy(job);
     }
     free(etags);
     if (fh) src->close(src, fh);
@@ -841,7 +878,7 @@ static void debug_hash(const char *arg, int repeat)
 /* Raw camera read rate with no hashing and no upload: reads `mb` MiB of one object
  * through the real read path into the part buffer, once with the zero-copy USB
  * DMA path and once with the copying path, so the difference is the DMA win. */
-static void debug_read(const char *arg, int mb)
+static void debug_read(const char *arg, int mb, int chunk_kib)
 {
     if (!cam || !cam->connected(cam)) { printf("no camera attached\n"); return; }
     cam_object_t o = {0};
@@ -864,7 +901,7 @@ static void debug_read(const char *arg, int mb)
         while (total < limit) {
             size_t got = 0;
             size_t slot_off = (size_t)(total % PART_BUF_BYTES);
-            size_t want = READ_CHUNK;
+            size_t want = chunk_kib > 0 ? (size_t)chunk_kib * 1024u : READ_CHUNK;
             if (want > PART_BUF_BYTES - slot_off) want = PART_BUF_BYTES - slot_off;
             e = cam->read(cam, fh, total, part_buf + slot_off, want, &got);
             if (e != ESP_OK) { printf("read failed at %llu: %s\n", (unsigned long long)total, esp_err_to_name(e)); break; }
@@ -949,8 +986,8 @@ static void debug_pipe(int mb, int rate_mb_s)
     printf("pipeline %d MiB at %s: %s in %.2f s = %.2f MB/s%s\n", mb, rate_mb_s > 0 ? "emulated camera rate" : "generator speed",
            esp_err_to_name(e), secs, (double)im.size / 1048576.0 / secs, rate_mb_s > 0 ? "" : " (upload-bound)");
     if (rate_mb_s > 0) printf("  camera alone would take %.2f s at %d MB/s; serial read-then-upload would add the upload time on top\n", (double)mb / rate_mb_s, rate_mb_s);
-    printf("  stages (overlapping): camera read %.2f s, blake3+md5 %.2f s, upload %.2f s\n",
-           (double)pipe_stats.read_us / 1e6, (double)pipe_stats.hash_us / 1e6, (double)pipe_stats.upload_us / 1e6);
+    printf("  stages (overlapping): camera read %.2f s, blake3 %.2f s, md5 %.2f s, upload %.2f s\n",
+           (double)pipe_stats.read_us / 1e6, (double)pipe_stats.hash_us / 1e6, (double)pipe_stats.md5_us / 1e6, (double)pipe_stats.upload_us / 1e6);
     if (e != ESP_OK) { ST_LOCK(); printf("  error: %s\n", st.last_error); ST_UNLOCK(); return; }
     printf("  pipeline blake3 %s expected\n", strcmp(got_hex, expect) == 0 ? "matches" : "DIFFERS FROM");
     hash_sink_t hs = {0}; rrc_blake3_init(&hs.b3);
@@ -962,6 +999,38 @@ static void debug_pipe(int mb, int rate_mb_s)
     printf("  read-back: %s (http %d) %llu bytes in %.2f s = %.2f MB/s, blake3 %s expected\n", esp_err_to_name(e), gr.status,
            (unsigned long long)hs.n, (double)(t1 - t0) / 1e6, (double)hs.n / 1048576.0 / ((double)(t1 - t0) / 1e6),
            strcmp(rb, expect) == 0 ? "matches" : "DIFFERS FROM");
+    rrc_s3_result_t dr;
+    rrc_s3_delete(&s3, key, &dr);
+}
+
+/* One real camera object through the real read/hash/upload pipeline to a scratch key
+ * under the control prefix (never the photo library), verified by the same checks a
+ * sync uses plus a read-back BLAKE3, then deleted. */
+static void debug_campipe(const char *arg, uint64_t size)
+{
+    if (!s3_ready) { printf("cloud not configured\n"); return; }
+    if (!cam || !cam->connected(cam)) { printf("no camera attached\n"); return; }
+    cam_object_t o = {0};
+    o.handle = (uint32_t)strtoul(arg, NULL, 16);
+    scpy(o.path, sizeof o.path, arg);
+    scpy(o.name, sizeof o.name, arg);
+    o.size = size;
+    char key[160];
+    snprintf(key, sizeof key, ".rrcloud/tmp/%s-campipe", app_device_id());
+    cancel_flag = false;
+    direct_checked = false;
+    char hex[65] = ""; uint64_t got = 0;
+    int64_t t0 = esp_timer_get_time();
+    esp_err_t e = upload_object(cam, &o, key, hex, &got);
+    double secs = (double)(esp_timer_get_time() - t0) / 1e6;
+    printf("camera -> bucket %llu bytes: %s in %.2f s = %.2f MB/s (usb direct %s)\n", (unsigned long long)got, esp_err_to_name(e), secs,
+           secs > 0 ? (double)got / 1048576.0 / secs : 0.0, rrc_ptp_direct_enabled() ? "on" : "off");
+    printf("  stages (overlapping): camera read %.2f s, blake3 %.2f s, md5 %.2f s, upload %.2f s\n",
+           (double)pipe_stats.read_us / 1e6, (double)pipe_stats.hash_us / 1e6, (double)pipe_stats.md5_us / 1e6, (double)pipe_stats.upload_us / 1e6);
+    if (e != ESP_OK) { ST_LOCK(); printf("  error: %s\n", st.last_error); ST_UNLOCK(); }
+    else printf("  blake3 %s\n", hex);
+    printf("  sync task stack: %u of %u bytes never used; internal heap free %u, largest block %u\n", (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)SYNC_TASK_STACK,
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     rrc_s3_result_t dr;
     rrc_s3_delete(&s3, key, &dr);
 }
@@ -1079,7 +1148,8 @@ static void sync_task(void *arg)
         case CMD_DEBUG_HASH: debug_hash(m.arg ? m.arg : "", m.repeat); free(m.arg); break;
         case CMD_DEBUG_SPEED: debug_speed(m.repeat); break;
         case CMD_DEBUG_PIPE: debug_pipe(m.repeat, m.port); break;
-        case CMD_DEBUG_READ: debug_read(m.arg ? m.arg : "", m.repeat); free(m.arg); break;
+        case CMD_DEBUG_CAMPIPE: debug_campipe(m.arg ? m.arg : "", (uint64_t)m.repeat * 1u); free(m.arg); break;
+        case CMD_DEBUG_READ: debug_read(m.arg ? m.arg : "", m.repeat, m.port); free(m.arg); break;
         case CMD_DEBUG_TCP: { char *colon = m.arg ? strrchr(m.arg, ':') : NULL; if (colon) { *colon = 0; debug_tcp(m.arg, atoi(colon + 1), m.repeat); } free(m.arg); break; }
         }
     }
@@ -1131,11 +1201,18 @@ void sync_cancel(void) { cancel_flag = true; msg_t m = {.cmd = CMD_CANCEL}; xQue
 void sync_config_changed(void) { msg_t m = {.cmd = CMD_CONFIG}; xQueueSend(q, &m, 0); }
 void sync_debug_list(void) { msg_t m = {.cmd = CMD_DEBUG_LS}; xQueueSend(q, &m, 0); }
 void sync_debug_speed(int mb) { msg_t m = {.cmd = CMD_DEBUG_SPEED, .repeat = mb}; xQueueSend(q, &m, 0); }
-void sync_debug_read(const char *arg, int mb)
+void sync_debug_read(const char *arg, int mb, int chunk_kib)
 {
     char *a = strdup(arg ? arg : "");
     if (!a) return;
-    msg_t m = {.cmd = CMD_DEBUG_READ, .arg = a, .repeat = mb};
+    msg_t m = {.cmd = CMD_DEBUG_READ, .arg = a, .repeat = mb, .port = chunk_kib};
+    if (xQueueSend(q, &m, 0) != pdTRUE) free(a);
+}
+void sync_debug_campipe(const char *handle, int size_bytes)
+{
+    char *a = strdup(handle ? handle : "");
+    if (!a) return;
+    msg_t m = {.cmd = CMD_DEBUG_CAMPIPE, .arg = a, .repeat = size_bytes};
     if (xQueueSend(q, &m, 0) != pdTRUE) free(a);
 }
 void sync_debug_pipe(int mb, int rate_mb_s) { msg_t m = {.cmd = CMD_DEBUG_PIPE, .repeat = mb, .port = rate_mb_s}; xQueueSend(q, &m, 0); }

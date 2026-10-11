@@ -12,7 +12,7 @@
 
 static const char *TAG = "rrc_ptp";
 
-#define PTP_IN_BUF   (64 * 1024)   /* bulk IN transfer buffer (internal DMA RAM) */
+#define PTP_IN_BUF   (16 * 1024)   /* bounce buffer for metadata and the fallback copy path (internal DMA RAM; the 50 KB largest free block cannot spare 64) */
 #define PTP_OUT_BUF  64
 #define PTP_CMD_TIMEOUT_MS   8000
 #define PTP_DATA_TIMEOUT_MS  20000
