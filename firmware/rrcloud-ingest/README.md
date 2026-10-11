@@ -220,7 +220,10 @@ The upload path is tuned so one TLS stream can fill the 100 Mbit Ethernet port:
   silicon: `ffffffff + 1` stays `ffffffff`, despite what the manual's prose says), and
   BLAKE3 does six modular adds per mixing step. Emulating one takes about ten vector
   ops, so a four-lane kernel is slower than the scalar code. The shifts, XOR and OR are
-  fine; only the add is the blocker.
+  fine; only the add is the blocker. Casting between signed and unsigned does not help (it
+  only chooses which clamp you get), and the core has no native rotate either: `misa.B` is
+  set, but `rori` raises an illegal-instruction trap on this silicon, so a rotate stays
+  three scalar instructions.
 - **Internal RAM is the scarce resource.** The hardware AES driver, both TLS sessions
   and every task stack compete for it, and "esp-aes: Failed to allocate memory" shows up
   as TLS write errors. lwIP and Wi-Fi hot paths are therefore not placed in IRAM,
