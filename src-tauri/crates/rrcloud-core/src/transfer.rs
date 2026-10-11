@@ -227,11 +227,11 @@ use md5::{Digest as _, Md5};
 
 use crate::clock::VersionVector;
 use crate::journal::{JournalEntry, Kind, Op, JOURNAL_VERSION};
-use crate::keys::{library_key, sidecar_key, RelKey};
+use crate::keys::{library_key, sidecar_key, thumb_key, RelKey, ThumbSize};
 use crate::publisher::{enqueue_entry_in, PublisherError};
 use crate::s3::{
     ByteRange, CompletedPart, ListMultipartUploadsRequest, ListPartsRequest, PartBody,
-    PutObjectOptions, S3Error, S3ErrorCode, S3TransferApi,
+    PutObjectOptions, S3Api, S3Error, S3ErrorCode, S3TransferApi,
 };
 use crate::semhash::{sem_hash, sidecar_badges, Blake3Hex, ContentId, SemHash, SemHashError};
 use crate::state::{
@@ -1953,9 +1953,31 @@ pub fn stub_pending_originals_bounded(
                 continue;
             }
         }
-        if let Err(e) = std::fs::File::create(&path) {
-            log::warn!("stub_pending_originals: create {}: {e}", path.display());
-            continue;
+        // `create_new` never truncates. The length check above and this
+        // create are two steps: if a download pump installed the real bytes
+        // in between (the two Android cycle engines used to be able to
+        // overlap; the on-demand hydrate still can), `File::create` would
+        // zero a verified original and the lost CAS below would then delete
+        // it. An existing EMPTY file — a placeholder a previous, interrupted
+        // pass left behind — is adopted as-is.
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let still_empty = std::fs::metadata(&path)
+                    .map(|m| m.len() == 0)
+                    .unwrap_or(false);
+                if !still_empty {
+                    continue;
+                }
+            }
+            Err(e) => {
+                log::warn!("stub_pending_originals: create {}: {e}", path.display());
+                continue;
+            }
         }
         let mtime = record.mtime_unix_ns / 1_000_000_000;
         let _ = filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(mtime, 0));
@@ -2006,6 +2028,367 @@ pub fn stub_pending_originals_bounded(
 /// whole pass (the desktop cycle, which has no per-cycle budget).
 pub fn stub_pending_originals(db: &SyncDb, dest_root: &Path) -> Result<usize, StateError> {
     stub_pending_originals_bounded(db, dest_root, &CancelFlag::new())
+}
+
+/// What one [`repair_stub_state_drift`] pass did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StubRepairSummary {
+    /// `Stub` records whose path held the full, blake3-verified bytes —
+    /// promoted to `Hydrated`.
+    pub promoted: Vec<RelKey>,
+    /// `Hydrated` records whose path held an empty file — demoted to `Stub`.
+    pub demoted: Vec<RelKey>,
+    /// Bytes-present stubs left alone because the bytes did not verify
+    /// against the record (wrong size or wrong blake3): logged, untouched.
+    pub unverified: usize,
+}
+
+impl StubRepairSummary {
+    /// `true` when the pass changed at least one record.
+    pub fn changed(&self) -> bool {
+        !self.promoted.is_empty() || !self.demoted.is_empty()
+    }
+}
+
+/// Reconciles the §3.5 stub records with what is actually on disk — the
+/// self-heal for the two ways a record and its file can drift apart:
+///
+/// - a `Stub` record over a file that holds bytes. Two cycle engines used to
+///   be able to overlap in one process (see [`crate::cycle`]): the download
+///   pump could install the full verified original while the other engine's
+///   stub pass committed `Stub`, leaving a fully-local photo rendered as a
+///   cloud placeholder with no thumbnail. When the bytes match the record's
+///   `size` **and** `blake3` the record is promoted to `Hydrated` — that is
+///   what a completed download would have committed — with `verified_remote`
+///   kept true. Bytes that do not verify are left exactly as found (never
+///   truncated, never trusted) and counted in `unverified`.
+/// - a `Hydrated` record over an empty file (a stub pass that truncated a
+///   just-installed original before the `create_new` guard existed, or any
+///   other zeroing). An original is never legitimately 0 bytes, so the
+///   record is demoted back to `Stub`: the placeholder hydrates on demand
+///   again instead of every reader decoding 0 bytes. A *missing* file is not
+///   touched — that is the local scan's business (it may be a deletion).
+///
+/// Cheap: one indexed scan per state plus a `stat` per item; a file is only
+/// hashed when its length already matches the record. `cancel` is checked
+/// between items. Call it right after the stub pass in a cycle.
+pub fn repair_stub_state_drift(
+    db: &SyncDb,
+    dest_root: &Path,
+    cancel: &CancelFlag,
+) -> Result<StubRepairSummary, StateError> {
+    let mut summary = StubRepairSummary::default();
+
+    for (rk, record) in db.items_in_state(ItemState::Stub)? {
+        if cancel.is_cancelled() {
+            return Ok(summary);
+        }
+        if record.deleted || record.kind != Kind::Original {
+            continue;
+        }
+        let path = local_target_path(dest_root, &rk, record.kind);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if meta.len() == 0 {
+            continue; // a proper stub
+        }
+        let Some(expected) = record.blake3.clone() else {
+            // Cannot verify without the remote truth; leave it for the next
+            // journal apply to fill in.
+            summary.unverified += 1;
+            continue;
+        };
+        if meta.len() != record.size {
+            log::warn!(
+                "stub repair: {rk} is a Stub record over {} bytes (record says {}); left alone",
+                meta.len(),
+                record.size
+            );
+            summary.unverified += 1;
+            continue;
+        }
+        match blake3_of_file(&path) {
+            Ok(actual) if actual == expected => {
+                // `Stub → Hydrated` is not a legal edge on its own (a stub only
+                // leaves through a download); walk the download's own two hops
+                // inside ONE transaction so no reader ever observes the
+                // intermediate `Downloading`.
+                let committed = db.with_txn_err::<(), StateError>(|t| {
+                    t.transition(&rk, ItemState::Stub, ItemState::Downloading, |_| {})?;
+                    t.transition(&rk, ItemState::Downloading, ItemState::Hydrated, |r| {
+                        r.verified_remote = true;
+                    })?;
+                    Ok(())
+                });
+                match committed {
+                    Ok(()) => {
+                        log::info!("stub repair: {rk} holds its verified bytes; now Hydrated");
+                        summary.promoted.push(rk);
+                    }
+                    // Moved on concurrently (a hydrate finished first): fine.
+                    Err(StateError::StaleState { .. }) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+            Ok(_) => {
+                log::warn!(
+                    "stub repair: {rk} holds bytes that do not match the record; left alone"
+                );
+                summary.unverified += 1;
+            }
+            Err(e) => {
+                log::warn!("stub repair: hashing {}: {e}", path.display());
+                summary.unverified += 1;
+            }
+        }
+    }
+
+    for (rk, record) in db.items_in_state(ItemState::Hydrated)? {
+        if cancel.is_cancelled() {
+            return Ok(summary);
+        }
+        if record.deleted || record.kind != Kind::Original || record.size == 0 {
+            continue;
+        }
+        let path = local_target_path(dest_root, &rk, record.kind);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue; // missing: the local scan's call, not ours
+        };
+        if meta.len() != 0 {
+            continue;
+        }
+        match db.transition(&rk, ItemState::Hydrated, ItemState::Stub, |_| {}) {
+            Ok(_) => {
+                log::warn!("stub repair: {rk} was Hydrated over an empty file; back to Stub");
+                summary.demoted.push(rk);
+            }
+            Err(StateError::StaleState { .. }) => {}
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Synchronous whole-file blake3 (the repair pass only hashes the rare
+/// drifted item, so the async chunked path is not worth threading here).
+fn blake3_of_file(path: &Path) -> std::io::Result<Blake3Hex> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(Blake3Hex::from_hash(&hasher.finalize()))
+}
+
+// ---------------------------------------------------------------------------
+// §3.5 stub thumbnails: the bucket's worker-generated `_small`/`_medium`
+// JPEGs, fetched for cloud stubs so the grid shows the photo, not a blank
+// tile.
+// ---------------------------------------------------------------------------
+
+/// Cap on one thumb object. A 1280px q75 JPEG is a few hundred KiB; this
+/// only bounds a hostile or mislabeled object.
+pub const MAX_STUB_THUMB_BYTES: usize = 8 * 1024 * 1024;
+
+/// How long a "not published yet" answer (the preview worker has not
+/// produced this original's thumbs) is remembered before the bucket is
+/// asked again.
+pub const STUB_THUMB_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// The local file a stub's fetched thumb lives at:
+/// `<thumbs_dir>/<content_id>_small.jpg` / `_medium.jpg` — the same
+/// `<content_id>_<variant>.jpg` scheme the host app's durable thumb store
+/// (`app_data_dir/rrcloud/thumbs/`) uses, so the two are one store.
+pub fn stub_thumb_path(thumbs_dir: &Path, content_id: &ContentId, size: ThumbSize) -> PathBuf {
+    let suffix = match size {
+        ThumbSize::Small => "small",
+        ThumbSize::Medium => "medium",
+    };
+    thumbs_dir.join(format!("{}_{suffix}.jpg", content_id.as_str()))
+}
+
+/// The content identity a stub's bucket thumbs are keyed by (§1.2): the
+/// journaled `content_id`, else the same value derived from the record's
+/// `blake3` (both are the hex blake3 of the original's bytes).
+pub fn stub_content_id(record: &ItemRecord) -> Option<ContentId> {
+    record
+        .content_id
+        .clone()
+        .or_else(|| record.blake3.as_ref().map(ContentId::from_blake3))
+}
+
+/// `true` when both thumbs for `content_id` are present in `thumbs_dir`.
+pub fn stub_thumbs_present(thumbs_dir: &Path, content_id: &ContentId) -> bool {
+    stub_thumb_path(thumbs_dir, content_id, ThumbSize::Small).is_file()
+        && stub_thumb_path(thumbs_dir, content_id, ThumbSize::Medium).is_file()
+}
+
+/// The negative-cache marker written when the bucket has no thumbs for
+/// `content_id` yet; its mtime is when we last asked.
+fn stub_thumb_missing_marker(thumbs_dir: &Path, content_id: &ContentId) -> PathBuf {
+    thumbs_dir.join(format!("{}.nothumb", content_id.as_str()))
+}
+
+fn marker_is_fresh(marker: &Path, retry_after: std::time::Duration) -> bool {
+    std::fs::metadata(marker)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < retry_after)
+}
+
+/// The outcome of one [`fetch_stub_thumbs`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThumbFetch {
+    /// Both thumbs were already present locally; nothing was fetched.
+    Present,
+    /// At least one thumb was fetched; both are present now.
+    Fetched,
+    /// The bucket has no thumb for this content yet (the preview worker
+    /// has not run over it). A marker throttles the next attempt.
+    NotPublished,
+    /// A recent `NotPublished` answer is still fresh; the bucket was not
+    /// asked.
+    Throttled,
+}
+
+/// Fetches the `_small` and `_medium` bucket thumbs for `content_id` into
+/// `thumbs_dir` (atomic temp+rename per file), skipping any already present.
+/// `NoSuchKey` on either means the preview worker has not published them yet:
+/// a `.nothumb` marker is touched and [`ThumbFetch::NotPublished`] returned;
+/// while that marker is younger than [`STUB_THUMB_RETRY_AFTER`] the call
+/// returns [`ThumbFetch::Throttled`] without touching the network. Other
+/// S3/I/O failures are returned (the caller's pump records them per item).
+pub async fn fetch_stub_thumbs(
+    s3: &impl S3Api,
+    bucket: &str,
+    thumbs_dir: &Path,
+    content_id: &ContentId,
+) -> Result<ThumbFetch, TransferError> {
+    fetch_stub_thumbs_with(s3, bucket, thumbs_dir, content_id, STUB_THUMB_RETRY_AFTER).await
+}
+
+/// [`fetch_stub_thumbs`] with an explicit negative-cache lifetime.
+pub async fn fetch_stub_thumbs_with(
+    s3: &impl S3Api,
+    bucket: &str,
+    thumbs_dir: &Path,
+    content_id: &ContentId,
+    retry_after: std::time::Duration,
+) -> Result<ThumbFetch, TransferError> {
+    if stub_thumbs_present(thumbs_dir, content_id) {
+        return Ok(ThumbFetch::Present);
+    }
+    let marker = stub_thumb_missing_marker(thumbs_dir, content_id);
+    if marker_is_fresh(&marker, retry_after) {
+        return Ok(ThumbFetch::Throttled);
+    }
+    std::fs::create_dir_all(thumbs_dir).map_err(|e| io_err(thumbs_dir, e))?;
+
+    let mut fetched_any = false;
+    for size in [ThumbSize::Small, ThumbSize::Medium] {
+        let dest = stub_thumb_path(thumbs_dir, content_id, size);
+        if dest.is_file() {
+            continue;
+        }
+        let key = thumb_key(content_id, size);
+        match s3.get_object(bucket, &key, None).await {
+            Ok(output) => {
+                let bytes = output.body.collect_capped(MAX_STUB_THUMB_BYTES).await?;
+                write_atomic(&dest, &bytes)?;
+                fetched_any = true;
+            }
+            Err(e) if e.is_no_such_key() => {
+                // Remember the miss; keep whatever did land.
+                let _ = std::fs::write(&marker, b"");
+                let _ = filetime::set_file_mtime(&marker, filetime::FileTime::now());
+                return Ok(ThumbFetch::NotPublished);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let _ = std::fs::remove_file(&marker);
+    Ok(if fetched_any {
+        ThumbFetch::Fetched
+    } else {
+        ThumbFetch::Present
+    })
+}
+
+/// Writes `bytes` to `dest` through a sibling temp file + rename, so a
+/// reader never sees a partial thumb.
+fn write_atomic(dest: &Path, bytes: &[u8]) -> Result<(), TransferError> {
+    let tmp = dest.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&tmp, bytes).map_err(|e| io_err(&tmp, e))?;
+    std::fs::rename(&tmp, dest).map_err(|e| io_err(dest, e))?;
+    Ok(())
+}
+
+/// What one [`pump_stub_thumbs`] pass did.
+#[derive(Debug, Default)]
+pub struct StubThumbSummary {
+    /// Stubs whose thumbs were fetched this pass (both now present).
+    pub fetched: Vec<RelKey>,
+    /// Stubs the bucket has no thumbs for yet (marker written).
+    pub not_published: usize,
+    /// Stubs whose fetch failed with a transport/I/O error; retried next
+    /// pass.
+    pub failed: Vec<(RelKey, TransferError)>,
+    /// `true` when the pass stopped early on the [`CancelFlag`].
+    pub cancelled: bool,
+}
+
+/// Fetches bucket thumbs for every `Stub` original that does not have them
+/// locally yet, at most `max_fetches` bucket round-trips per pass (stubs
+/// already present or inside their `.nothumb` throttle window cost nothing
+/// and do not count). Checks `cancel` between items. A client cycle runs it
+/// after the stub pass so a received photo gets its picture within a cycle
+/// or two; the host app's thumbnail generator fetches on demand for whatever
+/// is on screen before the pump gets there.
+pub async fn pump_stub_thumbs(
+    db: &SyncDb,
+    s3: &impl S3Api,
+    bucket: &str,
+    thumbs_dir: &Path,
+    cancel: &CancelFlag,
+    max_fetches: usize,
+) -> Result<StubThumbSummary, TransferError> {
+    let mut summary = StubThumbSummary::default();
+    let mut fetches = 0usize;
+    for (rk, record) in db.items_in_state(ItemState::Stub)? {
+        if cancel.is_cancelled() {
+            summary.cancelled = true;
+            break;
+        }
+        if fetches >= max_fetches {
+            break;
+        }
+        if record.deleted || record.kind != Kind::Original {
+            continue;
+        }
+        let Some(cid) = stub_content_id(&record) else {
+            continue;
+        };
+        if stub_thumbs_present(thumbs_dir, &cid)
+            || marker_is_fresh(
+                &stub_thumb_missing_marker(thumbs_dir, &cid),
+                STUB_THUMB_RETRY_AFTER,
+            )
+        {
+            continue;
+        }
+        fetches += 1;
+        match fetch_stub_thumbs(s3, bucket, thumbs_dir, &cid).await {
+            Ok(ThumbFetch::Fetched) => summary.fetched.push(rk),
+            Ok(ThumbFetch::NotPublished) => summary.not_published += 1,
+            Ok(ThumbFetch::Present | ThumbFetch::Throttled) => {}
+            Err(e) => {
+                log::warn!("stub thumbs: {rk}: {e}");
+                summary.failed.push((rk, e));
+            }
+        }
+    }
+    Ok(summary)
 }
 
 /// The §3.5 temp file a download streams into: `.rr.part-<name>` next to

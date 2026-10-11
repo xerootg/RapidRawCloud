@@ -32,13 +32,13 @@
 #[cfg(target_os = "android")]
 mod imp {
     use std::path::PathBuf;
-    use std::sync::Mutex;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use jni::objects::{JClass, JObject, JObjectArray, JString};
     use jni::sys::{jint, jlong};
     use jni::JNIEnv;
 
+    use crate::cycle::try_lock_cycle;
     use crate::engine::{admit_pending, notify_local_change, EngineConsumer, LocalScan};
     use crate::journal::Kind;
     use crate::keys::relkey;
@@ -48,8 +48,8 @@ mod imp {
     use crate::semhash::ContentId;
     use crate::state::{StateError, SyncDb};
     use crate::transfer::{
-        probe_backend, pump_downloads, pump_uploads, stored_backend_profile,
-        stub_pending_originals_bounded, CancelFlag, TransferConfig,
+        probe_backend, pump_downloads, pump_stub_thumbs, pump_uploads, repair_stub_state_drift,
+        stored_backend_profile, stub_pending_originals_bounded, CancelFlag, TransferConfig,
     };
     use crate::worker::mint_worker_device_id;
 
@@ -57,17 +57,10 @@ mod imp {
     use super::super::dcim_dedupe::{decide, DcimDecision, SeenRow};
     use super::super::result_code::BridgeResult;
 
-    /// Guards one sync cycle at a time **within this process** (§5.1):
-    /// WorkManager can in some configurations run a `Worker` in-process
-    /// with the app (a default-executor `Worker`, as opposed to a remote
-    /// process), so redb's own cross-*process* file lock
-    /// ([`StateError::AlreadyLocked`]) is not enough on its own — two
-    /// cycles racing inside the same process would both see the lock free.
-    /// A contended lock here backs off immediately with
-    /// [`BridgeResult::RetryLockHeld`] rather than blocking: WorkManager
-    /// already owns the retry/backoff policy, this just refuses to run two
-    /// cycles concurrently in-process.
-    static CYCLE_LOCK: Mutex<()> = Mutex::new(());
+    /// Bucket thumbs fetched for cloud stubs per bounded cycle (§3.5). Two
+    /// small GETs each; a few seconds of a WorkManager window at most, so
+    /// the download lane still gets its share of the budget.
+    const STUB_THUMBS_PER_CYCLE: usize = 32;
 
     /// Minimal subset of `AppSettings.sync` this bridge needs to build an
     /// `S3Client` + `TransferConfig` (ARCHITECTURE.md §5.1). Deliberately
@@ -238,7 +231,8 @@ mod imp {
     /// [`BridgeResult::RetryLockHeld`] (§5.1 cross-process exclusion).
     ///
     /// Only [`Java_com_plugin_rrcloud_RrcloudBridge_runSyncCycle`] takes
-    /// [`CYCLE_LOCK`] before calling this; `dcimScanDecisions`,
+    /// the process-wide cycle lock ([`crate::cycle::try_lock_cycle`], shared
+    /// with the host app's foreground cycle) before calling this; `dcimScanDecisions`,
     /// `dcimRecordImport` and `dirtyUnbackedCount` call it directly and
     /// rely on this function's own `AlreadyLocked`/`Locked` path for
     /// exclusion against a concurrently-running cycle. That is sound even
@@ -357,6 +351,7 @@ mod imp {
         s3: &S3Client,
         bucket: &str,
         root: PathBuf,
+        thumbs_dir: PathBuf,
         budget: CycleBudget,
     ) -> Result<(), String> {
         let backend = match stored_backend_profile(db).map_err(|e| e.to_string())? {
@@ -448,6 +443,53 @@ mod imp {
             }
         }
 
+        // Self-heal record/disk drift left by cycles that overlapped before
+        // the shared cycle lock existed (a Stub record over the full verified
+        // bytes, or a Hydrated record over an empty file). A stat per stub;
+        // best-effort, never fails the cycle.
+        match repair_stub_state_drift(db, &root, &cancel) {
+            Ok(s) if s.changed() => log::info!(
+                "stub repair: {} promoted to hydrated, {} demoted to stub",
+                s.promoted.len(),
+                s.demoted.len()
+            ),
+            Ok(_) => {}
+            Err(e) => log::warn!("stub repair: {e}"),
+        }
+
+        if budget.is_expired(now_ms()) {
+            return first_error.map_or(Ok(()), Err);
+        }
+
+        // §3.5 stub thumbnails: fetch the worker-generated `_small`/`_medium`
+        // JPEGs for a bounded number of stubs into the durable thumb store
+        // the app's grid reads, so received photos show their picture (with
+        // the cloud badge) instead of a blank tile. Runs BEFORE the download
+        // pump: it is a handful of tiny GETs, and the pump may spend the rest
+        // of the window on pinned originals.
+        match pump_stub_thumbs(db, s3, bucket, &thumbs_dir, &cancel, STUB_THUMBS_PER_CYCLE).await {
+            Ok(s) => {
+                if !s.fetched.is_empty() || s.not_published > 0 {
+                    log::info!(
+                        "stub thumbs: fetched {} set(s), {} not published yet",
+                        s.fetched.len(),
+                        s.not_published
+                    );
+                }
+                if let Some((relkey, err)) = s.failed.into_iter().next() {
+                    first_error.get_or_insert(format!("thumb fetch failed for {relkey}: {err}"));
+                }
+            }
+            Err(e) => {
+                log::warn!("stub thumbs: {e}");
+                first_error.get_or_insert(format!("stub thumb pass failed: {e}"));
+            }
+        }
+
+        if budget.is_expired(now_ms()) {
+            return first_error.map_or(Ok(()), Err);
+        }
+
         let down = pump_downloads(db, s3, &cfg, 2, &cancel)
             .await
             .map_err(|e| e.to_string())?;
@@ -487,13 +529,14 @@ mod imp {
         let start = now_ms();
         let budget = CycleBudget::from_budget_ms(start, budget_ms);
 
-        // Single-instance safety, in-process half (§5.1): a same-process
-        // concurrent cycle backs off immediately. The cross-process half
-        // (redb's own file lock) is checked when `open_state_db` runs,
-        // below.
-        let _guard = match CYCLE_LOCK.try_lock() {
-            Ok(g) => g,
-            Err(_) => return BridgeResult::RetryLockHeld.to_code(),
+        // Single-instance safety, in-process half (§5.1): the process-wide
+        // cycle lock is shared with the host app's foreground cycle (same
+        // redb, same library root — see `crate::cycle`), so a same-process
+        // concurrent cycle of EITHER engine backs off immediately. The
+        // cross-process half (redb's own file lock) is checked when
+        // `open_state_db` runs, below.
+        let Some(_guard) = try_lock_cycle() else {
+            return BridgeResult::RetryLockHeld.to_code();
         };
 
         super::init_ndk_context(&mut env, &ctx);
@@ -558,7 +601,20 @@ mod imp {
             }
         };
 
-        match runtime.block_on(run_bounded_cycle(&db, &s3, &settings.bucket, root, budget)) {
+        // The durable thumb store is `<state_dir>/thumbs`: the same
+        // directory the host app's `SyncManager` keys its seeded thumbs in
+        // (`app_data_dir/rrcloud/thumbs`, next to the redb), so a thumb this
+        // background cycle fetches is exactly what the grid links on its
+        // next look.
+        let thumbs_dir = state_dir.join("thumbs");
+        match runtime.block_on(run_bounded_cycle(
+            &db,
+            &s3,
+            &settings.bucket,
+            root,
+            thumbs_dir,
+            budget,
+        )) {
             Ok(()) => BridgeResult::Success.to_code(),
             Err(e) => {
                 eprintln!("rrcloud bridge: cycle: {e}");

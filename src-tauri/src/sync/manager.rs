@@ -457,20 +457,64 @@ impl SyncManager {
             // guard sites hydrate them on open/edit; the grid shows placeholders).
             // Authoritative: stub_paths is exactly the Stub-state items, so an
             // item hydrated this cycle correctly drops out.
-            if let Ok(stubs) = cfg.stub_paths()
-                && let Ok(mut set) = self.stub_set.lock()
-            {
-                set.clear();
-                set.extend(stubs);
-            }
+            self.reseed_stub_mirror(&cfg);
             // §3.8: push the post-cycle status + per-item deltas to the webview
             // so the badge and grid icons settle without a poll.
             self.publish_sync_events();
+            // §3.5: the stub thumbs this cycle fetched light up their grid
+            // tiles now, not on the next scroll.
+            self.surface_seeded_thumbs(&cfg);
             Ok(status)
         }
         #[cfg(not(feature = "sync"))]
         {
             Err(SyncError::FeatureDisabled)
+        }
+    }
+
+    /// Rebuilds the in-memory stub mirror from the durable `Stub` records
+    /// (§3.5). Called after every cycle — including one another engine ran
+    /// (see [`Self::spawn_foreground_cycle`]) — so `is_stub` answers for
+    /// stubs created outside this manager's own code paths.
+    #[cfg(feature = "sync")]
+    fn reseed_stub_mirror(&self, cfg: &imp::Configured) {
+        if let Ok(stubs) = cfg.stub_paths()
+            && let Ok(mut set) = self.stub_set.lock()
+        {
+            set.clear();
+            set.extend(stubs);
+        }
+    }
+
+    /// Links the stub thumbs the last cycle fetched into the webview cache
+    /// and emits `thumbnail-generated` for each, so a received photo's tile
+    /// fills in while the user is looking at the grid (§3.5). A no-op
+    /// without an app handle (tests / headless).
+    #[cfg(feature = "sync")]
+    fn surface_seeded_thumbs(&self, cfg: &imp::Configured) {
+        let seeded = cfg.take_seeded_thumb_paths();
+        if seeded.is_empty() {
+            return;
+        }
+        let Some(app) = self.app.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
+            return;
+        };
+        let cache_dir = match crate::file_management::get_thumb_cache_dir(&app) {
+            Ok(dir) => dir,
+            Err(e) => {
+                log::warn!("stub thumbs: thumbnail cache dir: {e}");
+                return;
+            }
+        };
+        for path in seeded {
+            if let Some((small, medium)) = cfg.link_stub_thumbs_into_cache(&path, &cache_dir) {
+                crate::file_management::emit_thumbnail_seeded(
+                    &app,
+                    &path.to_string_lossy(),
+                    &small.to_string_lossy(),
+                    &medium.to_string_lossy(),
+                );
+            }
         }
     }
 
@@ -496,6 +540,21 @@ impl SyncManager {
             }
             let me = Arc::clone(self);
             std::thread::spawn(move || {
+                // Process-wide single cycle (§5.1, `rrcloud_core::cycle`): on
+                // Android the bridge's WorkManager cycle shares this lock, and
+                // it works the same redb and library root. If it is mid-cycle,
+                // do not run a second one alongside it (that overlap is how a
+                // Stub record ended up over a fully downloaded original) —
+                // just refresh what the webview sees from the durable state
+                // and let the next tick run a full cycle.
+                let Some(_cycle) = rrcloud_core::cycle::try_lock_cycle() else {
+                    if let Ok(cfg) = me.configured() {
+                        me.reseed_stub_mirror(&cfg);
+                    }
+                    me.publish_sync_events();
+                    me.fg_cycle_running.store(false, Ordering::SeqCst);
+                    return;
+                };
                 let outcome = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -979,6 +1038,47 @@ impl SyncManager {
         }
     }
 
+    /// The grid thumbnails for the cloud stub at `image_path` (§3.5 thumb
+    /// seeding), linked into `cache_thumbnails_dir` under the generator's
+    /// exact cache key: `Some((small, medium))` when the bucket's
+    /// worker-generated thumbs are present in the durable store or could be
+    /// fetched right now (two small GETs on a dedicated runtime — this is
+    /// the thumbnail worker threads' on-demand path for stubs on screen);
+    /// `None` when sync is off, the path is not a stub, or the preview worker
+    /// has not published its thumbs yet (a negative-cache marker keeps the
+    /// grid from re-asking the bucket on every repaint). Backs
+    /// [`crate::sync::hooks::stub_thumbnails`].
+    pub fn stub_thumbnails(
+        &self,
+        image_path: &Path,
+        cache_thumbnails_dir: &Path,
+    ) -> Option<(PathBuf, PathBuf)> {
+        #[cfg(feature = "sync")]
+        {
+            let cfg = self.configured().ok()?;
+            if let Some(linked) = cfg.link_stub_thumbs_into_cache(image_path, cache_thumbnails_dir)
+            {
+                return Some(linked);
+            }
+            use rrcloud_core::transfer::ThumbFetch;
+            match cfg.fetch_stub_thumbs_blocking(image_path) {
+                Ok(ThumbFetch::Fetched | ThumbFetch::Present) => {
+                    cfg.link_stub_thumbs_into_cache(image_path, cache_thumbnails_dir)
+                }
+                Ok(ThumbFetch::NotPublished | ThumbFetch::Throttled) => None,
+                Err(e) => {
+                    log::debug!("stub thumbs: {}: {e}", image_path.display());
+                    None
+                }
+            }
+        }
+        #[cfg(not(feature = "sync"))]
+        {
+            let _ = (image_path, cache_thumbnails_dir);
+            None
+        }
+    }
+
     // ---- §3.8 control surface (U8 command layer) --------------------------
     //
     // These back the Tauri command handlers in `sync::commands`. They are
@@ -1170,7 +1270,7 @@ mod imp {
         restore_item,
     };
     use rrcloud_core::journal::{JournalEntry, Kind, Op};
-    use rrcloud_core::keys::{RelKey, relkey};
+    use rrcloud_core::keys::{RelKey, ThumbSize, relkey};
     use rrcloud_core::meta::{self, MetaDecision, MetaHead};
     use rrcloud_core::publisher::{enqueue_entry, publish_pending};
     use rrcloud_core::reader::poll;
@@ -1178,9 +1278,10 @@ mod imp {
     use rrcloud_core::semhash::{Blake3Hex, ContentId};
     use rrcloud_core::state::{ItemRecord, ItemState, StateError, SyncDb};
     use rrcloud_core::transfer::{
-        BackendProfile, CancelFlag, ExpectedDownload, TransferConfig, TransferError,
-        bucket_key_for, download_item, local_target_path, probe_backend, pump_downloads,
-        pump_uploads, stored_backend_profile,
+        BackendProfile, CancelFlag, ExpectedDownload, ThumbFetch, TransferConfig, TransferError,
+        bucket_key_for, download_item, fetch_stub_thumbs, local_target_path, probe_backend,
+        pump_downloads, pump_stub_thumbs, pump_uploads, repair_stub_state_drift,
+        stored_backend_profile, stub_content_id, stub_thumb_path, stub_thumbs_present,
     };
 
     use super::{
@@ -1194,6 +1295,13 @@ mod imp {
     /// Transfer concurrency per lane (§2.4 / §3.3). Small and fixed: the
     /// desktop app is not the bulk worker.
     const TRANSFER_CONCURRENCY: usize = 2;
+
+    /// Bucket thumbs fetched for cloud stubs per foreground cycle (§3.5).
+    /// Two small GETs each. The foreground cycle runs on focus and every
+    /// minute, so a library of a few thousand received photos fills in over
+    /// the first session; whatever is on screen sooner is fetched on demand
+    /// by the thumbnail generator itself.
+    const STUB_THUMBS_PER_CYCLE: usize = 96;
 
     /// Smart previews generated per `run_cycle` (§4.3). Small: generation is a
     /// full raw decode + demosaic, scheduled on the thumbnail worker priority
@@ -1438,6 +1546,12 @@ mod imp {
         /// first). Only ever holds an entry while the matching kind is in
         /// [`Configured::meta_dirty`].
         meta_pending: std::sync::Mutex<std::collections::HashMap<MetaKind, Vec<u8>>>,
+        /// §3.5 stub thumbs the last `run_cycle` fetched into the durable
+        /// store, as absolute image paths; drained by
+        /// [`Configured::take_seeded_thumb_paths`] so the outer `run_once`
+        /// can link them into the webview cache and emit
+        /// `thumbnail-generated` while the user is looking at the grid.
+        seeded_thumbs: std::sync::Mutex<Vec<PathBuf>>,
     }
 
     impl Configured {
@@ -1544,6 +1658,7 @@ mod imp {
                 meta_local_paths: std::sync::Mutex::new(std::collections::HashMap::new()),
                 meta_heads: std::sync::Mutex::new(meta_heads),
                 meta_pending: std::sync::Mutex::new(meta_pending),
+                seeded_thumbs: std::sync::Mutex::new(Vec::new()),
             })
         }
 
@@ -3103,12 +3218,7 @@ mod imp {
             //    the content-keyed thumb — else on the stub's relkey (no
             //    content_id yet). This store is *not* the OS-clearable cache
             //    (§3.5 D1 fix).
-            let store_dir = self
-                .db
-                .path()
-                .parent()
-                .unwrap_or(self.sync_root.as_path())
-                .join("thumbs");
+            let store_dir = self.thumb_store_dir();
             std::fs::create_dir_all(&store_dir).map_err(se)?;
             let content_key = match relkey(image_path, &self.sync_root) {
                 Ok(rk) => match self
@@ -3131,16 +3241,38 @@ mod imp {
             let durable = store_dir.join(format!("{content_key}_{suffix}.jpg"));
             std::fs::write(&durable, jpeg_bytes).map_err(se)?;
 
-            // 2. Surface it to the webview by hard-linking (copy fallback)
-            //    into `$APPCACHE/thumbnails/<hash>_<suffix>.jpg`, where
-            //    `<hash>` is the exact cache key
-            //    `generate_single_thumbnail_and_cache` looks up: the stub's
-            //    path + mtime + the **current adjustments** (§3.5). Sidecars
-            //    are never stubbed, so an edited cloud image has its real
-            //    sidecar on disk; keying with empty adjustments here would
-            //    land the thumb under a key the grid never looks up (orphaned
-            //    thumb, permanent cache miss). The asset-protocol scope and
-            //    `tauri.conf.json` stay untouched.
+            // 2. Surface it to the webview under the grid's cache key.
+            self.link_thumb_into_cache(&durable, image_path, suffix, cache_thumbnails_dir)
+        }
+
+        /// The durable thumb store: `<state_dir>/thumbs`, next to the redb —
+        /// the same directory the rrcloud-core cycles (the Android bridge's
+        /// `pump_stub_thumbs`) fetch bucket thumbs into, keyed
+        /// `<content_id>_<small|medium>.jpg`, so one store serves both.
+        fn thumb_store_dir(&self) -> PathBuf {
+            self.db
+                .path()
+                .parent()
+                .unwrap_or(self.sync_root.as_path())
+                .join("thumbs")
+        }
+
+        /// Hard-links (copy fallback) a durable thumb into
+        /// `$APPCACHE/thumbnails/<hash>_<suffix>.jpg`, where `<hash>` is the
+        /// exact cache key `generate_single_thumbnail_and_cache` looks up for
+        /// `image_path`: path + mtime + the **current adjustments** (§3.5).
+        /// Sidecars are never stubbed, so an edited cloud image has its real
+        /// sidecar on disk; keying with empty adjustments would land the
+        /// thumb under a key the grid never looks up (orphaned thumb,
+        /// permanent cache miss). The asset-protocol scope and
+        /// `tauri.conf.json` stay untouched. Returns the cache path.
+        fn link_thumb_into_cache(
+            &self,
+            durable: &Path,
+            image_path: &Path,
+            suffix: &str,
+            cache_thumbnails_dir: &Path,
+        ) -> Result<PathBuf, SyncError> {
             let path_str = image_path.to_string_lossy();
             let adjustments = crate::file_management::thumbnail_adjustments_key_bytes(&path_str);
             let hash =
@@ -3150,11 +3282,90 @@ mod imp {
             let linked = cache_thumbnails_dir.join(format!("{hash}_{suffix}.jpg"));
             // Replace any stale link/file at the key first.
             let _ = std::fs::remove_file(&linked);
-            if std::fs::hard_link(&durable, &linked).is_err() {
+            if std::fs::hard_link(durable, &linked).is_err() {
                 // Cross-filesystem (desktop) — copy fallback (§3.5).
-                std::fs::copy(&durable, &linked).map_err(se)?;
+                std::fs::copy(durable, &linked).map_err(se)?;
             }
             Ok(linked)
+        }
+
+        /// The stub record for `image_path`, if it is a live `Stub`
+        /// original, with the content identity its bucket thumbs are keyed
+        /// by. `None` for anything else (not tracked, deleted, hydrated,
+        /// no known content identity).
+        fn stub_content_id_for(&self, image_path: &Path) -> Option<ContentId> {
+            let rk = relkey(image_path, &self.sync_root).ok()?;
+            let record = self.db.get_item(&rk).ok().flatten()?;
+            if record.deleted || record.state != ItemState::Stub || record.kind != Kind::Original {
+                return None;
+            }
+            stub_content_id(&record)
+        }
+
+        /// Links the durable `_small`/`_medium` thumbs of the stub at
+        /// `image_path` into the webview cache (§3.5), when both are present
+        /// in the store. `Some((small, medium))` cache paths, `None` when the
+        /// path is not a stub or its thumbs have not been fetched yet.
+        pub fn link_stub_thumbs_into_cache(
+            &self,
+            image_path: &Path,
+            cache_thumbnails_dir: &Path,
+        ) -> Option<(PathBuf, PathBuf)> {
+            let cid = self.stub_content_id_for(image_path)?;
+            let store = self.thumb_store_dir();
+            if !stub_thumbs_present(&store, &cid) {
+                return None;
+            }
+            let mut linked = Vec::with_capacity(2);
+            for (size, variant) in [
+                (ThumbSize::Small, ThumbVariant::Small),
+                (ThumbSize::Medium, ThumbVariant::Medium),
+            ] {
+                let durable = stub_thumb_path(&store, &cid, size);
+                match self.link_thumb_into_cache(
+                    &durable,
+                    image_path,
+                    variant.suffix(),
+                    cache_thumbnails_dir,
+                ) {
+                    Ok(p) => linked.push(p),
+                    Err(e) => {
+                        log::warn!("stub thumbs: link {}: {e}", durable.display());
+                        return None;
+                    }
+                }
+            }
+            let medium = linked.pop()?;
+            let small = linked.pop()?;
+            Some((small, medium))
+        }
+
+        /// Fetches the bucket thumbs for the stub at `image_path` into the
+        /// durable store right now (§3.5 on-demand path, called from the
+        /// thumbnail worker threads for stubs on screen). Synchronous: runs
+        /// the two GETs on a dedicated-thread runtime with its own S3 client,
+        /// for the same pooled-connection reason `hydrate` documents.
+        pub fn fetch_stub_thumbs_blocking(
+            &self,
+            image_path: &Path,
+        ) -> Result<ThumbFetch, SyncError> {
+            let Some(cid) = self.stub_content_id_for(image_path) else {
+                return Err(se("fetch_stub_thumbs: not a stub with a known content id"));
+            };
+            // Bounded, unlike the cycle client: this runs on a thumbnail
+            // worker thread while the grid is on screen, and an unreachable
+            // endpoint must cost a visible tile seconds, not a hung worker.
+            let mut s3_config = self.s3.config().clone();
+            s3_config.connect_timeout = Some(std::time::Duration::from_secs(10));
+            s3_config.request_timeout = Some(std::time::Duration::from_secs(30));
+            let bucket = self.bucket.clone();
+            let store = self.thumb_store_dir();
+            run_blocking(async move {
+                let s3 = S3Client::new(s3_config).map_err(se)?;
+                fetch_stub_thumbs(&s3, &bucket, &store, &cid)
+                    .await
+                    .map_err(se)
+            })
         }
 
         /// The absolute local paths of every durable `ItemState::Stub`
@@ -3629,6 +3840,11 @@ mod imp {
             // `is_stub` / the guard-site hydration see them.
             self.stub_pending_originals();
 
+            // Self-heal record/disk drift (a Stub record over the full
+            // verified bytes, or a Hydrated record over an empty file) left by
+            // cycles that overlapped before the shared cycle lock existed.
+            self.repair_stub_state_drift();
+
             // §2.9 albums/presets meta lane: upload dirty meta documents and
             // apply any converged remote meta head. A no-op when no meta work
             // is pending, so cycles on devices that never touched
@@ -3651,7 +3867,65 @@ mod imp {
                 )));
             }
 
+            // §3.5 stub thumbnails: fetch the worker-generated `_small` /
+            // `_medium` JPEGs for a bounded number of stubs into the durable
+            // thumb store, so received photos get their picture (under the
+            // cloud badge) without being opened. Best-effort: a failure here
+            // never fails the cycle — the next one retries, and the thumbnail
+            // generator fetches on demand for whatever is on screen.
+            match pump_stub_thumbs(
+                &self.db,
+                self.s3.as_ref(),
+                &self.bucket,
+                &self.thumb_store_dir(),
+                &cancel,
+                STUB_THUMBS_PER_CYCLE,
+            )
+            .await
+            {
+                Ok(summary) => {
+                    if !summary.fetched.is_empty() || summary.not_published > 0 {
+                        log::info!(
+                            "stub thumbs: fetched {} set(s), {} not published yet",
+                            summary.fetched.len(),
+                            summary.not_published
+                        );
+                    }
+                    for (relkey, err) in &summary.failed {
+                        log::warn!("stub thumbs: {relkey}: {err}");
+                    }
+                    let mut seeded = self.seeded_thumbs.lock().unwrap_or_else(|e| e.into_inner());
+                    seeded.extend(
+                        summary
+                            .fetched
+                            .iter()
+                            .map(|rk| local_target_path(&self.sync_root, rk, Kind::Original)),
+                    );
+                }
+                Err(e) => log::warn!("stub thumbs: {e}"),
+            }
+
             Ok(self.status_snapshot(uploaded, down.completed.len()))
+        }
+
+        /// The §3.5 record/disk drift repair (see
+        /// `rrcloud_core::transfer::repair_stub_state_drift`), run right after
+        /// the stub pass. Best-effort: logged, never fails the cycle.
+        fn repair_stub_state_drift(&self) {
+            match repair_stub_state_drift(&self.db, &self.sync_root, &CancelFlag::new()) {
+                Ok(s) if s.changed() => log::info!(
+                    "stub repair: {} promoted to hydrated, {} demoted to stub",
+                    s.promoted.len(),
+                    s.demoted.len()
+                ),
+                Ok(_) => {}
+                Err(e) => log::warn!("stub repair: {e}"),
+            }
+        }
+
+        /// Drains the image paths whose stub thumbs the last cycle fetched.
+        pub fn take_seeded_thumb_paths(&self) -> Vec<PathBuf> {
+            std::mem::take(&mut *self.seeded_thumbs.lock().unwrap_or_else(|e| e.into_inner()))
         }
 
         /// The bounded exit-flush body (§3.3): drain the upload lane only
