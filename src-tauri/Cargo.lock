@@ -5830,6 +5830,7 @@ dependencies = [
  "image",
  "jni 0.21.1",
  "jni 0.22.4",
+ "log",
  "md-5",
  "ndk-context",
  "percent-encoding",
