@@ -148,3 +148,7 @@ CONFIG_LWIP_TCP_SACK_OUT=y
 # `tasks` console command (vTaskList): per-task stack high-water marks, to right-size internal-RAM stacks.
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+
+# Three persistent TLS connections to the bucket (control + two uploaders), the web UI and mDNS share the
+# socket table; at the default 10 a batch of small uploads ran out ("Failed to create socket").
+CONFIG_LWIP_MAX_SOCKETS=16

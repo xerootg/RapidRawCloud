@@ -26,13 +26,11 @@
 #include "store.h"
 #include "net.h"
 #include "log_ring.h"
+#include "upload_engine.h"
 
 static const char *TAG = "sync";
 
-/* One multipart part / max single PUT. Smaller and more numerous beats fewer and bigger in the same
- * PSRAM: a buffer slot cycles read -> hash -> upload, so a shorter cycle keeps both upload connections
- * fed (3 x 8 MiB left them idle ~25% of the time). 6 MiB stays above the 5 MiB S3 multipart minimum. */
-#define PART_BUF_BYTES   (6u * 1024u * 1024u)
+#define PART_BUF_BYTES   UE_PART_BYTES   /* diagnostics: the size of one part buffer */
 /* The sync task runs the S3 client and its TLS session (mbedTLS handshake and
  * record buffers on the stack) under several KiB of path/key/journal-line locals;
  * 24 KiB overflowed by ~6 KiB on hardware (stack protection fault in "sync"). */
@@ -48,20 +46,18 @@ static const char *TAG = "sync";
 #define MANIFEST_RECONFIRM_S (24 * 3600)   /* §2.10 rule 2 */
 #define LAGGARD_CAP_S       (14 * 24 * 3600) /* §2.10 rule 3 */
 
-typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG, CMD_DEBUG_LS, CMD_DEBUG_HASH, CMD_DEBUG_SPEED, CMD_DEBUG_TCP, CMD_DEBUG_PIPE, CMD_DEBUG_READ, CMD_DEBUG_CAMPIPE, CMD_DEBUG_NETPAR } cmd_t;
+typedef enum { CMD_ATTACH, CMD_DETACH, CMD_SYNC_NOW, CMD_CANCEL, CMD_TICK, CMD_CONFIG, CMD_DEBUG_LS, CMD_DEBUG_HASH, CMD_DEBUG_SPEED, CMD_DEBUG_TCP, CMD_DEBUG_PIPE, CMD_DEBUG_READ, CMD_DEBUG_CAMPIPE, CMD_DEBUG_MULTI, CMD_DEBUG_PIPEMULTI } cmd_t;
 typedef struct { cmd_t cmd; cam_source_t *src; char *arg; int repeat; int port; } msg_t;
 
 static QueueHandle_t q;
 static SemaphoreHandle_t st_mtx;
 static sync_status_t st;
 static rrc_s3_t s3;
-static rrc_s3_t s3b;                  /* second connection, see upload_worker */
+static rrc_s3_t s3b, s3c;             /* one connection per upload task; `s3` is the control connection */
 static bool s3_ready;
 static cam_source_t *cam;             /* attached camera (or NULL) */
 static volatile bool cancel_flag;
-#define PART_SLOTS 4
-static uint8_t *part_bufs[PART_SLOTS];   /* read-ahead pipeline buffers, PSRAM */
-static uint8_t *part_buf;                /* = part_bufs[0]; scratch for the diagnostics */
+static uint8_t *part_buf;                /* the engine's first part buffer; scratch for the diagnostics */
 static esp_timer_handle_t tick_timer;
 static int64_t last_tick_pending_check;
 static bool cam_identified;      /* PTP: OpenSession + DeviceInfo succeeded (source_id is final) */
@@ -95,8 +91,9 @@ static void configure_s3(void)
     bool was = s3_ready;
     bool had_offset = s3.have_server_offset;
     int64_t off = s3.server_offset_s;
-    if (s3_ready) { rrc_s3_disconnect(&s3); rrc_s3_disconnect(&s3b); }
+    if (s3_ready) { rrc_s3_disconnect(&s3); rrc_s3_disconnect(&s3b); rrc_s3_disconnect(&s3c); }
     rrc_s3_init(&s3b, &cfg);
+    rrc_s3_init(&s3c, &cfg);
     s3_ready = rrc_s3_init(&s3, &cfg) == ESP_OK;
     if (s3_ready && had_offset) { s3.have_server_offset = true; s3.server_offset_s = off; }
     /* digest-probe result is per backend; remembered in the store */
@@ -340,491 +337,26 @@ static void compact_segments(void)
     }
 }
 
-/* ---- upload ---------------------------------------------------------------- */
+/* ---- upload (the pipeline lives in upload_engine.c) --------------------------------- */
 typedef struct { rrc_blake3_ctx b3; uint64_t n; } hash_sink_t;
 static int hash_sink(void *ctx, const uint8_t *d, size_t n) { hash_sink_t *h = ctx; rrc_blake3_update(&h->b3, d, n); h->n += n; return 0; }
 
-/* ---- read-ahead pipeline ----------------------------------------------------
- * Reading a part from the camera (PTP runs at a few MB/s), hashing it and pushing
- * the previous part through TLS are independent, so they overlap on the two
- * cores: reader -> hasher -> uploader (the sync task), PART_SLOTS buffers in
- * flight. The reader sits in the camera transfer most of the time, the hasher
- * runs BLAKE3 (~11 MB/s in software) and MD5, the uploader does TLS. The tasks
- * only meet at the queues; the reader's final `last` message travels through
- * the hasher, and the uploader waits for it before touching the source again. */
-typedef struct {
-    int slot;        /* index into part_bufs */
-    size_t len;      /* bytes in the buffer */
-    esp_err_t err;   /* read error; len bytes before it are still valid */
-    bool last;       /* nothing follows (EOF, short part, or error) */
-    uint8_t md5[16]; /* filled by the checksum stage: Content-MD5 / single-PUT ETag */
-    uint8_t sha[32]; /* ... or, for multipart parts on a backend that verifies it, SHA-256 on the hardware engine */
-} part_msg_t;
-
-/* Where the last upload_object spent its time, per stage (microseconds). The
- * stages overlap, so the sum exceeds the wall time; pipe-test prints them. */
-static struct { int64_t read_us, hash_us, md5_us, upload_us; } pipe_stats;
-/* Per-part timeline of the last upload (microseconds since upload_object began), printed by cam-pipe. */
-static struct { int64_t t0, ready, start, end; char who; } part_tl[16];
-static int64_t tl_t0;
-
-typedef struct {
-    cam_source_t *src;
-    void *fh;
-    uint64_t size;
-    rrc_blake3_ctx *b3;
-    QueueHandle_t free_q, hash_q, md5_q, full_q;
-    TaskHandle_t reader_h, hasher_h, md5_h, h2_h;
-    QueueHandle_t h2_q, h2_out;   /* helper hashing the second half of each full part */
-    uint64_t hashed;              /* bytes already folded into b3 */
-    bool use_sha;                 /* per-part checksum is SHA-256 (hardware) instead of MD5 (software) */
-    volatile bool abort;   /* uploader gave up; stop reading */
-    uint64_t fail_at;
-    esp_err_t fail_err;
-} reader_job_t;
-
-#define READER_TASK_STACK 16384
-
-static void reader_task(void *arg)
+static void on_progress(void *ctx, const char *path, uint64_t size, uint64_t done)
 {
-    reader_job_t *j = arg;
-    uint64_t total = 0;
-    for (;;) {
-        int slot = 0;
-        xQueueReceive(j->free_q, &slot, portMAX_DELAY);
-        part_msg_t m = {.slot = slot};
-        uint8_t *buf = part_bufs[slot];
-        while (m.len < PART_BUF_BYTES && total + m.len < j->size) {
-            if (j->abort || cancel_flag || !j->src->connected(j->src)) { m.err = ESP_ERR_INVALID_STATE; break; }
-            size_t want = PART_BUF_BYTES - m.len;
-            if (want > READ_CHUNK) want = READ_CHUNK;
-            if (want > j->size - total - m.len) want = (size_t)(j->size - total - m.len);
-            size_t got = 0;
-            int64_t t0 = esp_timer_get_time();
-            esp_err_t e = j->src->read(j->src, j->fh, total + m.len, buf + m.len, want, &got);
-            pipe_stats.read_us += esp_timer_get_time() - t0;
-            if (e != ESP_OK) { j->fail_at = total + m.len; j->fail_err = e; m.err = e; break; }
-            if (got == 0) break; /* unexpected EOF: a short part ends the object */
-            m.len += got;
-            ST_LOCK(); st.current_done = total + m.len; ST_UNLOCK();
-        }
-        total += m.len;
-        m.last = m.err != ESP_OK || total >= j->size || m.len < PART_BUF_BYTES;
-        xQueueSend(j->hash_q, &m, portMAX_DELAY);
-        if (m.last) break;
-    }
-    for (;;) vTaskSuspend(NULL);   /* the uploader deletes this task (its stack is a caps allocation) */
+    (void)ctx;
+    ST_LOCK(); scpy(st.current_file, sizeof st.current_file, path); st.current_size = size; st.current_done = done; ST_UNLOCK();
 }
 
-#define HASHER_TASK_STACK 4096
-
-/* BLAKE3 is a tree, so a full part, which starts on a part-size boundary, splits into aligned 1 MiB
- * (1024-chunk) subtrees. Both cores pull subtrees off a shared counter, then the results are
- * appended to the running hash in order. Anything else (the short last part) goes through the
- * plain streaming update. */
-#define SUB_CHUNKS 1024u
-#define SUB_BYTES  (SUB_CHUNKS * 1024u)
-#define MAX_SUBS   (PART_BUF_BYTES / SUB_BYTES)
-typedef struct { const uint8_t *buf; uint64_t first_chunk; size_t nsub; volatile int next; uint32_t cv[MAX_SUBS][8]; } h2_work_t;
-
-static void h2_run(h2_work_t *w)
+/* One object through the engine, start to finish (diagnostics; a sync keeps several in flight). */
+static esp_err_t upload_one(cam_source_t *src, const cam_object_t *o, const char *key, char b3hex[65], uint64_t *size)
 {
-    for (;;) {
-        int i = __atomic_fetch_add(&w->next, 1, __ATOMIC_RELAXED);
-        if (i >= (int)w->nsub) return;
-        rrc_blake3_subtree_cv(w->buf + (size_t)i * SUB_BYTES, SUB_CHUNKS, w->first_chunk + (uint64_t)i * SUB_CHUNKS, w->cv[i]);
-    }
-}
-
-static void hash2_task(void *arg)
-{
-    reader_job_t *j = arg;
-    for (;;) {
-        h2_work_t *w;
-        xQueueReceive(j->h2_q, &w, portMAX_DELAY);
-        h2_run(w);
-        uint32_t done = 1;
-        xQueueSend(j->h2_out, &done, portMAX_DELAY);
-    }
-}
-
-static void hasher_task(void *arg)
-{
-    reader_job_t *j = arg;
-    h2_work_t *w = heap_caps_malloc(sizeof *w, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    for (;;) {
-        part_msg_t m;
-        xQueueReceive(j->hash_q, &m, portMAX_DELAY);
-        if (m.err == ESP_OK && m.len && !j->abort) {
-            int64_t t0 = esp_timer_get_time();
-            const uint8_t *buf = part_bufs[m.slot];
-            bool split = w && j->h2_h && m.len == PART_BUF_BYTES && j->hashed % PART_BUF_BYTES == 0;
-            if (split) {
-                w->buf = buf; w->first_chunk = j->hashed / 1024; w->nsub = MAX_SUBS; w->next = 0;
-                xQueueSend(j->h2_q, &w, portMAX_DELAY);     /* wake the helper, then work alongside it */
-                h2_run(w);
-                uint32_t done;
-                xQueueReceive(j->h2_out, &done, portMAX_DELAY);
-                bool ok = true;
-                for (size_t i = 0; i < MAX_SUBS && ok; i++) {
-                    if (rrc_blake3_add_subtree(j->b3, w->cv[i], SUB_CHUNKS) != 0) {
-                        if (i == 0) { rrc_blake3_update(j->b3, buf, m.len); ok = false; }   /* refused before consuming anything */
-                        else abort();                                                         /* aligned by construction */
-                    }
-                }
-            } else {
-                rrc_blake3_update(j->b3, buf, m.len);
-            }
-            j->hashed += m.len;
-            pipe_stats.hash_us += esp_timer_get_time() - t0;
-        }
-        xQueueSend(j->md5_q, &m, portMAX_DELAY);
-        if (m.last) break;
-    }
-    free(w);
-    for (;;) vTaskSuspend(NULL);
-}
-
-/* The per-part checksum is its own stage: BLAKE3 and MD5 in one task capped the pipeline at ~6 MB/s. */
-static void md5_task(void *arg)
-{
-    reader_job_t *j = arg;
-    for (;;) {
-        part_msg_t m;
-        xQueueReceive(j->md5_q, &m, portMAX_DELAY);
-        if (m.err == ESP_OK && !j->abort) {
-            int64_t t0 = esp_timer_get_time();
-            if (j->use_sha) rrc_sha256(part_bufs[m.slot], m.len, m.sha);   /* SHA engine, DMA */
-            else rrc_md5(part_bufs[m.slot], m.len, m.md5);
-            pipe_stats.md5_us += esp_timer_get_time() - t0;
-        }
-        xQueueSend(j->full_q, &m, portMAX_DELAY);
-        if (m.last) break;
-    }
-    for (;;) vTaskSuspend(NULL);
-}
-
-/* The reader and hasher run on PSRAM stacks: they never touch flash, and 16 KiB of
- * internal RAM matters (the hardware AES driver and TLS fail to allocate without it).
- * The sync task itself keeps an internal stack because it writes NVS and LittleFS. */
-static void job_destroy(reader_job_t *j)
-{
-    if (j->reader_h) vTaskDeleteWithCaps(j->reader_h);
-    if (j->hasher_h) vTaskDeleteWithCaps(j->hasher_h);
-    if (j->md5_h) vTaskDeleteWithCaps(j->md5_h);
-    if (j->h2_h) vTaskDeleteWithCaps(j->h2_h);
-    if (j->h2_q) vQueueDelete(j->h2_q);
-    if (j->h2_out) vQueueDelete(j->h2_out);
-    if (j->md5_q) vQueueDelete(j->md5_q);
-    if (j->free_q) vQueueDelete(j->free_q);
-    if (j->hash_q) vQueueDelete(j->hash_q);
-    if (j->full_q) vQueueDelete(j->full_q);
-    free(j);
-}
-
-/* Stops the reader (if still running) and waits for its final message. `held`
- * is a slot the uploader still owns, handed back so a blocked reader can exit. */
-static void reader_join(reader_job_t *j, bool *done, int held)
-{
-    j->abort = true;
-    if (held >= 0) xQueueSend(j->free_q, &held, 0);
-    while (!*done) {
-        part_msg_t m;
-        xQueueReceive(j->full_q, &m, portMAX_DELAY);
-        *done = m.last;
-    }
-}
-
-/* ---- second upload connection ------------------------------------------------
- * One TCP stream over this ~40 ms WAN path tops out near 6 MB/s (a lone Reno-style
- * sender loses ground to the occasional drop; the laptop shows the same: 9 MB/s on
- * one stream, 12-13 on two or more). Multipart parts are independent, so a worker task
- * with its own connection uploads every other part while the sync task uploads the
- * rest. The worker is persistent (one TLS handshake, then keep-alive across files)
- * and has an internal-RAM stack because the hardware AES-GCM engine only takes
- * DMA-capable buffers and mbedTLS keeps its AAD on the stack. */
-typedef struct {
-    const char *key, *upload_id;
-    int part_no, slot;
-    const uint8_t *data, *md5, *sha;
-    size_t len;
-    char *etag;
-    QueueHandle_t free_q;
-    SemaphoreHandle_t slots;     /* counting: one give per finished part, so the dispatcher knows an uploader is free */
-} part_job_t;
-
-#define WORKER_STACK (24u * 1024u)
-#define N_UPLOADERS 2
-/* Both uploaders are tasks, so the sync task is a pure dispatcher and never sits in an upload
- * while the other connection idles (measured: a dispatcher that also uploaded left the worker
- * idle for ~0.8 s per part). Uploader 0 owns the extra connection; uploader 1 borrows the sync
- * task's own, which it does not touch between multipart create and complete. */
-static struct { rrc_s3_t *conn; QueueHandle_t q; volatile bool busy; } up[N_UPLOADERS];
-static volatile esp_err_t w_err;
-static char w_errmsg[96];
-static bool worker_ready;
-static uint8_t pj_md5[PART_SLOTS][16];   /* the checksums must outlive the message that carried them */
-static uint8_t pj_sha[PART_SLOTS][32];
-
-static void upload_worker(void *arg)
-{
-    int idx = (int)(intptr_t)arg;
-    for (;;) {
-        part_job_t j;
-        xQueueReceive(up[idx].q, &j, portMAX_DELAY);
-        rrc_s3_t *c = up[idx].conn;
-        if (c != &s3) { c->have_server_offset = s3.have_server_offset; c->server_offset_s = s3.server_offset_s; }
-        rrc_s3_result_t res = {0};
-        int64_t t0 = esp_timer_get_time();
-        if (j.part_no <= 16) { part_tl[j.part_no - 1].start = t0 - tl_t0; part_tl[j.part_no - 1].who = (char)('0' + idx); }
-        esp_err_t e = rrc_s3_upload_part(c, j.key, j.upload_id, j.part_no, j.data, j.len, j.md5, j.sha, j.etag, 40, &res);
-        pipe_stats.upload_us += esp_timer_get_time() - t0;
-        if (j.part_no <= 16) part_tl[j.part_no - 1].end = esp_timer_get_time() - tl_t0;
-        if (e != ESP_OK && w_err == ESP_OK) {
-            char b[64];
-            snprintf(w_errmsg, sizeof w_errmsg, "part %d failed: %s", j.part_no, rrc_s3_result_str(&res, b, sizeof b));
-            w_err = e;
-        }
-        xQueueSend(j.free_q, &j.slot, 0);
-        up[idx].busy = false;
-        xSemaphoreGive(j.slots);
-    }
-}
-
-/* Waits (bounded by the S3 timeout) until both uploaders have finished their part. */
-static void worker_quiesce(void)
-{
-    for (int i = 0; i < 700; i++) {
-        bool busy = false;
-        for (int k = 0; k < N_UPLOADERS; k++) busy |= up[k].busy;
-        if (!busy) return;
-        vTaskDelay(pdMS_TO_TICKS(100));
-    }
-}
-
-/* ---- zero-copy USB read self-check ---------------------------------------------
- * The USB controller DMAs straight into the part buffers and the stack does cache
- * maintenance on line-rounded ranges, so a mistake there would silently corrupt a
- * photo (the upload verifies the hash of what it read, not what the camera sent).
- * Once per camera attach, before the first upload, the first part of the first
- * file is read both ways and compared byte for byte, with guard patterns around
- * the destination to catch stray writes. A mismatch turns the DMA path off for
- * the rest of the session and says so in the log. */
-static bool direct_checked;
-
-/* NVS "usb_direct": 0 verified/unknown, 1 a check was running (a crash during it
- * leaves this at 1, so the next boot treats the path as broken instead of looping),
- * 2 disabled by a failed or crashed check. `usb-direct on` clears it. */
-static uint8_t direct_state_get(void)
-{
-    nvs_handle_t h; uint8_t v = 0;
-    if (nvs_open("rrc", NVS_READONLY, &h) == ESP_OK) { nvs_get_u8(h, "usb_direct", &v); nvs_close(h); }
-    return v;
-}
-void sync_usb_direct_state_set(uint8_t v)
-{
-    nvs_handle_t h;
-    if (nvs_open("rrc", NVS_READWRITE, &h) == ESP_OK) { nvs_set_u8(h, "usb_direct", v); nvs_commit(h); nvs_close(h); }
-}
-static void direct_state_boot(void)
-{
-    uint8_t v = direct_state_get();
-    if (v == 1) { sync_usb_direct_state_set(2); v = 2; log_ring_printf("usb: the previous zero-copy DMA check did not finish (reset during it); copying path in use until 'usb-direct on'"); }
-    if (v == 2) rrc_ptp_set_direct(false);
-}
-
-static void direct_selfcheck(cam_source_t *src, const cam_object_t *o, void *fh)
-{
-    if (direct_checked || strcmp(src->kind, "ptp") != 0 || !rrc_ptp_direct_enabled() || o->size < 256 * 1024) return;
-    direct_checked = true;
-    sync_usb_direct_state_set(1);
-    const size_t n = (size_t)(o->size < 1024 * 1024 + 4100 ? o->size : 1024 * 1024 + 4100);   /* ends mid cache line on purpose */
-    uint8_t *a = part_bufs[0], *b = part_bufs[1];
-    memset(a - 12, 0xA5, 12 + n + 192); memset(b - 12, 0x5A, 12 + n + 192);
-    size_t ga = 0, gb = 0;
-    rrc_ptp_set_direct(true);
-    esp_err_t ea = src->read(src, fh, 0, a, n, &ga);
-    rrc_ptp_set_direct(false);
-    esp_err_t eb = src->read(src, fh, 0, b, n, &gb);
-    rrc_ptp_set_direct(true);
-    bool guards = true;
-    for (int i = -12; i < 0; i++) guards &= a[i] == 0xA5;       /* the 12 bytes the container header lands on */
-    for (size_t i = n; i < n + 192; i++) guards &= a[i] == 0xA5; /* nothing past the end */
-    bool same = ea == ESP_OK && eb == ESP_OK && ga == n && gb == n && memcmp(a, b, n) == 0;
-    if (same && guards) {
-        sync_usb_direct_state_set(0);
-        log_ring_printf("usb: zero-copy DMA read verified against the copying path (%u bytes identical)", (unsigned)n);
-        return;
-    }
-    size_t first = 0;
-    if (ea == ESP_OK && eb == ESP_OK) while (first < n && a[first] == b[first]) first++;
-    rrc_ptp_set_direct(false);
-    sync_usb_direct_state_set(2);
-    log_ring_printf("usb: zero-copy DMA read FAILED its check (%s/%s, got %u/%u of %u, first diff at %u, guards %s); using the copying path",
-                    esp_err_to_name(ea), esp_err_to_name(eb), (unsigned)ga, (unsigned)gb, (unsigned)n, (unsigned)first, guards ? "ok" : "corrupted");
-}
-
-/* Uploads one camera object to `key`; fills blake3 hex. Returns ESP_OK when the
- * object is verified in the bucket. */
-static esp_err_t upload_object(cam_source_t *src, const cam_object_t *o, const char *key, char blake3_hex[65], uint64_t *out_size)
-{
-    void *fh = NULL;
-    esp_err_t e = src->open(src, o, &fh);
-    if (e != ESP_OK) return e;
-    rrc_kv meta[1] = {{"rrc-device", app_device_id()}};
-    rrc_blake3_ctx b3;
-    rrc_blake3_init(&b3);
-    bool multipart = o->size > PART_BUF_BYTES;
-    bool use_sha = multipart && s3.sha256_check_known && s3.backend_checks_sha256;
-    char upload_id[160] = "";
-    char (*etags)[40] = NULL;
-    int parts = 0;
-    rrc_s3_result_t res = {0};
-    uint64_t total = 0;
-    char single_md5_hex[33] = "";
-    reader_job_t *job = NULL;
-    bool reader_done = true;
-    int held = -1;
-    memset(&pipe_stats, 0, sizeof pipe_stats);
-    memset(part_tl, 0, sizeof part_tl);
-    tl_t0 = esp_timer_get_time();
-    w_err = ESP_OK;
-    SemaphoreHandle_t slots = NULL;
-    if (multipart && worker_ready) {
-        slots = xSemaphoreCreateCounting(N_UPLOADERS, N_UPLOADERS);
-        if (!slots) { e = ESP_ERR_NO_MEM; goto fail; }
-    }
-    if (multipart) {
-        e = rrc_s3_multipart_create(&s3, key, "application/octet-stream", meta, 1, upload_id, sizeof upload_id, &res);
-        if (e != ESP_OK) { char b[96]; set_error("multipart create failed: %s", rrc_s3_result_str(&res, b, sizeof b)); goto fail; }
-        etags = heap_caps_malloc(1024 * 40, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!etags) { e = ESP_ERR_NO_MEM; goto fail; }
-    }
-    direct_selfcheck(src, o, fh);
-    job = calloc(1, sizeof *job);
-    if (!job) { e = ESP_ERR_NO_MEM; goto fail; }
-    job->src = src; job->fh = fh; job->size = o->size; job->b3 = &b3; job->use_sha = use_sha;
-    job->free_q = xQueueCreate(PART_SLOTS, sizeof(int));
-    job->hash_q = xQueueCreate(PART_SLOTS, sizeof(part_msg_t));
-    job->md5_q = xQueueCreate(PART_SLOTS, sizeof(part_msg_t));
-    job->full_q = xQueueCreate(PART_SLOTS, sizeof(part_msg_t));
-    if (!job->free_q || !job->hash_q || !job->md5_q || !job->full_q) { e = ESP_ERR_NO_MEM; goto fail; }
-    for (int i = 0; i < PART_SLOTS; i++) xQueueSend(job->free_q, &i, 0);
-    const uint32_t stack_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
-    if (xTaskCreatePinnedToCoreWithCaps(md5_task, "cam_md5", HASHER_TASK_STACK, job, 4, &job->md5_h, tskNO_AFFINITY, stack_caps) != pdPASS) { set_error("cannot start the md5 stage"); e = ESP_ERR_NO_MEM; goto fail; }
-    /* optional helper: if any of this fails the hasher simply does the whole part itself */
-    job->h2_q = xQueueCreate(1, sizeof(void *));
-    job->h2_out = xQueueCreate(1, sizeof(uint32_t));
-    if (!job->h2_q || !job->h2_out || xTaskCreatePinnedToCoreWithCaps(hash2_task, "cam_hash2", HASHER_TASK_STACK, job, 4, &job->h2_h, tskNO_AFFINITY, stack_caps) != pdPASS) job->h2_h = NULL;
-    reader_done = false; /* from here the stages own a message stream that must end with `last` */
-    part_msg_t end = {.slot = 0, .len = 0, .err = ESP_ERR_NO_MEM, .last = true};
-    if (xTaskCreatePinnedToCoreWithCaps(hasher_task, "cam_hash", HASHER_TASK_STACK, job, 4, &job->hasher_h, tskNO_AFFINITY, stack_caps) != pdPASS) {
-        xQueueSend(job->md5_q, &end, portMAX_DELAY);
-        set_error("cannot start the hasher"); e = ESP_ERR_NO_MEM; goto fail;
-    }
-    if (xTaskCreatePinnedToCoreWithCaps(reader_task, "cam_read", READER_TASK_STACK, job, 4, &job->reader_h, tskNO_AFFINITY, stack_caps) != pdPASS) {
-        xQueueSend(job->hash_q, &end, portMAX_DELAY);
-        set_error("cannot start the camera reader"); e = ESP_ERR_NO_MEM; goto fail;
-    }
-    if (slots) xSemaphoreTake(slots, portMAX_DELAY);   /* uploader token for the first part */
-    for (;;) {
-        part_msg_t m;
-        xQueueReceive(job->full_q, &m, portMAX_DELAY);
-        reader_done = m.last;
-        held = m.slot;
-        if (m.err == ESP_ERR_INVALID_STATE) { e = m.err; goto fail; }
-        if (m.err != ESP_OK) { set_error("camera read failed at %llu: %s", (unsigned long long)job->fail_at, esp_err_to_name(m.err)); e = m.err; goto fail; }
-        uint8_t *buf = part_bufs[m.slot];
-        if (m.len == 0 && total > 0) break;
-        int64_t t_up = esp_timer_get_time();
-        if (multipart) {
-            if (parts >= 1024) { e = ESP_ERR_INVALID_SIZE; goto fail; }
-            if (w_err != ESP_OK) { set_error("%s", w_errmsg); e = w_err; goto fail; }
-            if (worker_ready && slots) {
-                /* an uploader is guaranteed free: this was taken before the part arrived */
-                int u = !up[0].busy ? 0 : 1;
-                part_job_t pj = {.key = key, .upload_id = upload_id, .part_no = parts + 1, .slot = m.slot, .data = buf, .len = m.len,
-                                 .etag = etags[parts], .free_q = job->free_q, .slots = slots};
-                memcpy(pj_md5[m.slot], m.md5, 16);
-                memcpy(pj_sha[m.slot], m.sha, 32);
-                pj.md5 = pj_md5[m.slot];
-                pj.sha = use_sha ? pj_sha[m.slot] : NULL;
-                if (parts < 16) part_tl[parts].ready = esp_timer_get_time() - tl_t0;
-                up[u].busy = true;
-                xQueueSend(up[u].q, &pj, 0);
-                parts++;
-                total += m.len;
-                held = -1;
-                if (m.last) break;
-                xSemaphoreTake(slots, portMAX_DELAY);   /* wait for the next free uploader before taking the next part */
-                continue;
-            }
-            e = rrc_s3_upload_part(&s3, key, upload_id, parts + 1, buf, m.len, m.md5, use_sha ? m.sha : NULL, etags[parts], 40, &res);
-            if (parts < 16) part_tl[parts].end = esp_timer_get_time() - tl_t0;
-            if (e != ESP_OK) { char b[96]; set_error("part %d failed: %s", parts + 1, rrc_s3_result_str(&res, b, sizeof b)); goto fail; }
-            parts++;
-        } else {
-            e = rrc_s3_put_md5(&s3, key, buf, m.len, "application/octet-stream", meta, 1, m.md5, &res);
-            if (e != ESP_OK) { char b[96]; set_error("put failed: %s", rrc_s3_result_str(&res, b, sizeof b)); goto fail; }
-            rrc_hex_lower(m.md5, 16, single_md5_hex);
-        }
-        pipe_stats.upload_us += esp_timer_get_time() - t_up;
-        total += m.len;
-        xQueueSend(job->free_q, &m.slot, 0);
-        held = -1;
-        if (m.last) break;
-    }
-    if (!reader_done) reader_join(job, &reader_done, held);
-    held = -1;
-    worker_quiesce();
-    if (w_err != ESP_OK) { set_error("%s", w_errmsg); e = w_err; goto fail; }
-    if (total != o->size) { set_error("short read from camera: %llu of %llu bytes", (unsigned long long)total, (unsigned long long)o->size); e = ESP_FAIL; goto fail; }
-    if (multipart) {
-        /* Heap, not stack: up to 1024 pointers (4 KiB) on top of the TLS session
-         * below this frame overflowed the sync task on hardware. */
-        const char **etag_ptrs = calloc((size_t)(parts > 0 ? parts : 1), sizeof *etag_ptrs);
-        if (!etag_ptrs) { set_error("multipart complete: out of memory"); e = ESP_ERR_NO_MEM; goto fail; }
-        for (int i = 0; i < parts; i++) etag_ptrs[i] = etags[i];
-        e = rrc_s3_multipart_complete(&s3, key, upload_id, etag_ptrs, parts, &res);
-        free(etag_ptrs);
-        if (e != ESP_OK) { char b[96]; set_error("multipart complete failed: %s", rrc_s3_result_str(&res, b, sizeof b)); goto fail; }
-        upload_id[0] = 0;
-    }
-    rrc_blake3_final_hex(&b3, blake3_hex);
-    /* §2.4 verifying: HEAD size; single-part ETag == MD5; multipart without a
-     * digest-checking backend → full read-back re-hash. */
-    rrc_s3_result_t h;
-    if (rrc_s3_head(&s3, key, &h) != ESP_OK || h.status != 200) { set_error("verify HEAD failed (%d)", h.status); e = ESP_FAIL; goto fail_nomp; }
-    if (h.content_length >= 0 && (uint64_t)h.content_length != total) { set_error("verify size mismatch %lld != %llu", (long long)h.content_length, (unsigned long long)total); e = ESP_FAIL; goto fail_nomp; }
-    if (!multipart) {
-        if (strcasecmp(h.etag, single_md5_hex) != 0) { set_error("verify ETag != MD5 (%s vs %s)", h.etag, single_md5_hex); e = ESP_FAIL; goto fail_nomp; }
-    } else if (!use_sha && (!s3.digest_check_known || !s3.backend_rejects_bad_md5)) {   /* a backend that verified every part's SHA-256 needs no read-back */
-        hash_sink_t hs = {0};
-        rrc_blake3_init(&hs.b3);
-        rrc_s3_result_t gr;
-        if (rrc_s3_get_stream(&s3, key, hash_sink, &hs, &gr) != ESP_OK) { set_error("read-back failed (%d)", gr.status); e = ESP_FAIL; goto fail_nomp; }
-        char rb[65];
-        rrc_blake3_final_hex(&hs.b3, rb);
-        if (hs.n != total || strcmp(rb, blake3_hex) != 0) { set_error("read-back blake3 mismatch"); e = ESP_FAIL; goto fail_nomp; }
-    }
-    *out_size = total;
-    free(etags);
-    job_destroy(job);
-    if (slots) vSemaphoreDelete(slots);
-    src->close(src, fh);
-    return ESP_OK;
-fail:
-    worker_quiesce();
-    if (multipart && upload_id[0]) { rrc_s3_result_t ar; rrc_s3_multipart_abort(&s3, key, upload_id, &ar); }
-fail_nomp:
-    if (job) {
-        if (!reader_done) reader_join(job, &reader_done, held);
-        job_destroy(job);
-    }
-    if (slots) { worker_quiesce(); vSemaphoreDelete(slots); }
-    free(etags);
-    if (fh) src->close(src, fh);
-    return e == ESP_OK ? ESP_FAIL : e;
+    char err[96] = "";
+    ue_job_t *j = ue_submit(src, o, key, NULL, err, sizeof err);
+    if (!j) { set_error("%s", err); return ESP_FAIL; }
+    ue_job_t *d = ue_wait(UINT32_MAX);
+    esp_err_t e = ue_finish(d, b3hex, size, err, sizeof err);
+    if (e != ESP_OK) set_error("%s", err);
+    return e;
 }
 
 /* ---- enumeration ----------------------------------------------------------- */
@@ -859,6 +391,132 @@ static int cmp_obj(const void *a, const void *b)
 }
 
 /* ---- one sync run ---------------------------------------------------------- */
+#define RUN_WINDOW 3
+typedef struct {
+    ue_job_t *job;
+    const cam_object_t *o;
+    char relkey[RRC_RELKEY_MAX];
+    char key[RRC_RELKEY_MAX + 16];
+} flight_t;
+
+typedef struct {
+    cam_source_t *src;
+    const app_config_t *cfg;
+    flight_t *fl;
+    int inflight, consecutive_failures;
+    bool warned;
+} run_t;
+
+/* Next finished job, aborting the engine if the run is cancelled or the camera goes away meanwhile. */
+static ue_job_t *run_wait(run_t *rc)
+{
+    for (;;) {
+        ue_job_t *j = ue_wait(200);
+        if (j) return j;
+        if (cancel_flag || !rc->src->connected(rc->src)) ue_set_abort(true);
+    }
+}
+
+/* A job whose parts have all been uploaded (or failed): complete it, verify it, then the journal entry and
+ * the ledger commit (§2.1.5 order: object verified -> journal entry -> ledger commit). */
+static void run_finish(run_t *rc, ue_job_t *dj)
+{
+    flight_t *f = ue_job_user(dj);
+    const cam_object_t *o = f->o;
+    char b3hex[65], err[96] = "";
+    uint64_t size = 0;
+    rc->inflight--;
+    esp_err_t e = ue_finish(dj, b3hex, &size, err, sizeof err);
+    f->job = NULL;
+    rrc_ledger_rec lr = {.source_id = rc->src->source_id, .source_path = o->path, .size = o->size, .mtime = o->mtime, .relkey = f->relkey, .blake3_hex = "", .seq = 0, .ts = 0};
+    if (e != ESP_OK) {
+        if (!cancel_flag && rc->src->connected(rc->src)) set_error("%s: %s", f->relkey, err);
+        ST_LOCK(); st.run_failed++; ST_UNLOCK();
+        rc->consecutive_failures++;
+        return;
+    }
+    /* Peek, encode, append: the seq is committed by the append (store.h), so an encode/append failure leaves
+     * no gap and a reboot cannot reuse it. */
+    uint64_t seq = store_journal_next_seq();
+    int64_t ts = rrc_s3_server_now(&s3);
+    rrc_journal_put_original je = {.seq = seq, .ts = ts, .device = app_device_id(), .bucket_key = f->key, .vv_self = 1, .size = size,
+                                   .blake3_hex = b3hex, .content_id_hex = b3hex, .has_mtime = o->mtime > 0, .mtime = o->mtime};
+    char line[1200];
+    if (rrc_journal_encode_put_original(&je, line, sizeof line) < 0 || store_journal_append_pending(line) != ESP_OK) {
+        set_error("%s: journal append failed (flash full?) — object is in the bucket and will be adopted by the worker", f->relkey);
+        ST_LOCK(); st.run_failed++; ST_UNLOCK();
+        return;
+    }
+    lr.status = RRC_LEDGER_UPLOADED; lr.blake3_hex = b3hex; lr.seq = seq; lr.ts = ts;
+    store_ledger_append(&lr);
+    store_kv_set_u64("manifest_dirty", 1);
+    rc->consecutive_failures = 0;
+    ST_LOCK(); st.run_done++; st.run_bytes += size; st.lifetime_uploaded++; st.lifetime_bytes += size; ST_UNLOCK();
+    log_ring_printf("uploaded %s (%llu bytes)", f->relkey, (unsigned long long)size);
+    if (store_journal_pending_entries() >= SEGMENT_FREEZE_ENTRIES || store_journal_pending_bytes() >= SEGMENT_FREEZE_BYTES) {
+        uint64_t first; store_journal_freeze(&first);
+    }
+}
+
+static void run_complete_one(run_t *rc) { run_finish(rc, run_wait(rc)); }
+
+/* Decides what to do with one camera object (skip it, or start uploading it). */
+static void run_submit(run_t *rc, const cam_object_t *o)
+{
+    cam_source_t *src = rc->src;
+    char dir[512] = "";
+    const char *slash = strrchr(o->path, '/');
+    if (slash) { size_t dl = (size_t)(slash - o->path); if (dl >= sizeof dir) dl = sizeof dir - 1; memcpy(dir, o->path, dl); dir[dl] = 0; }
+    rrc_template_vars tv = {.name = o->name, .path = dir, .model = src->model, .serial = src->serial, .when = o->mtime};
+    flight_t *f = NULL;
+    for (int k = 0; k < RUN_WINDOW; k++) if (!rc->fl[k].job) { f = &rc->fl[k]; break; }
+    if (!f) return;   /* cannot happen: the caller checks the window */
+    rrc_relkey_err re = rrc_template_expand(rc->cfg->key_template, &tv, f->relkey, sizeof f->relkey);
+    if (re != RRC_RELKEY_OK) { set_error("%s: unsyncable key (%s)", o->path, rrc_relkey_err_str(re)); ST_LOCK(); st.run_failed++; ST_UNLOCK(); return; }
+    rrc_key_library(f->relkey, f->key, sizeof f->key);
+    /* A photo that is still uploading from the other card slot has to land (and be recorded) before this
+     * one is judged: if that upload failed, this copy must still go. */
+    for (;;) {
+        bool twin = false;
+        for (int k = 0; k < RUN_WINDOW; k++) if (rc->fl[k].job && &rc->fl[k] != f && !strcmp(rc->fl[k].relkey, f->relkey)) twin = true;
+        if (!twin) break;
+        run_complete_one(rc);
+    }
+    /* Dual-slot bodies (Nikon "backup" to the second card) list the same photo twice under two storages;
+     * the copies are not byte-identical, so only the first one seen is the library's. Record the mirror so
+     * it is never retried. */
+    if (store_ledger_relkey_uploaded(f->relkey, o->size)) {
+        rrc_ledger_rec mirror = {.source_id = src->source_id, .source_path = o->path, .size = o->size, .mtime = o->mtime, .relkey = f->relkey, .blake3_hex = "", .seq = 0, .ts = 0, .status = RRC_LEDGER_REMOTE_EXISTS};
+        log_ring_printf("skip %s: the same photo was already uploaded from this camera's other card slot", f->relkey);
+        store_ledger_append(&mirror);
+        ST_LOCK(); st.run_skipped++; ST_UNLOCK();
+        return;
+    }
+    /* HEAD: already in the bucket? */
+    rrc_s3_result_t hr;
+    if (rrc_s3_head(&s3, f->key, &hr) != ESP_OK) { set_error("%s: HEAD failed (%d)", f->relkey, hr.status); ST_LOCK(); st.run_failed++; ST_UNLOCK(); rc->consecutive_failures++; return; }
+    if (hr.status == 200 && strcmp(hr.meta_device, app_device_id()) != 0) {
+        rrc_ledger_rec lr = {.source_id = src->source_id, .source_path = o->path, .size = o->size, .mtime = o->mtime, .relkey = f->relkey, .blake3_hex = "", .seq = 0, .ts = 0};
+        if (hr.content_length >= 0 && (uint64_t)hr.content_length == o->size) {
+            lr.status = RRC_LEDGER_REMOTE_EXISTS;
+            log_ring_printf("skip %s: already in library (another device)", f->relkey);
+        } else {
+            lr.status = RRC_LEDGER_COLLISION;
+            log_ring_printf("skip %s: a different file already uses this key (%lld bytes vs %llu)", f->relkey, (long long)hr.content_length, (unsigned long long)o->size);
+        }
+        store_ledger_append(&lr);
+        ST_LOCK(); st.run_skipped++; ST_UNLOCK();
+        return;
+    }
+    /* 404, or a 200 that is OUR earlier (unjournaled) upload -> (re)upload idempotently. */
+    char err[96] = "";
+    f->o = o;
+    f->job = ue_submit(src, o, f->key, f, err, sizeof err);
+    if (!f->job) { set_error("%s: %s", f->relkey, err); ST_LOCK(); st.run_failed++; ST_UNLOCK(); rc->consecutive_failures++; return; }
+    rc->inflight++;
+}
+
+
 static void sync_run(cam_source_t *src)
 {
     if (!s3_ready) { run_deferred = true; set_error("cloud not configured — pair or enter S3 settings first; the sync starts once it is"); return; }
@@ -879,80 +537,22 @@ static void sync_run(cam_source_t *src)
     if (ec.n > 1) qsort(ec.items, ec.n, sizeof ec.items[0], cmp_obj);
     ST_LOCK(); st.run_total = (uint32_t)ec.n; st.phase = SYNC_UPLOADING; ST_UNLOCK();
     log_ring_printf("sync: %u new file(s) to upload", (unsigned)ec.n);
-    const app_config_t *cfg = app_config_get();
-    int consecutive_failures = 0;
-    for (size_t i = 0; i < ec.n && !cancel_flag && src->connected(src); i++) {
-        if (consecutive_failures >= 5) { set_error("aborting run after %d consecutive failures", consecutive_failures); break; }
-        cam_object_t *o = &ec.items[i];
-        ST_LOCK(); scpy(st.current_file, sizeof st.current_file, o->path); st.current_size = o->size; st.current_done = 0; ST_UNLOCK();
-        /* key */
-        char dir[512] = "";
-        const char *slash = strrchr(o->path, '/');
-        if (slash) { size_t dl = (size_t)(slash - o->path); if (dl >= sizeof dir) dl = sizeof dir - 1; memcpy(dir, o->path, dl); dir[dl] = 0; }
-        rrc_template_vars tv = {.name = o->name, .path = dir, .model = src->model, .serial = src->serial, .when = o->mtime};
-        char relkey[RRC_RELKEY_MAX], key[RRC_RELKEY_MAX + 16];
-        rrc_relkey_err re = rrc_template_expand(cfg->key_template, &tv, relkey, sizeof relkey);
-        if (re != RRC_RELKEY_OK) { set_error("%s: unsyncable key (%s)", o->path, rrc_relkey_err_str(re)); ST_LOCK(); st.run_failed++; ST_UNLOCK(); continue; }
-        rrc_key_library(relkey, key, sizeof key);
-        /* Dual-slot bodies (Nikon "backup" to the second card) list the same photo
-         * twice under two storages; the copies are not byte-identical, so only the
-         * first one seen is the library's. Record the mirror so it is never retried. */
-        if (store_ledger_relkey_uploaded(relkey, o->size)) {
-            rrc_ledger_rec mirror = {.source_id = src->source_id, .source_path = o->path, .size = o->size, .mtime = o->mtime, .relkey = relkey, .blake3_hex = "", .seq = 0, .ts = 0, .status = RRC_LEDGER_REMOTE_EXISTS};
-            log_ring_printf("skip %s: the same photo was already uploaded from this camera's other card slot", relkey);
-            store_ledger_append(&mirror);
-            ST_LOCK(); st.run_skipped++; ST_UNLOCK();
-            continue;
+    run_t rc = {.src = src, .cfg = app_config_get()};
+    rc.fl = calloc(RUN_WINDOW, sizeof *rc.fl);
+    if (!rc.fl) { set_error("out of memory"); free(ec.items); set_phase(SYNC_ERROR); return; }
+    /* Up to RUN_WINDOW files in flight: while earlier ones upload, the next are checked against the
+     * bucket and read from the camera, so neither the camera nor the network waits on a round trip. */
+    size_t next = 0;
+    while (true) {
+        while (next < ec.n && rc.inflight < RUN_WINDOW && !cancel_flag && src->connected(src) && rc.consecutive_failures < 5) {
+            run_submit(&rc, &ec.items[next++]);
         }
-        /* HEAD: already in the bucket? */
-        rrc_s3_result_t hr;
-        if (rrc_s3_head(&s3, key, &hr) != ESP_OK) { set_error("%s: HEAD failed (%d)", relkey, hr.status); ST_LOCK(); st.run_failed++; ST_UNLOCK(); consecutive_failures++; continue; }
-        rrc_ledger_rec lr = {.source_id = src->source_id, .source_path = o->path, .size = o->size, .mtime = o->mtime, .relkey = relkey, .blake3_hex = "", .seq = 0, .ts = 0};
-        if (hr.status == 200 && strcmp(hr.meta_device, app_device_id()) != 0) {
-            if (hr.content_length >= 0 && (uint64_t)hr.content_length == o->size) {
-                lr.status = RRC_LEDGER_REMOTE_EXISTS;
-                log_ring_printf("skip %s: already in library (another device)", relkey);
-            } else {
-                lr.status = RRC_LEDGER_COLLISION;
-                log_ring_printf("skip %s: a different file already uses this key (%lld bytes vs %llu)", relkey, (long long)hr.content_length, (unsigned long long)o->size);
-            }
-            store_ledger_append(&lr);
-            ST_LOCK(); st.run_skipped++; ST_UNLOCK();
-            continue;
-        }
-        /* 404, or a 200 that is OUR earlier (unjournaled) upload → (re)upload idempotently. */
-        char b3hex[65];
-        uint64_t size = 0;
-        e = upload_object(src, o, key, b3hex, &size);
-        if (e != ESP_OK) {
-            ST_LOCK(); st.run_failed++; ST_UNLOCK();
-            consecutive_failures++;
-            if (!src->connected(src) || cancel_flag) break;
-            continue;
-        }
-        /* journal (§2.1.5 order: object verified → journal entry → ledger commit) */
-        /* Peek, encode, append: the seq is committed by the append (store.h), so
-         * an encode/append failure leaves no gap and a reboot cannot reuse it. */
-        uint64_t seq = store_journal_next_seq();
-        int64_t ts = rrc_s3_server_now(&s3);
-        rrc_journal_put_original je = {.seq = seq, .ts = ts, .device = app_device_id(), .bucket_key = key, .vv_self = 1, .size = size,
-                                       .blake3_hex = b3hex, .content_id_hex = b3hex, .has_mtime = o->mtime > 0, .mtime = o->mtime};
-        char line[1200];
-        if (rrc_journal_encode_put_original(&je, line, sizeof line) < 0 || store_journal_append_pending(line) != ESP_OK) {
-            set_error("%s: journal append failed (flash full?) — object is in the bucket and will be adopted by the worker", relkey);
-            ST_LOCK(); st.run_failed++; ST_UNLOCK();
-            continue;
-        }
-        lr.status = RRC_LEDGER_UPLOADED; lr.blake3_hex = b3hex; lr.seq = seq; lr.ts = ts;
-        store_ledger_append(&lr);
-        store_kv_set_u64("manifest_dirty", 1);
-        consecutive_failures = 0;
-        ST_LOCK(); st.run_done++; st.run_bytes += size; st.lifetime_uploaded++; st.lifetime_bytes += size; ST_UNLOCK();
-        log_ring_printf("uploaded %s (%llu bytes)", relkey, (unsigned long long)size);
-        if (store_journal_pending_entries() >= SEGMENT_FREEZE_ENTRIES || store_journal_pending_bytes() >= SEGMENT_FREEZE_BYTES) {
-            uint64_t first; store_journal_freeze(&first);
-        }
+        if (rc.inflight == 0) break;
+        run_complete_one(&rc);
+        if (rc.consecutive_failures >= 5 && !rc.warned) { rc.warned = true; set_error("aborting run after %d consecutive failures", rc.consecutive_failures); }
     }
+    ue_set_abort(false);
+    free(rc.fl);
     free(ec.items);
     ST_LOCK(); st.current_file[0] = 0; st.phase = SYNC_PUBLISHING; ST_UNLOCK();
     bool uploaded_any;
@@ -1162,15 +762,16 @@ static void debug_pipe(int mb, int rate_mb_s)
     snprintf(key, sizeof key, ".rrcloud/tmp/%s-pipetest", app_device_id());
     cancel_flag = false;
     char got_hex[65] = ""; uint64_t size = 0;
+    memset(ue_stats(), 0, sizeof *ue_stats());
     int64_t t0 = esp_timer_get_time();
-    esp_err_t e = upload_object(&src, &o, key, got_hex, &size);
+    esp_err_t e = upload_one(&src, &o, key, got_hex, &size);
     int64_t t1 = esp_timer_get_time();
     double secs = (double)(t1 - t0) / 1e6;
     printf("pipeline %d MiB at %s: %s in %.2f s = %.2f MB/s%s\n", mb, rate_mb_s > 0 ? "emulated camera rate" : "generator speed",
            esp_err_to_name(e), secs, (double)im.size / 1048576.0 / secs, rate_mb_s > 0 ? "" : " (upload-bound)");
     if (rate_mb_s > 0) printf("  camera alone would take %.2f s at %d MB/s; serial read-then-upload would add the upload time on top\n", (double)mb / rate_mb_s, rate_mb_s);
     printf("  stages (overlapping): camera read %.2f s, blake3 %.2f s, md5 %.2f s, upload %.2f s\n",
-           (double)pipe_stats.read_us / 1e6, (double)pipe_stats.hash_us / 1e6, (double)pipe_stats.md5_us / 1e6, (double)pipe_stats.upload_us / 1e6);
+           (double)ue_stats()->read_us / 1e6, (double)ue_stats()->hash_us / 1e6, (double)ue_stats()->md5_us / 1e6, (double)ue_stats()->upload_us / 1e6);
     if (e != ESP_OK) { ST_LOCK(); printf("  error: %s\n", st.last_error); ST_UNLOCK(); return; }
     printf("  pipeline blake3 %s expected\n", strcmp(got_hex, expect) == 0 ? "matches" : "DIFFERS FROM");
     hash_sink_t hs = {0}; rrc_blake3_init(&hs.b3);
@@ -1184,46 +785,6 @@ static void debug_pipe(int mb, int rate_mb_s)
            strcmp(rb, expect) == 0 ? "matches" : "DIFFERS FROM");
     rrc_s3_result_t dr;
     rrc_s3_delete(&s3, key, &dr);
-}
-
-/* Network-only parallel upload test: `nparts` copies of one pre-hashed part through one or both
- * uploaders, nothing else running. Separates what the WAN path can carry from what the dock's CPUs
- * can feed it. Aborts the multipart upload afterwards. */
-static void debug_netpar(int nparts, int nup)
-{
-    if (!s3_ready || !worker_ready) { printf("cloud not configured\n"); return; }
-    run_digest_probe_if_needed();
-    if (nparts < 1) nparts = 8;
-    if (nup < 1 || nup > N_UPLOADERS) nup = N_UPLOADERS;
-    for (size_t i = 0; i < PART_BUF_BYTES; i += 4096) memset(part_bufs[0] + i, (int)(0x30 + (i / 4096) % 64), 4096);
-    uint8_t md5[16], sha[32]; rrc_md5(part_bufs[0], PART_BUF_BYTES, md5); rrc_sha256(part_bufs[0], PART_BUF_BYTES, sha);
-    bool use_sha = s3.sha256_check_known && s3.backend_checks_sha256;
-    char key[160], upload_id[160] = "";
-    snprintf(key, sizeof key, ".rrcloud/tmp/%s-netpar", app_device_id());
-    rrc_s3_result_t res;
-    rrc_kv meta[1] = {{"rrc-device", app_device_id()}};
-    if (rrc_s3_multipart_create(&s3, key, "application/octet-stream", meta, 1, upload_id, sizeof upload_id, &res) != ESP_OK) { printf("multipart create failed\n"); return; }
-    char (*etags)[40] = calloc((size_t)nparts, 40);
-    QueueHandle_t fq = xQueueCreate(nparts + 1, sizeof(int));
-    SemaphoreHandle_t slots = xSemaphoreCreateCounting(nup, nup);
-    w_err = ESP_OK;
-    memset(part_tl, 0, sizeof part_tl); memset(&pipe_stats, 0, sizeof pipe_stats);
-    tl_t0 = esp_timer_get_time();
-    for (int i = 0; i < nparts; i++) {
-        xSemaphoreTake(slots, portMAX_DELAY);
-        int u = !up[0].busy ? 0 : 1;
-        if (nup == 1) u = 0;
-        part_job_t pj = {.key = key, .upload_id = upload_id, .part_no = i + 1, .slot = 0, .data = part_bufs[0], .md5 = md5, .sha = use_sha ? sha : NULL, .len = PART_BUF_BYTES, .etag = etags[i], .free_q = fq, .slots = slots};
-        if (i < 16) part_tl[i].ready = esp_timer_get_time() - tl_t0;
-        up[u].busy = true;
-        xQueueSend(up[u].q, &pj, 0);
-    }
-    worker_quiesce();
-    double secs = (double)(esp_timer_get_time() - tl_t0) / 1e6;
-    double mb = (double)nparts * PART_BUF_BYTES / 1048576.0;
-    printf("network only, %d uploader%s: %d x %u MiB in %.2f s = %.2f MB/s%s\n", nup, nup > 1 ? "s" : "", nparts, (unsigned)(PART_BUF_BYTES >> 20), secs, mb / secs, w_err != ESP_OK ? " (FAILED)" : "");
-    rrc_s3_multipart_abort(&s3, key, upload_id, &res);
-    vQueueDelete(fq); vSemaphoreDelete(slots); free(etags);
 }
 
 /* One real camera object through the real read/hash/upload pipeline to a scratch key
@@ -1242,23 +803,110 @@ static void debug_campipe(const char *arg, uint64_t size)
     char key[160];
     snprintf(key, sizeof key, ".rrcloud/tmp/%s-campipe", app_device_id());
     cancel_flag = false;
-    direct_checked = false;
+    ue_camera_attached();
     char hex[65] = ""; uint64_t got = 0;
+    memset(ue_stats(), 0, sizeof *ue_stats());
     int64_t t0 = esp_timer_get_time();
-    esp_err_t e = upload_object(cam, &o, key, hex, &got);
+    esp_err_t e = upload_one(cam, &o, key, hex, &got);
     double secs = (double)(esp_timer_get_time() - t0) / 1e6;
     printf("camera -> bucket %llu bytes: %s in %.2f s = %.2f MB/s (usb direct %s)\n", (unsigned long long)got, esp_err_to_name(e), secs,
            secs > 0 ? (double)got / 1048576.0 / secs : 0.0, rrc_ptp_direct_enabled() ? "on" : "off");
     printf("  stages (overlapping): camera read %.2f s, blake3 %.2f s, md5 %.2f s, upload %.2f s\n",
-           (double)pipe_stats.read_us / 1e6, (double)pipe_stats.hash_us / 1e6, (double)pipe_stats.md5_us / 1e6, (double)pipe_stats.upload_us / 1e6);
+           (double)ue_stats()->read_us / 1e6, (double)ue_stats()->hash_us / 1e6, (double)ue_stats()->md5_us / 1e6, (double)ue_stats()->upload_us / 1e6);
     if (e != ESP_OK) { ST_LOCK(); printf("  error: %s\n", st.last_error); ST_UNLOCK(); }
     else printf("  blake3 %s\n", hex);
-    for (int i = 0; i < 16 && part_tl[i].end; i++)
-        printf("  part %d: ready %.2f s, upload %c %.2f-%.2f s\n", i + 1, (double)part_tl[i].ready / 1e6, part_tl[i].who, (double)part_tl[i].start / 1e6, (double)part_tl[i].end / 1e6);
     printf("  sync task stack: %u of %u bytes never used; internal heap free %u, largest block %u\n", (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)SYNC_TASK_STACK,
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     rrc_s3_result_t dr;
     rrc_s3_delete(&s3, key, &dr);
+}
+
+/* Several real camera objects through the engine at once ("handle:size handle:size ..."), to scratch keys
+ * under the control prefix (never the library), verified and deleted: what a sync's window of files does. */
+static void debug_multi(const char *list)
+{
+    if (!s3_ready) { printf("cloud not configured\n"); return; }
+    if (!cam || !cam->connected(cam)) { printf("no camera attached\n"); return; }
+    run_digest_probe_if_needed();
+    cam_object_t objs[8]; char keys[8][160]; int n = 0;
+    char *copy = strdup(list), *save = NULL;
+    for (char *tok = strtok_r(copy, " ,", &save); tok && n < 8; tok = strtok_r(NULL, " ,", &save)) {
+        char *colon = strchr(tok, ':');
+        if (!colon) continue;
+        memset(&objs[n], 0, sizeof objs[n]);
+        objs[n].handle = (uint32_t)strtoul(tok, NULL, 16);
+        scpy(objs[n].path, sizeof objs[n].path, tok); scpy(objs[n].name, sizeof objs[n].name, tok);
+        objs[n].size = strtoull(colon + 1, NULL, 10);
+        snprintf(keys[n], sizeof keys[n], ".rrcloud/tmp/%s-multi-%d", app_device_id(), n);
+        n++;
+    }
+    free(copy);
+    ue_set_abort(false);
+    memset(ue_stats(), 0, sizeof *ue_stats());
+    uint64_t bytes = 0; int ok = 0, inflight = 0, next = 0;
+    int64_t t0 = esp_timer_get_time();
+    while (next < n || inflight > 0) {
+        while (next < n && inflight < RUN_WINDOW) {
+            char err[96] = "";
+            if (ue_submit(cam, &objs[next], keys[next], &keys[next], err, sizeof err)) inflight++; else printf("  submit %d failed: %s\n", next, err);
+            next++;
+        }
+        if (!inflight) break;
+        ue_job_t *dj = ue_wait(UINT32_MAX);
+        char *key = ue_job_user(dj), hex[65], err[96] = "";
+        uint64_t sz = 0;
+        esp_err_t e = ue_finish(dj, hex, &sz, err, sizeof err);
+        inflight--;
+        printf("  %s: %s at %.2f s, %llu bytes%s%s\n", key + strlen(".rrcloud/tmp/"), esp_err_to_name(e), (double)(esp_timer_get_time() - t0) / 1e6, (unsigned long long)sz, e ? " — " : "", e ? err : "");
+        if (e == ESP_OK) { ok++; bytes += sz; }
+        rrc_s3_result_t dr; rrc_s3_delete(&s3, key, &dr);
+    }
+    double secs = (double)(esp_timer_get_time() - t0) / 1e6;
+    printf("%d of %d files, %.1f MB in %.2f s = %.2f MB/s (window %d)\n", ok, n, (double)bytes / 1048576.0, secs, secs > 0 ? (double)bytes / 1048576.0 / secs : 0.0, RUN_WINDOW);
+    printf("  stages (summed over files): camera read %.2f s, blake3 %.2f s, checksum %.2f s, upload %.2f s; internal heap %u free\n",
+           (double)ue_stats()->read_us / 1e6, (double)ue_stats()->hash_us / 1e6, (double)ue_stats()->md5_us / 1e6, (double)ue_stats()->upload_us / 1e6,
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+}
+
+/* `count` synthetic files of `mb` MiB each through the engine with a window of RUN_WINDOW, to scratch keys,
+ * verified by size/checksum and deleted: concurrent small files and concurrent large files, no camera. */
+static void debug_pipemulti(int count, int mb)
+{
+    if (!s3_ready) { printf("cloud not configured\n"); return; }
+    run_digest_probe_if_needed();
+    if (count < 1) count = 12;
+    if (count > 40) count = 40;
+    synth_impl_t im = {.size = (uint64_t)(mb > 0 ? mb : 2) * 1024u * 1024u, .rate_kib_s = 0};
+    cam_source_t src = {.kind = "synth", .source_id = "synth", .model = "synthetic", .serial = "0", .impl = &im,
+                        .enumerate = synth_enumerate, .open = synth_open, .read = synth_read, .close = synth_close,
+                        .connected = synth_connected, .release = synth_release};
+    char (*keys)[96] = calloc((size_t)count, 96);
+    cam_object_t o = {.name = "m.bin", .path = "m.bin", .size = im.size};
+    ue_set_abort(false);
+    memset(ue_stats(), 0, sizeof *ue_stats());
+    int ok = 0, bad = 0, inflight = 0, next = 0;
+    int64_t t0 = esp_timer_get_time();
+    while (next < count || inflight > 0) {
+        while (next < count && inflight < RUN_WINDOW) {
+            snprintf(keys[next], 96, ".rrcloud/tmp/%s-pm-%d", app_device_id(), next);
+            char err[96] = "";
+            if (ue_submit(&src, &o, keys[next], keys[next], err, sizeof err)) inflight++; else { bad++; printf("  submit failed: %s\n", err); }
+            next++;
+        }
+        if (!inflight) break;
+        ue_job_t *dj = ue_wait(UINT32_MAX);
+        char *key = ue_job_user(dj), hex[65], err[96] = "";
+        uint64_t sz = 0;
+        esp_err_t e = ue_finish(dj, hex, &sz, err, sizeof err);
+        inflight--;
+        if (e == ESP_OK) ok++; else { bad++; printf("  %s failed: %s\n", key, err); }
+        rrc_s3_result_t dr; rrc_s3_delete(&s3, key, &dr);
+    }
+    double secs = (double)(esp_timer_get_time() - t0) / 1e6;
+    double mbytes = (double)ok * (double)im.size / 1048576.0;
+    printf("%d x %d MiB, window %d: %d ok, %d failed, %.1f MB in %.2f s = %.2f MB/s (%.2f files/s); internal heap %u free\n", count, mb, RUN_WINDOW, ok, bad, mbytes, secs,
+           secs > 0 ? mbytes / secs : 0.0, secs > 0 ? ok / secs : 0.0, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    free(keys);
 }
 
 /* Pure cloud-path throughput: PUT `mb` MiB of pattern from the part buffer to a
@@ -1374,7 +1022,8 @@ static void sync_task(void *arg)
         case CMD_DEBUG_HASH: debug_hash(m.arg ? m.arg : "", m.repeat); free(m.arg); break;
         case CMD_DEBUG_SPEED: debug_speed(m.repeat); break;
         case CMD_DEBUG_PIPE: debug_pipe(m.repeat, m.port); break;
-        case CMD_DEBUG_NETPAR: debug_netpar(m.repeat, m.port); break;
+        case CMD_DEBUG_PIPEMULTI: debug_pipemulti(m.repeat, m.port); break;
+        case CMD_DEBUG_MULTI: debug_multi(m.arg ? m.arg : ""); free(m.arg); break;
         case CMD_DEBUG_CAMPIPE: debug_campipe(m.arg ? m.arg : "", (uint64_t)m.repeat * 1u); free(m.arg); break;
         case CMD_DEBUG_READ: debug_read(m.arg ? m.arg : "", m.repeat, m.port); free(m.arg); break;
         case CMD_DEBUG_TCP: { char *colon = m.arg ? strrchr(m.arg, ':') : NULL; if (colon) { *colon = 0; debug_tcp(m.arg, atoi(colon + 1), m.repeat); } free(m.arg); break; }
@@ -1388,7 +1037,7 @@ void sync_on_camera_event(cam_event_t ev, cam_source_t *src, void *arg)
 {
     (void)arg;
     if (ev == CAM_EV_DETACHED) cancel_flag = true;
-    if (ev == CAM_EV_ATTACHED) direct_checked = false;   /* a new body gets its own check */
+    if (ev == CAM_EV_ATTACHED) ue_camera_attached();   /* a new body gets its own zero-copy USB check */
     msg_t m = {.cmd = ev == CAM_EV_ATTACHED ? CMD_ATTACH : CMD_DETACH, .src = src};
     xQueueSend(q, &m, pdMS_TO_TICKS(100));
 }
@@ -1397,25 +1046,10 @@ esp_err_t sync_init(void)
 {
     st_mtx = xSemaphoreCreateMutex();
     q = xQueueCreate(16, sizeof(msg_t));
-    /* The USB controller DMAs PTP data straight into these (see rrc_ptp_read_partial_direct):
-     * the 12-byte container header precedes the payload in the stream, so the payload
-     * starts 12 bytes into a cache-line-aligned block, and the block has slack for the
-     * line rounding the USB stack applies to the last transfer. */
-    worker_ready = true;
-    up[0].conn = &s3b; up[1].conn = &s3;
-    for (int i = 0; i < N_UPLOADERS; i++) {
-        up[i].q = xQueueCreate(1, sizeof(part_job_t));
-        if (!up[i].q || xTaskCreate(upload_worker, i ? "s3_up1" : "s3_up0", WORKER_STACK, (void *)(intptr_t)i, 4, NULL) != pdPASS) worker_ready = false;
-    }
-    if (!worker_ready) ESP_LOGW(TAG, "upload workers unavailable; parts are uploaded inline");
-    direct_state_boot();
-    size_t al = rrc_ptp_direct_align();
-    for (int i = 0; i < PART_SLOTS; i++) {
-        uint8_t *base = heap_caps_aligned_alloc(al, PART_BUF_BYTES + 12 + 2 * al + 1024, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!base) { ESP_LOGE(TAG, "cannot allocate %u-byte part buffer %d in PSRAM", PART_BUF_BYTES, i); return ESP_ERR_NO_MEM; }
-        part_bufs[i] = base + 12;
-    }
-    part_buf = part_bufs[0];
+    ue_config_t uc = {.ctl = &s3, .conn = {&s3b, &s3c}, .device_id = app_device_id(), .progress = on_progress};
+    esp_err_t ue = ue_init(&uc);
+    if (ue != ESP_OK) { ESP_LOGE(TAG, "upload engine failed to start: %s", esp_err_to_name(ue)); return ue; }
+    part_buf = ue_slot_buf(0);
     ST_LOCK();
     st.lifetime_uploaded = (uint32_t)store_ledger_uploaded_count();
     st.lifetime_bytes = store_ledger_uploaded_bytes();
@@ -1442,7 +1076,14 @@ void sync_debug_read(const char *arg, int mb, int chunk_kib)
     msg_t m = {.cmd = CMD_DEBUG_READ, .arg = a, .repeat = mb, .port = chunk_kib};
     if (xQueueSend(q, &m, 0) != pdTRUE) free(a);
 }
-void sync_debug_netpar(int nparts, int uploaders) { msg_t m = {.cmd = CMD_DEBUG_NETPAR, .repeat = nparts, .port = uploaders}; xQueueSend(q, &m, 0); }
+void sync_debug_pipemulti(int count, int mb) { msg_t m = {.cmd = CMD_DEBUG_PIPEMULTI, .repeat = count, .port = mb}; xQueueSend(q, &m, 0); }
+void sync_debug_multi(const char *list)
+{
+    char *a = strdup(list ? list : "");
+    if (!a) return;
+    msg_t m = {.cmd = CMD_DEBUG_MULTI, .arg = a};
+    if (xQueueSend(q, &m, 0) != pdTRUE) free(a);
+}
 void sync_debug_campipe(const char *handle, int size_bytes)
 {
     char *a = strdup(handle ? handle : "");

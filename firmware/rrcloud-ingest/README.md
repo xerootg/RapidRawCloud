@@ -188,22 +188,24 @@ The upload path is tuned so one TLS stream can fill the 100 Mbit Ethernet port:
   `CONFIG_IDF_EXPERIMENTAL_FEATURES`); at the default 20 MHz the 8 MiB part buffer alone
   held the whole pipeline back.
 
-- **Four-stage pipeline.** A sync reads, hashes and uploads at the same time: a reader
-  task fills one of three 8 MiB PSRAM part buffers from the camera, a BLAKE3 task and an
-  MD5 task each pass over the filled buffer, and the sync task pushes the previous part
-  through TLS. A camera that delivers 3 MB/s therefore syncs at about 3 MB/s instead of
-  the sum of read, hash and upload time. The reader and hash tasks run on PSRAM stacks
-  (internal RAM is short: the hardware AES driver fails to allocate without the 16 KiB).
-  `pipe-test [MiB] [MB/s]` drives the real pipeline from a synthetic camera at an
-  emulated rate; `cam-pipe <handle> <size>` pushes one real camera object through the
-  whole thing to a scratch key outside the library, verifies it and deletes it.
+- **Several files in flight.** The upload engine (`upload_engine.c`) is a persistent
+  pipeline: a reader task fills 6 MiB part buffers from the camera, a BLAKE3 task and a
+  checksum task process them, and two uploader tasks, each with its own TLS connection,
+  pull parts of *any* file off one shared queue. The sync task keeps a window of three
+  files in flight: while earlier ones upload it checks the next against the bucket
+  (HEAD), starts their multipart uploads, and finalizes each one (complete, verify,
+  journal, ledger) as it finishes. So the tail of one file overlaps the head of the next,
+  small files upload two at a time, and a big file uses both connections. Two copies of
+  the same photo (a dual-slot body) are never in flight together: the second waits for
+  the first to be recorded, so a failed first upload cannot cost you the second.
+  Diagnostics: `cam-pipe <handle> <size>` (one real object), `cam-multi <handle:size>...`
+  (several real objects at once) and `pipe-multi [files] [MiB]` (synthetic, no camera)
+  all go through the engine to scratch keys outside the library, verify and delete.
 - **Two upload connections.** One TCP stream over a ~40 ms WAN path carries about
-  6.3 MB/s, two carry about 8.1 MB/s (`net-par [parts] [1|2]` measures this with
-  pre-hashed parts and nothing else running). Multipart parts alternate between two
-  upload tasks, one on its own TLS connection and one borrowing the sync task's, so the
-  sync task is a pure dispatcher. The upload tasks keep internal-RAM stacks (about 21 KB
-  used of 24 KB): the hardware AES-GCM engine only takes DMA-capable buffers and mbedTLS
-  keeps its AAD on the stack.
+  6.3 MB/s and two carry about 8 MB/s. The upload tasks keep internal-RAM stacks (about
+  21 KB used of 24 KB): the hardware AES-GCM engine only takes DMA-capable buffers and
+  mbedTLS keeps its AAD on the stack. The socket table holds 16 sockets: three persistent
+  TLS connections, the web UI and mDNS ran out of the default 10.
 - **Parallel BLAKE3.** BLAKE3 is a tree, so each 6 MiB part is split into aligned 1 MiB
   subtrees that both cores hash, then appended in order (`rrc_blake3_add_subtree`;
   host-tested against the sequential digest). Four 6 MiB part buffers keep both uploads

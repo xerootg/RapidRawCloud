@@ -284,7 +284,15 @@ static int cmd_tasks(int argc, char **argv)
     free(buf);
     return 0;
 }
-static int cmd_net_par(int argc, char **argv) { sync_debug_netpar(argc > 1 ? atoi(argv[1]) : 8, argc > 2 ? atoi(argv[2]) : 2); return 0; }
+static int cmd_cam_multi(int argc, char **argv)
+{
+    char list[256] = "";
+    for (int i = 1; i < argc; i++) { strlcat(list, argv[i], sizeof list); strlcat(list, " ", sizeof list); }
+    if (!list[0]) { printf("usage: cam-multi <handle:size> [<handle:size> ...]   (see cam-ls)\n"); return 1; }
+    sync_debug_multi(list);
+    return 0;
+}
+static int cmd_pipe_multi(int argc, char **argv) { sync_debug_pipemulti(argc > 1 ? atoi(argv[1]) : 12, argc > 2 ? atoi(argv[2]) : 2); return 0; }
 static int cmd_cam_pipe(int argc, char **argv)
 {
     if (argc < 3) { printf("usage: cam-pipe <handle> <size bytes>   (see cam-ls)\n"); return 1; }
@@ -366,7 +374,8 @@ esp_err_t console_start(void)
         {.command = "crypto-bench", .help = "crypto-bench: throughput of SHA-256, MD5 and AES-GCM on this board (internal RAM vs PSRAM)", .func = cmd_crypto_bench},
         {.command = "cam-read", .help = "cam-read <handle|path> [MiB] [chunk KiB]: raw camera read rate (no hash, no upload), USB DMA straight into PSRAM vs bounce+copy", .func = cmd_cam_read},
         {.command = "tasks", .help = "tasks: every task with its stack headroom (words), and the internal heap low-water mark", .func = cmd_tasks},
-        {.command = "net-par", .help = "net-par [parts] [uploaders 1|2]: pre-hashed parts through 1 or 2 upload connections, nothing else running (network ceiling)", .func = cmd_net_par},
+        {.command = "cam-multi", .help = "cam-multi <handle:size>...: several real camera objects through the upload engine at once to scratch keys (not the library), verified and deleted", .func = cmd_cam_multi},
+        {.command = "pipe-multi", .help = "pipe-multi [files] [MiB each]: synthetic files through the upload engine with the sync window (concurrent uploads), no camera", .func = cmd_pipe_multi},
         {.command = "cam-pipe", .help = "cam-pipe <handle> <size>: one real camera object through the whole pipeline to a scratch key (not the library), verified, then deleted", .func = cmd_cam_pipe},
         {.command = "usb-direct", .help = "usb-direct [on|off]: zero-copy USB DMA reads on/off (A/B for diagnostics)", .func = cmd_usb_direct},
         {.command = "pipe-test", .help = "pipe-test [MiB] [MB/s]: push a synthetic object through the real read-ahead/upload pipeline at an emulated camera rate (0 = unthrottled), verify by read-back", .func = cmd_pipe_test},
