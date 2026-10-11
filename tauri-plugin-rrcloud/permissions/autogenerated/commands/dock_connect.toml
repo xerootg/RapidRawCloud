@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-dock-connect"
+description = "Enables the dock_connect command without any pre-configured scope."
+commands.allow = ["dock_connect"]
+
+[[permission]]
+identifier = "deny-dock-connect"
+description = "Denies the dock_connect command without any pre-configured scope."
+commands.deny = ["dock_connect"]

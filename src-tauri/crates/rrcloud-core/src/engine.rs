@@ -215,7 +215,7 @@ pub enum EngineError {
 /// letter), so this is total in practice; the `Result` keeps the
 /// no-panic contract honest.
 pub fn sidecar_item_relkey(image: &RelKey) -> Result<RelKey, KeyError> {
-    RelKey::new(format!("{image}.rrdata"))
+    Ok(RelKey::new(format!("{image}.rrdata"))?)
 }
 
 /// The items-table key of `image`'s **virtual-copy sidecar** with
@@ -225,7 +225,7 @@ pub fn vc_item_relkey(image: &RelKey, vc6: &str) -> Result<RelKey, KeyError> {
     if !crate::hexutil::is_lower_hex(vc6, 6) {
         return Err(KeyError::BadVcSuffix(vc6.to_string()));
     }
-    RelKey::new(format!("{image}.{vc6}.rrdata"))
+    Ok(RelKey::new(format!("{image}.{vc6}.rrdata"))?)
 }
 
 /// The deterministic §2.6 loser virtual-copy suffix:
@@ -264,7 +264,7 @@ pub fn original_conflict_relkey(
         Some((stem, ext)) => format!("{dir}{stem}.conflict-{h6}.{ext}"),
         None => format!("{dir}{name}.conflict-{h6}"),
     };
-    Ok(RelKey::new(spelled)?)
+    Ok(RelKey::new(spelled).map_err(KeyError::from)?)
 }
 
 /// The items-table key a classified bucket key addresses (`None` for
@@ -1214,12 +1214,14 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                 txn.remove_deleted(item)?;
             }
             // xmp download policy is P2: metadata recording only. Note: ORIGINALS
-            // are enqueued here too, but the app-layer cycle's stub policy
-            // (`sync::manager::Configured::stub_pending_originals`, §3.5) turns
-            // unpinned PendingDown originals into cloud stubs and dequeues them
-            // before `pump_downloads` runs, so they hydrate on demand rather than
-            // downloading eagerly. The engine itself stays download-everything;
-            // the stub-vs-download *policy* lives in the app.
+            // are enqueued here too, but the client cycles' stub policy
+            // (`crate::transfer::stub_pending_originals`, §3.5 — called by both
+            // the desktop `sync::manager` cycle and the Android bridge cycle)
+            // turns unpinned PendingDown originals into cloud stubs and dequeues
+            // them before `pump_downloads` runs, so they hydrate on demand rather
+            // than downloading eagerly. The engine itself stays
+            // download-everything; the stub-vs-download *policy* lives in the
+            // cycle that calls it (the preview worker never does).
             if kind != Kind::Xmp {
                 txn.queue_push(Queue::Down, item, transfer_class(kind))?;
             }

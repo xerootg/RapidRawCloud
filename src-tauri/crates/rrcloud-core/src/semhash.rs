@@ -17,9 +17,14 @@
 //! on parse failure, and hashing that default would make a corrupt file look
 //! like a deliberate "reset everything" edit.
 
-use std::fmt;
-
-use serde::{Deserialize, Serialize};
+/// The three 64-char lowercase-hex hash newtypes are the generated
+/// `rrcloud-proto` SDK's: [`SemHash`] (the §2.5 semantic hash),
+/// [`ContentId`] (identity of an *original's* bytes, keys previews/thumbs)
+/// and [`Blake3Hex`] (the journal's `blake3` field — any uploaded object's
+/// digest). All three validate on decode, so a malformed or uppercase
+/// digest from a foreign/buggy writer surfaces at decode time, never as a
+/// silently never-equal string.
+pub use rrcloud_proto::{Blake3Hex, ContentId, SemHash};
 
 /// Error from [`sem_hash`] or the hash-string parsers.
 #[derive(Debug, thiserror::Error)]
@@ -36,174 +41,14 @@ pub enum SemHashError {
     InvalidHash(String),
 }
 
-/// A semantic hash of a sidecar document: lowercase hex blake3 (64 chars) of
-/// the canonical projection described in the module docs.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct SemHash(String);
-
-impl SemHash {
-    /// Validates `s` as 64 lowercase hex characters and wraps it.
-    pub fn parse(s: impl Into<String>) -> Result<Self, SemHashError> {
-        let s = s.into();
-        if is_lower_hex64(&s) {
-            Ok(SemHash(s))
-        } else {
-            Err(SemHashError::InvalidHash(s))
+impl From<rrcloud_proto::ProtoError> for SemHashError {
+    /// The SDK's scalar rejection, as the engine's hash error (the only
+    /// `ProtoError` a hash constructor produces is `Invalid`).
+    fn from(e: rrcloud_proto::ProtoError) -> Self {
+        match e {
+            rrcloud_proto::ProtoError::Invalid { value, .. } => SemHashError::InvalidHash(value),
+            other => SemHashError::InvalidHash(other.to_string()),
         }
-    }
-
-    /// The lowercase hex form.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-/// `true` when `s` is exactly 64 lowercase hex characters.
-fn is_lower_hex64(s: &str) -> bool {
-    crate::hexutil::is_lower_hex(s, 64)
-}
-
-impl TryFrom<String> for SemHash {
-    type Error = SemHashError;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        Self::parse(s)
-    }
-}
-
-impl From<SemHash> for String {
-    fn from(h: SemHash) -> String {
-        h.0
-    }
-}
-
-impl fmt::Display for SemHash {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// A content identity: full lowercase hex blake3 of a file's bytes
-/// (64 chars, prefix-free; §1.2). Previews and thumbs are keyed by it.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct ContentId(String);
-
-impl ContentId {
-    /// Hashes `bytes` with blake3 into a content id.
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        ContentId(blake3::hash(bytes).to_hex().to_string())
-    }
-
-    /// A content id naming the same bytes as `digest` — a §1.2 content id
-    /// *is* the full-file blake3, so this is a relabeling, not a rehash.
-    /// Used by the §2.4 upload path, whose running hash is computed
-    /// streaming (no contiguous buffer ever exists to pass to
-    /// [`ContentId::from_bytes`]).
-    pub fn from_blake3(digest: &Blake3Hex) -> Self {
-        ContentId(digest.as_str().to_owned())
-    }
-
-    /// Validates `s` as 64 lowercase hex characters and wraps it.
-    pub fn parse(s: impl Into<String>) -> Result<Self, SemHashError> {
-        let s = s.into();
-        if is_lower_hex64(&s) {
-            Ok(ContentId(s))
-        } else {
-            Err(SemHashError::InvalidHash(s))
-        }
-    }
-
-    /// The lowercase hex form.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for ContentId {
-    type Error = SemHashError;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        Self::parse(s)
-    }
-}
-
-impl From<ContentId> for String {
-    fn from(c: ContentId) -> String {
-        c.0
-    }
-}
-
-impl fmt::Display for ContentId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-/// A full blake3 digest of transferred bytes: 64 lowercase hex characters.
-///
-/// This is the type of the journal's `blake3` field (§2.2). It is kept
-/// distinct from [`ContentId`] (the identity of an *original's* bytes, used
-/// to key previews/thumbs) because a `blake3` can cover any uploaded object
-/// — a sidecar, a thumbpack, a manifest read-back — not just originals.
-///
-/// Validated on decode exactly like [`SemHash`]/[`ContentId`]: the
-/// attestation gate for LRU eviction (§3.5), verify-state checks (§2.4) and
-/// manifest-row merge (§2.3) all compare this field, and a malformed or
-/// uppercase digest from a foreign/buggy writer must surface at decode time,
-/// not as a silently never-equal string.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct Blake3Hex(String);
-
-impl Blake3Hex {
-    /// Hashes `bytes` with blake3 into a digest.
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        Blake3Hex(blake3::hash(bytes).to_hex().to_string())
-    }
-
-    /// Wraps an already-finalized blake3 hash (infallible by construction:
-    /// `to_hex` is always 64 lowercase hex characters). This is the
-    /// streaming-hash path of the §2.4 transfer engine, whose running
-    /// digest covers bytes that never exist in one buffer.
-    pub fn from_hash(hash: &blake3::Hash) -> Self {
-        Blake3Hex(hash.to_hex().to_string())
-    }
-
-    /// Validates `s` as 64 lowercase hex characters and wraps it.
-    pub fn parse(s: impl Into<String>) -> Result<Self, SemHashError> {
-        let s = s.into();
-        if is_lower_hex64(&s) {
-            Ok(Blake3Hex(s))
-        } else {
-            Err(SemHashError::InvalidHash(s))
-        }
-    }
-
-    /// The lowercase hex form.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl TryFrom<String> for Blake3Hex {
-    type Error = SemHashError;
-
-    fn try_from(s: String) -> Result<Self, Self::Error> {
-        Self::parse(s)
-    }
-}
-
-impl From<Blake3Hex> for String {
-    fn from(b: Blake3Hex) -> String {
-        b.0
-    }
-}
-
-impl fmt::Display for Blake3Hex {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
     }
 }
 
@@ -368,8 +213,7 @@ fn write_json_string(s: &str, out: &mut String) {
 /// Invalid JSON or a non-object root is an error — never a default.
 pub fn sem_hash(sidecar_json_bytes: &[u8]) -> Result<SemHash, SemHashError> {
     let canonical = semantic_document(sidecar_json_bytes)?;
-    let hex = blake3::hash(canonical.as_bytes()).to_hex().to_string();
-    Ok(SemHash(hex))
+    Ok(SemHash::from_bytes(canonical.as_bytes()))
 }
 
 /// The **canonical semantic document** of a sidecar (§2.5): the

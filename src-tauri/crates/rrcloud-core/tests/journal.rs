@@ -6,6 +6,7 @@
 //! and the tombstone document.
 
 use rrcloud_core::clock::{DeviceId, VersionVector};
+use rrcloud_core::journal::JournalEntryExt as _;
 use rrcloud_core::journal::{
     decode_segment, encode_segment, format_segment_filename, parse_segment_filename, JournalEntry,
     JournalError, Kind, Op, SegmentFilename, Tombstone, JOURNAL_VERSION, SEGMENT_MAX_BYTES,

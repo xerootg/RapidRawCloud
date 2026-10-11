@@ -4,7 +4,33 @@ use tauri::{
     AppHandle, Runtime,
 };
 
-use crate::commands::DcimAccessStatus;
+use serde::{Deserialize, Serialize};
+
+use crate::commands::{DcimAccessStatus, DockRpcReply};
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DockAddressArgs {
+    address: String,
+}
+
+/// The Kotlin side takes and returns bodies as JSON *text* (`bodyJson`) so
+/// arbitrary documents cross the invoke bridge without a typed schema.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DockRpcArgs {
+    method: String,
+    path: String,
+    body_json: Option<String>,
+    auth: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DockRpcRaw {
+    status: i32,
+    body_json: String,
+}
 
 /// Initializes the Kotlin plugin class. `RrcloudPlugin` (package
 /// `com.plugin.rrcloud`, matching the JNI bridge's package in
@@ -49,5 +75,53 @@ impl<R: Runtime> Rrcloud<R> {
         self.0
             .run_mobile_plugin("checkPartialMediaAccess", ())
             .map_err(Into::into)
+    }
+
+    pub fn dock_scan_start(&self) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin("dockScanStart", ())
+            .map_err(Into::into)
+    }
+
+    pub fn dock_scan_stop(&self) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin("dockScanStop", ())
+            .map_err(Into::into)
+    }
+
+    pub fn dock_connect(&self, address: String) -> crate::Result<rrcloud_proto::DockBleInfo> {
+        self.0
+            .run_mobile_plugin("dockConnect", DockAddressArgs { address })
+            .map_err(Into::into)
+    }
+
+    pub fn dock_disconnect(&self) -> crate::Result<()> {
+        self.0
+            .run_mobile_plugin("dockDisconnect", ())
+            .map_err(Into::into)
+    }
+
+    pub fn dock_rpc(
+        &self,
+        method: String,
+        path: String,
+        body: Option<serde_json::Value>,
+        auth: Option<String>,
+    ) -> crate::Result<DockRpcReply> {
+        let body_json = body.map(|b| b.to_string());
+        let raw: DockRpcRaw = self.0.run_mobile_plugin(
+            "dockRpc",
+            DockRpcArgs {
+                method,
+                path,
+                body_json,
+                auth,
+            },
+        )?;
+        let body = serde_json::from_str(&raw.body_json).unwrap_or(serde_json::Value::Null);
+        Ok(DockRpcReply {
+            status: raw.status,
+            body,
+        })
     }
 }

@@ -11,6 +11,8 @@ links = "tauri-plugin-rrcloud"
 [dependencies]
 tauri = { version = "2.11.3" }
 serde = "1.0"
+serde_json = "1"
+rrcloud-proto = { path = "../protocol/gen/rust/rrcloud-proto" }
 thiserror = "2"
 
 [build-dependencies]

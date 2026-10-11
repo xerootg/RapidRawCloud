@@ -1,0 +1,12 @@
+library_original	2026/10/IMG_0001.NEF	library/2026/10/IMG_0001.NEF
+sidecar	2026/10/IMG_0001.NEF	library/2026/10/IMG_0001.NEF.rrdata
+vc_sidecar	2026/10/IMG_0001.NEF|abc123	library/2026/10/IMG_0001.NEF.abc123.rrdata
+journal_segment	0f6b2a1e-1111-4222-8333-944444444444|412	.rrcloud/v1/journal/0f6b2a1e-1111-4222-8333-944444444444/000000000000019c.v1.ndjson
+manifest	0f6b2a1e-1111-4222-8333-944444444444	.rrcloud/v1/manifests/0f6b2a1e-1111-4222-8333-944444444444.json.gz
+device_registry	0f6b2a1e-1111-4222-8333-944444444444	.rrcloud/v1/devices/0f6b2a1e-1111-4222-8333-944444444444.json
+device_retired	0f6b2a1e-1111-4222-8333-944444444444	.rrcloud/v1/devices/0f6b2a1e-1111-4222-8333-944444444444.retired
+tombstone	2026/10/IMG_0001.NEF	.rrcloud/v1/tombstones/0bc8e8c6a22020a81787787c8a79dc06.json
+preview	6a0f8e2d3c4b5a69788796a5b4c3d2e1f0f1e2d3c4b5a69788796a5b4c3d2e1f	.rrcloud/v1/previews/6a0f8e2d3c4b5a69788796a5b4c3d2e1f0f1e2d3c4b5a69788796a5b4c3d2e1f.pxy.dng
+thumb	6a0f8e2d3c4b5a69788796a5b4c3d2e1f0f1e2d3c4b5a69788796a5b4c3d2e1f|medium	.rrcloud/v1/thumbs/6a0f8e2d3c4b5a69788796a5b4c3d2e1f0f1e2d3c4b5a69788796a5b4c3d2e1f_medium.jpg
+thumbpack	2026/10	.rrcloud/v1/thumbpacks/5cc8170fa62d44a02044b866e03d9bd1.tar
+pairing_user_config	alice	users/alice/config.json

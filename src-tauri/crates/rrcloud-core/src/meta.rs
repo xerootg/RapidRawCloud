@@ -255,7 +255,7 @@ fn relativize_path_str(s: &str, sync_root: &Path) -> Option<String> {
 fn localize_path_str(s: &str, sync_root: &Path) -> Result<String, MetaError> {
     match s.strip_prefix(RR_SCHEME) {
         Some(rest) => {
-            let rk = RelKey::parse_wire(rest.to_string())?;
+            let rk = RelKey::parse_wire(rest.to_string()).map_err(KeyError::from)?;
             Ok(local_path(&rk, sync_root).to_string_lossy().into_owned())
         }
         None => Ok(s.to_string()),

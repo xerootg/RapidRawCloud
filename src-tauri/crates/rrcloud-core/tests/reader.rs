@@ -18,6 +18,7 @@ use common::sync::{
 };
 use futures::FutureExt as _;
 use rrcloud_core::clock::DeviceId;
+use rrcloud_core::journal::JournalEntryExt as _;
 use rrcloud_core::keys::{journal_segment_key, CONTROL_PREFIX};
 use rrcloud_core::publisher::{enqueue_entry, publish_pending};
 use rrcloud_core::reader::{

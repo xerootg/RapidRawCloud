@@ -6,7 +6,8 @@
   edits to the minimum the architecture promises (plugin registration +
   gradle dep lines only).
 -->
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <!-- DCIM watch (§5.2): full access pre-API33, the split
          images/video grant API33+, and the Android 14 partial-selection
          grant this plugin detects (RrcloudPlugin.checkPartialMediaAccess). -->
@@ -27,6 +28,16 @@
     <!-- §5.3: the sync progress / "N edits not backed up" notification
          channels (runtime-requested on Android 13+, RrcloudPlugin.load). -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Camera dock setup over Bluetooth LE (DockBleClient). Android 12+ uses
+         the dedicated BLUETOOTH_SCAN/CONNECT runtime permissions; older
+         releases gate BLE scanning behind fine location. -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
 
     <application>
         <service

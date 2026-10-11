@@ -1,4 +1,6 @@
 import { useEffect, useState } from 'react';
+import DockSection from './DockSection';
+import { useIsAndroid } from '../../../hooks/useOsPlatform';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { useSettingsStore } from '../../../store/useSettingsStore';
@@ -155,6 +157,7 @@ export default function SyncSettingsSection() {
   };
 
   const credsConfigured = status?.credentialsConfigured ?? false;
+  const isAndroid = useIsAndroid();
 
   return (
     <div className="flex flex-col gap-6">
@@ -191,6 +194,8 @@ export default function SyncSettingsSection() {
           </p>
         )}
       </section>
+
+      {isAndroid && <DockSection />}
 
       <section className="flex flex-col gap-3">
         <h3 className="text-text-primary font-medium">Cloud Sync</h3>

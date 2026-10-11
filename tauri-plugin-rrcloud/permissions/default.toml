@@ -3,4 +3,10 @@ description = "Default permissions for the plugin"
 permissions = [
     "allow-sync-start-foreground-sync",
     "allow-sync-dcim-access-status",
+    "allow-dock-scan-start",
+    "allow-dock-scan-stop",
+    "allow-dock-connect",
+    "allow-dock-disconnect",
+    "allow-dock-rpc",
+    "allow-plugin-events",
 ]

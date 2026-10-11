@@ -1,0 +1,43 @@
+name: 'Protocol: definition, generated SDKs, conformance'
+
+on:
+  push:
+    branches: [main]
+    paths: ['protocol/**', 'src-tauri/crates/rrcloud-core/tests/proto_conformance.rs', '.github/workflows/protocol.yml']
+  pull_request:
+    paths: ['protocol/**', 'src-tauri/crates/rrcloud-core/tests/proto_conformance.rs', '.github/workflows/protocol.yml']
+  workflow_dispatch:
+
+jobs:
+  generated-output-is-current:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 protocol/rrcgen --check
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            protocol/tests/rust
+            src-tauri/crates/rrcloud-core
+      - name: Generated crate + SDK conformance
+        run: cd protocol/tests/rust && cargo test
+      - name: Engine vs SDK conformance
+        run: cd src-tauri/crates/rrcloud-core && cargo test --test proto_conformance --test firmware_interop
+
+  c-cpp:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          cmake -S protocol/tests/c -B protocol/tests/c/build
+          cmake --build protocol/tests/c/build
+          ctest --test-dir protocol/tests/c/build --output-on-failure

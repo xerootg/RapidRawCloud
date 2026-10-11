@@ -31,6 +31,7 @@ use rrcloud_core::engine::{
     original_conflict_relkey, recently_deleted, reconcile_wholeness, restore_item,
     sidecar_item_relkey, vc_item_relkey, ChangeOutcome, EngineConsumer, LocalScan,
 };
+use rrcloud_core::journal::JournalEntryExt as _;
 use rrcloud_core::journal::{JournalEntry, Kind, Op, Tombstone};
 use rrcloud_core::keys::{library_key, sidecar_key, tombstone_key, RelKey};
 use rrcloud_core::manifest::{build_manifest, merge};

@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-dock-rpc"
+description = "Enables the dock_rpc command without any pre-configured scope."
+commands.allow = ["dock_rpc"]
+
+[[permission]]
+identifier = "deny-dock-rpc"
+description = "Denies the dock_rpc command without any pre-configured scope."
+commands.deny = ["dock_rpc"]

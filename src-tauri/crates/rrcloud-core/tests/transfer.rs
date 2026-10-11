@@ -20,6 +20,7 @@ use common::garage;
 use common::sync::{dev, entry, open_db, rel, FakeS3, DEV_B};
 use common::transfer as h;
 use common::transfer::CountingS3;
+use rrcloud_core::journal::JournalEntryExt as _;
 use rrcloud_core::journal::{JournalEntry, Kind, Op, SEGMENT_MAX_BYTES};
 use rrcloud_core::keys::{library_key, sidecar_key, thumb_key, ThumbSize};
 use rrcloud_core::publisher::{enqueue_entry, enqueue_entry_in, PublisherError};
