@@ -74,7 +74,7 @@ static char *build_url(const rrc_s3_t *s3, const char *raw_path, const rrc_kv *q
  * at ~0.2 MB/s. This layer keeps one connection per client, sets TCP_NODELAY
  * so the last partial segment of every write is not held back for a delayed
  * ACK, and hands whole 64 KiB slices of the PSRAM part buffer to mbedTLS. */
-#define CONN_WRITE_SLICE (64u * 1024u)
+#define CONN_WRITE_SLICE (8u * 1024u)   /* one TLS record per call: the AES DMA path allocates a record-sized internal bounce buffer, and two uploaders must both find one */
 
 static void conn_close(rrc_s3_t *s3)
 {

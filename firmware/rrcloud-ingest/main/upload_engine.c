@@ -103,10 +103,23 @@ static uint8_t direct_state_get(void)
     if (nvs_open("rrc", NVS_READONLY, &h) == ESP_OK) { nvs_get_u8(h, "usb_direct", &v); nvs_close(h); }
     return v;
 }
+/* Flash writes need a task whose stack is in internal RAM (the cache is off during the write), and the
+ * reader runs on a PSRAM stack, so the write happens on a short-lived helper task. */
+typedef struct { uint8_t v; SemaphoreHandle_t done; } direct_set_t;
+static void direct_state_set_task(void *arg)
+{
+    direct_set_t *d = arg;
+    nvs_handle_t h;
+    if (nvs_open("rrc", NVS_READWRITE, &h) == ESP_OK) { nvs_set_u8(h, "usb_direct", d->v); nvs_commit(h); nvs_close(h); }
+    xSemaphoreGive(d->done);
+    vTaskDelete(NULL);
+}
 void sync_usb_direct_state_set(uint8_t v)
 {
-    nvs_handle_t h;
-    if (nvs_open("rrc", NVS_READWRITE, &h) == ESP_OK) { nvs_set_u8(h, "usb_direct", v); nvs_commit(h); nvs_close(h); }
+    direct_set_t d = { .v = v, .done = xSemaphoreCreateBinary() };
+    if (!d.done) return;
+    if (xTaskCreate(direct_state_set_task, "ue_nvs", 3072, &d, 5, NULL) == pdPASS) xSemaphoreTake(d.done, portMAX_DELAY);
+    vSemaphoreDelete(d.done);
 }
 static void direct_state_boot(void)
 {
