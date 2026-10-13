@@ -1,0 +1,51 @@
+name: pairing
+
+on:
+  push:
+    paths:
+      - 'pairing/**'
+      - '.github/workflows/pairing.yml'
+  pull_request:
+    paths:
+      - 'pairing/**'
+      - '.github/workflows/pairing.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  pairing-tests:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: pairing
+    steps:
+      - uses: actions/checkout@v4
+
+      # Unlike rrcloud-core, this crate does NOT live under src-tauri/, so
+      # src-tauri/rust-toolchain.toml (channel 1.98) is not found when
+      # walking up from pairing/ and plain `stable` is what cargo selects
+      # here. The crate declares rust-version = "1.82"; current stable
+      # satisfies it.
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt,clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: pairing
+
+      - name: cargo fmt
+        run: cargo fmt --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test
+
+      # Same invocation as pairing/Dockerfile; --locked keeps CI honest about
+      # the committed Cargo.lock (the crate is standalone, with its own lock).
+      - name: cargo build --release --locked
+        run: cargo build --release --locked
