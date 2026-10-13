@@ -705,6 +705,14 @@ pub async fn tombstone_gc(
             unstamped += 1;
         }
         let body = match s3.get_object(bucket, key, None).await {
+            // The age GC trusts is the LISTED entry's `LastModified`, but the
+            // body it acts on comes from this later GET, so a peer re-PUTting
+            // the key in between pairs an aged stamp with a fresh body (one
+            // naming a different, live relkey, or a dominating vv). Bind the
+            // two by ETag and retain on mismatch (an unlisted/empty ETag
+            // counts as one): the object's age is unknown this pass and the
+            // next pass lists it fresh — never fall back to `server_ts`.
+            Ok(output) if etag_norm(&output.e_tag) != etag_norm(&obj.e_tag) => continue,
             Ok(output) => output.body.collect_capped(TOMBSTONE_MAX_BYTES).await?,
             // Vanished between LIST and GET (another runner raced us): a
             // stale LIST never forces an action, so skip it.
@@ -716,6 +724,12 @@ pub async fn tombstone_gc(
         let Ok(tomb) = serde_json::from_slice::<Tombstone>(&body) else {
             continue;
         };
+        // Belt and braces for the same LIST→GET race: every destructive step
+        // below is keyed by the body's relkey, so a body that does not hash
+        // to the key it was listed at was never this tombstone — retain it.
+        if tombstone_key(&tomb.relkey) != *key {
+            continue;
+        }
         let content_id = db.get_item(&tomb.relkey)?.and_then(|r| r.content_id);
         candidates.push(TombCandidate {
             tomb,
@@ -1413,6 +1427,12 @@ fn tombstone_age(now: i64, server_ts: i64, last_modified_unix: Option<i64>) -> O
     let asserted = now.saturating_sub(last_modified_unix?);
     let claimed = now.saturating_sub(server_ts);
     Some(claimed.min(asserted).max(0))
+}
+
+/// An ETag made comparable across the listing's `<ETag>` element and the
+/// GET's `ETag` header: quotes stripped, ASCII-lowercased.
+fn etag_norm(e_tag: &str) -> String {
+    crate::s3::xml::strip_etag_quotes(e_tag.trim()).to_ascii_lowercase()
 }
 
 /// Parses a `ListObjectsV2` `LastModified` (RFC 3339 / ISO 8601, e.g.
