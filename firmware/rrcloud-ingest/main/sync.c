@@ -467,7 +467,7 @@ static void run_finish(run_t *rc, ue_job_t *dj)
 static void run_complete_one(run_t *rc) { run_finish(rc, run_wait(rc)); }
 
 /* Decides what to do with one camera object (skip it, or start uploading it). */
-static void run_submit(run_t *rc, const cam_object_t *o)
+static bool run_submit(run_t *rc, const cam_object_t *o, bool may_defer)
 {
     cam_source_t *src = rc->src;
     char dir[512] = "";
@@ -476,9 +476,9 @@ static void run_submit(run_t *rc, const cam_object_t *o)
     rrc_template_vars tv = {.name = o->name, .path = dir, .model = src->model, .serial = src->serial, .when = o->mtime};
     flight_t *f = NULL;
     for (int k = 0; k < RUN_WINDOW; k++) if (!rc->fl[k].job) { f = &rc->fl[k]; break; }
-    if (!f) return;   /* cannot happen: the caller checks the window */
+    if (!f) return true;   /* cannot happen: the caller checks the window */
     rrc_relkey_err re = rrc_template_expand(rc->cfg->key_template, &tv, f->relkey, sizeof f->relkey);
-    if (re != RRC_RELKEY_OK) { set_error("%s: unsyncable key (%s)", o->path, rrc_relkey_err_str(re)); ST_LOCK(); st.run_failed++; ST_UNLOCK(); return; }
+    if (re != RRC_RELKEY_OK) { set_error("%s: unsyncable key (%s)", o->path, rrc_relkey_err_str(re)); ST_LOCK(); st.run_failed++; ST_UNLOCK(); return true; }
     rrc_key_library(f->relkey, f->key, sizeof f->key);
     /* A photo that is still uploading from the other card slot has to land (and be recorded) before this
      * one is judged: if that upload failed, this copy must still go. */
@@ -486,6 +486,7 @@ static void run_submit(run_t *rc, const cam_object_t *o)
         bool twin = false;
         for (int k = 0; k < RUN_WINDOW; k++) if (rc->fl[k].job && &rc->fl[k] != f && !strcmp(rc->fl[k].relkey, f->relkey)) twin = true;
         if (!twin) break;
+        if (may_defer) return false;   /* let the caller try a different file first */
         run_complete_one(rc);
     }
     /* Dual-slot bodies (Nikon "backup" to the second card) list the same photo twice under two storages;
@@ -496,11 +497,11 @@ static void run_submit(run_t *rc, const cam_object_t *o)
         log_ring_printf("skip %s: the same photo was already uploaded from this camera's other card slot", f->relkey);
         store_ledger_append(&mirror);
         ST_LOCK(); st.run_skipped++; st.run_total_bytes -= o->size; ST_UNLOCK();
-        return;
+        return true;
     }
     /* HEAD: already in the bucket? */
     rrc_s3_result_t hr;
-    if (rrc_s3_head(&s3, f->key, &hr) != ESP_OK) { set_error("%s: HEAD failed (%d)", f->relkey, hr.status); ST_LOCK(); st.run_failed++; ST_UNLOCK(); rc->consecutive_failures++; return; }
+    if (rrc_s3_head(&s3, f->key, &hr) != ESP_OK) { set_error("%s: HEAD failed (%d)", f->relkey, hr.status); ST_LOCK(); st.run_failed++; ST_UNLOCK(); rc->consecutive_failures++; return true; }
     if (hr.status == 200 && strcmp(hr.meta_device, app_device_id()) != 0) {
         rrc_ledger_rec lr = {.source_id = src->source_id, .source_path = o->path, .size = o->size, .mtime = o->mtime, .relkey = f->relkey, .blake3_hex = "", .seq = 0, .ts = 0};
         if (hr.content_length >= 0 && (uint64_t)hr.content_length == o->size) {
@@ -512,14 +513,15 @@ static void run_submit(run_t *rc, const cam_object_t *o)
         }
         store_ledger_append(&lr);
         ST_LOCK(); st.run_skipped++; st.run_total_bytes -= o->size; ST_UNLOCK();
-        return;
+        return true;
     }
     /* 404, or a 200 that is OUR earlier (unjournaled) upload -> (re)upload idempotently. */
     char err[96] = "";
     f->o = o;
     f->job = ue_submit(src, o, f->key, f, err, sizeof err);
-    if (!f->job) { set_error("%s: %s", f->relkey, err); ST_LOCK(); st.run_failed++; ST_UNLOCK(); rc->consecutive_failures++; return; }
+    if (!f->job) { set_error("%s: %s", f->relkey, err); ST_LOCK(); st.run_failed++; ST_UNLOCK(); rc->consecutive_failures++; return true; }
     rc->inflight++; ST_LOCK(); st.run_inflight = (uint32_t)rc->inflight; ST_UNLOCK();
+    return true;
 }
 
 
@@ -553,9 +555,16 @@ static void sync_run(cam_source_t *src)
     /* Up to RUN_WINDOW files in flight: while earlier ones upload, the next are checked against the
      * bucket and read from the camera, so neither the camera nor the network waits on a round trip. */
     size_t next = 0;
+    int defers = 0;
     while (true) {
         while (next < ec.n && rc.inflight < RUN_WINDOW && !cancel_flag && src->connected(src) && rc.consecutive_failures < 5) {
-            run_submit(&rc, &ec.items[next++]);
+            size_t idx = next++;
+            /* Dual-slot twins sit next to each other; instead of idling until the first copy lands, move on
+             * to another file and come back (at most RUN_WINDOW swaps in a row, so this cannot spin). */
+            if (!run_submit(&rc, &ec.items[idx], next < ec.n && defers < RUN_WINDOW)) {
+                cam_object_t tmp = ec.items[idx]; ec.items[idx] = ec.items[next]; ec.items[next] = tmp;
+                next = idx; defers++;
+            } else defers = 0;
         }
         if (rc.inflight == 0) break;
         run_complete_one(&rc);

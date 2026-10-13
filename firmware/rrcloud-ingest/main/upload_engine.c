@@ -22,7 +22,7 @@ static const char *TAG = "upload";
 #define READ_CHUNK       (4u * 1024u * 1024u)   /* one GetPartialObject: the Z 7II pays a fixed latency per request */
 #define READER_STACK     16384                  /* reader and hash tasks: PSRAM stacks, they never touch flash */
 #define HASH_STACK       4096
-#define UPLOADER_STACK   (24u * 1024u)          /* TLS handshake uses ~21 KB; INTERNAL RAM, see README */
+#define UPLOADER_STACK   (16u * 1024u)          /* record I/O and request signing only; TLS handshakes run on the s3_open helper (PSRAM stack) */
 #define N_UP             2
 
 struct ue_job {
