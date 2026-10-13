@@ -81,6 +81,6 @@ Notes:
   `$APPCACHE/thumbnails` asset-protocol scope (ARCHITECTURE.md §3.5).
 - P0 keeps `crates/rrcloud-core` standalone (own lockfile, no workspace membership) so the
   upstream manifest stays untouched until the first real consumer lands in P1.
-- Branch model note: the session's push policy only permits the designated work branch, so
-  `main` (= upstream `a82251f`) is cut by the repo owner when merging; this branch carries
-  upstream history + additive commits + hook commits.
+- Branch model note: `main` is the fork's trunk (upstream history from `a82251f` + additive
+  commits + hook commits), not an upstream mirror as ARCHITECTURE.md §7 originally planned. To
+  rebase onto upstream, diff against `CyberTimon/RapidRAW` directly and walk this table.
