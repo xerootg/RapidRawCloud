@@ -24,6 +24,10 @@ typedef struct {
     uint64_t current_size, current_done;
     uint32_t run_total, run_done, run_skipped, run_failed;
     uint64_t run_bytes;
+    uint64_t run_total_bytes, run_read_bytes;   /* to upload / already read from the camera */
+    uint32_t run_inflight;
+    uint32_t run_elapsed_ms;                    /* frozen when the run ends */
+    double stage_read_s, stage_hash_s, stage_sum_s, stage_upload_s;   /* summed over files, stages overlap */
     int64_t last_run_ts;
     int64_t last_heartbeat_ts;
     int64_t last_manifest_ts;

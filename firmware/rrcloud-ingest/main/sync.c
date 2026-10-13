@@ -341,10 +341,16 @@ static void compact_segments(void)
 typedef struct { rrc_blake3_ctx b3; uint64_t n; } hash_sink_t;
 static int hash_sink(void *ctx, const uint8_t *d, size_t n) { hash_sink_t *h = ctx; rrc_blake3_update(&h->b3, d, n); h->n += n; return 0; }
 
+static int64_t run_t0_us, run_end_us;   /* run_end_us == 0 while a run is going */
+
 static void on_progress(void *ctx, const char *path, uint64_t size, uint64_t done)
 {
     (void)ctx;
-    ST_LOCK(); scpy(st.current_file, sizeof st.current_file, path); st.current_size = size; st.current_done = done; ST_UNLOCK();
+    ST_LOCK();
+    /* the reader works through one file at a time, so a drop in `done` (or a new path) starts a file */
+    st.run_read_bytes += (strcmp(st.current_file, path) == 0 && done >= st.current_done) ? done - st.current_done : done;
+    scpy(st.current_file, sizeof st.current_file, path); st.current_size = size; st.current_done = done;
+    ST_UNLOCK();
 }
 
 /* One object through the engine, start to finish (diagnostics; a sync keeps several in flight). */
@@ -425,7 +431,7 @@ static void run_finish(run_t *rc, ue_job_t *dj)
     const cam_object_t *o = f->o;
     char b3hex[65], err[96] = "";
     uint64_t size = 0;
-    rc->inflight--;
+    rc->inflight--; ST_LOCK(); st.run_inflight = (uint32_t)rc->inflight; ST_UNLOCK();
     esp_err_t e = ue_finish(dj, b3hex, &size, err, sizeof err);
     f->job = NULL;
     rrc_ledger_rec lr = {.source_id = rc->src->source_id, .source_path = o->path, .size = o->size, .mtime = o->mtime, .relkey = f->relkey, .blake3_hex = "", .seq = 0, .ts = 0};
@@ -489,7 +495,7 @@ static void run_submit(run_t *rc, const cam_object_t *o)
         rrc_ledger_rec mirror = {.source_id = src->source_id, .source_path = o->path, .size = o->size, .mtime = o->mtime, .relkey = f->relkey, .blake3_hex = "", .seq = 0, .ts = 0, .status = RRC_LEDGER_REMOTE_EXISTS};
         log_ring_printf("skip %s: the same photo was already uploaded from this camera's other card slot", f->relkey);
         store_ledger_append(&mirror);
-        ST_LOCK(); st.run_skipped++; ST_UNLOCK();
+        ST_LOCK(); st.run_skipped++; st.run_total_bytes -= o->size; ST_UNLOCK();
         return;
     }
     /* HEAD: already in the bucket? */
@@ -505,7 +511,7 @@ static void run_submit(run_t *rc, const cam_object_t *o)
             log_ring_printf("skip %s: a different file already uses this key (%lld bytes vs %llu)", f->relkey, (long long)hr.content_length, (unsigned long long)o->size);
         }
         store_ledger_append(&lr);
-        ST_LOCK(); st.run_skipped++; ST_UNLOCK();
+        ST_LOCK(); st.run_skipped++; st.run_total_bytes -= o->size; ST_UNLOCK();
         return;
     }
     /* 404, or a 200 that is OUR earlier (unjournaled) upload -> (re)upload idempotently. */
@@ -513,7 +519,7 @@ static void run_submit(run_t *rc, const cam_object_t *o)
     f->o = o;
     f->job = ue_submit(src, o, f->key, f, err, sizeof err);
     if (!f->job) { set_error("%s: %s", f->relkey, err); ST_LOCK(); st.run_failed++; ST_UNLOCK(); rc->consecutive_failures++; return; }
-    rc->inflight++;
+    rc->inflight++; ST_LOCK(); st.run_inflight = (uint32_t)rc->inflight; ST_UNLOCK();
 }
 
 
@@ -528,14 +534,18 @@ static void sync_run(cam_source_t *src)
     }
     run_deferred = false;
     cancel_flag = false;
-    ST_LOCK(); st.phase = SYNC_ENUMERATING; st.run_total = st.run_done = st.run_skipped = st.run_failed = 0; st.run_bytes = 0; st.last_error[0] = 0; ST_UNLOCK();
+    ST_LOCK(); st.phase = SYNC_ENUMERATING; st.run_total = st.run_done = st.run_skipped = st.run_failed = 0; st.run_bytes = 0; st.run_total_bytes = st.run_read_bytes = 0; st.run_inflight = 0; st.run_elapsed_ms = 0; st.current_file[0] = 0; st.current_done = 0; st.last_error[0] = 0; ST_UNLOCK();
+    memset(ue_stats(), 0, sizeof *ue_stats());
+    run_t0_us = esp_timer_get_time(); run_end_us = 0;
     run_digest_probe_if_needed();
     log_ring_printf("sync: scanning %s (%s)", src->model, src->source_id);
     enum_ctx_t ec = {.src = src};
     esp_err_t e = src->enumerate(src, enum_cb, &ec);
     if (e != ESP_OK) { set_error("camera enumeration failed: %s", esp_err_to_name(e)); free(ec.items); set_phase(SYNC_ERROR); return; }
     if (ec.n > 1) qsort(ec.items, ec.n, sizeof ec.items[0], cmp_obj);
-    ST_LOCK(); st.run_total = (uint32_t)ec.n; st.phase = SYNC_UPLOADING; ST_UNLOCK();
+    uint64_t tb = 0;
+    for (size_t i = 0; i < ec.n; i++) tb += ec.items[i].size;
+    ST_LOCK(); st.run_total = (uint32_t)ec.n; st.run_total_bytes = tb; st.phase = SYNC_UPLOADING; ST_UNLOCK();
     log_ring_printf("sync: %u new file(s) to upload", (unsigned)ec.n);
     run_t rc = {.src = src, .cfg = app_config_get()};
     rc.fl = calloc(RUN_WINDOW, sizeof *rc.fl);
@@ -562,6 +572,7 @@ static void sync_run(cam_source_t *src)
         if (uploaded_any || store_kv_get_u64("manifest_dirty", 0) || manifest_ts() == 0) publish_manifest();
     }
     ST_LOCK();
+    run_end_us = esp_timer_get_time();
     st.last_run_ts = (int64_t)time(NULL);
     st.phase = st.run_failed ? SYNC_ERROR : SYNC_IDLE;
     log_ring_printf("sync done: %u uploaded, %u skipped, %u failed, %llu bytes", (unsigned)st.run_done, (unsigned)st.run_skipped, (unsigned)st.run_failed, (unsigned long long)st.run_bytes);
@@ -1124,6 +1135,12 @@ int sync_status_json(char *out, size_t cap)
 {
     sync_status_t s;
     sync_get_status(&s);
+    if (run_t0_us) {
+        const ue_stats_t *u = ue_stats();
+        s.run_elapsed_ms = (uint32_t)(((run_end_us ? run_end_us : esp_timer_get_time()) - run_t0_us) / 1000);
+        s.stage_read_s = (double)u->read_us / 1e6; s.stage_hash_s = (double)u->hash_us / 1e6;
+        s.stage_sum_s = (double)u->md5_us / 1e6; s.stage_upload_s = (double)u->upload_us / 1e6;
+    }
     rrc_jsonw w;
     rrc_jsonw_init(&w, out, cap);
     rrc_jsonw_raw(&w, "{");
@@ -1141,6 +1158,14 @@ int sync_status_json(char *out, size_t cap)
     rrc_jsonw_key(&w, "run_skipped", false); rrc_jsonw_u64(&w, s.run_skipped);
     rrc_jsonw_key(&w, "run_failed", false); rrc_jsonw_u64(&w, s.run_failed);
     rrc_jsonw_key(&w, "run_bytes", false); rrc_jsonw_u64(&w, s.run_bytes);
+    rrc_jsonw_key(&w, "run_total_bytes", false); rrc_jsonw_u64(&w, s.run_total_bytes);
+    rrc_jsonw_key(&w, "run_read_bytes", false); rrc_jsonw_u64(&w, s.run_read_bytes);
+    rrc_jsonw_key(&w, "run_inflight", false); rrc_jsonw_u64(&w, s.run_inflight);
+    rrc_jsonw_key(&w, "run_elapsed_ms", false); rrc_jsonw_u64(&w, s.run_elapsed_ms);
+    rrc_jsonw_key(&w, "stage_read_ms", false); rrc_jsonw_u64(&w, (uint64_t)(s.stage_read_s * 1000.0));
+    rrc_jsonw_key(&w, "stage_hash_ms", false); rrc_jsonw_u64(&w, (uint64_t)(s.stage_hash_s * 1000.0));
+    rrc_jsonw_key(&w, "stage_sum_ms", false); rrc_jsonw_u64(&w, (uint64_t)(s.stage_sum_s * 1000.0));
+    rrc_jsonw_key(&w, "stage_upload_ms", false); rrc_jsonw_u64(&w, (uint64_t)(s.stage_upload_s * 1000.0));
     rrc_jsonw_key(&w, "last_run_ts", false); rrc_jsonw_i64(&w, s.last_run_ts);
     rrc_jsonw_key(&w, "last_heartbeat_ts", false); rrc_jsonw_i64(&w, s.last_heartbeat_ts);
     rrc_jsonw_key(&w, "last_manifest_ts", false); rrc_jsonw_i64(&w, s.last_manifest_ts);
