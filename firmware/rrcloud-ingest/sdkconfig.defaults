@@ -133,7 +133,7 @@ CONFIG_ESP_WIFI_IRAM_OPT=n
 CONFIG_ESP_WIFI_RX_IRAM_OPT=n
 # NimBLE's mbuf pools live in PSRAM for the same reason.
 CONFIG_BT_NIMBLE_MEM_ALLOC_MODE_EXTERNAL=y
-CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=16384
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=8192
 # 256 KiB L2 cache (default 128): part buffers stream through PSRAM.
 CONFIG_CACHE_L2_CACHE_256KB=y
 
@@ -148,3 +148,7 @@ CONFIG_LWIP_TCP_SACK_OUT=y
 # `tasks` console command (vTaskList): per-task stack high-water marks, to right-size internal-RAM stacks.
 CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
+
+# Three persistent TLS connections to the bucket (control + two uploaders), the web UI and mDNS share the
+# socket table; at the default 10 a batch of small uploads ran out ("Failed to create socket").
+CONFIG_LWIP_MAX_SOCKETS=16

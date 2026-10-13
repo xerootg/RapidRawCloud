@@ -24,6 +24,10 @@ typedef struct {
     uint64_t current_size, current_done;
     uint32_t run_total, run_done, run_skipped, run_failed;
     uint64_t run_bytes;
+    uint64_t run_total_bytes, run_read_bytes;   /* to upload / already read from the camera */
+    uint32_t run_inflight;
+    uint32_t run_elapsed_ms;                    /* frozen when the run ends */
+    double stage_read_s, stage_hash_s, stage_sum_s, stage_upload_s;   /* summed over files, stages overlap */
     int64_t last_run_ts;
     int64_t last_heartbeat_ts;
     int64_t last_manifest_ts;
@@ -51,11 +55,12 @@ void sync_debug_tcp_speed(const char *host, int port, int mb);
 void sync_debug_pipe(int mb, int rate_mb_s);
 /* Reads `mb` MiB of one camera object with no hashing or upload, zero-copy USB DMA vs copying, and prints both rates. */
 void sync_debug_read(const char *handle_or_path, int mb, int chunk_kib);
-/* Persistent state of the zero-copy USB read check: 0 ok/unknown, 1 running, 2 disabled. */
-void sync_usb_direct_state_set(uint8_t v);
+#include "upload_engine.h"   /* sync_usb_direct_state_set */
 /* Pushes one real camera object (handle, size in bytes) through the real pipeline to a scratch key and verifies it. */
-/* Pre-hashed parts through 1 or 2 uploaders, nothing else running: the network ceiling. */
-void sync_debug_netpar(int nparts, int uploaders);
+/* Several real camera objects ("handle:size handle:size ...") through the engine at once to scratch keys. */
+void sync_debug_multi(const char *list);
+/* `count` synthetic files of `mb` MiB through the engine with the sync window, no camera. */
+void sync_debug_pipemulti(int count, int mb);
 void sync_debug_campipe(const char *handle, int size_bytes);
 /* Camera event hook (registered with the source installers). */
 void sync_on_camera_event(cam_event_t ev, cam_source_t *src, void *arg);

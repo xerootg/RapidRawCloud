@@ -7,6 +7,12 @@
 #include <ctype.h>
 #include "esp_log.h"
 #include "esp_tls.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "freertos/idf_additions.h"
+#include "esp_heap_caps.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
 #include "esp_crt_bundle.h"
@@ -74,7 +80,7 @@ static char *build_url(const rrc_s3_t *s3, const char *raw_path, const rrc_kv *q
  * at ~0.2 MB/s. This layer keeps one connection per client, sets TCP_NODELAY
  * so the last partial segment of every write is not held back for a delayed
  * ACK, and hands whole 64 KiB slices of the PSRAM part buffer to mbedTLS. */
-#define CONN_WRITE_SLICE (64u * 1024u)
+#define CONN_WRITE_SLICE (8u * 1024u)   /* one TLS record per call: the AES DMA path allocates a record-sized internal bounce buffer, and two uploaders must both find one */
 
 static void conn_close(rrc_s3_t *s3)
 {
@@ -113,7 +119,7 @@ static int bio_recv(void *ctx, unsigned char *buf, size_t len)
 /* Seconds on the monotonic timer; see have_server_offset in the header. */
 static int64_t mono_s(void) { return esp_timer_get_time() / 1000000; }
 
-static esp_err_t conn_open(rrc_s3_t *s3)
+static esp_err_t conn_open_impl(rrc_s3_t *s3)
 {
     if (s3->conn_fd >= 0) return ESP_OK;
     int timeout = s3->cfg.timeout_ms > 0 ? s3->cfg.timeout_ms : 30000;
@@ -159,6 +165,56 @@ static esp_err_t conn_open(rrc_s3_t *s3)
     setsockopt(s3->conn_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
     setsockopt(s3->conn_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
     return ESP_OK;
+}
+
+/* A TLS handshake (certificate chain parsing, bignum math) wants ~21 KB of stack. The uploader tasks keep
+ * their stacks in scarce internal RAM, so handshakes all run on one helper task whose stack lives in
+ * PSRAM; this also means two connections never handshake at the same time, which is when internal RAM
+ * peaks. The session it creates is plain heap state and is used from any task afterwards. */
+typedef struct { rrc_s3_t *s3; esp_err_t result; SemaphoreHandle_t done; } open_req_t;
+static QueueHandle_t g_open_q;
+static SemaphoreHandle_t g_open_mtx;
+static void open_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        open_req_t *r;
+        if (xQueueReceive(g_open_q, &r, portMAX_DELAY) != pdTRUE) continue;
+        r->result = conn_open_impl(r->s3);
+        xSemaphoreGive(r->done);
+    }
+}
+static esp_err_t conn_open(rrc_s3_t *s3)
+{
+    if (s3->conn_fd >= 0) return ESP_OK;
+    static portMUX_TYPE once = portMUX_INITIALIZER_UNLOCKED;
+    if (!g_open_mtx) {
+        SemaphoreHandle_t m = xSemaphoreCreateMutex();
+        taskENTER_CRITICAL(&once);
+        if (!g_open_mtx) { g_open_mtx = m; m = NULL; }
+        taskEXIT_CRITICAL(&once);
+        if (m) vSemaphoreDelete(m);
+    }
+    xSemaphoreTake(g_open_mtx, portMAX_DELAY);
+    esp_err_t e = ESP_ERR_NO_MEM;
+    if (!g_open_q) {
+        g_open_q = xQueueCreate(1, sizeof(open_req_t *));
+        if (g_open_q && xTaskCreatePinnedToCoreWithCaps(open_task, "s3_open", 28 * 1024, NULL, 5, NULL, tskNO_AFFINITY, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
+            vQueueDelete(g_open_q); g_open_q = NULL;
+        }
+    }
+    if (g_open_q) {
+        open_req_t r = {.s3 = s3, .result = ESP_FAIL, .done = xSemaphoreCreateBinary()};
+        if (r.done) {
+            open_req_t *rp = &r;
+            xQueueSend(g_open_q, &rp, portMAX_DELAY);
+            xSemaphoreTake(r.done, portMAX_DELAY);
+            vSemaphoreDelete(r.done);
+            e = r.result;
+        }
+    }
+    xSemaphoreGive(g_open_mtx);
+    return e;
 }
 
 void rrc_s3_disconnect(rrc_s3_t *s3) { conn_close(s3); }

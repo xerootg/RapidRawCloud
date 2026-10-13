@@ -53,7 +53,9 @@
         <div id="curfile" class="note"></div>
         <progress id="prog" max="100" value="0"></progress>
         <div id="runstats" class="note"></div>
+        <div id="stages" class="note"></div>
       </div>
+      <div id="runlast" class="note"></div>
       <div id="lasterr" class="note" style="color:var(--err)"></div>
       <button id="syncnow">Sync now</button>
       <button id="synccancel" class="secondary">Cancel</button>
@@ -187,6 +189,15 @@ async function pollPair(){
   } catch(e) {}
 }
 
+function runLine(y){
+  const sec = y.run_elapsed_ms/1000, rate = sec > 0 ? y.run_bytes/1e6/sec : 0;
+  return `${y.run_done} uploaded · ${y.run_skipped} skipped · ${y.run_failed} failed · ${y.run_total} found · ${fmtBytes(y.run_bytes)} in ${sec.toFixed(1)} s = ${rate.toFixed(2)} MB/s`;
+}
+function runStats(y){
+  const sec = y.run_elapsed_ms/1000, rate = sec > 0 ? (y.run_bytes + y.run_read_bytes)/2e6/sec : 0;
+  $('runstats').textContent = runLine(y).replace(/ in [\d.]+ s = [\d.]+ MB\/s$/, '') + ` · ${y.run_inflight} in flight · ${sec.toFixed(0)} s · ~${rate.toFixed(1)} MB/s`;
+  $('stages').textContent = `busy time (overlapping): camera read ${(y.stage_read_ms/1000).toFixed(1)} s · BLAKE3 ${(y.stage_hash_ms/1000).toFixed(1)} s · checksum ${(y.stage_sum_ms/1000).toFixed(1)} s · upload ${(y.stage_upload_ms/1000).toFixed(1)} s · camera read so far ${fmtBytes(y.run_read_bytes)} of ${fmtBytes(y.run_total_bytes)}`;
+}
 const phaseClass = { idle:'ok', uploading:'ok', publishing:'ok', enumerating:'ok', error:'err', unconfigured:'warn', waiting_network:'warn' };
 async function refresh(){
   try {
@@ -202,7 +213,12 @@ async function refresh(){
     $('lastrun').textContent = fmtTs(y.last_run_ts);
     const active = y.phase==='uploading' || y.phase==='enumerating' || y.phase==='publishing';
     $('progwrap').style.display = active ? 'block' : 'none';
-    if (active) { $('curfile').textContent = y.current_file ? `${y.current_file} — ${fmtBytes(y.current_done)} / ${fmtBytes(y.current_size)}` : (y.phase==='enumerating' ? 'scanning camera…' : 'publishing journal…'); $('prog').value = y.current_size ? 100*y.current_done/y.current_size : 0; $('runstats').textContent = `${y.run_done} uploaded · ${y.run_skipped} skipped · ${y.run_failed} failed · ${y.run_total} queued · ${fmtBytes(y.run_bytes)}`; }
+    if (active) {
+      $('curfile').textContent = y.current_file ? `reading ${y.current_file} — ${fmtBytes(y.current_done)} / ${fmtBytes(y.current_size)}` : (y.phase==='enumerating' ? 'scanning camera…' : (y.phase==='publishing' ? 'publishing journal…' : 'finishing in-flight files…'));
+      $('prog').value = y.run_total_bytes ? 100*Math.min(1, (y.run_bytes + y.run_read_bytes)/(2*y.run_total_bytes)) : 0;
+      runStats(y);
+    }
+    if (!active) { $('runlast').textContent = y.run_elapsed_ms ? 'Last run: ' + runLine(y) : ''; }
     $('lasterr').textContent = y.last_error ? 'Last error: ' + y.last_error : '';
     const r = s.coproc, b = s.ble;
     if (r) {

@@ -127,14 +127,13 @@ void rrc_sigv4_amz_date(time_t t, char out[17])
     strftime(out, 17, "%Y%m%dT%H%M%SZ", &tm);
 }
 
-int rrc_sigv4_sign(const rrc_sigv4_request *req, char *authorization, size_t cap)
+static int sign_impl(const rrc_sigv4_request *req, char *authorization, size_t cap, canon_hdr *hdrs)
 {
     if (!req || !req->method || !req->host || !req->amz_date || strlen(req->amz_date) != 16 || !req->region ||
         !req->access_key || !req->secret_key || !req->payload_sha256_hex) return -1;
     if (req->n_headers + 3 > RRC_SIGV4_MAX_HEADERS) return -1;
 
     /* 1. Canonical headers (lowercase names, canonical values, sorted). */
-    canon_hdr hdrs[RRC_SIGV4_MAX_HEADERS];
     size_t nh = 0;
     for (size_t i = 0; i < req->n_headers; i++) {
         const char *n = req->headers[i].name;
@@ -209,5 +208,15 @@ int rrc_sigv4_sign(const rrc_sigv4_request *req, char *authorization, size_t cap
     rc = (n > 0 && (size_t)n < cap) ? 0 : -1;
 done:
     free(cpath); free(cquery);
+    return rc;
+}
+
+/* The canonical header table is ~9 KB: it lives on the heap so the callers' task stacks can stay small. */
+int rrc_sigv4_sign(const rrc_sigv4_request *req, char *authorization, size_t cap)
+{
+    canon_hdr *hdrs = malloc(sizeof(canon_hdr) * RRC_SIGV4_MAX_HEADERS);
+    if (!hdrs) return -1;
+    int rc = sign_impl(req, authorization, cap, hdrs);
+    free(hdrs);
     return rc;
 }
