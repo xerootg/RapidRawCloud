@@ -28,6 +28,14 @@ use super::{sigv4, xml};
 /// this module).
 pub const MAX_LIST_PAGES: u32 = 100_000;
 
+/// Cumulative cap on keys [`S3Client::list_all_objects`] will buffer. A
+/// page may legally carry 1000 keys, so the page cap alone still lets a
+/// hostile endpoint (or, in fleet mode, a hostile admin bucket) grow the
+/// result to 100M `ObjectSummary` values; this mirrors the sibling bounded
+/// listers' 1_000_000-key bound (`worker::list_objects_bounded`,
+/// `compact::list_keys_under`) and refuses before buffering order-of-GB.
+pub const MAX_LIST_KEYS: usize = 1_000_000;
+
 /// Connection settings for an S3-compatible endpoint.
 ///
 /// Addressing is always path-style (`<endpoint>/<bucket>/<key>`); the
@@ -731,7 +739,9 @@ impl S3Client {
     /// Capped at [`MAX_LIST_PAGES`] pages: a backend (or middlebox) that
     /// keeps answering truncated pages with a non-advancing token must not
     /// loop forever and grow the result without bound; the cap surfaces as
-    /// [`S3Error::InvalidResponse`].
+    /// [`S3Error::InvalidResponse`]. Also capped at [`MAX_LIST_KEYS`]
+    /// cumulative keys, so full pages with fresh tokens cannot buffer
+    /// millions of summaries before the page cap trips.
     pub async fn list_all_objects(
         &self,
         bucket: &str,
@@ -740,6 +750,7 @@ impl S3Client {
         let mut all = Vec::new();
         let mut continuation_token: Option<String> = None;
         let mut pages: u32 = 0;
+        let mut listed: usize = 0;
         loop {
             if pages >= MAX_LIST_PAGES {
                 return Err(S3Error::InvalidResponse(format!(
@@ -758,6 +769,13 @@ impl S3Client {
                     },
                 )
                 .await?;
+            listed += page.objects.len();
+            if listed > MAX_LIST_KEYS {
+                return Err(S3Error::InvalidResponse(format!(
+                    "ListObjectsV2 returned more than {MAX_LIST_KEYS} keys under {prefix:?}; \
+                     refusing unbounded key buffering (hostile bucket or runaway writer)"
+                )));
+            }
             all.extend(page.objects);
             if !page.is_truncated {
                 return Ok(all);
