@@ -76,7 +76,9 @@ pub mod proxy_support {
     pub use crate::gpu_processing::{
         gpu_adapter_probe, init_gpu_context_headless, render_adjustments_headless,
     };
-    pub use crate::image_loader::{proxy_decode_settings, proxy_reported_dimensions};
+    pub use crate::image_loader::{
+        load_image_with_orientation, proxy_decode_settings, proxy_reported_dimensions,
+    };
     pub use crate::image_processing::{GpuContext, apply_srgb_to_linear, downscale_f32_image};
     pub use crate::raw_processing::develop_raw_image;
     pub use crate::sync::hooks::ProxyHandle;
