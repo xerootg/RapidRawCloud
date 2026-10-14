@@ -83,6 +83,12 @@ pub const AUTO_RETIRE_SECS: i64 = 7776000;
 /// Manifest deleted-set rows are retained 12 months (§2.3).
 pub const DELETED_SET_RETENTION_SECS: i64 = 31536000;
 
+/// User-metadata key (the bare suffix of `x-amz-meta-rrc-device`) a participant may set on an original it PUTs, naming its device id. Marks the object as that participant's to journal, not a foreign drop (§6).
+pub const UPLOADER_META_KEY: &str = "rrc-device";
+
+/// How long the worker leaves an original tagged with UPLOADER_META_KEY to its uploader's journal before adopting it as foreign (server time since the object's LastModified, §6).
+pub const UPLOADER_JOURNAL_GRACE_SECS: i64 = 86400;
+
 /// Pairing service: public discovery document (PairingInfo).
 pub const PAIRING_INFO_PATH: &str = "/api/pairing-info";
 

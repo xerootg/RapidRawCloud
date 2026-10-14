@@ -72,6 +72,7 @@ use crate::keys::{
     CONTROL_PREFIX, LIBRARY_PREFIX,
 };
 use crate::manifest::{get_manifest, merge as merge_manifests, Manifest, ManifestError};
+use crate::mtime::backfill_earliest_mtimes;
 use crate::proxy::{generate_proxy_with, ProxyError, ProxyParams};
 use crate::publisher::{
     enqueue_entry_in, get_device_entry, publish_pending, put_device_entry, DeviceProfile,
@@ -134,6 +135,16 @@ const LIST_MAX_KEYS: usize = 1_000_000;
 
 /// The default `--daemon` interval (§6: "also `--daemon --interval 15m`").
 pub const DEFAULT_DAEMON_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
+/// The user-metadata key (bare `x-amz-meta-` suffix) a participant sets on
+/// an original it PUTs, naming its device id (`rrcloud_proto`). The ingest
+/// dock tags every upload with it.
+pub const UPLOADER_META_KEY: &str = rrcloud_proto::UPLOADER_META_KEY;
+
+/// How long [`adopt_foreign_originals`] leaves an original tagged with
+/// [`UPLOADER_META_KEY`] to its uploader's journal, in server seconds since
+/// the object's `LastModified` (`rrcloud_proto`).
+pub const UPLOADER_JOURNAL_GRACE_SECS: i64 = rrcloud_proto::UPLOADER_JOURNAL_GRACE_SECS;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -404,6 +415,16 @@ pub struct CycleReport {
     /// aborts the cycle (§6 forward progress). A subset of
     /// [`CycleReport::adopted`].
     pub adopted_without_proxy: Vec<RelKey>,
+    /// `library/` originals with no journal-known state that this cycle
+    /// left to their uploader: tagged with [`UPLOADER_META_KEY`] by another
+    /// device and younger than [`UPLOADER_JOURNAL_GRACE_SECS`], so the
+    /// uploader's own journal entry is still expected (see
+    /// [`adopt_foreign_originals`]).
+    pub deferred_to_uploader: Vec<RelKey>,
+    /// Originals whose recorded mtime the one-time §2.2 earliest-mtime
+    /// backfill ([`crate::mtime::backfill_earliest_mtimes`]) moved earlier
+    /// this cycle (0 once the backfill has completed).
+    pub mtimes_backfilled: usize,
     /// §2.7/§6 whole-item resurrections re-advertised this cycle by
     /// [`crate::engine::reconcile_wholeness`] (a live sidecar's tombstoned
     /// original, or the converse), by item relkey — the GC worker's
@@ -669,6 +690,17 @@ pub async fn run_cycle(worker: &Worker, opts: &CycleOptions) -> Result<CycleRepo
     let leftover = publish_pending(db, s3, bucket).await?;
     report.journal_entries_published += leftover.entries;
 
+    // (1a″) One-time §2.2 earliest-mtime backfill (`crate::mtime`): records
+    // converged before that rule existed — this worker's early adoptions of
+    // dock uploads, stamped with the upload time — take the earliest mtime
+    // any peer's put carries for the same bytes, so the manifest this worker
+    // writes advertises the real date. Writes no journal entry; a no-op once
+    // done, and a failure is logged and retried next cycle, never an abort.
+    match backfill_earliest_mtimes(db, s3, bucket, None).await {
+        Ok(done) => report.mtimes_backfilled = done.corrected.len(),
+        Err(e) => eprintln!("rrcloud-worker: mtime backfill failed (retrying next cycle): {e}"),
+    }
+
     // (1b) §2.7/§6 whole-item backstop at quiescence: re-advertise any
     // original a live sidecar still references that a delete-vs-edit race
     // left tombstoned (and the converse). This is the GC worker's
@@ -838,6 +870,9 @@ async fn heartbeat(worker: &Worker) -> Result<(), WorkerError> {
 /// **stage** `attest` + `put` (original/preview/thumb), recording the
 /// adopted original in our own state so a re-run is a no-op and the manifest
 /// advertises it. Staging only — [`run_cycle`] publishes once, afterward.
+/// An original another participant tagged with [`UPLOADER_META_KEY`] is left
+/// to that uploader's journal while younger than
+/// [`UPLOADER_JOURNAL_GRACE_SECS`] ([`CycleReport::deferred_to_uploader`]).
 ///
 /// Per-item isolation (§6 forward progress): a non-RAW/undecodable
 /// `library/` object is still a valid §1.2 original, so its proxy failure
@@ -874,6 +909,34 @@ async fn adopt_foreign_originals(
         // key would resurrect it (A3).
         if db.get_item(&relkey)?.is_some() || db.get_deleted(&relkey)?.is_some() {
             continue;
+        }
+
+        // A participant's own upload is not a foreign drop. The ingest dock
+        // tags every original it PUTs with UPLOADER_META_KEY and journals a
+        // whole card run only when the run ends — hours after its first PUT
+        // on a big card. Adopting inside that window minted a `{worker:1}`
+        // version concurrent with the dock's, stamped with the object's
+        // LastModified (the upload time, not the file's date). So a tagged
+        // object is left to its uploader for UPLOADER_JOURNAL_GRACE_SECS;
+        // past that the uploader evidently lost its entry and adoption keeps
+        // the object reachable (should the entry land after all, the §2.2
+        // earliest-mtime rule settles the date). A failed HEAD skips the
+        // object this cycle, like a failed adoption GET below.
+        match awaiting_uploader_journal(s3, bucket, &key, last_modified.as_deref(), now_ts, &device)
+            .await
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                report.deferred_to_uploader.push(relkey);
+                continue;
+            }
+            Err(e) => {
+                eprintln!(
+                    "rrcloud-worker: skipping {key} this cycle (HEAD failed, not aborting the \
+                     cycle): {e}"
+                );
+                continue;
+            }
         }
 
         // Foreign original: GET the bytes and derive identity. PER-ITEM
@@ -1395,6 +1458,35 @@ async fn fetch_foreign_original(
     Ok(bytes)
 }
 
+/// Whether the `library/` object `key` is another participant's upload whose
+/// journal entry should still be on its way: younger than
+/// [`UPLOADER_JOURNAL_GRACE_SECS`] by its `LastModified` against the §2.10
+/// server clock `now_server`, and tagged with [`UPLOADER_META_KEY`] naming a
+/// valid device id other than `own`. Only a young object costs a HEAD; an
+/// object whose age cannot be read is not deferred (adopting is the safe
+/// default — an unreadable timestamp must not hide it forever).
+async fn awaiting_uploader_journal(
+    s3: &S3Client,
+    bucket: &str,
+    key: &str,
+    last_modified: Option<&str>,
+    now_server: i64,
+    own: &DeviceId,
+) -> Result<bool, S3Error> {
+    let Some(uploaded) = last_modified.and_then(parse_object_last_modified) else {
+        return Ok(false);
+    };
+    if now_server.saturating_sub(uploaded) >= UPLOADER_JOURNAL_GRACE_SECS {
+        return Ok(false);
+    }
+    let head = s3.head_object(bucket, key).await?;
+    Ok(head
+        .metadata
+        .get(UPLOADER_META_KEY)
+        .and_then(|tag| DeviceId::new(tag.trim()).ok())
+        .is_some_and(|uploader| uploader != *own))
+}
+
 /// Parse an object's server timestamp to unix seconds. A `ListObjectsV2`
 /// `LastModified` is an ISO-8601 / RFC 3339 value (e.g.
 /// `2026-10-03T13:47:23.060Z` on Garage), so RFC 3339 is tried FIRST; a
@@ -1450,11 +1542,14 @@ pub async fn run(worker: &Worker, mode: RunMode, opts: &CycleOptions) -> Result<
 /// Structured per-cycle log line to stdout (§6 point 3).
 fn log_cycle(report: &CycleReport) {
     println!(
-        "rrcloud-worker cycle: adopted={} adopted_no_proxy={} resurrected={} proxies={} \
-         previews_put={} thumbs_put={} journaled={} aborted_uploads={} gc_destroyed={} \
-         gc_retained={} compacted_segments={} retired={}",
+        "rrcloud-worker cycle: adopted={} adopted_no_proxy={} deferred_to_uploader={} \
+         mtimes_backfilled={} resurrected={} proxies={} previews_put={} thumbs_put={} \
+         journaled={} aborted_uploads={} gc_destroyed={} gc_retained={} compacted_segments={} \
+         retired={}",
         report.adopted.len(),
         report.adopted_without_proxy.len(),
+        report.deferred_to_uploader.len(),
+        report.mtimes_backfilled,
         report.resurrected.len(),
         report.proxies_generated,
         report.previews_put,

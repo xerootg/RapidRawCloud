@@ -57,6 +57,10 @@ static const uint32_t RRCP_PROTO_READ[1] = {1};
 #define RRCP_AUTO_RETIRE_SECS (7776000ll)
 /** Manifest deleted-set rows are retained 12 months (§2.3). */
 #define RRCP_DELETED_SET_RETENTION_SECS (31536000ll)
+/** User-metadata key (the bare suffix of `x-amz-meta-rrc-device`) a participant may set on an original it PUTs, naming its device id. Marks the object as that participant's to journal, not a foreign drop (§6). */
+#define RRCP_UPLOADER_META_KEY "rrc-device"
+/** How long the worker leaves an original tagged with UPLOADER_META_KEY to its uploader's journal before adopting it as foreign (server time since the object's LastModified, §6). */
+#define RRCP_UPLOADER_JOURNAL_GRACE_SECS (86400ll)
 /** Pairing service: public discovery document (PairingInfo). */
 #define RRCP_PAIRING_INFO_PATH "/api/pairing-info"
 /** Pairing service: per-user config document (PairingConfigDoc), `Authorization: Bearer <oidc access token>`. */

@@ -3845,6 +3845,12 @@ mod imp {
             // cycles that overlapped before the shared cycle lock existed.
             self.repair_stub_state_drift();
 
+            // One-time §2.2 earliest-mtime backfill: originals this device
+            // converged before that rule existed take the earliest mtime the
+            // bucket's puts carry for the same bytes, and their stubs/files
+            // are re-stamped so the library sorts by the real date.
+            self.backfill_earliest_mtimes().await;
+
             // §2.9 albums/presets meta lane: upload dirty meta documents and
             // apply any converged remote meta head. A no-op when no meta work
             // is pending, so cycles on devices that never touched
@@ -3906,6 +3912,27 @@ mod imp {
             }
 
             Ok(self.status_snapshot(uploaded, down.completed.len()))
+        }
+
+        /// The one-time §2.2 earliest-mtime backfill (see
+        /// `rrcloud_core::mtime::backfill_earliest_mtimes`). Best-effort: a
+        /// no-op once done, logged, never fails the cycle; a pass that fails
+        /// runs again next cycle.
+        async fn backfill_earliest_mtimes(&self) {
+            match rrcloud_core::mtime::backfill_earliest_mtimes(
+                &self.db,
+                self.s3.as_ref(),
+                &self.bucket,
+                Some(self.sync_root.as_path()),
+            )
+            .await
+            {
+                Ok(r) if !r.corrected.is_empty() => {
+                    log::info!("mtime backfill: {} original(s) re-dated", r.corrected.len())
+                }
+                Ok(_) => {}
+                Err(e) => log::warn!("mtime backfill: {e}"),
+            }
         }
 
         /// The §3.5 record/disk drift repair (see

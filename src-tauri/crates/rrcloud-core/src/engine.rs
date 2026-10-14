@@ -50,10 +50,11 @@
 //!
 //! 1. **Converged** (`vv` equal, or same content: equal `sem_hash` for
 //!    sidecars, equal `blake3` otherwise) → adopt metadata (vv
-//!    elementwise max), no download. A strictly dominating converged
-//!    entry additionally hands its `blake3`/`size` to a record whose
-//!    state holds no local bytes, and supersedes a `CorruptRemote`
-//!    condemnation back into the fetch lane (review round 1; see
+//!    elementwise max), no download; an original keeps the earliest
+//!    mtime either side carries ([`crate::mtime`]). A strictly
+//!    dominating converged entry additionally hands its `blake3`/`size`
+//!    to a record whose state holds no local bytes, and supersedes a
+//!    `CorruptRemote` condemnation back into the fetch lane (review round 1; see
 //!    [`EngineConsumer::converge`]). Over **uncommitted dirt**, a
 //!    file-equal entry collapses the dirt only when it is a descendant
 //!    of the local base or wins the §2.6 pick against it — a file-equal
@@ -1330,6 +1331,16 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             && !state_holds_local_bytes(local.state)
             && entry.blake3.is_some()
             && entry.blake3 != local.blake3;
+        // §2.2 earliest-mtime rule (`crate::mtime`): content-equal versions
+        // of an original are the same bytes, so the record keeps the
+        // earliest mtime any of them carries — whatever order they arrive
+        // in. (Keeping the first-applied twin's mtime let a worker adoption
+        // that beat the uploader's journal pin its upload time as the date.)
+        let earlier_mtime = if local.kind == Kind::Original {
+            crate::mtime::earlier_mtime(local.mtime_unix_ns, entry.mtime)
+        } else {
+            None
+        };
         let mutate = |r: &mut ItemRecord| {
             r.vv.merge(&entry.vv);
             if adopt_content {
@@ -1342,14 +1353,16 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                 // device is adopting (review round 3, minor:
                 // `adopt_remote`/`create_from_put` already carry them, so
                 // the converge path must not leave them stale — §4.4
-                // proxy_scale reads them). `mtime` is left as-is: a holder
-                // keeps its local file's nanosecond mtime, which the
-                // whole-second wire value would only coarsen.
+                // proxy_scale reads them). `mtime` is not adopted: only the
+                // earliest-mtime rule below moves it.
                 r.w = entry.w;
                 r.h = entry.h;
                 // Integrity facts described the superseded blake3.
                 r.verified_remote = false;
                 r.attested = false;
+            }
+            if let Some(secs) = earlier_mtime {
+                r.mtime_unix_ns = secs.saturating_mul(1_000_000_000);
             }
             if adopt_identity {
                 r.head_ts = Some(entry.ts);
@@ -1359,7 +1372,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                 r.deleted = false;
             }
         };
-        if local.kind == Kind::Original && local.state == ItemState::Synced {
+        let settled = if local.kind == Kind::Original && local.state == ItemState::Synced {
             // §3.5 axis normalization: for an original, the upload
             // pipeline's `Synced` terminal and `Hydrated` name the same
             // physical fact (bytes present + verified locally). The
@@ -1372,6 +1385,7 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
             mutate(&mut record);
             record.state = ItemState::Hydrated;
             txn.replay_put_item_cas(item, ItemState::Synced, &record)?;
+            ItemState::Hydrated
         } else if local.state == ItemState::CorruptRemote && ord == VvOrder::Greater {
             // The §2.4 repair edge (doc comment): supersede the condemned
             // advertisement and fetch the newer version.
@@ -1382,8 +1396,14 @@ impl<'a, E: EngineEvents> EngineConsumer<'a, E> {
                 mutate,
             )?;
             txn.queue_push(Queue::Down, item, transfer_class(local.kind))?;
+            ItemState::PendingDown
         } else {
             txn.update_item(item, local.state, mutate)?;
+            local.state
+        };
+        if let Some(secs) = earlier_mtime {
+            // The grid sorts by the file's mtime: follow the record.
+            crate::mtime::restamp_local_file(&self.sync_root, item, settled, secs);
         }
         self.clear_superseded_row(txn, &entry.vv, item)
     }

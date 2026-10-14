@@ -31,6 +31,8 @@ Definition v1, wire version 1. Normative design: `docs/ARCHITECTURE.md`.
 | `RECENTLY_DELETED_GRACE_SECS` | `i64` | `2592000` | Tombstoned data keys survive ≥ 30 days (the user-facing Recently Deleted window, §2.10). |
 | `AUTO_RETIRE_SECS` | `i64` | `7776000` | Devices silent for 90 days are auto-retired by GC (§2.10). |
 | `DELETED_SET_RETENTION_SECS` | `i64` | `31536000` | Manifest deleted-set rows are retained 12 months (§2.3). |
+| `UPLOADER_META_KEY` | `str` | `rrc-device` | User-metadata key (the bare suffix of `x-amz-meta-rrc-device`) a participant may set on an original it PUTs, naming its device id. Marks the object as that participant's to journal, not a foreign drop (§6). |
+| `UPLOADER_JOURNAL_GRACE_SECS` | `i64` | `86400` | How long the worker leaves an original tagged with UPLOADER_META_KEY to its uploader's journal before adopting it as foreign (server time since the object's LastModified, §6). |
 | `PAIRING_INFO_PATH` | `str` | `/api/pairing-info` | Pairing service: public discovery document (PairingInfo). |
 | `PAIRING_CONFIG_PATH` | `str` | `/api/config` | Pairing service: per-user config document (PairingConfigDoc), `Authorization: Bearer <oidc access token>`. |
 | `PAIRING_REDIRECT_URI` | `str` | `rapidraw://auth-callback` | OAuth redirect URI of the RapidRAW editor's PKCE flow (PairingInfo.redirectUri, kept for older clients). |

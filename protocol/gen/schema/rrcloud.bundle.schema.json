@@ -28,6 +28,8 @@
     "RECENTLY_DELETED_GRACE_SECS": 2592000,
     "AUTO_RETIRE_SECS": 7776000,
     "DELETED_SET_RETENTION_SECS": 31536000,
+    "UPLOADER_META_KEY": "rrc-device",
+    "UPLOADER_JOURNAL_GRACE_SECS": 86400,
     "PAIRING_INFO_PATH": "/api/pairing-info",
     "PAIRING_CONFIG_PATH": "/api/config",
     "PAIRING_REDIRECT_URI": "rapidraw://auth-callback",

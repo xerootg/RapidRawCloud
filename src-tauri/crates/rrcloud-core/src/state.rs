@@ -444,6 +444,9 @@ const K_META_HEAD_PREFIX: &str = "meta_head:";
 /// §2.9 per-kind durably-staged pending-publish bytes key prefix (see
 /// [`SyncDb::pending_meta_bytes`]).
 const K_META_PENDING_PREFIX: &str = "meta_pending:";
+/// Set once the one-time §2.2 earliest-mtime backfill
+/// ([`crate::mtime::backfill_earliest_mtimes`]) has completed on this db.
+const K_MTIME_BACKFILL_DONE: &str = "mtime_backfill_v1";
 
 /// The meta key holding the server-time publish stamp of the own-prefix
 /// segment starting at `first_seq` (zero-padded hex, so keys sort in seq
@@ -2192,6 +2195,27 @@ impl SyncDb {
         self.with_txn(|t| {
             let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
             meta.insert(K_APPLIED_PROOF_SERVER_TS, to_json(&server_ts)?.as_slice())
+                .map_err(db_err)?;
+            Ok(())
+        })
+    }
+
+    /// Whether the one-time §2.2 earliest-mtime backfill
+    /// ([`crate::mtime::backfill_earliest_mtimes`]) has completed on this
+    /// db. `false` until [`SyncDb::set_mtime_backfill_done`] records it, so
+    /// an interrupted pass simply runs again.
+    pub fn mtime_backfill_done(&self) -> Result<bool, StateError> {
+        let txn = self.begin_read()?;
+        let meta = txn.open_table(T_META).map_err(db_err)?;
+        Ok(meta_get::<bool>(&meta, K_MTIME_BACKFILL_DONE)?.unwrap_or(false))
+    }
+
+    /// Records that the one-time earliest-mtime backfill completed (see
+    /// [`SyncDb::mtime_backfill_done`]).
+    pub fn set_mtime_backfill_done(&self) -> Result<(), StateError> {
+        self.with_txn(|t| {
+            let mut meta = t.txn.open_table(T_META).map_err(db_err)?;
+            meta.insert(K_MTIME_BACKFILL_DONE, to_json(&true)?.as_slice())
                 .map_err(db_err)?;
             Ok(())
         })

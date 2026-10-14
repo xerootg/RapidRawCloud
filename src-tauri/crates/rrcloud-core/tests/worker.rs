@@ -1495,3 +1495,178 @@ async fn backfills_previews_for_journal_known_originals_without_them() {
     );
     assert_eq!(second.previews_put, 0, "no duplicate preview PUT");
 }
+
+// ===========================================================================
+// UPLOADER DEFERRAL (a participant's tagged upload is not a foreign drop)
+// ===========================================================================
+
+/// PUTs `body` at `key` tagged the way the ingest dock tags its uploads:
+/// `x-amz-meta-rrc-device: <uploader>`.
+async fn put_tagged(client: &S3Client, bucket: &str, key: &str, body: &[u8], uploader: &DeviceId) {
+    let opts = PutObjectOptions {
+        metadata: [(
+            worker::UPLOADER_META_KEY.to_string(),
+            uploader.as_str().to_string(),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    client
+        .put_object(bucket, key, Bytes::copy_from_slice(body), &opts)
+        .await
+        .unwrap_or_else(|e| panic!("put {key}: {e}"));
+}
+
+/// §6: an original another participant tagged with `UPLOADER_META_KEY` is
+/// that participant's to journal, not a foreign drop. While it is younger
+/// than the grace the worker leaves it alone (no `{worker:1}` version stamped
+/// with the upload time); when the uploader's entry lands the worker learns
+/// the item from the journal without ever adopting it; an untagged drop
+/// beside it is adopted as before; and a tagged object whose uploader never
+/// journals it is adopted once the grace has passed, so it cannot stay
+/// invisible.
+#[tokio::test]
+async fn a_tagged_participant_upload_is_left_to_its_uploaders_journal_until_the_grace_passes() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-uploader");
+    let client = g.client();
+    let state = tempfile::tempdir().expect("state dir");
+    let cfg = worker_cfg(g, &bucket, Some(state.path().to_path_buf()));
+    let worker = Worker::open(&cfg).expect("open worker");
+
+    let dock = dev(DEV_B);
+    let journaled = rel("Camera Import/Z 7_2/2026/08/29/_DSC0001.JPG");
+    let orphaned = rel("Camera Import/Z 7_2/2026/08/29/_DSC0002.JPG");
+    let dropped = rel("ingest/drop.JPG");
+    put_tagged(
+        &client,
+        &bucket,
+        &library_key(&journaled),
+        b"dock-one",
+        &dock,
+    )
+    .await;
+    put_tagged(
+        &client,
+        &bucket,
+        &library_key(&orphaned),
+        b"dock-two",
+        &dock,
+    )
+    .await;
+    put_raw(&client, &bucket, &library_key(&dropped), b"rclone-drop").await;
+
+    let fresh = CycleOptions {
+        clock: Some(ServerClock::pinned(real_now())),
+        ..Default::default()
+    };
+    let first = worker::run_cycle(&worker, &fresh).await.expect("cycle 1");
+    assert_eq!(
+        first.deferred_to_uploader,
+        vec![journaled.clone(), orphaned.clone()],
+        "both young tagged uploads are left to the dock"
+    );
+    assert_eq!(
+        first.adopted,
+        vec![dropped.clone()],
+        "the untagged drop is adopted"
+    );
+    assert!(worker.db().get_item(&journaled).unwrap().is_none());
+    assert!(worker.db().get_item(&orphaned).unwrap().is_none());
+
+    // The dock's run ends and its entry for one of them lands.
+    let (_dock_dir, _dock_path, dock_db) = open_db(&dock);
+    let mut put = journal_entry(&dock, Op::Put, Kind::Original, library_key(&journaled));
+    put.size = Some(8);
+    put.blake3 = Some(Blake3Hex::from_bytes(b"dock-one"));
+    put.content_id = Some(ContentId::from_bytes(b"dock-one"));
+    put.mtime = Some(1_787_996_925);
+    enqueue_entry(&dock_db, &put).expect("enqueue dock put");
+    publish_pending(&dock_db, &client, &bucket)
+        .await
+        .expect("dock publish");
+
+    let second = worker::run_cycle(&worker, &fresh).await.expect("cycle 2");
+    assert_eq!(second.deferred_to_uploader, vec![orphaned.clone()]);
+    assert!(
+        second.adopted.is_empty(),
+        "nothing adopted: {:?}",
+        second.adopted
+    );
+    let known = worker
+        .db()
+        .get_item(&journaled)
+        .unwrap()
+        .expect("learned from the dock");
+    assert_eq!(known.vv, vv(&[(&dock, 1)]), "no worker version was minted");
+    assert_eq!(known.mtime_unix_ns, 1_787_996_925 * 1_000_000_000);
+
+    // A day later the orphan's uploader has still not journaled it.
+    let late = CycleOptions {
+        clock: Some(ServerClock::pinned(
+            real_now() + worker::UPLOADER_JOURNAL_GRACE_SECS + 60,
+        )),
+        ..Default::default()
+    };
+    let third = worker::run_cycle(&worker, &late).await.expect("cycle 3");
+    assert!(third.deferred_to_uploader.is_empty());
+    assert_eq!(
+        third.adopted,
+        vec![orphaned.clone()],
+        "adopted after the grace"
+    );
+}
+
+/// The tag must name a valid device other than the worker itself: a tag
+/// carrying garbage, or the worker's own id, does not defer adoption.
+#[tokio::test]
+async fn an_invalid_or_own_uploader_tag_does_not_defer_adoption() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("wk-badtag");
+    let client = g.client();
+    let state = tempfile::tempdir().expect("state dir");
+    let cfg = worker_cfg(g, &bucket, Some(state.path().to_path_buf()));
+    let worker = Worker::open(&cfg).expect("open worker");
+
+    let garbage = rel("ingest/garbage-tag.JPG");
+    let opts = PutObjectOptions {
+        metadata: [(
+            worker::UPLOADER_META_KEY.to_string(),
+            "not-a-uuid".to_string(),
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    client
+        .put_object(
+            &bucket,
+            &library_key(&garbage),
+            Bytes::from_static(b"x"),
+            &opts,
+        )
+        .await
+        .expect("put garbage-tagged");
+    let own = rel("ingest/own-tag.JPG");
+    put_tagged(
+        &client,
+        &bucket,
+        &library_key(&own),
+        b"y",
+        worker.device_id(),
+    )
+    .await;
+
+    let report = worker::run_cycle(
+        &worker,
+        &CycleOptions {
+            clock: Some(ServerClock::pinned(real_now())),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("cycle");
+    assert!(report.deferred_to_uploader.is_empty());
+    assert!(report.adopted.contains(&garbage) && report.adopted.contains(&own));
+}

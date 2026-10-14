@@ -135,6 +135,16 @@ type = "i64"
 value = 31536000
 doc = "Manifest deleted-set rows are retained 12 months (§2.3)."
 
+[constants.UPLOADER_META_KEY]
+type = "str"
+value = "rrc-device"
+doc = "User-metadata key (the bare suffix of `x-amz-meta-rrc-device`) a participant may set on an original it PUTs, naming its device id. Marks the object as that participant's to journal, not a foreign drop (§6)."
+
+[constants.UPLOADER_JOURNAL_GRACE_SECS]
+type = "i64"
+value = 86400
+doc = "How long the worker leaves an original tagged with UPLOADER_META_KEY to its uploader's journal before adopting it as foreign (server time since the object's LastModified, §6)."
+
 [constants.PAIRING_INFO_PATH]
 type = "str"
 value = "/api/pairing-info"

@@ -42,6 +42,7 @@ mod imp {
     use crate::engine::{admit_pending, notify_local_change, EngineConsumer, LocalScan};
     use crate::journal::Kind;
     use crate::keys::relkey;
+    use crate::mtime::backfill_earliest_mtimes;
     use crate::publisher::publish_pending;
     use crate::reader::poll_with_cancel;
     use crate::s3::{S3Client, S3Config};
@@ -459,6 +460,20 @@ mod imp {
 
         if budget.is_expired(now_ms()) {
             return first_error.map_or(Ok(()), Err);
+        }
+
+        // One-time §2.2 earliest-mtime backfill (`crate::mtime`): records
+        // this device converged before that rule existed take the earliest
+        // mtime the bucket's puts carry for the same bytes, and their stubs
+        // and files are re-stamped so the library sorts by the real date. A
+        // no-op once done (a LIST and a few small GETs the one time it runs);
+        // a failure is logged, retried next cycle, and never fails this one.
+        match backfill_earliest_mtimes(db, s3, bucket, Some(root.as_path())).await {
+            Ok(r) if !r.corrected.is_empty() => {
+                log::info!("mtime backfill: {} original(s) re-dated", r.corrected.len())
+            }
+            Ok(_) => {}
+            Err(e) => log::warn!("mtime backfill: {e}"),
         }
 
         // §3.5 stub thumbnails: fetch the worker-generated `_small`/`_medium`
