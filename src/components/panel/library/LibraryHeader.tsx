@@ -38,6 +38,7 @@ import Dropdown from '../../ui/Dropdown';
 import { useSettingsStore } from '../../../store/useSettingsStore';
 import { useUIStore } from '../../../store/useUIStore';
 import { ADVANCED_QUERY_REGEX } from '../../../hooks/useSortedLibrary';
+import FolderSectionsToggle from './FolderSectionsToggle';
 
 function DropdownMenu({ buttonContent, buttonTitle, children, contentClassName = 'w-56' }: any) {
   const [isOpen, setIsOpen] = useState(false);
@@ -674,6 +675,7 @@ export function ViewOptionsDropdown({
                 }}
               />
             </div>
+            <FolderSectionsToggle libraryViewMode={libraryViewMode} />
           </div>
 
           <div>

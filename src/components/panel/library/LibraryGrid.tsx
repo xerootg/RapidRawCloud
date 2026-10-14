@@ -18,6 +18,7 @@ import Text from '../../ui/Text';
 import { TextColors, TextVariants, TextWeights, TEXT_COLOR_KEYS } from '../../../types/typography';
 import { useProcessStore } from '../../../store/useProcessStore';
 import { useSettingsStore } from '../../../store/useSettingsStore';
+import { useFolderSections } from './FolderSectionsToggle';
 
 function ListHeader({ widths, setWidths, containerRef, sortCriteria, onSortChange }: any) {
   const { t } = useTranslation();
@@ -247,6 +248,7 @@ export default function LibraryGrid(props: any) {
     })),
   );
 
+  const folderSections = useFolderSections();
   const [gridSize, setGridSize] = useState({ height: 0, width: 0 });
   const [listHandle, setListHandle] = useListCallbackRef();
   const [collapsedRecursiveFolders, setCollapsedRecursiveFolders] = useState<Set<string>>(new Set());
@@ -444,7 +446,7 @@ export default function LibraryGrid(props: any) {
     const rows: any[] = [];
     const isJustified = thumbnailAspectRatio === ThumbnailAspectRatio.Justified && !isListView;
 
-    if (libraryViewMode === LibraryViewMode.Recursive) {
+    if (libraryViewMode === LibraryViewMode.Recursive && folderSections) {
       const groups = groupImagesByFolder(imageList, currentFolderPath);
       groups.forEach((group) => {
         if (group.images.length === 0) return;
@@ -499,6 +501,7 @@ export default function LibraryGrid(props: any) {
     gridSize.width,
     imageList,
     libraryViewMode,
+    folderSections,
     libraryDisplayMode,
     collapsedRecursiveFolders,
     thumbnailSize,

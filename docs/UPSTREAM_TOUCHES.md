@@ -35,6 +35,8 @@ Status legend: [ ] planned (phase) · [x] landed
 | `src/components/ui/AppProperties.tsx` | `Invokes.Sync*` entries + `SyncSettings`/`SyncStatusDto`/`SyncPeerDevice`/`SyncRecentlyDeleted`/`SyncConflict` types + `ImageFile.sync_state` + `AppSettings.sync` (U8); pairing: `Invokes.SyncPairBegin`/`SyncPairComplete`; per-device DCIM: `Invokes.SyncListMediaBuckets` | [x] U8 · [x] pairing |
 | UI components | MainLibrary status badge, SettingsPanel "Sync" category, App.tsx conflict toast (mount-point one-liners); new `components/panel/sync/*` + `useSyncStore`/`useSyncActions`/`useSyncItemMenu` are additive | [x] U8 |
 | `src/components/panel/library/LibraryItems.tsx` | `SyncItemBadge` overlay on grid `Thumbnail` + list `ListItem` (fed by `imageFile.sync_state`); mount-point one-liners | [x] U8 |
+| `src/components/panel/library/LibraryHeader.tsx` | `FolderSectionsToggle` ("Group by folder", shown in Recursive mode) mounted under View Options → Display Mode: an import + one JSX line. The toggle, its `useFolderSections` hook and `store/useLibraryLayoutStore.ts` (localStorage, per device) are additive | [x] flat view |
+| `src/components/panel/library/LibraryGrid.tsx` | `useFolderSections()` (import + one hook line) gates the Recursive per-folder sections (`&& folderSections` on the grouping condition + its memo dep): with "Group by folder" off a recursive listing renders as one grid in the chosen sort order — the all-photos timeline for a library of deep date folders | [x] flat view |
 | `src/hooks/useAppContextMenus.ts` | `useSyncItemMenu()` entries spliced into the thumbnail context menu behind the empty-list guard (inert upstream) | [x] U8 |
 
 Notes:
