@@ -3,9 +3,12 @@
 # color parity with the app needs no app code. Slim runtime: just the binary +
 # CA certs for TLS to the S3 endpoint.
 #
-# Build context is the crate directory: docker build -f worker/Dockerfile \
-#   src-tauri/crates/rrcloud-core   (CI passes that context; see
-#   .github/workflows/worker-image.yml).
+# rrcloud-core's wire types come from the generated protocol SDK
+# (protocol/gen/rust/rrcloud-proto, a `../../../protocol/...` path dependency),
+# so the build context is the REPOSITORY ROOT:
+#   docker build -f worker/Dockerfile .
+# (CI passes that context; see .github/workflows/worker-image.yml). Same
+# approach as pairing/Dockerfile.
 FROM rust:1.97-bookworm AS builder
 WORKDIR /build
 # rrcloud-core declares rust-version 1.97, edition 2021. rawler is a git dep
@@ -13,14 +16,17 @@ WORKDIR /build
 # though a --bin build compiles no tests/dev-deps: the crate declares explicit
 # [[test]] targets (state_crash, transfer_crash), and cargo requires their
 # source files to exist to PARSE the manifest, before target selection.
-COPY Cargo.toml Cargo.lock ./
-COPY src ./src
-COPY tests ./tests
+# Same relative layout as the repository, so the path dependency resolves.
+COPY protocol/gen/rust/rrcloud-proto ./protocol/gen/rust/rrcloud-proto
+COPY src-tauri/crates/rrcloud-core/Cargo.toml src-tauri/crates/rrcloud-core/Cargo.lock ./src-tauri/crates/rrcloud-core/
+COPY src-tauri/crates/rrcloud-core/src ./src-tauri/crates/rrcloud-core/src
+COPY src-tauri/crates/rrcloud-core/tests ./src-tauri/crates/rrcloud-core/tests
+WORKDIR /build/src-tauri/crates/rrcloud-core
 # Build only the worker bin in release.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+    --mount=type=cache,target=/build/src-tauri/crates/rrcloud-core/target \
     cargo build --release --locked --bin rrcloud-worker \
- && cp /build/target/release/rrcloud-worker /usr/local/bin/rrcloud-worker
+ && cp /build/src-tauri/crates/rrcloud-core/target/release/rrcloud-worker /usr/local/bin/rrcloud-worker
 
 FROM debian:bookworm-slim AS runtime
 # TLS roots for HTTPS S3 endpoints (Garage public ingress, AWS, B2, R2).

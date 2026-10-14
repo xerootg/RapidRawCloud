@@ -8,6 +8,7 @@ on:
     branches: [main, cloud, ccr-70e6b1a3-bux8cz]
     paths:
       - 'src-tauri/crates/rrcloud-core/**'
+      - 'protocol/gen/rust/**'
       - 'worker/Dockerfile'
       - '.github/workflows/worker-image.yml'
     tags: ['v*']
@@ -44,9 +45,11 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          # rrcloud-core is a standalone crate (own Cargo.lock); build context is
-          # the crate dir so the image carries no app/tauri code.
-          context: src-tauri/crates/rrcloud-core
+          # rrcloud-core is a standalone crate (own Cargo.lock) with a path
+          # dependency on protocol/gen/rust/rrcloud-proto, so the context is the
+          # repo root; the Dockerfile copies only those two crates, so the image
+          # still carries no app/tauri code.
+          context: .
           file: worker/Dockerfile
           push: true
           tags: ${{ steps.meta.outputs.tags }}
