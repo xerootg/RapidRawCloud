@@ -16,10 +16,10 @@ add_library(rrc_pure STATIC
     ${COMP}/rrc_glob/rrc_glob.c
     ${COMP}/rrc_proto/rrc_relkey.c ${COMP}/rrc_proto/rrc_keys.c ${COMP}/rrc_proto/rrc_jsonw.c ${COMP}/rrc_proto/rrc_journal.c
     ${COMP}/rrc_proto/rrc_manifest.c ${COMP}/rrc_proto/rrc_gzip_store.c ${COMP}/rrc_proto/rrc_timefmt.c ${COMP}/rrc_proto/rrc_ledger.c
-    ${COMP}/rrc_ptp/rrc_ptp_codec.c
+    ${COMP}/rrc_ptp/rrc_ptp_codec.c ${COMP}/rrc_exfat/rrc_exfat.c
     ${GEN}/rrcloud_proto.c ${COMP}/rrcloud_proto/rrcp_blake3_hook.c)
 target_include_directories(rrc_pure PUBLIC
-    ${COMP}/rrc_hash/include ${COMP}/rrc_blake3/include ${COMP}/rrc_s3/include ${COMP}/rrc_glob/include ${COMP}/rrc_proto/include ${COMP}/rrc_ptp/include ${GEN})
+    ${COMP}/rrc_hash/include ${COMP}/rrc_blake3/include ${COMP}/rrc_s3/include ${COMP}/rrc_glob/include ${COMP}/rrc_proto/include ${COMP}/rrc_ptp/include ${COMP}/rrc_exfat/include ${GEN})
 
 enable_testing()
 foreach(t test_hash test_sigv4 test_glob test_proto test_ptp_codec)
@@ -31,6 +31,13 @@ add_test(NAME sigv4_vs_botocore COMMAND test_sigv4 ${VEC}/sigv4_vectors.txt)
 add_test(NAME glob COMMAND test_glob)
 add_test(NAME proto COMMAND test_proto ${CMAKE_CURRENT_BINARY_DIR}/manifest_test.gz)
 add_test(NAME ptp_codec COMMAND test_ptp_codec)
+# exFAT: needs images built with tools/make_exfat_image.sh (root); pass -DEXFAT_IMAGES="a.img;b.img" -DEXFAT_TREE=dir
+add_executable(test_exfat test_exfat.c)
+target_link_libraries(test_exfat rrc_pure)
+foreach(img ${EXFAT_IMAGES})
+    get_filename_component(n ${img} NAME_WE)
+    add_test(NAME exfat_${n} COMMAND test_exfat ${img} ${EXFAT_TREE})
+endforeach()
 find_program(PYTHON3 python3)
 if(PYTHON3)
     add_test(NAME gzip_decodes_with_stdlib COMMAND ${PYTHON3} -I ${CMAKE_CURRENT_SOURCE_DIR}/tools/check_gzip.py ${CMAKE_CURRENT_BINARY_DIR}/manifest_test.gz)

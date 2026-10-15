@@ -22,7 +22,7 @@ static int64_t last_cycle_us;
 void usb_diag_set_verbose(bool verbose)
 {
     const esp_log_level_t lvl = verbose ? ESP_LOG_DEBUG : ESP_LOG_INFO;
-    static const char *const tags[] = {"HUB", "HCD DWC", "USBH", "ENUM", "USB HOST", "USB MSC", "rrc_ptp", "usb"};
+    static const char *const tags[] = {"HUB", "HCD DWC", "USBH", "ENUM", "USB HOST", "USB MSC", "USB_MSC", "USB_MSC_SCSI", "MSC VFS", "diskio_usb", "src_msc", "rrc_ptp", "usb"};
     for (size_t i = 0; i < sizeof tags / sizeof tags[0]; i++) esp_log_level_set(tags[i], lvl);
     ESP_LOGI(TAG, "usb stack log level: %s", verbose ? "debug" : "info");
 }

@@ -152,3 +152,6 @@ CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS=y
 # Three persistent TLS connections to the bucket (control + two uploaders), the web UI and mDNS share the
 # socket table; at the default 10 a batch of small uploads ran out ("Failed to create socket").
 CONFIG_LWIP_MAX_SOCKETS=16
+
+# USB mass-storage disks use 512-byte sectors; the 4096 default makes f_mount reject them
+CONFIG_FATFS_SECTOR_512=y
