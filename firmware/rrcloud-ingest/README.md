@@ -11,7 +11,7 @@ Supported cameras:
 | Camera | USB mode | Driver |
 |---|---|---|
 | Nikon Z f, Z 7II (and other PTP/MTP bodies) | *MTP/PTP* | `components/rrc_ptp` — a USB Still Image Class (PTP) host driver written for this project |
-| Sigma fp | *Mass Storage* | `espressif/usb_host_msc` + FATFS; the card is scanned under `DCIM/` |
+| Sigma fp | *Mass Storage* | `espressif/usb_host_msc`; FAT cards through FatFS, exFAT cards (the fp formats anything over 32 GB as exFAT) through the in-repo read-only `rrc_exfat` reader; the card is scanned under `DCIM/` |
 
 The board runs on PoE (or USB-C), so the dock is a single cable on a shelf: Ethernet is
 always on; Wi‑Fi 6 via the on-board ESP32‑C6 is optional.
