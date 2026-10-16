@@ -135,7 +135,7 @@ Pairing (`cd pairing`): `cargo fmt --check && cargo clippy --all-targets -- -D w
 | anything (PR)                      | `lint.yml`                | frontend lint/format/i18n (non-blocking), `cargo fmt`, `cargo clippy -D warnings` on `src-tauri` |
 | `src-tauri/crates/rrcloud-core/**` | `rrcloud.yml`             | fmt, clippy, tests with Garage                                                                   |
 | `protocol/**`                      | `protocol.yml`            | generated output up to date, Rust + C/C++ conformance, engine-vs-SDK conformance                 |
-| `firmware/**` or `protocol/**`     | `firmware.yml`            | host tests, committed interop fixtures up to date, ESP-IDF build                                 |
+| `firmware/**` or `protocol/**`     | `firmware.yml`            | host tests, interop fixtures up to date, UI simulator, ESP-IDF build of both boards              |
 
 Run the matching local commands before pushing.
 
