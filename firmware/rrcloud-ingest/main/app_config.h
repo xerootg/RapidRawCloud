@@ -38,6 +38,10 @@ typedef struct {
     bool admin_auth;                  /* require HTTP basic auth (user "admin") */
     bool usb_debug;                   /* DEBUG-level logs from the USB host stack */
     bool ble_enabled;                 /* advertise the BLE admin service (RapidRAW app) */
+    /* On-device display (boards with CONFIG_RRC_HAS_DISPLAY; stored everywhere) */
+    uint8_t display_brightness;       /* 5..100 % */
+    uint16_t display_timeout_s;       /* screen off after this much inactivity, 0 = never */
+    bool display_dark;                /* Material 3 dark scheme */
 } app_config_t;
 
 esp_err_t app_config_init(void);                     /* nvs_flash_init + load (defaults when empty) */

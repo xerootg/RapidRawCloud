@@ -1,10 +1,12 @@
 /*
  * rrcloud-ingest — RapidRawCloud camera-ingest dock for the Waveshare
- * ESP32-P4-WIFI6-POE-ETH. Plug a camera into the USB-A port; new photos are
- * uploaded into the library bucket as journaled originals (architecture §2.2),
- * exactly as a phone or desktop would publish them.
+ * ESP32-P4-WIFI6-POE-ETH (and the ESP32-P4-WIFI6-Touch-LCD-4.3, which adds an
+ * on-screen UI; main/board.h). Plug a camera into the USB host port; new photos
+ * are uploaded into the library bucket as journaled originals (architecture
+ * §2.2), exactly as a phone or desktop would publish them.
  */
 #include <stdio.h>
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
@@ -23,6 +25,9 @@
 #include "ble.h"
 #include "console.h"
 #include "power.h"
+#if CONFIG_RRC_HAS_DISPLAY
+#include "display.h"
+#endif
 
 static const char *TAG = "main";
 
@@ -45,6 +50,11 @@ void app_main(void)
     log_ring_printf("rrcloud-ingest starting; device %s; psram free %u KiB", app_device_id(), (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
 
     power_init();
+#if CONFIG_RRC_HAS_DISPLAY
+    /* First, so the screen shows progress while the rest comes up; a dead panel
+     * or touch controller is logged and the dock carries on headless. */
+    display_start();
+#endif
     ESP_ERROR_CHECK(net_init());
     coproc_start(); /* ESP32-C6 link for BLE/version reporting, with or without Wi-Fi */
     ble_start();    /* BLE admin service once the C6 is linked */
