@@ -37,10 +37,35 @@
 //!
 //! The fix is one process-wide `Once` **per global**, shared by every
 //! call site via the `pub fn`s below — not two (or more) independent
-//! ones. Both `android_integration.rs` and `bridge.rs` route through
-//! these now; neither touches `ndk_context::initialize_android_context`
-//! or `rustls_platform_verifier::android::init_with_env` directly, and
-//! neither declares its own `Once` for either global any more.
+//! ones. Neither `android_integration.rs` nor `bridge.rs` touches
+//! `ndk_context::initialize_android_context` or
+//! `rustls_platform_verifier::android::init_with_env` directly, and
+//! neither declares its own `Once` for either global any more (and since
+//! tao 0.37 the bridge does not initialize `ndk_context` at all — see the
+//! next section).
+//!
+//! ## tao 0.37+ owns `ndk_context` (tauri 2.12)
+//!
+//! tao 0.37, which tauri 2.12 pulls in, calls
+//! `ndk_context::initialize_android_context` itself from the activity's
+//! `onCreate` glue, with the application context and with no "already
+//! set" check of its own. A shared guard on our side cannot cover a call
+//! site inside tao, so the process survives only if nothing else ever
+//! initializes `ndk_context`:
+//!
+//! - initialized by anyone before tao (e.g. a `WorkManager` worker in a
+//!   process the worker cold-started), the next activity launch in that
+//!   process aborts inside tao's `onCreate`;
+//! - initialized by tao first, any later caller aborts in its own call.
+//!
+//! So [`super::bridge`] no longer initializes `ndk_context` — nothing in
+//! this crate reads it — and the app bootstrap (`android_integration.rs`)
+//! probes it and only calls [`ensure_ndk_context_initialized`] when tao
+//! has not (a tao older than 0.37). The two sections below describe the
+//! earlier two-initializer design; [`ensure_ndk_context_initialized`]
+//! keeps its `make_context_ptr` shape, so that bootstrap path is still
+//! correct. `rustls_platform_verifier` is unaffected: both call sites
+//! still share its guard.
 //!
 //! ## Is a stored vm/context pointer pair from either call site as good as the other's?
 //!
@@ -231,9 +256,10 @@ pub fn run_exactly_once(once: &Once, init: impl FnOnce()) {
     once.call_once(init);
 }
 
-/// The single process-wide guard for `ndk_context::initialize_android_context`,
-/// shared by every call site in this process (`android_integration.rs`'s
-/// app bootstrap and [`super::bridge`]'s JNI entry points).
+/// The single process-wide guard for `ndk_context::initialize_android_context`.
+/// Since tao 0.37 its only caller is `android_integration.rs`'s app
+/// bootstrap, and only when tao has not initialized `ndk_context` itself
+/// (see this module's doc).
 #[cfg(target_os = "android")]
 static NDK_CONTEXT_INIT: Once = Once::new();
 
@@ -506,6 +532,27 @@ mod tests {
              fix is the single shared Once exercised by the test above"
         );
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Regression for the tao 0.37 (tauri 2.12) double-init abort: tao
+    /// initializes `ndk_context` itself in the activity's `onCreate`, with
+    /// no guard we can share, so the same-process `WorkManager` bridge must
+    /// never initialize it — whichever of the two calls comes second aborts
+    /// the process (worker first: the next app launch dies in tao; tao
+    /// first: the worker dies). Structural, because the bridge's JNI entry
+    /// points only compile for Android.
+    #[test]
+    fn bridge_never_initializes_ndk_context() {
+        let bridge = include_str!("bridge.rs");
+        for needle in [
+            "ensure_ndk_context_initialized(",
+            "initialize_android_context(",
+        ] {
+            assert!(
+                !bridge.contains(needle),
+                "bridge.rs must not call `{needle}`: tao 0.37+ owns ndk_context init"
+            );
+        }
     }
 
     /// Regression for the blocker this round fixes ("shared guard is not

@@ -240,9 +240,11 @@ export interface ParametricCurve {
 }
 
 export interface Adjustments {
+  activeTools: ActiveTools;
   [index: string]: any;
   aiPatches: Array<AiPatch>;
   aspectRatio: number | null;
+  baselineExposure: boolean;
   blacks: number;
   brightness: number;
   centré: number;
@@ -330,7 +332,6 @@ export interface Adjustments {
   orientationSteps: number;
   rotation: number;
   saturation: number;
-  sectionVisibility: SectionVisibility;
   shadows: number;
   sharpness: number;
   sharpnessThreshold: number;
@@ -414,6 +415,7 @@ interface Hsl {
 }
 
 export interface MaskAdjustments {
+  activeTools: ActiveTools;
   [index: string]: any;
   blacks: number;
   brightness: number;
@@ -436,7 +438,6 @@ export interface MaskAdjustments {
   id?: string;
   lumaNoiseReduction: number;
   saturation: number;
-  sectionVisibility: SectionVisibility;
   shadows: number;
   sharpness: number;
   sharpnessThreshold: number;
@@ -466,14 +467,7 @@ export interface Sections {
   effects: Array<string>;
 }
 
-export interface SectionVisibility {
-  [index: string]: boolean;
-  basic: boolean;
-  curves: boolean;
-  color: boolean;
-  details: boolean;
-  effects: boolean;
-}
+export type ActiveTools = Record<string, boolean>;
 
 export const COLOR_LABELS: Array<Color> = [
   { name: 'red', color: '#ef4444' },
@@ -543,6 +537,7 @@ export const getDefaultCurves = (): Curves => ({
 export const DEFAULT_PARAMETRIC_CURVE = getDefaultParametricCurve();
 
 export const INITIAL_MASK_ADJUSTMENTS: MaskAdjustments = {
+  activeTools: {},
   blacks: 0,
   brightness: 0,
   clarity: 0,
@@ -572,13 +567,6 @@ export const INITIAL_MASK_ADJUSTMENTS: MaskAdjustments = {
   hue: 0,
   lumaNoiseReduction: 0,
   saturation: 0,
-  sectionVisibility: {
-    basic: true,
-    curves: true,
-    color: true,
-    details: true,
-    effects: true,
-  },
   shadows: 0,
   sharpness: 0,
   sharpnessThreshold: 15,
@@ -599,8 +587,10 @@ export const INITIAL_MASK_CONTAINER: MaskContainer = {
 };
 
 export const INITIAL_ADJUSTMENTS: Adjustments = {
+  activeTools: {},
   aiPatches: [],
   aspectRatio: null,
+  baselineExposure: true,
   blacks: 0,
   brightness: 0,
   centré: 0,
@@ -687,13 +677,6 @@ export const INITIAL_ADJUSTMENTS: Adjustments = {
   orientationSteps: 0,
   rotation: 0,
   saturation: 0,
-  sectionVisibility: {
-    basic: true,
-    curves: true,
-    color: true,
-    details: true,
-    effects: true,
-  },
   shadows: 0,
   sharpness: 0,
   sharpnessThreshold: 15,
@@ -785,10 +768,8 @@ export const normalizeLoadedAdjustments = (loadedAdjustments: Adjustments): any 
           ? deepCloneParametric(containerAdjustments.parametricCurve)
           : getDefaultParametricCurve(),
         curveMode: containerAdjustments.curveMode || INITIAL_MASK_ADJUSTMENTS.curveMode,
-        sectionVisibility: {
-          ...INITIAL_MASK_ADJUSTMENTS.sectionVisibility,
-          ...(containerAdjustments.sectionVisibility || {}),
-        },
+        activeTools: getActiveTools(containerAdjustments),
+        sectionVisibility: undefined,
         sharpnessThreshold: containerAdjustments.sharpnessThreshold ?? INITIAL_MASK_ADJUSTMENTS.sharpnessThreshold,
       },
       subMasks: normalizedSubMasks,
@@ -820,6 +801,7 @@ export const normalizeLoadedAdjustments = (loadedAdjustments: Adjustments): any 
       })(),
       autoCrop: loadedAdjustments.guidedPerspective?.autoCrop ?? true,
     },
+    baselineExposure: loadedAdjustments.baselineExposure ?? false,
     lutIsSceneReferred: loadedAdjustments.lutIsSceneReferred ?? false,
     flareAmount: loadedAdjustments.flareAmount ?? INITIAL_ADJUSTMENTS.flareAmount,
     glowAmount: loadedAdjustments.glowAmount ?? INITIAL_ADJUSTMENTS.glowAmount,
@@ -882,10 +864,8 @@ export const normalizeLoadedAdjustments = (loadedAdjustments: Adjustments): any 
     curveMode: loadedAdjustments.curveMode || INITIAL_ADJUSTMENTS.curveMode,
     masks: normalizedMasks,
     aiPatches: normalizedAiPatches,
-    sectionVisibility: {
-      ...INITIAL_ADJUSTMENTS.sectionVisibility,
-      ...(loadedAdjustments.sectionVisibility || {}),
-    },
+    activeTools: getActiveTools(loadedAdjustments),
+    sectionVisibility: undefined,
     sharpnessThreshold: loadedAdjustments.sharpnessThreshold ?? INITIAL_ADJUSTMENTS.sharpnessThreshold,
   };
 };
@@ -1126,6 +1106,7 @@ export const withAdjustmentLayout = (settings: AppSettings, changes: Partial<Adj
 export interface AdjustmentSectionTool {
   id: string;
   label: string;
+  subTools?: Array<string>;
 }
 
 export const ADJUSTMENT_SECTION_TOOLS: Record<string, Array<AdjustmentSectionTool>> = {
@@ -1145,15 +1126,58 @@ export const ADJUSTMENT_SECTION_TOOLS: Record<string, Array<AdjustmentSectionToo
   ],
   effects: [
     { id: 'creative', label: 'adjustments.effects.creative' },
-    { id: 'spatial', label: 'adjustments.effects.spatial' },
+    { id: 'spatial', label: 'adjustments.effects.spatial', subTools: ['lensBlur', 'relight', 'fog'] },
     { id: 'lut', label: 'adjustments.effects.lut' },
     { id: 'vignette', label: 'adjustments.effects.vignette' },
     { id: 'grain', label: 'adjustments.effects.grain' },
   ],
 };
 
+export const ALL_ADJUSTMENT_TOOLS = Object.values(ADJUSTMENT_SECTION_TOOLS).flat();
+
+export const ADJUSTMENT_TOOLS_BY_ID: Record<string, AdjustmentSectionTool> = Object.fromEntries(
+  ALL_ADJUSTMENT_TOOLS.map((tool) => [tool.id, tool]),
+);
+
 export const getAdjustmentSectionToolIds = (section: string): string[] =>
   (ADJUSTMENT_SECTION_TOOLS[section] ?? []).map((tool) => tool.id);
+
+const getToolIds = (id: string): Array<string> => {
+  const expand = (tool: AdjustmentSectionTool) => tool.subTools ?? [tool.id];
+  const sectionTools = ADJUSTMENT_SECTION_TOOLS[id];
+  if (sectionTools) {
+    return sectionTools.flatMap(expand);
+  }
+  const tool = ADJUSTMENT_TOOLS_BY_ID[id];
+  return tool ? expand(tool) : [id];
+};
+
+export const isToolActive = (activeTools: ActiveTools, id: string): boolean =>
+  getToolIds(id).some((tool) => activeTools[tool] !== false);
+
+export const setToolActive = (activeTools: ActiveTools, id: string, active: boolean): ActiveTools => ({
+  ...activeTools,
+  ...Object.fromEntries(getToolIds(id).map((tool) => [tool, active])),
+});
+
+export const toggleToolActive = (activeTools: ActiveTools, id: string): ActiveTools =>
+  setToolActive(activeTools, id, !isToolActive(activeTools, id));
+
+interface ToolStateSource {
+  activeTools?: ActiveTools;
+  sectionVisibility?: Record<string, boolean>;
+}
+
+export const getActiveTools = (adjustments: ToolStateSource): ActiveTools =>
+  adjustments.activeTools ??
+  Object.entries(adjustments.sectionVisibility ?? {})
+    .filter(([, visible]) => !visible)
+    .reduce((activeTools, [id]) => setToolActive(activeTools, id, false), {});
+
+export const mergeActiveTools = (base: ToolStateSource, overrides: ToolStateSource): ActiveTools => ({
+  ...getActiveTools(base),
+  ...getActiveTools(overrides),
+});
 
 export const getAdjustmentToolOrder = (section: string, toolOrder?: Record<string, string[]>): string[] =>
   reconcileOrder(getAdjustmentSectionToolIds(section), toolOrder?.[section]);

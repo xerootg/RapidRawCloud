@@ -20,87 +20,54 @@ use std::path::PathBuf;
 // its own. With `sync` on, `initialize_android` below calls through
 // `rrcloud_core::android::platform_init`'s shared, process-wide guards
 // instead — see that module's doc for the on-device double-init crash
-// (`SIGABRT` in a same-process WorkManager worker thread) two independent
-// local `Once`s like these actually caused, which is why they must not be
-// used when a second call site (the bridge) can exist in this process.
+// (`SIGABRT` in a same-process WorkManager worker thread) that independent
+// per-call-site guards caused.
 #[cfg(all(target_os = "android", not(feature = "sync")))]
 static INIT_NDK_CONTEXT: std::sync::Once = std::sync::Once::new();
 #[cfg(all(target_os = "android", not(feature = "sync")))]
 static INIT_RUSTLS_PLATFORM_VERIFIER: std::sync::Once = std::sync::Once::new();
 
 #[cfg(target_os = "android")]
+fn ndk_context_is_initialized() -> bool {
+    // tao 0.37+ initializes ndk-context in its Android `onCreate` glue (with the
+    // application context) before `main` runs; tao 0.35 (the Android CI pin) does
+    // not. `ndk-context` 0.1.x has no `get_or_init`, and `android_context()`
+    // panics when the context is unset, so probe with `catch_unwind`. A no-op
+    // panic hook is installed for the duration of the probe so the app's real
+    // hook doesn't log a scary `PANIC!` line on every startup.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let initialized = std::panic::catch_unwind(ndk_context::android_context).is_ok();
+    std::panic::set_hook(previous_hook);
+    initialized
+}
+
+#[cfg(target_os = "android")]
 pub fn initialize_android(window: &tauri::WebviewWindow) {
     let _ = window.with_webview(|webview| {
         webview.jni_handle().exec(|env, context, _webview| {
-            if let Ok(vm) = env.get_java_vm() {
+            if ndk_context_is_initialized() {
+                log::info!("ndk-context already initialized by tao; skipping re-init.");
+            } else if let Ok(vm) = env.get_java_vm() {
                 let vm_ptr = vm.get_java_vm_pointer() as *mut std::ffi::c_void;
                 let context_ptr = context.as_raw() as *mut std::ffi::c_void;
 
                 #[cfg(feature = "sync")]
                 {
-                    // Shared process-wide guard: a same-process WorkManager
-                    // worker (`SyncCycleWorker`/`DcimScanWorker`, via
-                    // `tauri-plugin-rrcloud`'s JNI bridge) may call the SAME
-                    // `ndk_context` init from this same process (this app sets
-                    // no `android:process` override anywhere, so the worker
-                    // and the app share one process). Routing both call sites
-                    // through `rrcloud_core`'s one shared `Once` -- instead of
-                    // each keeping its own, as this code used to -- is what
-                    // prevents the on-device crash.
+                    // Only reached on a tao that does not initialize
+                    // `ndk_context` itself (pre-0.37). The same-process
+                    // WorkManager bridge never initializes it (tao 0.37+
+                    // would abort the activity launch if anything did so
+                    // first), so this is the only initializer; it still goes
+                    // through `rrcloud_core`'s shared process-wide guard --
+                    // see `rrcloud_core::android::platform_init`'s module doc.
                     //
-                    // No local-to-global promotion needed on this side (unlike
-                    // the bridge's): `context` here derefs from `wry`'s own
-                    // `ActivityProxy.activity` `GlobalRef`, cloned into every
-                    // dispatch (see `rrcloud_core::android::platform_init`'s
-                    // module doc), so `context_ptr` is already a global
-                    // reference's raw handle, good for the life of the
-                    // process -- the closure just hands that pointer through
-                    // unchanged. It only runs at all if this call wins the
-                    // shared race.
+                    // No local-to-global promotion needed: `context` here
+                    // derefs from `wry`'s own `ActivityProxy.activity`
+                    // `GlobalRef`, cloned into every dispatch, so
+                    // `context_ptr` is already a global reference's raw
+                    // handle, good for the life of the process.
                     rrcloud_core::android::ensure_ndk_context_initialized(vm_ptr, || context_ptr);
-
-                    // Caches the app's `ClassLoader` so later
-                    // `#[tauri::command]` handlers (which run on a Tokio
-                    // thread, never one the JVM created) can resolve
-                    // `com.plugin.rrcloud.RrcloudBridge` correctly — see
-                    // `rrcloud_core::android::platform_init`'s module doc
-                    // ("The `ClassNotFoundException` this module also
-                    // fixes") for the on-device crash this prevents. Must
-                    // run on this closure's thread (the WebView's own,
-                    // genuinely Java-originated) while `env`/`context` are
-                    // still live and attached correctly.
-                    rrcloud_core::android::ensure_class_loader_initialized(|| {
-                        match env
-                            .call_method(context, "getClass", "()Ljava/lang/Class;", &[])
-                            .and_then(|v| v.l())
-                            .and_then(|class_obj| {
-                                env.call_method(
-                                    &class_obj,
-                                    "getClassLoader",
-                                    "()Ljava/lang/ClassLoader;",
-                                    &[],
-                                )
-                            })
-                            .and_then(|v| v.l())
-                            .and_then(|loader_obj| env.new_global_ref(&loader_obj))
-                        {
-                            Ok(global_loader) => {
-                                let ptr = global_loader.as_obj().as_raw() as *mut std::ffi::c_void;
-                                // Intentionally leaked -- same rationale as
-                                // `context_ptr` above: this cache must
-                                // outlive this one call, for the rest of
-                                // the process's life.
-                                std::mem::forget(global_loader);
-                                ptr
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "rrcloud: failed to cache app ClassLoader at startup: {e:?}"
-                                );
-                                std::ptr::null_mut()
-                            }
-                        }
-                    });
                 }
                 #[cfg(not(feature = "sync"))]
                 {
@@ -113,7 +80,52 @@ pub fn initialize_android(window: &tauri::WebviewWindow) {
 
             #[cfg(feature = "sync")]
             {
-                // Same shared-guard rationale as above. Unlike `ndk_context`,
+                // Caches the app's `ClassLoader` so later
+                // `#[tauri::command]` handlers (which run on a Tokio
+                // thread, never one the JVM created) can resolve
+                // `com.plugin.rrcloud.RrcloudBridge` correctly — see
+                // `rrcloud_core::android::platform_init`'s module doc
+                // ("The `ClassNotFoundException` this module also
+                // fixes") for the on-device crash this prevents. Must
+                // run on this closure's thread (the WebView's own,
+                // genuinely Java-originated) while `env`/`context` are
+                // still live and attached correctly. Independent of the
+                // `ndk_context` branch above: it must run even when tao
+                // (0.37+) already owns `ndk_context`.
+                rrcloud_core::android::ensure_class_loader_initialized(|| {
+                    match env
+                        .call_method(context, "getClass", "()Ljava/lang/Class;", &[])
+                        .and_then(|v| v.l())
+                        .and_then(|class_obj| {
+                            env.call_method(
+                                &class_obj,
+                                "getClassLoader",
+                                "()Ljava/lang/ClassLoader;",
+                                &[],
+                            )
+                        })
+                        .and_then(|v| v.l())
+                        .and_then(|loader_obj| env.new_global_ref(&loader_obj))
+                    {
+                        Ok(global_loader) => {
+                            let ptr = global_loader.as_obj().as_raw() as *mut std::ffi::c_void;
+                            // Intentionally leaked: this cache must outlive
+                            // this one call, for the rest of the process's
+                            // life.
+                            std::mem::forget(global_loader);
+                            ptr
+                        }
+                        Err(e) => {
+                            eprintln!("rrcloud: failed to cache app ClassLoader at startup: {e:?}");
+                            std::ptr::null_mut()
+                        }
+                    }
+                });
+            }
+
+            #[cfg(feature = "sync")]
+            {
+                // Same shared-guard rationale as `ndk_context`'s above. Unlike it,
                 // `rustls_platform_verifier::android::init_with_env` is
                 // internally idempotent on a second call (it stores its
                 // state in a `once_cell::sync::OnceCell`), so this was never
