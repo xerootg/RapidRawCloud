@@ -83,7 +83,7 @@ never returned by the API.
 
 ## Building and flashing
 
-Requirements: ESP-IDF **v5.5** (`idf.py`), target `esp32p4`. Managed components
+Requirements: ESP-IDF **v5.5.5** (`idf.py`; 5.5.1 is the first 5.5.x that supports ESP32-P4 rev 3 silicon), target `esp32p4`. Managed components
 (`usb_host_msc`, `esp_wifi_remote`/`esp_hosted`, `littlefs`, `mdns`) are fetched by the
 component manager on first build.
 

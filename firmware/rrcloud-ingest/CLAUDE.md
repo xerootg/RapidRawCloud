@@ -2,7 +2,7 @@
 
 Also read the root `CLAUDE.md` and this directory's `README.md`.
 
-- C on ESP-IDF v5.5, target `esp32p4`. Full builds need `idf.py` (CI uses the `espressif/idf`
+- C on ESP-IDF v5.5.5, target `esp32p4`. Full builds need `idf.py` (CI uses the `espressif/idf`
   container via `.github/workflows/firmware-build.yml`); you usually don't have it locally.
 - What you can always run — host tests for the pure components (gcc + cmake only):
   ```sh
