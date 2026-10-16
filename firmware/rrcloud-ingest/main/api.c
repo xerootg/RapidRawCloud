@@ -176,6 +176,24 @@ static void r_log(api_resp_t *out)
     set(out, 200, buf, n);
 }
 
+static void r_json(api_resp_t *out, size_t cap, int (*fn)(char *, size_t))
+{
+    char *buf = malloc(cap);
+    if (!buf) { set(out, 500, NULL, 0); return; }
+    int n = fn(buf, cap);
+    if (n < 0 || (size_t)n >= cap) { free(buf); err(out, 500, "encode"); return; }
+    set(out, 200, buf, n);
+}
+
+static void r_wifi_scan(api_resp_t *out)
+{
+    esp_err_t e = net_wifi_scan_start();
+    if (e == ESP_ERR_NOT_SUPPORTED) { err(out, 409, "Wi-Fi is turned off"); return; }
+    if (e == ESP_ERR_INVALID_STATE) { err(out, 409, "a scan is already running"); return; }
+    if (e != ESP_OK) { err(out, 500, esp_err_to_name(e)); return; }
+    ok(out);
+}
+
 static void restart_cb(void *arg) { (void)arg; esp_restart(); }
 
 static void r_reboot(api_resp_t *out)
@@ -221,6 +239,10 @@ void api_dispatch(const char *method, const char *path, const char *body, size_t
     else if (post && !strcmp(path, "/api/reboot")) r_reboot(out);
     else if (post && !strcmp(path, "/api/coproc/update")) r_coproc_update(body, body_len, out);
     else if (post && !strcmp(path, "/api/ble/forget")) { ble_forget_bonds(); ok(out); }
+    else if (get && !strcmp(path, "/api/wifi")) r_json(out, 1024, net_wifi_json);
+    else if (post && !strcmp(path, "/api/wifi/scan")) r_wifi_scan(out);
+    /* worst case: NET_SCAN_MAX SSIDs of 32 bytes, each escaped up to \u00XX (6x) */
+    else if (get && !strcmp(path, "/api/wifi/scan")) r_json(out, 10240, net_wifi_scan_json);
     else err(out, 404, "unknown endpoint");
     if (!out->json) set(out, 500, NULL, 0);
 }

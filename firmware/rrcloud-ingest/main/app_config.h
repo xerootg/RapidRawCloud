@@ -31,6 +31,7 @@ typedef struct {
     /* Device identity shown in the registry */
     char device_name[48];
     /* Network */
+    bool wifi_enabled;                /* master switch for the Wi-Fi station */
     char wifi_ssid[33];
     char hostname[32];
     /* Admin UI */

@@ -1,6 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 esp_err_t net_init(void);                 /* Ethernet (where fitted) + optional Wi-Fi STA + SNTP + mDNS */
@@ -16,5 +17,34 @@ const char *net_eth_ip(void);
 void net_eth_link_info(int *speed_mbps, bool *full_duplex);
 bool net_wifi_connected(void);
 bool net_time_synced(void);
-/* Re-applies Wi-Fi credentials from config (after the UI changed them). */
+/* Re-applies Wi-Fi settings from config (after the UI changed them). Identical
+ * credentials leave a live association alone. */
 esp_err_t net_wifi_reconfigure(void);
+
+/* Station details for /api/wifi:
+ * {"enabled","ssid","standby","started","associated","has_ip","attempts","last_reason","last_reason_text",
+ *  "connected_s","bssid","rssi","channel","security","phy","mac","ip","netmask","gateway","dns"}
+ * (association and address fields only while they exist). */
+int net_wifi_json(char *out, size_t cap);
+/* RSSI of the current association in dBm, 0 when not associated (cached ~3 s). */
+int net_wifi_rssi(void);
+
+/* Asynchronous scan (runs on the network task; poll net_wifi_scan_json).
+ * ESP_ERR_NOT_SUPPORTED while Wi-Fi is disabled, ESP_ERR_INVALID_STATE while a scan runs. */
+esp_err_t net_wifi_scan_start(void);
+typedef enum { NET_SCAN_IDLE, NET_SCAN_RUNNING, NET_SCAN_DONE, NET_SCAN_FAILED } net_scan_state_t;
+#define NET_SCAN_MAX 24
+typedef struct {
+    char ssid[33];
+    uint8_t bssid[6];
+    int8_t rssi;
+    uint8_t channel;
+    uint8_t authmode;   /* wifi_auth_mode_t */
+    bool wifi6;
+    uint8_t aps;        /* access points advertising this SSID */
+} net_ap_t;
+/* {"state":"idle|running|done|failed","error":"…","networks":[{"ssid","bssid","rssi","channel","security","open","wifi6","aps"}]}
+ * One entry per SSID (strongest access point), strongest first. */
+int net_wifi_scan_json(char *out, size_t cap);
+const char *net_wifi_authmode_str(int authmode);
+const char *net_wifi_reason_str(int reason);

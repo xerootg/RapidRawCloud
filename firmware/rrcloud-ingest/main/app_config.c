@@ -32,6 +32,7 @@ static void defaults(app_config_t *c)
     c->admin_auth = false;
     c->usb_debug = true;   /* pre-release default: camera bring-up is the open question */
     c->ble_enabled = true;
+    c->wifi_enabled = true;
 }
 
 static esp_err_t nvs_get_string(nvs_handle_t h, const char *key, char *out, size_t cap)
@@ -132,6 +133,7 @@ static int to_json(const app_config_t *c, char *out, size_t cap, bool for_ui)
     put_bool(&w, "upload_videos", c->upload_videos);
     rrc_jsonw_key(&w, "min_size_kb", false); rrc_jsonw_u64(&w, c->min_size_kb);
     put_str(&w, "device_name", c->device_name, false);
+    put_bool(&w, "wifi_enabled", c->wifi_enabled);
     put_str(&w, "wifi_ssid", c->wifi_ssid, false);
     put_str(&w, "hostname", c->hostname, false);
     put_bool(&w, "admin_auth", c->admin_auth);
@@ -238,6 +240,7 @@ esp_err_t app_config_apply_json(const char *json, size_t len, char *err, size_t 
     cJSON *ms = cJSON_GetObjectItemCaseSensitive(o, "min_size_kb");
     if (cJSON_IsNumber(ms) && ms->valuedouble >= 0) c.min_size_kb = (uint32_t)ms->valuedouble;
     copy_str(o, "device_name", c.device_name, sizeof c.device_name);
+    copy_bool(o, "wifi_enabled", &c.wifi_enabled);
     copy_str(o, "wifi_ssid", c.wifi_ssid, sizeof c.wifi_ssid);
     copy_str(o, "hostname", c.hostname, sizeof c.hostname);
     copy_bool(o, "admin_auth", &c.admin_auth);
