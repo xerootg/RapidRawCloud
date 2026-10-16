@@ -1,0 +1,32 @@
+menu "rrcloud-ingest board"
+
+    choice RRC_BOARD
+        prompt "Target board"
+        default RRC_BOARD_P4_POE_ETH
+        help
+            The Waveshare ESP32-P4 board this image is built for. Both share the ESP32-C6
+            radio wiring (SDIO slot 1, CLK 18, CMD 19, D0-D3 14-17, reset 54), the 32 MB
+            flash / 32 MB PSRAM and the microSD pins; they differ in Ethernet, display,
+            touch, battery and USB host power. Pick the matching sdkconfig overlay rather
+            than flipping this by hand (README "Building and flashing").
+
+        config RRC_BOARD_P4_POE_ETH
+            bool "ESP32-P4-WIFI6-POE-ETH (Ethernet + PoE, USB-A host, headless)"
+
+        config RRC_BOARD_P4_TOUCH_LCD_43
+            bool "ESP32-P4-WIFI6-Touch-LCD-4.3 (Wi-Fi only, 480x800 touch display, Li-ion battery)"
+    endchoice
+
+    config RRC_HAS_ETHERNET
+        bool
+        default y if RRC_BOARD_P4_POE_ETH
+
+    config RRC_HAS_DISPLAY
+        bool
+        default y if RRC_BOARD_P4_TOUCH_LCD_43
+
+    config RRC_HAS_BATTERY
+        bool
+        default y if RRC_BOARD_P4_TOUCH_LCD_43
+
+endmenu

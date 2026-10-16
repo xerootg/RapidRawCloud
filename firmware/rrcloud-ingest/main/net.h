@@ -3,10 +3,12 @@
 #include <stddef.h>
 #include "esp_err.h"
 
-esp_err_t net_init(void);                 /* Ethernet + optional Wi-Fi STA + SNTP + mDNS */
+esp_err_t net_init(void);                 /* Ethernet (where fitted) + optional Wi-Fi STA + SNTP + mDNS */
 bool net_has_ip(void);
 /* "eth 192.168.1.20" / "wifi 10.0.0.5" / "" — for the UI */
 void net_describe(char *out, size_t cap);
+/* The board has an Ethernet port (CONFIG_RRC_HAS_ETHERNET). */
+bool net_has_ethernet(void);
 bool net_eth_link(void);
 /* Ethernet IPv4 as text ("" when none). */
 const char *net_eth_ip(void);

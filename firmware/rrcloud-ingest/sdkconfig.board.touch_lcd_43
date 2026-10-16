@@ -1,0 +1,7 @@
+# Overlay for the Waveshare ESP32-P4-WIFI6-Touch-LCD-4.3, applied on top of sdkconfig.defaults:
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43" build
+# (README "Building and flashing"). Same SoC, flash, PSRAM and C6 wiring as the PoE board.
+CONFIG_RRC_BOARD_P4_TOUCH_LCD_43=y
+
+# ---- No Ethernet on this board: the EMAC driver is not linked.
+CONFIG_ETH_USE_ESP32_EMAC=n

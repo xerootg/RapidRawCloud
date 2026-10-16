@@ -10,9 +10,6 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_event.h"
-#include "esp_eth.h"
-#include "esp_eth_mac_esp.h"
-#include "esp_eth_phy.h"
 #include "esp_netif_sntp.h"
 #include "esp_wifi.h"
 #include "mdns.h"
@@ -20,25 +17,34 @@
 #include "board.h"
 #include "app_config.h"
 #include "log_ring.h"
+#if CONFIG_RRC_HAS_ETHERNET
+#include "esp_eth.h"
+#include "esp_eth_mac_esp.h"
+#include "esp_eth_phy.h"
+#endif
 #if CONFIG_ESP_WIFI_REMOTE_ENABLED
 #include "esp_hosted.h"
 #include "coproc.h"
 #endif
 
-static const char *TAG = "net";
-static esp_netif_t *eth_netif, *wifi_netif;
+static esp_netif_t *wifi_netif;
 static bool eth_link, eth_ip, wifi_up, wifi_ip, wifi_started;
-static esp_eth_handle_t eth_handle;
 static char applied_ssid[33], applied_pw[65];
-/* Wi-Fi is failover only: it carries traffic when the cable is out. Both links
- * sit in the same subnet, and lwIP routes on-link destinations to whichever
- * netif it finds first, so an associated Wi-Fi station would silently take
- * uploads off the wire. Policy changes run on their own task because starting
- * Wi-Fi waits for the co-processor link. */
+/* On the Ethernet board Wi-Fi is failover only: it carries traffic when the
+ * cable is out. Both links sit in the same subnet, and lwIP routes on-link
+ * destinations to whichever netif it finds first, so an associated Wi-Fi
+ * station would silently take uploads off the wire. On a board without
+ * Ethernet Wi-Fi is the only path and comes up at boot. Policy changes run on
+ * their own task because starting Wi-Fi waits for the co-processor link. */
 typedef enum { WIFI_POLICY_UP, WIFI_POLICY_DOWN, WIFI_POLICY_REAPPLY } wifi_policy_t;
 static QueueHandle_t policy_q;
 static void policy_post(wifi_policy_t p) { if (policy_q) xQueueSend(policy_q, &p, 0); }
 static char eth_ip_str[16], wifi_ip_str[16];
+
+#if CONFIG_RRC_HAS_ETHERNET
+static const char *TAG = "net";
+static esp_netif_t *eth_netif;
+static esp_eth_handle_t eth_handle;
 
 static void eth_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -49,6 +55,7 @@ static void eth_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     default: break;
     }
 }
+#endif
 
 static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
@@ -81,6 +88,7 @@ static void wifi_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     }
 }
 
+#if CONFIG_RRC_HAS_ETHERNET
 static esp_err_t eth_init(void)
 {
     eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
@@ -121,6 +129,7 @@ static esp_err_t eth_init(void)
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, eth_event, NULL));
     return esp_eth_start(eth);
 }
+#endif
 
 static esp_err_t wifi_start(void)
 {
@@ -219,14 +228,20 @@ esp_err_t net_init(void)
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, ip_event, NULL));
+#if CONFIG_RRC_HAS_ETHERNET
     esp_err_t e = eth_init();
     if (e != ESP_OK) log_ring_printf("ethernet init failed: %s", esp_err_to_name(e));
+#endif
     policy_q = xQueueCreate(8, sizeof(wifi_policy_t));
     xTaskCreate(policy_task, "net_policy", 4096, NULL, 3, NULL);
+#if CONFIG_RRC_HAS_ETHERNET
     /* No cable within ten seconds of boot: bring Wi-Fi up (link detection takes ~2 s). */
     const esp_timer_create_args_t ta = {.callback = boot_policy_cb, .name = "wifi_boot"};
     esp_timer_handle_t t;
     if (esp_timer_create(&ta, &t) == ESP_OK) esp_timer_start_once(t, 10 * 1000 * 1000);
+#else
+    boot_policy_cb(NULL); /* Wi-Fi is the only network */
+#endif
     esp_sntp_config_t sc = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(2, ESP_SNTP_SERVER_LIST("pool.ntp.org", "time.cloudflare.com"));
     sc.start = true;
     sc.sync_cb = sntp_synced;
@@ -240,15 +255,22 @@ esp_err_t net_init(void)
 }
 
 bool net_has_ip(void) { return eth_ip || wifi_ip; }
+#if CONFIG_RRC_HAS_ETHERNET
+bool net_has_ethernet(void) { return true; }
+#else
+bool net_has_ethernet(void) { return false; }
+#endif
 bool net_eth_link(void) { return eth_link; }
 
 void net_eth_link_info(int *speed_mbps, bool *full_duplex)
 {
     *speed_mbps = 0; *full_duplex = false;
+#if CONFIG_RRC_HAS_ETHERNET
     if (!eth_handle) return;
     eth_speed_t sp = ETH_SPEED_10M; eth_duplex_t dp = ETH_DUPLEX_HALF;
     if (esp_eth_ioctl(eth_handle, ETH_CMD_G_SPEED, &sp) == ESP_OK) *speed_mbps = sp == ETH_SPEED_100M ? 100 : 10;
     if (esp_eth_ioctl(eth_handle, ETH_CMD_G_DUPLEX_MODE, &dp) == ESP_OK) *full_duplex = dp == ETH_DUPLEX_FULL;
+#endif
 }
 bool net_wifi_connected(void) { return wifi_up; }
 bool net_time_synced(void) { return time(NULL) > 1600000000; }
@@ -258,5 +280,6 @@ void net_describe(char *out, size_t cap)
     if (eth_ip && wifi_ip) snprintf(out, cap, "eth %s, wifi %s", eth_ip_str, wifi_ip_str);
     else if (eth_ip) snprintf(out, cap, "eth %s", eth_ip_str);
     else if (wifi_ip) snprintf(out, cap, "wifi %s", wifi_ip_str);
-    else snprintf(out, cap, "%s", eth_link ? "eth link, no ip" : "offline");
+    else if (eth_link) snprintf(out, cap, "eth link, no ip");
+    else snprintf(out, cap, "%s", wifi_up ? "wifi associated, no ip" : "offline");
 }
