@@ -299,7 +299,7 @@ async fn load_image_from_proxy(
     let dng_path_str = dng_path.to_string_lossy().to_string();
 
     let decoded = tokio::task::spawn_blocking(
-        move || -> Result<(DynamicImage, HashMap<String, String>), String> {
+        move || -> Result<(DynamicImage, HashMap<String, String>, crate::as_shot::AsShot), String> {
             if generation_tracker.load(Ordering::SeqCst) != my_generation {
                 return Err("Load cancelled".to_string());
             }
@@ -324,13 +324,19 @@ async fn load_image_from_proxy(
                 remove_raw_artifacts_and_enhance(&mut img, color_nr_amount, sharpening_amount);
             }
             let exif = crate::exif_processing::read_exif_data(&dng_path_str, &bytes);
-            Ok((img, exif))
+            // As-shot white balance and exposure are properties of the
+            // ORIGINAL raw; the proxy stands in for both (WB from the
+            // original's AsShotNeutral + matrices, exposure — incl. maker-note
+            // highlight preservation — from its as-shot record).
+            let as_shot = crate::sync::hooks::proxy_as_shot(&bytes)
+                .unwrap_or_else(crate::as_shot::AsShot::reference);
+            Ok((img, exif, as_shot))
         },
     )
     .await
     .map_err(|e| e.to_string())??;
 
-    let (proxy_img, exif_data) = decoded;
+    let (proxy_img, exif_data, as_shot) = decoded;
 
     if state.load_image_generation.load(Ordering::SeqCst) != my_generation {
         return Err("Load cancelled".to_string());
@@ -344,14 +350,6 @@ async fn load_image_from_proxy(
     );
 
     *state.proxy_scale.lock().unwrap_or_else(|e| e.into_inner()) = Some(proxy_scale);
-
-    // As-shot white balance and exposure (baseline / highlight-preservation
-    // compensation) are properties of the ORIGINAL raw, not the linear proxy
-    // DNG; `as_shot` reads them from the original path and falls back to the
-    // reference when the original is not a readable raw — the expected case
-    // while editing an evicted stub via its proxy, so proxy mode renders
-    // without the original's baseline compensation.
-    let as_shot = crate::as_shot::as_shot(&path);
 
     *state
         .original_image

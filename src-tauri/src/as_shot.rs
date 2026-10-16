@@ -35,8 +35,8 @@ pub fn as_shot(path: &str) -> AsShot {
     if let Some(cached) = as_shot_cache().lock().unwrap().get(&source_path) {
         return *cached;
     }
-    if crate::sync::hooks::is_stub(Path::new(&source_path)) {
-        return AsShot::reference();
+    if let Some(stub) = crate::sync::hooks::stub_as_shot(Path::new(&source_path)) {
+        return stub;
     }
 
     let as_shot = read_file_mapped(Path::new(&source_path))

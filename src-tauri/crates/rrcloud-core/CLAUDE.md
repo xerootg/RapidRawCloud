@@ -20,3 +20,8 @@ Also read the root `CLAUDE.md` and this directory's `README.md`.
   `tests/download_size_cap.rs`, `worker_list_cap.rs`, `xml_hostile_input.rs`), validate endpoints
   (`fleet_endpoint_validation.rs`), and redact secrets in `Debug` (`secret_redaction.rs`).
 - New behaviour gets a test in `tests/`; shared harness code is in `tests/common/`.
+- `src/as_shot.rs` compiles upstream's `src-tauri/src/baseline_exposure.rs` verbatim (`#[path]`,
+  `#[rustfmt::skip]` — it is edition-2024 code; never format it from here) so proxies carry the
+  original's maker-note exposure exactly as the app computes it. Its one app import is met by the
+  `app_settings` shim in `src/lib.rs`; the worker Dockerfile and the `rrcloud`/`worker-image` CI
+  path filters name the file.

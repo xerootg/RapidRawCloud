@@ -149,6 +149,45 @@ pub fn proxy_handle(path: &Path) -> Option<ProxyHandle> {
     }
 }
 
+/// The as-shot white balance and exposure for the cloud stub at `path`
+/// (§4.4): `Some` for a stub — its local smart preview's values (see
+/// [`proxy_as_shot`]), or the reference when it has no proxy — and `None`
+/// when `path` is not a stub or sync is off, so upstream's `as_shot` reads
+/// the original as usual. Backs the stub branch of `as_shot::as_shot`; the
+/// result is never put in upstream's per-path cache, so the real values are
+/// read once the original is hydrated.
+pub fn stub_as_shot(path: &Path) -> Option<crate::as_shot::AsShot> {
+    #[cfg(feature = "sync")]
+    {
+        imp::stub_as_shot(path)
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// The as-shot inputs a smart preview stands in for (§4.4): upstream's own
+/// reader on the proxy bytes (white balance from the original's
+/// `AsShotNeutral` and color matrices, which the proxy carries), with the
+/// exposure replaced by the original's from the proxy's as-shot record
+/// (`rrcloud_core::as_shot`) — the maker-note highlight preservation the
+/// proxy's own tags cannot carry. A proxy generated before the record
+/// existed keeps what it yields itself (no highlight preservation). `None`
+/// when sync is off.
+pub fn proxy_as_shot(proxy_bytes: &[u8]) -> Option<crate::as_shot::AsShot> {
+    #[cfg(feature = "sync")]
+    {
+        Some(imp::proxy_as_shot(proxy_bytes))
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = proxy_bytes;
+        None
+    }
+}
+
 /// The grid thumbnails for the cloud stub at `image_path`, surfaced into the
 /// webview thumbnail cache under the exact key the generator looks up
 /// (§3.5 thumb seeding): `Some((small, medium))` cache paths when the
@@ -295,6 +334,33 @@ mod imp {
         // routes the editor load through the proxy DNG. No configured manager
         // or no proxy ⇒ `None`, so the loader falls through to hydrate.
         global_manager().and_then(|mgr| mgr.proxy_handle(path))
+    }
+
+    pub fn stub_as_shot(path: &Path) -> Option<crate::as_shot::AsShot> {
+        // §4.4: a stub has no readable original, so its as-shot inputs come
+        // from its smart preview. No proxy (editing it hydrates first): the
+        // reference, which is what upstream yields for an unreadable raw.
+        if !is_stub(path) {
+            return None;
+        }
+        let proxy_bytes = proxy_handle(path).and_then(|h| std::fs::read(&h.dng_path).ok());
+        Some(match proxy_bytes {
+            Some(bytes) => proxy_as_shot(&bytes),
+            None => crate::as_shot::AsShot::reference(),
+        })
+    }
+
+    pub fn proxy_as_shot(proxy_bytes: &[u8]) -> crate::as_shot::AsShot {
+        let mut as_shot = crate::raw_processing::read_as_shot(proxy_bytes)
+            .unwrap_or_else(crate::as_shot::AsShot::reference);
+        if let Some(e) = rrcloud_core::proxy::read_as_shot_exposure(proxy_bytes) {
+            as_shot.exposure = crate::baseline_exposure::RawExposure {
+                scene_referred: e.scene_referred,
+                dng_baseline: e.dng_baseline,
+                highlight_preservation: e.highlight_preservation,
+            };
+        }
+        as_shot
     }
 
     pub fn stub_thumbnails(

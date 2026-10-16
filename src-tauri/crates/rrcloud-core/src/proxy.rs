@@ -11,6 +11,11 @@
 //! highlights, WB, curves, HSL, color grading) is the same function applied
 //! to a resampled version of the same data (§4.1).
 //!
+//! The original's maker-note **exposure** (highlight preservation, DNG
+//! baseline), which no DNG tag of the proxy can reproduce, travels in a
+//! `DNGPrivateData` record ([`crate::as_shot`]) so proxy edit mode renders
+//! with the same compensation as the original (§4.4).
+//!
 //! This module is **feature-independent** inside `rrcloud-core`: both the
 //! importing client (via the app) and the headless worker (P4) call it. It
 //! is built directly against the pinned rawler
@@ -26,13 +31,16 @@ use rawler::decoders::{Orientation, RawDecodeParams};
 use rawler::dng::writer::DngWriter;
 use rawler::dng::{CropMode, DngCompression, DngPhotometricConversion, DNG_VERSION_V1_6};
 use rawler::formats::tiff::reader::{GenericTiffReader, TiffReader};
+use rawler::formats::tiff::Value;
 use rawler::imgop::develop::{Intermediate, ProcessingStep, RawDevelop};
 use rawler::imgop::xyz::{FlatColorMatrix, Illuminant};
 use rawler::pixarray::PixU16;
 use rawler::rawimage::{BlackLevel, RawImage, RawPhotometricInterpretation, WhiteLevel};
 use rawler::rawsource::RawSource;
-use rawler::tags::{ExifTag, TiffCommonTag};
+use rawler::tags::{DngTag, ExifTag, TiffCommonTag};
 use rayon::prelude::*;
+
+use crate::as_shot::AsShotExposure;
 
 /// DNG `ColorMatrix` rational denominator used by the rawler writer
 /// (`matrix_to_tiff_value(.., 10_000)`); the decoder reads each entry back as
@@ -141,6 +149,9 @@ pub struct ProxyOutput {
     pub proxy_width: u32,
     /// Proxy DNG height (`<= long_edge`).
     pub proxy_height: u32,
+    /// The original's as-shot exposure, as embedded in [`Self::dng`]
+    /// ([`crate::as_shot`]).
+    pub as_shot_exposure: AsShotExposure,
 }
 
 impl fmt::Debug for ProxyOutput {
@@ -153,6 +164,7 @@ impl fmt::Debug for ProxyOutput {
             .field("orig_height", &self.orig_height)
             .field("proxy_width", &self.proxy_width)
             .field("proxy_height", &self.proxy_height)
+            .field("as_shot_exposure", &self.as_shot_exposure)
             .finish()
     }
 }
@@ -184,7 +196,9 @@ pub fn generate_proxy(raw_bytes: &[u8]) -> Result<ProxyOutput, ProxyError> {
 ///    `color_matrix` map from the decoded original; write via
 ///    `SubFrameWriter::raw_image(.., CropMode::None, DngCompression::Lossless,
 ///    DngPhotometricConversion::Original, ..)`; embed original EXIF + a
-///    medium JPEG preview IFD; tag `Software = PROXY_SOFTWARE_TAG`.
+///    medium JPEG preview IFD; tag `Software = PROXY_SOFTWARE_TAG`; and the
+///    original's as-shot exposure record (`DNGPrivateData`,
+///    [`crate::as_shot`]).
 /// 8. Emit `_small` / `_medium` JPEG thumbs (q75).
 ///
 /// The convenience `rgb_image_u16` is **not** used (it hard-codes
@@ -203,6 +217,10 @@ pub fn generate_proxy_with(
     let metadata = decoder
         .raw_metadata(&source, &rd)
         .map_err(|e| ProxyError::Decode(e.to_string()))?;
+
+    // The original's maker-note exposure, which the proxy's own tags cannot
+    // reproduce; it rides along as a `DNGPrivateData` record (§4.4).
+    let as_shot_exposure = AsShotExposure::from_original(decoder.as_ref(), raw_bytes, &raw_image);
 
     // The original decode facts the proxy must carry verbatim (§4.2 step 7).
     let orig_wb = raw_image.wb_coeffs;
@@ -361,7 +379,13 @@ pub fn generate_proxy_with(
     proxy_raw.blackareas = Vec::new();
     proxy_raw.bps = 16;
 
-    let dng = write_proxy_dng(&proxy_raw, &metadata, orientation, display_image.as_ref())?;
+    let dng = write_proxy_dng(
+        &proxy_raw,
+        &metadata,
+        orientation,
+        display_image.as_ref(),
+        &as_shot_exposure,
+    )?;
 
     // 8. JPEG thumbs (q75), matching `encode_thumbnail`.
     let (small_jpeg, medium_jpeg) = match &display_image {
@@ -391,6 +415,7 @@ pub fn generate_proxy_with(
         orig_height,
         proxy_width: proxy_w,
         proxy_height: proxy_h,
+        as_shot_exposure,
     })
 }
 
@@ -408,12 +433,14 @@ fn orientation_swaps_axes(o: Orientation) -> bool {
 /// Serialize the proxy `RawImage` to an in-memory `.pxy.dng` (LinearRaw, LJPEG
 /// lossless, 16-bit, 3-component), embedding the original EXIF (capture date,
 /// orientation, camera/lens via `load_metadata`), a medium JPEG preview IFD,
-/// and the `Software = RapidRawCloud/pxy1` marker (§4.2 step 7).
+/// the `Software = RapidRawCloud/pxy1` marker (§4.2 step 7), and the
+/// original's as-shot exposure record ([`crate::as_shot`]).
 fn write_proxy_dng(
     proxy_raw: &RawImage,
     metadata: &rawler::decoders::RawMetadata,
     orientation: Orientation,
     preview: Option<&DynamicImage>,
+    as_shot_exposure: &AsShotExposure,
 ) -> Result<Vec<u8>, ProxyError> {
     let mut buf = Cursor::new(Vec::new());
     {
@@ -450,6 +477,10 @@ fn write_proxy_dng(
         }
         dng.root_ifd_mut()
             .add_tag(TiffCommonTag::Software, PROXY_SOFTWARE_TAG);
+        dng.root_ifd_mut().add_value(
+            DngTag::DNGPrivateData,
+            Value::Byte(as_shot_exposure.encode()),
+        );
         dng.close().map_err(|e| ProxyError::Write(e.to_string()))?;
     }
     Ok(buf.into_inner())
@@ -766,6 +797,18 @@ pub fn read_software_tag(dng_bytes: &[u8]) -> Option<String> {
         .and_then(|e| e.value.as_string().cloned())
 }
 
+/// The original's as-shot exposure a proxy carries ([`crate::as_shot`]), or
+/// `None` when `dng_bytes` holds no valid record (a proxy generated before
+/// the record existed, or not a proxy). The app's proxy-mode as-shot reader
+/// takes this in place of the exposure the proxy itself yields (§4.4).
+pub fn read_as_shot_exposure(dng_bytes: &[u8]) -> Option<AsShotExposure> {
+    let reader = GenericTiffReader::new_with_buffer(dng_bytes, 0, 0, None).ok()?;
+    match &reader.get_entry(DngTag::DNGPrivateData)?.value {
+        Value::Byte(data) | Value::Undefined(data) => AsShotExposure::decode(data),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,5 +839,66 @@ mod tests {
         let nominal = PROXY_WHITE_LEVEL as f32 / u16::MAX as f32;
         assert!((nominal - 0.5).abs() < 0.01, "nominal white ≈ 0.5");
         assert_eq!(PROXY_BLACK_LEVEL, 0);
+    }
+
+    /// A tiny LinearRaw proxy written by the real DNG writer, built the way
+    /// `generate_proxy_with` builds one (no corpus needed).
+    fn synthetic_proxy_dng(as_shot_exposure: &AsShotExposure) -> Vec<u8> {
+        let (w, h) = (8usize, 6usize);
+        let pix = PixU16::new_with(vec![1000u16; w * h * 3], w * 3, h);
+        let mut raw = RawImage::new(
+            rawler::decoders::Camera::default(),
+            pix,
+            3,
+            [1.0, 1.0, 1.0, f32::NAN],
+            RawPhotometricInterpretation::LinearRaw,
+            Some(BlackLevel::new(&[0u32, 0, 0], 1, 1, 3)),
+            Some(WhiteLevel(vec![PROXY_WHITE_LEVEL as u32; 3])),
+            false,
+        );
+        raw.bps = 16;
+        write_proxy_dng(
+            &raw,
+            &rawler::decoders::RawMetadata::default(),
+            Orientation::Normal,
+            None,
+            as_shot_exposure,
+        )
+        .expect("write synthetic proxy")
+    }
+
+    /// §4.4: the original's as-shot exposure survives the DNG writer and is
+    /// found again by `read_as_shot_exposure`, next to the proxy marker.
+    #[test]
+    fn as_shot_exposure_round_trips_through_the_dng_writer() {
+        let exposure = AsShotExposure {
+            scene_referred: true,
+            dng_baseline: 0.5,
+            highlight_preservation: 0.66,
+        };
+        let dng = synthetic_proxy_dng(&exposure);
+        assert_eq!(read_software_tag(&dng).as_deref(), Some(PROXY_SOFTWARE_TAG));
+        assert_eq!(read_as_shot_exposure(&dng), Some(exposure));
+    }
+
+    /// Another writer's `DNGPrivateData`, or bytes that are not a TIFF at
+    /// all, yield no record rather than a value the render would use.
+    #[test]
+    fn foreign_private_data_or_garbage_yields_no_as_shot_exposure() {
+        let exposure = AsShotExposure {
+            scene_referred: true,
+            dng_baseline: 0.0,
+            highlight_preservation: 1.0,
+        };
+        let mut dng = synthetic_proxy_dng(&exposure);
+        let creator = b"RapidRawCloud\0";
+        let at = dng
+            .windows(creator.len())
+            .position(|w| w == creator)
+            .expect("record present");
+        dng[at] = b'X';
+        assert_eq!(read_as_shot_exposure(&dng), None);
+        assert_eq!(read_as_shot_exposure(b"not a tiff"), None);
+        assert_eq!(read_as_shot_exposure(&[]), None);
     }
 }

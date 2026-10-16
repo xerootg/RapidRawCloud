@@ -69,8 +69,9 @@ pub use crate::file_management::{compute_thumbnail_cache_hash, is_cloud_placehol
 /// GPU entry points, plus the proxy-mode dimension-reporting helpers, so the
 /// `tests/proxy_fidelity.rs` integration suite can drive the real code paths
 /// (RawDevelop LinearRaw branch, the clamp fix, linear-space Lanczos3, the
-/// wgpu adapter probe) without widening those modules' own visibility. No
-/// behavior: re-exports and the `ProxyHandle` type only.
+/// wgpu adapter probe, the original-vs-proxy as-shot readers) without
+/// widening those modules' own visibility. No behavior: re-exports and the
+/// `ProxyHandle` type only.
 #[doc(hidden)]
 pub mod proxy_support {
     pub use crate::gpu_processing::{
@@ -80,8 +81,12 @@ pub mod proxy_support {
         load_image_with_orientation, proxy_decode_settings, proxy_reported_dimensions,
     };
     pub use crate::image_processing::{GpuContext, apply_srgb_to_linear, downscale_f32_image};
-    pub use crate::raw_processing::develop_raw_image;
-    pub use crate::sync::hooks::ProxyHandle;
+    pub use crate::raw_processing::{develop_raw_image, read_as_shot};
+    pub use crate::sync::hooks::{ProxyHandle, proxy_as_shot};
+    // The as-shot types the two readers above return (§4.4 parity test).
+    pub use crate::as_shot::AsShot;
+    pub use crate::baseline_exposure::RawExposure;
+    pub use crate::white_balance::WhiteBalance;
 }
 
 /// Test seam for the §3.5 `copy_files` guard: a plain-function wrapper over
