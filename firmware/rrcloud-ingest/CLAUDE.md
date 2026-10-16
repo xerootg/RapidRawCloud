@@ -18,6 +18,8 @@ Also read the root `CLAUDE.md` and this directory's `README.md`.
   Touch-LCD-4.3 builds with `-DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43"`.
   Guard board-specific code with `CONFIG_RRC_HAS_ETHERNET` / `_DISPLAY` / `_BATTERY`, not board names.
   Use a separate `-B`/`-DSDKCONFIG=` per board, or the old board's `sdkconfig` is reused.
+  ESP32-P4 rev 3 silicon needs its own image: add `sdkconfig.chip_rev3` last (README "Which image for
+  which chip"). Never hard-code rev-specific clock sources; leave IDF's revision-aware defaults.
 - The on-screen UI (`components/rrc_ui`) is pure LVGL + cJSON and talks to the dock only through
   `/api/…` (the host hooks in `main/display.c`); add features as API routes first. Check UI changes with
   the simulator, which also fails on missing glyphs, leaks and asserts:

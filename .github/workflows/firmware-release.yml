@@ -77,7 +77,7 @@ jobs:
     needs: meta
     strategy:
       matrix:
-        board: [poe-eth, touch-lcd-43]
+        board: [poe-eth, touch-lcd-43, touch-lcd-43-rev3]
     uses: ./.github/workflows/firmware-build.yml
     with:
       board: ${{ matrix.board }}
@@ -89,15 +89,20 @@ jobs:
     strategy:
       matrix:
         include:
-          # The PoE board keeps the original zip name; the touch board gets its own.
+          # The PoE board keeps the original zip name. The touch board ships one image per
+          # ESP32-P4 chip generation (an image for one is refused by the other's bootloader).
           - board: poe-eth
             suffix: esp32p4
             title: ESP32-P4-WIFI6-POE-ETH
             then: "Then open http://rrcloud-ingest.local/ (or the DHCP address printed on the console)."
           - board: touch-lcd-43
-            suffix: esp32p4-touch-lcd-4.3
-            title: ESP32-P4-WIFI6-Touch-LCD-4.3
-            then: "Then set up Wi-Fi and pairing on the touchscreen (or at http://rrcloud-ingest.local/ once it is on Wi-Fi)."
+            suffix: esp32p4-touch-lcd-4.3-chip-v1
+            title: "ESP32-P4-WIFI6-Touch-LCD-4.3, ESP32-P4 chip revision v0.x/v1.x"
+            then: "Then set up Wi-Fi and pairing on the touchscreen. If the boot log says the chip revision is not supported, the board has a v3 chip: flash the -chip-v3 zip instead ("esptool.py chip_id" prints the revision)."
+          - board: touch-lcd-43-rev3
+            suffix: esp32p4-touch-lcd-4.3-chip-v3
+            title: "ESP32-P4-WIFI6-Touch-LCD-4.3, ESP32-P4 chip revision v3.x"
+            then: "Then set up Wi-Fi and pairing on the touchscreen. If the boot log says the chip revision is not supported, the board has an older chip: flash the -chip-v1 zip instead ("esptool.py chip_id" prints the revision)."
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.5
@@ -164,7 +169,7 @@ jobs:
           {
             echo "# rrcloud-ingest ${VERSION} — camera ingest dock firmware"
             echo
-            echo "Targets: Waveshare ESP32-P4-WIFI6-POE-ETH (\`…-esp32p4.zip\`) and ESP32-P4-WIFI6-Touch-LCD-4.3 (\`…-esp32p4-touch-lcd-4.3.zip\`), ESP-IDF 5.5.5. Built from \`${GITHUB_SHA}\`."
+            echo "Targets: Waveshare ESP32-P4-WIFI6-POE-ETH (\`…-esp32p4.zip\`) and ESP32-P4-WIFI6-Touch-LCD-4.3 (\`…-touch-lcd-4.3-chip-v3.zip\` for ESP32-P4 chip v3.x, \`…-chip-v1.zip\` for v0.x/v1.x), ESP-IDF 5.5.5. Built from \`${GITHUB_SHA}\`."
             echo
             echo "Flash with \`esptool.py --chip esp32p4 -p PORT write_flash 0x0 rrcloud-ingest-merged.bin\` — full instructions in FLASH.md inside the zip,"
             echo "setup and pairing in [firmware/rrcloud-ingest/README.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/firmware/rrcloud-ingest/README.md)."

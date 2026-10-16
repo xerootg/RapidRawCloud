@@ -112,7 +112,25 @@ idf.py -p /dev/ttyACM0 flash monitor      # USB-C console port (CH343 / the "USB
 
 Switching boards in one checkout: delete `sdkconfig` (or use separate `-B` build dirs with
 `-DSDKCONFIG=<dir>/sdkconfig`), otherwise the old board's configuration is reused. CI builds
-both (`.github/workflows/firmware.yml`) and a release ships one zip per board.
+every variant (`.github/workflows/firmware.yml`) and a release ships one zip per variant.
+
+### Which image for which chip
+
+ESP32-P4 silicon comes in two generations, and ESP-IDF builds an image for one of them:
+revisions v0.x/v1.x (`sdkconfig.defaults`) or v3.x (add `sdkconfig.chip_rev3` last). Rev 3
+runs the cores at 400 MHz instead of 360 and the PSRAM at 250 MHz instead of 200. Flashing
+the wrong image is harmless: the bootloader refuses it and the boot log says the chip
+revision is not supported. `esptool.py chip_id` (on the USB-to-UART port) prints the
+revision before you flash.
+
+| Board | Chip | Overlays | Release zip |
+|---|---|---|---|
+| ESP32-P4-WIFI6-POE-ETH | v0.x/v1.x | — | `rrcloud-ingest-<v>-esp32p4.zip` |
+| ESP32-P4-WIFI6-Touch-LCD-4.3 | v0.x/v1.x | `sdkconfig.board.touch_lcd_43` | `…-esp32p4-touch-lcd-4.3-chip-v1.zip` |
+| ESP32-P4-WIFI6-Touch-LCD-4.3 | v3.x | `sdkconfig.board.touch_lcd_43`, `sdkconfig.chip_rev3` | `…-esp32p4-touch-lcd-4.3-chip-v3.zip` |
+
+A PoE-ETH board with a v3 chip would build the same way (`sdkconfig.chip_rev3` on top of the
+defaults); it is not built by CI because none has been tested.
 
 Board facts baked into `sdkconfig.defaults` / `main/board.h`: 32 MB flash, 32 MB PSRAM
 (hex, 200 MHz), IP101GRI RMII PHY (addr 1, MDC 31, MDIO 52, RST 51, REF_CLK in on 50),

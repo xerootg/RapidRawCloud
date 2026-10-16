@@ -3,8 +3,8 @@ name: 'Reusable: ESP-IDF build of rrcloud-ingest (esp32p4)'
 # The one definition of "build the firmware": the CI workflow (firmware.yml) and the release
 # workflow (firmware-release.yml) both call it, so the container image, target and the set of
 # artifacts cannot drift between a PR check and a release. One call builds one board
-# (firmware/rrcloud-ingest/main/Kconfig.projbuild); the board's sdkconfig overlay is layered
-# on sdkconfig.defaults.
+# (firmware/rrcloud-ingest/main/Kconfig.projbuild) for one ESP32-P4 chip generation: the
+# board's sdkconfig overlay, then sdkconfig.chip_rev3 for rev 3 silicon, on sdkconfig.defaults.
 on:
   workflow_call:
     inputs:
@@ -17,7 +17,7 @@ on:
         type: string
         default: v5.5.5
       board:
-        description: "poe-eth (ESP32-P4-WIFI6-POE-ETH) or touch-lcd-43 (ESP32-P4-WIFI6-Touch-LCD-4.3)"
+        description: "poe-eth (ESP32-P4-WIFI6-POE-ETH), touch-lcd-43 (ESP32-P4-WIFI6-Touch-LCD-4.3, chip rev < 3) or touch-lcd-43-rev3 (same board, chip rev >= 3)"
         type: string
         default: poe-eth
     outputs:
@@ -45,6 +45,7 @@ jobs:
           case "${{ inputs.board }}" in
             poe-eth) DEFAULTS="sdkconfig.defaults" ;;
             touch-lcd-43) DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43" ;;
+            touch-lcd-43-rev3) DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43;sdkconfig.chip_rev3" ;;
             *) echo "::error::unknown board ${{ inputs.board }}"; exit 1 ;;
           esac
           idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" set-target esp32p4

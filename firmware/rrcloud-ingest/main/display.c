@@ -119,7 +119,9 @@ static esp_err_t panel_init(void)
     esp_lcd_dsi_bus_config_t bus_cfg = {
         .bus_id = 0,
         .num_data_lanes = BOARD_LCD_DSI_LANES,
-        .phy_clk_src = MIPI_DSI_PHY_CLK_SRC_DEFAULT,
+        /* phy_clk_src left 0: the driver picks the PHY PLL reference for the chip
+         * generation the image is built for (PLL_F20M before rev 3, XTAL from rev 3);
+         * the old MIPI_DSI_PHY_CLK_SRC_DEFAULT is the pre-rev-3 one only. */
         .lane_bit_rate_mbps = BOARD_LCD_DSI_LANE_MBPS,
     };
     ESP_RETURN_ON_ERROR(esp_lcd_new_dsi_bus(&bus_cfg, &bus), TAG, "DSI bus");
