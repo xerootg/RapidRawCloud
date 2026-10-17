@@ -1,4 +1,5 @@
 #include "usb_diag.h"
+#include "usb_fault.h"
 #include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
@@ -104,6 +105,7 @@ static void watchdog_task(void *arg)
     int idle_polls = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(WATCHDOG_POLL_MS));
+        usb_fault_drain();
         int n = usb_diag_device_count();
         if (n != 0) { idle_polls = 0; continue; }
         if (++idle_polls * WATCHDOG_POLL_MS < WATCHDOG_IDLE_S * 1000) continue;

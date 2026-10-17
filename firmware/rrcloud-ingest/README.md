@@ -368,6 +368,35 @@ The root-port timings are set above the IDF defaults in `sdkconfig.defaults`
 (debounce 500 ms, reset hold 50 ms, recovery 100 ms) because cameras are slow to settle
 compared with flash drives.
 
+## Troubleshooting a transfer that dies mid-sync
+
+A failed bulk transfer surfaces at three levels, from the controller up:
+
+- `W src_msc: read10 lba … x…: ESP_ERR_…` — the SCSI read the engine asked for failed; the
+  engine retries the file and the run aborts after seven failures in a row.
+- `I rrc: usb: channel fault at … ms: hcint 0x… [bnaintr …], channel NOT halted …` — the raw
+  channel interrupt bits the DWC controller raised, captured in `main/usb_fault.c` by
+  wrapping IDF's HAL decoder at link time. Which bit names appear says what the hardware
+  objected to; *channel NOT halted* is the case IDF's HAL asserts on
+  (`usb_dwc_hal.c`, `usb_dwc_hal_chan_decode_intr`). That assert rebooted the dock
+  mid-sync once, so the firmware builds with `CONFIG_HAL_ASSERTION_DISABLE` and records
+  the fault instead. A `stray channel halt … on an idle channel` line afterwards means
+  the hardware halted later and the HAL took it for a completed transfer.
+- `usb_faults` and `usb_chan_irqs` in `/api/status`: faults recorded since boot, and
+  channel interrupts decoded since boot (every transfer counts, so a non-zero value proves
+  the recorder is in the build).
+
+If the dock does reset during a run, the boot line says why
+(`rrcloud-ingest starting after panic reset (4)`), and a run interrupted by a panic or
+watchdog reset restarts by itself when the camera is next seen, even with auto-sync off,
+up to three times in a row (`sync: restarted after a crash during a run`). A power-on or
+console `reboot` reset does not resume.
+
+Every five minutes the serial console gets a `D health:` line with uptime, internal heap
+free/minimum/largest block, PSRAM free and the USB counters. It is debug level so it stays
+out of the web UI log; it is there to tell a quiet dock from a dead one when reading a
+long serial capture.
+
 ## Known limitations
 
 - Write-only participant: deletions made elsewhere are not observed. A file already
