@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <time.h>
 #include "esp_log.h"
+#include "esp_attr.h"
+#include "esp_system.h"
 #include "esp_timer.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
@@ -525,7 +527,42 @@ static bool run_submit(run_t *rc, const cam_object_t *o, bool may_defer)
 }
 
 
+/* A run interrupted by a crash reset (panic or watchdog) picks itself up again
+ * when the camera comes back, even with auto_sync off: the operator started it.
+ * The marker lives in retained RAM, which survives those resets but not power
+ * loss; the ledger makes the resumed run skip everything already uploaded. */
+#define RUN_MAGIC 0x52554e31u   /* "RUN1" */
+#define RESUME_MAX_TRIES 3
+static RTC_NOINIT_ATTR uint32_t rtc_run_magic;
+static RTC_NOINIT_ATTR uint32_t rtc_resume_tries;
+static bool resume_pending;
+
+static void resume_check_at_boot(void)
+{
+    esp_reset_reason_t r = esp_reset_reason();
+    bool crash = r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+    if (!crash) { rtc_run_magic = 0; rtc_resume_tries = 0; return; }
+    if (rtc_run_magic != RUN_MAGIC) return;
+    rtc_run_magic = 0;
+    if (rtc_resume_tries >= RESUME_MAX_TRIES) {
+        log_ring_printf("sync: not resuming the run interrupted by a crash (%u restarts in a row)", (unsigned)rtc_resume_tries);
+        return;
+    }
+    rtc_resume_tries++;
+    resume_pending = true;
+    log_ring_printf("sync: restarted after a crash during a run; it resumes when the camera is back");
+}
+
+static void sync_run_impl(cam_source_t *src);
 static void sync_run(cam_source_t *src)
+{
+    rtc_run_magic = RUN_MAGIC;
+    sync_run_impl(src);
+    rtc_run_magic = 0;
+    rtc_resume_tries = 0;
+}
+
+static void sync_run_impl(cam_source_t *src)
 {
     if (!s3_ready) { run_deferred = true; set_error("cloud not configured — pair or enter S3 settings first; the sync starts once it is"); return; }
     if (!net_has_ip()) { run_deferred = true; set_phase(SYNC_WAITING_NETWORK); set_error("waiting for the network"); return; }
@@ -535,6 +572,7 @@ static void sync_run(cam_source_t *src)
         ST_LOCK(); scpy(st.camera_model, sizeof st.camera_model, src->model); scpy(st.camera_serial, sizeof st.camera_serial, src->serial); ST_UNLOCK();
     }
     run_deferred = false;
+    resume_pending = false;
     cancel_flag = false;
     ST_LOCK(); st.phase = SYNC_ENUMERATING; st.run_total = st.run_done = st.run_skipped = st.run_failed = 0; st.run_bytes = 0; st.run_total_bytes = st.run_read_bytes = 0; st.run_inflight = 0; st.run_elapsed_ms = 0; st.current_file[0] = 0; st.current_done = 0; st.last_error[0] = 0; ST_UNLOCK();
     memset(ue_stats(), 0, sizeof *ue_stats());
@@ -593,7 +631,7 @@ static void on_tick(void)
 {
     /* A run that could not start (no network yet, cloud unconfigured, camera asleep)
      * is retried here instead of waiting for a replug. */
-    if (run_deferred && cam && cam->connected(cam) && app_config_get()->auto_sync) sync_run(cam);
+    if (run_deferred && cam && cam->connected(cam) && (app_config_get()->auto_sync || resume_pending)) sync_run(cam);
     if (!s3_ready || !net_has_ip()) return;
     int64_t now = (int64_t)time(NULL);
     int64_t hb;
@@ -1020,7 +1058,7 @@ static void sync_task(void *arg)
             scpy(st.camera_serial, sizeof st.camera_serial, cam->serial);
             ST_UNLOCK();
             log_ring_printf("camera attached: %s [%s]", cam->model, cam->source_id);
-            if (app_config_get()->auto_sync) sync_run(cam);
+            if (app_config_get()->auto_sync || resume_pending) sync_run(cam);
             break;
         case CMD_DETACH:
             if (cam) { cam->release(cam); }
@@ -1064,6 +1102,7 @@ void sync_on_camera_event(cam_event_t ev, cam_source_t *src, void *arg)
 
 esp_err_t sync_init(void)
 {
+    resume_check_at_boot();
     st_mtx = xSemaphoreCreateMutex();
     q = xQueueCreate(16, sizeof(msg_t));
     ue_config_t uc = {.ctl = &s3, .conn = {&s3b, &s3c}, .device_id = app_device_id(), .progress = on_progress};

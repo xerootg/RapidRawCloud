@@ -103,7 +103,9 @@ static int xread(void *ctx, uint64_t lba, uint32_t count, void *buf)
 {
     msc_impl_t *m = ctx;
     if (!m->connected || lba > UINT32_MAX) return -1;
-    return scsi_cmd_read10(m->dev, buf, (uint32_t)lba, count, RRC_EXFAT_SECTOR) == ESP_OK ? 0 : -1;
+    esp_err_t e = scsi_cmd_read10(m->dev, buf, (uint32_t)lba, count, RRC_EXFAT_SECTOR);
+    if (e != ESP_OK) ESP_LOGW(TAG, "read10 lba %llu x%u: %s", (unsigned long long)lba, (unsigned)count, esp_err_to_name(e));
+    return e == ESP_OK ? 0 : -1;
 }
 
 typedef struct { cam_enum_cb_t cb; void *ctx; rrc_exfat_t *fs; char rel[512]; int depth; } xwalk_t;
