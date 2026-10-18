@@ -368,7 +368,71 @@ static esp_err_t upload_one(cam_source_t *src, const cam_object_t *o, const char
 }
 
 /* ---- enumeration ----------------------------------------------------------- */
-typedef struct { cam_object_t *items; size_t n, cap; cam_source_t *src; } enum_ctx_t;
+/* The run's file list. A card can carry tens of thousands of objects and a
+ * cam_object_t is 790 bytes, so the list keeps one small record per file and
+ * the path in a string pool, both grown in modest chunks: no allocation ever
+ * needs megabytes of contiguous PSRAM, which a long run leaves fragmented (the
+ * old doubling realloc failed silently at 8192 entries on a Z f). The name is
+ * the path's last component, which every source guarantees. */
+typedef struct { uint64_t size; int64_t mtime; uint32_t handle; uint32_t path; /* pool << 16 | offset */ } item_t;
+#define ITEM_CHUNK 2048u                      /* records per chunk (48 KiB) */
+#define POOL_CHUNK (64u * 1024u)              /* path bytes per pool chunk */
+#define MAX_CHUNKS 64                         /* 131072 files, 4 MiB of paths */
+typedef struct {
+    item_t *chunks[MAX_CHUNKS];
+    char *pools[MAX_CHUNKS];
+    size_t n, nchunks, npools, pool_used;
+    uint32_t *order;                          /* sorted record indices */
+    bool oom;
+    cam_source_t *src;
+} enum_ctx_t;
+
+static void enum_free(enum_ctx_t *c)
+{
+    for (size_t i = 0; i < c->nchunks; i++) free(c->chunks[i]);
+    for (size_t i = 0; i < c->npools; i++) free(c->pools[i]);
+    free(c->order);
+    c->nchunks = c->npools = c->n = 0; c->order = NULL;
+}
+
+static inline item_t *item_at(const enum_ctx_t *c, size_t i) { return &c->chunks[i / ITEM_CHUNK][i % ITEM_CHUNK]; }
+static inline const char *item_path(const enum_ctx_t *c, const item_t *it) { return c->pools[it->path >> 16] + (it->path & 0xFFFF); }
+
+static bool item_add(enum_ctx_t *c, const cam_object_t *o)
+{
+    size_t plen = strlen(o->path) + 1;
+    if (plen > POOL_CHUNK) return false;
+    if (c->npools == 0 || c->pool_used + plen > POOL_CHUNK) {
+        if (c->npools == MAX_CHUNKS) return false;
+        char *pool = heap_caps_malloc(POOL_CHUNK, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!pool) return false;
+        c->pools[c->npools++] = pool; c->pool_used = 0;
+    }
+    if (c->n % ITEM_CHUNK == 0) {
+        if (c->nchunks == MAX_CHUNKS) return false;
+        item_t *ch = heap_caps_malloc(ITEM_CHUNK * sizeof *ch, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!ch) return false;
+        c->chunks[c->nchunks++] = ch;
+    }
+    memcpy(c->pools[c->npools - 1] + c->pool_used, o->path, plen);
+    item_t *it = item_at(c, c->n);
+    it->size = o->size; it->mtime = o->mtime; it->handle = o->handle;
+    it->path = (uint32_t)((c->npools - 1) << 16 | c->pool_used);
+    c->pool_used += plen;
+    c->n++;
+    return true;
+}
+
+/* Rebuilds the full cam_object_t for one record. */
+static void item_fill(const enum_ctx_t *c, size_t i, cam_object_t *o)
+{
+    const item_t *it = item_at(c, i);
+    memset(o, 0, sizeof *o);
+    scpy(o->path, sizeof o->path, item_path(c, it));
+    const char *slash = strrchr(o->path, '/');
+    scpy(o->name, sizeof o->name, slash ? slash + 1 : o->path);
+    o->size = it->size; o->mtime = it->mtime; o->handle = it->handle;
+}
 
 static int enum_cb(void *ctx, const cam_object_t *o)
 {
@@ -381,28 +445,25 @@ static int enum_cb(void *ctx, const cam_object_t *o)
     snprintf(inc, sizeof inc, "%s%s", cfg->include_globs, cfg->upload_videos ? " *.mov *.mp4" : "");
     if (!rrc_glob_selected(inc, cfg->exclude_globs, o->path)) return 0;
     if (store_ledger_lookup(c->src->source_id, o->path, o->size)) return 0; /* seen before */
-    if (c->n == c->cap) {
-        size_t nc = c->cap ? c->cap * 2 : 256;
-        cam_object_t *ni = heap_caps_realloc(c->items, nc * sizeof *ni, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!ni) return 1;
-        c->items = ni; c->cap = nc;
-    }
-    c->items[c->n++] = *o;
+    if (!item_add(c, o)) { c->oom = true; return 1; }
     return 0;
 }
 
-static int cmp_obj(const void *a, const void *b)
+/* qsort has no context argument; a run enumerates on one task at a time. */
+static const enum_ctx_t *sort_ctx;
+static int cmp_item(const void *a, const void *b)
 {
-    const cam_object_t *x = a, *y = b;
+    const item_t *x = item_at(sort_ctx, *(const uint32_t *)a), *y = item_at(sort_ctx, *(const uint32_t *)b);
     if (x->mtime != y->mtime) return x->mtime < y->mtime ? -1 : 1;
-    return strcmp(x->path, y->path);
+    return strcmp(item_path(sort_ctx, x), item_path(sort_ctx, y));
 }
 
 /* ---- one sync run ---------------------------------------------------------- */
 #define RUN_WINDOW 3
 typedef struct {
     ue_job_t *job;
-    const cam_object_t *o;
+    const cam_object_t *o;                    /* &obj while in flight */
+    cam_object_t obj;
     char relkey[RRC_RELKEY_MAX];
     char key[RRC_RELKEY_MAX + 16];
 } flight_t;
@@ -469,16 +530,18 @@ static void run_finish(run_t *rc, ue_job_t *dj)
 static void run_complete_one(run_t *rc) { run_finish(rc, run_wait(rc)); }
 
 /* Decides what to do with one camera object (skip it, or start uploading it). */
-static bool run_submit(run_t *rc, const cam_object_t *o, bool may_defer)
+static bool run_submit(run_t *rc, const enum_ctx_t *ec, size_t item, bool may_defer)
 {
     cam_source_t *src = rc->src;
+    flight_t *f = NULL;
+    for (int k = 0; k < RUN_WINDOW; k++) if (!rc->fl[k].job) { f = &rc->fl[k]; break; }
+    if (!f) return true;   /* cannot happen: the caller checks the window */
+    item_fill(ec, item, &f->obj);
+    const cam_object_t *o = &f->obj;
     char dir[512] = "";
     const char *slash = strrchr(o->path, '/');
     if (slash) { size_t dl = (size_t)(slash - o->path); if (dl >= sizeof dir) dl = sizeof dir - 1; memcpy(dir, o->path, dl); dir[dl] = 0; }
     rrc_template_vars tv = {.name = o->name, .path = dir, .model = src->model, .serial = src->serial, .when = o->mtime};
-    flight_t *f = NULL;
-    for (int k = 0; k < RUN_WINDOW; k++) if (!rc->fl[k].job) { f = &rc->fl[k]; break; }
-    if (!f) return true;   /* cannot happen: the caller checks the window */
     rrc_relkey_err re = rrc_template_expand(rc->cfg->key_template, &tv, f->relkey, sizeof f->relkey);
     if (re != RRC_RELKEY_OK) { set_error("%s: unsyncable key (%s)", o->path, rrc_relkey_err_str(re)); ST_LOCK(); st.run_failed++; ST_UNLOCK(); return true; }
     rrc_key_library(f->relkey, f->key, sizeof f->key);
@@ -581,15 +644,19 @@ static void sync_run_impl(cam_source_t *src)
     log_ring_printf("sync: scanning %s (%s)", src->model, src->source_id);
     enum_ctx_t ec = {.src = src};
     esp_err_t e = src->enumerate(src, enum_cb, &ec);
-    if (e != ESP_OK) { set_error("camera enumeration failed: %s", esp_err_to_name(e)); free(ec.items); set_phase(SYNC_ERROR); return; }
-    if (ec.n > 1) qsort(ec.items, ec.n, sizeof ec.items[0], cmp_obj);
+    if (e != ESP_OK) { set_error("camera enumeration failed: %s", esp_err_to_name(e)); enum_free(&ec); set_phase(SYNC_ERROR); return; }
+    if (ec.oom) log_ring_printf("sync: the file list stopped at %u entries (out of memory); the rest is picked up by the next run", (unsigned)ec.n);
+    ec.order = heap_caps_malloc((ec.n ? ec.n : 1) * sizeof *ec.order, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ec.order) { set_error("out of memory"); enum_free(&ec); set_phase(SYNC_ERROR); return; }
+    for (size_t i = 0; i < ec.n; i++) ec.order[i] = (uint32_t)i;
+    if (ec.n > 1) { sort_ctx = &ec; qsort(ec.order, ec.n, sizeof ec.order[0], cmp_item); sort_ctx = NULL; }
     uint64_t tb = 0;
-    for (size_t i = 0; i < ec.n; i++) tb += ec.items[i].size;
+    for (size_t i = 0; i < ec.n; i++) tb += item_at(&ec, i)->size;
     ST_LOCK(); st.run_total = (uint32_t)ec.n; st.run_total_bytes = tb; st.phase = SYNC_UPLOADING; ST_UNLOCK();
     log_ring_printf("sync: %u new file(s) to upload", (unsigned)ec.n);
     run_t rc = {.src = src, .cfg = app_config_get()};
-    rc.fl = calloc(RUN_WINDOW, sizeof *rc.fl);
-    if (!rc.fl) { set_error("out of memory"); free(ec.items); set_phase(SYNC_ERROR); return; }
+    rc.fl = heap_caps_calloc(RUN_WINDOW, sizeof *rc.fl, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!rc.fl) { set_error("out of memory"); enum_free(&ec); set_phase(SYNC_ERROR); return; }
     /* Up to RUN_WINDOW files in flight: while earlier ones upload, the next are checked against the
      * bucket and read from the camera, so neither the camera nor the network waits on a round trip. */
     size_t next = 0;
@@ -599,8 +666,8 @@ static void sync_run_impl(cam_source_t *src)
             size_t idx = next++;
             /* Dual-slot twins sit next to each other; instead of idling until the first copy lands, move on
              * to another file and come back (at most RUN_WINDOW swaps in a row, so this cannot spin). */
-            if (!run_submit(&rc, &ec.items[idx], next < ec.n && defers < RUN_WINDOW)) {
-                cam_object_t tmp = ec.items[idx]; ec.items[idx] = ec.items[next]; ec.items[next] = tmp;
+            if (!run_submit(&rc, &ec, ec.order[idx], next < ec.n && defers < RUN_WINDOW)) {
+                uint32_t tmp = ec.order[idx]; ec.order[idx] = ec.order[next]; ec.order[next] = tmp;
                 next = idx; defers++;
             } else defers = 0;
         }
@@ -610,7 +677,7 @@ static void sync_run_impl(cam_source_t *src)
     }
     ue_set_abort(false);
     free(rc.fl);
-    free(ec.items);
+    enum_free(&ec);
     ST_LOCK(); st.current_file[0] = 0; st.phase = SYNC_PUBLISHING; ST_UNLOCK();
     bool uploaded_any;
     ST_LOCK(); uploaded_any = st.run_done > 0; ST_UNLOCK();
