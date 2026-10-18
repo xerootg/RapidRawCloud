@@ -1145,12 +1145,17 @@ pub async fn load_image(
     let (pristine_arc, exif_data) = if let Some((cached_img, cached_exif)) = cached_data {
         (cached_img, cached_exif)
     } else {
-        if crate::file_management::is_cloud_placeholder(&source_path) {
+        // A 0-byte file under a configured sync is a placeholder whatever the
+        // stub mirror says: the mirror can lag the durable state (issue #37),
+        // and the alternative is handing an empty file to the RAW decoder,
+        // which surfaces as "No decoder found".
+        let empty_placeholder = crate::sync::hooks::is_empty_placeholder(&source_path);
+        if crate::file_management::is_cloud_placeholder(&source_path) || empty_placeholder {
             // §3.5 guard: a RapidRawCloud sync stub is hydrated in place and
             // the load proceeds on the real bytes. A non-stub placeholder (a
             // macOS iCloud dataless file, or any placeholder with sync off,
             // where `is_stub` is a const `false`) keeps the upstream error.
-            if crate::sync::hooks::is_stub(&source_path) {
+            if crate::sync::hooks::is_stub(&source_path) || empty_placeholder {
                 // P3 proxy edit mode (§4.4): if a smart preview is present
                 // locally, decode the PROXY instead of hydrating, but report
                 // the ORIGINAL (journal) dimensions. `proxy_handle` is `None`
