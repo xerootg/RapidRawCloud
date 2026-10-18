@@ -105,15 +105,19 @@ int usb_diag_device_count(void)
  * same hcd_port_recover the hub driver would run, which also returns it to the
  * not-powered state the hub driver believes it is in) and the hub driver sees
  * no event. Everything else passes through untouched. */
-static volatile bool cycling;
+/* Set for the power-off half of a cycle that started with nothing enumerated.
+ * Decided before the cycle, in the caller's task: usb_host_lib_info takes the
+ * USBH mutex, which is not something to do from inside the hub driver's event
+ * path. With a device enumerated (the web UI's retry button) the hub driver's
+ * own path is the right one and the wrapper stays out of it. */
+static volatile bool cycling_empty;
 
 hcd_port_event_t __real_hcd_port_handle_event(hcd_port_handle_t port_hdl);
 
 hcd_port_event_t __wrap_hcd_port_handle_event(hcd_port_handle_t port_hdl)
 {
     hcd_port_event_t ev = __real_hcd_port_handle_event(port_hdl);
-    if (!cycling || (ev != HCD_PORT_EVENT_DISCONNECTION && ev != HCD_PORT_EVENT_ERROR)) return ev;
-    if (usb_diag_device_count() != 0) return ev;   /* enumerated: the hub driver's own path is right */
+    if (!cycling_empty || (ev != HCD_PORT_EVENT_DISCONNECTION && ev != HCD_PORT_EVENT_ERROR)) return ev;
     esp_err_t e = hcd_port_recover(port_hdl);
     if (e != ESP_OK) {
         ESP_LOGW(TAG, "root port event %d during the power cycle with nothing enumerated; recover failed: %s", (int)ev, esp_err_to_name(e));
@@ -125,13 +129,13 @@ hcd_port_event_t __wrap_hcd_port_handle_event(hcd_port_handle_t port_hdl)
 
 esp_err_t usb_diag_power_cycle(void)
 {
-    cycling = true;
+    cycling_empty = usb_diag_device_count() == 0;
     esp_err_t e = usb_host_lib_set_root_port_power(false);
-    if (e != ESP_OK) { cycling = false; ESP_LOGW(TAG, "root port power off: %s", esp_err_to_name(e)); return e; }
+    if (e != ESP_OK) { cycling_empty = false; ESP_LOGW(TAG, "root port power off: %s", esp_err_to_name(e)); return e; }
     vTaskDelay(pdMS_TO_TICKS(500));
     /* Cleared before power-on: a stale event handled after that point must
      * reach the hub driver, whose recovery then re-powers the port itself. */
-    cycling = false;
+    cycling_empty = false;
     e = usb_host_lib_set_root_port_power(true);
     if (e != ESP_OK) ESP_LOGW(TAG, "root port power on: %s", esp_err_to_name(e));
     last_cycle_us = esp_timer_get_time();
