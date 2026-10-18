@@ -29,24 +29,71 @@ static struct {
 
 static void attach(rrc_ptp_dev_t *dev);
 
-typedef struct { uint32_t handle, parent; uint16_t fmt; bool is_dir; char name[128]; } node_t;
+/* One storage's object table for enumeration. Names live in a string pool
+ * and both grow in modest chunks, so a card with tens of thousands of objects
+ * never asks for one large contiguous PSRAM block (a 140-byte node times
+ * 6665 objects used to, and failed once the heap was fragmented). */
+typedef struct { uint64_t size; int64_t mtime; uint32_t handle, parent, name /* pool << 16 | offset */; uint16_t fmt; bool is_dir; } node_t;
+#define NODE_CHUNK 2048u
+#define NAME_POOL  (32u * 1024u)
+#define NODE_MAX_CHUNKS 64
+typedef struct {
+    node_t *chunks[NODE_MAX_CHUNKS];
+    char *pools[NODE_MAX_CHUNKS];
+    size_t n, nchunks, npools, pool_used;
+} ntab_t;
 
-static const node_t *find_node(const node_t *nodes, size_t n, uint32_t handle)
+static void ntab_free(ntab_t *t)
 {
-    for (size_t i = 0; i < n; i++) if (nodes[i].handle == handle) return &nodes[i];
+    for (size_t i = 0; i < t->nchunks; i++) free(t->chunks[i]);
+    for (size_t i = 0; i < t->npools; i++) free(t->pools[i]);
+    memset(t, 0, sizeof *t);
+}
+
+static inline node_t *node_at(const ntab_t *t, size_t i) { return &t->chunks[i / NODE_CHUNK][i % NODE_CHUNK]; }
+static inline const char *node_name(const ntab_t *t, const node_t *n) { return t->pools[n->name >> 16] + (n->name & 0xFFFF); }
+
+/* Appends a node; NULL when memory runs out. */
+static node_t *ntab_add(ntab_t *t, const char *name)
+{
+    size_t len = strlen(name) + 1;
+    if (len > NAME_POOL) return NULL;
+    if (t->npools == 0 || t->pool_used + len > NAME_POOL) {
+        if (t->npools == NODE_MAX_CHUNKS) return NULL;
+        char *pool = heap_caps_malloc(NAME_POOL, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!pool) return NULL;
+        t->pools[t->npools++] = pool; t->pool_used = 0;
+    }
+    if (t->n % NODE_CHUNK == 0) {
+        if (t->nchunks == NODE_MAX_CHUNKS) return NULL;
+        node_t *ch = heap_caps_calloc(NODE_CHUNK, sizeof *ch, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (!ch) return NULL;
+        t->chunks[t->nchunks++] = ch;
+    }
+    memcpy(t->pools[t->npools - 1] + t->pool_used, name, len);
+    node_t *n = node_at(t, t->n++);
+    memset(n, 0, sizeof *n);
+    n->name = (uint32_t)((t->npools - 1) << 16 | t->pool_used);
+    t->pool_used += len;
+    return n;
+}
+
+static const node_t *find_node(const ntab_t *t, uint32_t handle)
+{
+    for (size_t i = 0; i < t->n; i++) { const node_t *n = node_at(t, i); if (n->handle == handle) return n; }
     return NULL;
 }
 
 /* Builds "A/B/name" by walking parents (bounded depth). */
-static void build_path(const node_t *nodes, size_t n, const node_t *leaf, char *out, size_t cap)
+static void build_path(const ntab_t *t, const node_t *leaf, char *out, size_t cap)
 {
     const char *parts[16];
     int np = 0;
     const node_t *cur = leaf;
     while (cur && np < 16) {
-        parts[np++] = cur->name;
+        parts[np++] = node_name(t, cur);
         if (cur->parent == 0 || cur->parent == 0xFFFFFFFFu) break;
-        cur = find_node(nodes, n, cur->parent);
+        cur = find_node(t, cur->parent);
     }
     size_t o = 0;
     out[0] = 0;
@@ -130,44 +177,38 @@ static esp_err_t ptp_enumerate(cam_source_t *s, cam_enum_cb_t cb, void *ctx)
             e = collect_handles_recursive(p, stores[si], &handles, &nh);
             if (e != ESP_OK) { ESP_LOGW(TAG, "recursive enumeration of 0x%08x failed: %s", stores[si], esp_err_to_name(e)); continue; }
         }
-        node_t *nodes = heap_caps_calloc(nh ? nh : 1, sizeof *nodes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!nodes) nodes = calloc(nh ? nh : 1, sizeof *nodes);
-        if (!nodes) { free(handles); return ESP_ERR_NO_MEM; }
+        ntab_t tab = {0};
         /* pass 1: object infos (names, parents, sizes) */
-        uint64_t *sizes = heap_caps_calloc(nh ? nh : 1, sizeof *sizes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        int64_t *mtimes = heap_caps_calloc(nh ? nh : 1, sizeof *mtimes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!sizes || !mtimes) { free(sizes); free(mtimes); free(nodes); free(handles); return ESP_ERR_NO_MEM; }
-        size_t good = 0;
         for (size_t i = 0; i < nh; i++) {
             ptp_object_info oi;
             if (rrc_ptp_get_object_info(p->dev, handles[i], &oi) != ESP_OK) {
-                if (!rrc_ptp_is_connected(p->dev)) { free(sizes); free(mtimes); free(nodes); free(handles); return ESP_ERR_NOT_FOUND; }
+                if (!rrc_ptp_is_connected(p->dev)) { ntab_free(&tab); free(handles); return ESP_ERR_NOT_FOUND; }
                 continue;
             }
-            node_t *n = &nodes[good];
+            node_t *n = ntab_add(&tab, oi.filename);
+            if (!n) { ntab_free(&tab); free(handles); return ESP_ERR_NO_MEM; }
             n->handle = handles[i]; n->parent = oi.parent_object; n->fmt = oi.object_format;
             n->is_dir = oi.object_format == PTP_OFC_Association;
-            scpy(n->name, sizeof n->name, oi.filename);
-            sizes[good] = oi.compressed_size;
+            n->size = oi.compressed_size;
             int64_t t = rrc_parse_ptp_datetime(oi.capture_date);
             if (t <= 0) t = rrc_parse_ptp_datetime(oi.modification_date);
-            mtimes[good] = t > 0 ? t : 0;
-            good++;
+            n->mtime = t > 0 ? t : 0;
         }
-        ESP_LOGI(TAG, "storage 0x%08x: %u objects", stores[si], (unsigned)good);
+        ESP_LOGI(TAG, "storage 0x%08x: %u objects", stores[si], (unsigned)tab.n);
         /* pass 2: emit files with reconstructed paths */
         int stop = 0;
-        for (size_t i = 0; i < good && !stop; i++) {
-            if (nodes[i].is_dir) continue;
+        for (size_t i = 0; i < tab.n && !stop; i++) {
+            const node_t *n = node_at(&tab, i);
+            if (n->is_dir) continue;
             cam_object_t o = {0};
-            scpy(o.name, sizeof o.name, nodes[i].name);
-            build_path(nodes, good, &nodes[i], o.path, sizeof o.path);
-            o.size = sizes[i];
-            o.mtime = mtimes[i];
-            o.handle = nodes[i].handle;
+            scpy(o.name, sizeof o.name, node_name(&tab, n));
+            build_path(&tab, n, o.path, sizeof o.path);
+            o.size = n->size;
+            o.mtime = n->mtime;
+            o.handle = n->handle;
             stop = cb(ctx, &o);
         }
-        free(sizes); free(mtimes); free(nodes); free(handles);
+        ntab_free(&tab); free(handles);
         if (stop) break;
     }
     return ESP_OK;
