@@ -81,6 +81,7 @@ void app_main(void)
     store_ledger_load();
     esp_reset_reason_t rr = esp_reset_reason();
     log_ring_printf("rrcloud-ingest starting after %s reset (%d); device %s; psram free %u KiB", reset_reason_str(rr), (int)rr, app_device_id(), (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    usb_fault_init();
     esp_log_level_set("health", ESP_LOG_DEBUG);
     const esp_timer_create_args_t ht = {.callback = health_tick, .name = "health"};
     esp_timer_handle_t health;

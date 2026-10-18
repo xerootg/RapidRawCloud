@@ -375,14 +375,20 @@ A failed bulk transfer surfaces at three levels, from the controller up:
 
 - `W src_msc: read10 lba … x…: ESP_ERR_…` — the SCSI read the engine asked for failed; the
   engine retries the file and the run aborts after seven failures in a row.
-- `I rrc: usb: channel fault at … ms: hcint 0x… [bnaintr …], channel NOT halted …` — the raw
-  channel interrupt bits the DWC controller raised, captured in `main/usb_fault.c` by
-  wrapping IDF's HAL decoder at link time. Which bit names appear says what the hardware
-  objected to; *channel NOT halted* is the case IDF's HAL asserts on
-  (`usb_dwc_hal.c`, `usb_dwc_hal_chan_decode_intr`). That assert rebooted the dock
-  mid-sync once, so the firmware builds with `CONFIG_HAL_ASSERTION_DISABLE` and records
-  the fault instead. A `stray channel halt … on an idle channel` line afterwards means
-  the hardware halted later and the HAL took it for a completed transfer.
+- `I rrc: usb: channel fault at … ms: hcint 0x… [bnaintr] without a halt (buffer not
+  available); halted it in N us, failed the transfer` — the raw channel interrupt bits
+  the DWC controller raised, captured in `main/usb_fault.c` by wrapping IDF's HAL
+  decoder at link time. Buffer Not Available is the one channel error that does not halt
+  the channel; IDF's HAL asserted on exactly that (`usb_dwc_hal.c`,
+  `usb_dwc_hal_chan_decode_intr`; espressif/esp-idf#19111) and, with the assert off
+  (`CONFIG_HAL_ASSERTION_DISABLE`), its HCD aborted on the same error one layer up
+  (`_buffer_parse`). Each one rebooted the dock mid-sync, about once per 10–100 GB on a
+  Sigma fp L. The wrapper now halts the channel itself and reports a plain transaction
+  error, so the HCD fails the one transfer, `src_msc` resets the device and retries the
+  read, and the sync carries on. Other bit names in the brackets are the ordinary errors
+  (`stall`, `xcs_xact_err`, `bblerr`), which come with `chhltd` and need no help. A
+  `stray channel halt … ignored` line means the hardware halted a channel the HAL had
+  already finished with; it is dropped rather than parsed as a completion.
 - `usb_faults` and `usb_chan_irqs` in `/api/status`: faults recorded since boot, and
   channel interrupts decoded since boot (every transfer counts, so a non-zero value proves
   the recorder is in the build).

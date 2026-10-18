@@ -104,8 +104,16 @@ static int xread(void *ctx, uint64_t lba, uint32_t count, void *buf)
     msc_impl_t *m = ctx;
     if (!m->connected || lba > UINT32_MAX) return -1;
     esp_err_t e = scsi_cmd_read10(m->dev, buf, (uint32_t)lba, count, RRC_EXFAT_SECTOR);
-    if (e != ESP_OK) ESP_LOGW(TAG, "read10 lba %llu x%u: %s", (unsigned long long)lba, (unsigned)count, esp_err_to_name(e));
-    return e == ESP_OK ? 0 : -1;
+    if (e == ESP_OK) return 0;
+    /* A failed bulk transfer leaves the device mid-command and the host pipe
+     * halted. Bulk-Only Transport reset recovery clears both; then the read is
+     * worth one more try before the caller sees the failure. */
+    ESP_LOGW(TAG, "read10 lba %llu x%u: %s; resetting the device", (unsigned long long)lba, (unsigned)count, esp_err_to_name(e));
+    esp_err_t r = msc_host_reset_recovery(m->dev);
+    if (r != ESP_OK) { ESP_LOGW(TAG, "reset recovery: %s", esp_err_to_name(r)); return -1; }
+    e = scsi_cmd_read10(m->dev, buf, (uint32_t)lba, count, RRC_EXFAT_SECTOR);
+    if (e != ESP_OK) { ESP_LOGW(TAG, "read10 lba %llu x%u after reset: %s", (unsigned long long)lba, (unsigned)count, esp_err_to_name(e)); return -1; }
+    return 0;
 }
 
 typedef struct { cam_enum_cb_t cb; void *ctx; rrc_exfat_t *fs; char rel[512]; int depth; } xwalk_t;

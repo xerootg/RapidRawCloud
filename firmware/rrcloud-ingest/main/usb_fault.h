@@ -15,6 +15,10 @@
 #pragma once
 #include <stdint.h>
 
+/* Call once at boot, after the log ring is up: logs any faults retained
+ * across a crash reset, then arms the ring for this boot. */
+void usb_fault_init(void);
+
 /* Writes every fault recorded since the last call to the log ring. */
 void usb_fault_drain(void);
 
