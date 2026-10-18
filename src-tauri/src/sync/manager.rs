@@ -231,6 +231,12 @@ pub struct SyncManager {
     last_config: std::sync::Mutex<Option<(SyncSettings, Credentials, PathBuf, PathBuf)>>,
 }
 
+/// A regular file of length zero: the on-disk shape of a cloud placeholder.
+/// Missing or unreadable paths answer `false` (nothing to hydrate over).
+fn is_empty_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == 0)
+}
+
 impl SyncManager {
     /// Constructs an inert manager (the `AppState` initial value). It
     /// becomes live only after [`SyncManager::configure`].
@@ -455,8 +461,9 @@ impl SyncManager {
             // §3.5: reseed the in-memory stub mirror from the durable records so
             // the cloud stubs this cycle just materialized read as stubs (the
             // guard sites hydrate them on open/edit; the grid shows placeholders).
-            // Authoritative: stub_paths is exactly the Stub-state items, so an
-            // item hydrated this cycle correctly drops out.
+            // Authoritative: stub_paths is exactly the placeholder-state items
+            // (Stub, PendingDown, Downloading), so an item hydrated this cycle
+            // correctly drops out.
             self.reseed_stub_mirror(&cfg);
             // §3.8: push the post-cycle status + per-item deltas to the webview
             // so the badge and grid icons settle without a poll.
@@ -894,8 +901,12 @@ impl SyncManager {
         #[cfg(feature = "sync")]
         {
             // Fast path: not a stub ⇒ the real bytes are already present
-            // (idempotent hydration, the common guard-site case).
-            if !self.is_stub(path) {
+            // (idempotent hydration, the common guard-site case). A 0-byte
+            // file is never "present": if the mirror is behind the durable
+            // state (a reseed between the journal apply and the policy pass,
+            // issue #37), hydrate from the record anyway rather than let the
+            // caller read the placeholder as content.
+            if !self.is_stub(path) && !is_empty_file(path) {
                 return Ok(path.to_path_buf());
             }
             let cfg = self.configured()?;
@@ -3376,10 +3387,25 @@ mod imp {
         /// stub after a restart and every §3.5 guard site reads (or copies)
         /// the 0-byte stub as content — the "mirror of redb" the doc promises
         /// is only ever written in-process, never read back on load.
+        /// The record states whose local target is not the real bytes: a
+        /// 0-byte placeholder, or nothing yet. `Stub` is the evicted or
+        /// never-fetched original; `PendingDown` / `Downloading` are journal-
+        /// applied originals the §3.5 policy has not settled or whose
+        /// transfer is in flight. All three must read as cloud placeholders
+        /// at the guard sites, or a load between the journal apply and the
+        /// policy pass hands an empty file to the RAW decoder ("No decoder
+        /// found", seen on the tablet 2026-10-18, issue #37).
+        pub(super) fn placeholder_state(state: ItemState) -> bool {
+            matches!(
+                state,
+                ItemState::Stub | ItemState::PendingDown | ItemState::Downloading
+            )
+        }
+
         pub fn stub_paths(&self) -> Result<Vec<PathBuf>, SyncError> {
             let mut out = Vec::new();
             for (rk, record) in self.db.iter_items().map_err(se)? {
-                if record.deleted || record.state != ItemState::Stub {
+                if record.deleted || !Self::placeholder_state(record.state) {
                     continue;
                 }
                 out.push(local_target_path(&self.sync_root, &rk, record.kind));
@@ -4010,7 +4036,36 @@ mod imp {
 
     #[cfg(test)]
     mod tests {
-        use super::{ItemState, item_state_ui};
+        use super::super::is_empty_file;
+        use super::{Configured, ItemState, item_state_ui};
+
+        #[test]
+        fn placeholder_states_cover_every_not_yet_local_original() {
+            let placeholder_state = Configured::placeholder_state;
+            for s in [
+                ItemState::Stub,
+                ItemState::PendingDown,
+                ItemState::Downloading,
+            ] {
+                assert!(placeholder_state(s), "{s:?} has no real bytes locally");
+            }
+            for s in [ItemState::Hydrated, ItemState::Synced, ItemState::Dirty] {
+                assert!(!placeholder_state(s), "{s:?} is local content");
+            }
+        }
+
+        #[test]
+        fn empty_file_is_the_placeholder_shape() {
+            let dir = tempfile::tempdir().unwrap();
+            let empty = dir.path().join("stub.NEF");
+            std::fs::write(&empty, b"").unwrap();
+            let full = dir.path().join("real.NEF");
+            std::fs::write(&full, b"II*\0").unwrap();
+            assert!(is_empty_file(&empty));
+            assert!(!is_empty_file(&full));
+            assert!(!is_empty_file(dir.path()));
+            assert!(!is_empty_file(&dir.path().join("missing.NEF")));
+        }
 
         #[test]
         fn item_state_ui_collapses_lanes_to_the_badge_vocabulary() {
