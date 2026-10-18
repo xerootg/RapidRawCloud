@@ -12,5 +12,9 @@ idf_component_register(
         "../www/index.html"
 )
 
-# usb_fault.c wraps the IDF HAL channel-interrupt decoder to record raw fault bits.
-target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=usb_dwc_hal_chan_decode_intr")
+# usb_fault.c wraps the IDF HAL channel-interrupt decoder to record raw fault bits;
+# usb_diag.c wraps the HCD port-event collector to guard a hub-driver abort during
+# the root port power cycle (it needs the usb component's private hcd.h for that).
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=usb_dwc_hal_chan_decode_intr" "-Wl,--wrap=hcd_port_handle_event")
+idf_component_get_property(usb_component_dir usb COMPONENT_DIR)
+target_include_directories(${COMPONENT_LIB} PRIVATE "${usb_component_dir}/private_include")

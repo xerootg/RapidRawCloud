@@ -363,6 +363,7 @@ Sigma fp exposing `08/06/50` is mass storage; `ff/..` with three endpoints is MT
 | Device dumped, no `camera attached` | Enumerated, but neither driver matched the interface classes. | Compare the `intf` lines with the table above and switch the camera's USB mode. |
 | `W rrc_ptp: … is not a PTP device` at DEBUG only | Normal for the mass-storage path (the MSC driver owns it). | — |
 | `I usb: addr … full-speed` for a Sigma fp | The card reader fell back to USB 1.1 (12 Mbit/s): a bad cable or hub. | Use a direct USB 2.0 cable. |
+| `W HUB: Device tree node (parent_port=0): not found` followed by `ESP_ERROR_CHECK failed … hub.c` and a reboot | An IDF hub-driver abort (espressif/esp-idf#18366 is the same check): the root port was powered off while a device was attached but not yet enumerated, so the driver reported a device gone that it never had. The dock's own power-cycle watchdog can trigger it when a camera is plugged in at the wrong moment or after a failed bus reset. | The firmware wraps the HCD's port-event collector (`main/usb_diag.c`) and, during its own power cycle with nothing enumerated, recovers the port itself instead of handing the event to the hub driver; the log says `usb: an unenumerated device dropped off during the root port power cycle; port recovered`. If the abort still appears, the log around it is worth keeping. |
 
 The root-port timings are set above the IDF defaults in `sdkconfig.defaults`
 (debounce 500 ms, reset hold 50 ms, recovery 100 ms) because cameras are slow to settle
