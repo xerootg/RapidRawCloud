@@ -473,6 +473,7 @@ typedef struct {
     const app_config_t *cfg;
     flight_t *fl;
     int inflight, consecutive_failures;
+    int interrupted;   /* in-flight files stopped by a cancel or the camera going away: not failures */
     bool warned;
 } run_t;
 
@@ -499,7 +500,10 @@ static void run_finish(run_t *rc, ue_job_t *dj)
     f->job = NULL;
     rrc_ledger_rec lr = {.source_id = rc->src->source_id, .source_path = o->path, .size = o->size, .mtime = o->mtime, .relkey = f->relkey, .blake3_hex = "", .seq = 0, .ts = 0};
     if (e != ESP_OK) {
-        if (!cancel_flag && rc->src->connected(rc->src)) set_error("%s: %s", f->relkey, err);
+        /* Stopped by a cancel or an unplugged camera: nothing went wrong with the
+         * file, and the ledger has no record of it, so the next run uploads it. */
+        if (cancel_flag || !rc->src->connected(rc->src)) { rc->interrupted++; return; }
+        set_error("%s: %s", f->relkey, err);
         ST_LOCK(); st.run_failed++; ST_UNLOCK();
         rc->consecutive_failures++;
         return;
@@ -694,11 +698,17 @@ static void sync_run_impl(cam_source_t *src)
         heartbeat();
         if (uploaded_any || store_kv_get_u64("manifest_dirty", 0) || manifest_ts() == 0) publish_manifest();
     }
+    bool stopped = cancel_flag || !src->connected(src);
     ST_LOCK();
     run_end_us = esp_timer_get_time();
     st.last_run_ts = (int64_t)time(NULL);
     st.phase = st.run_failed ? SYNC_ERROR : SYNC_IDLE;
-    log_ring_printf("sync done: %u uploaded, %u skipped, %u failed, %llu bytes", (unsigned)st.run_done, (unsigned)st.run_skipped, (unsigned)st.run_failed, (unsigned long long)st.run_bytes);
+    if (stopped)
+        log_ring_printf("sync stopped (%s): %u uploaded, %u skipped, %u failed, %llu bytes; %d in flight left for the next run",
+                        cancel_flag ? "cancelled" : "camera disconnected", (unsigned)st.run_done, (unsigned)st.run_skipped,
+                        (unsigned)st.run_failed, (unsigned long long)st.run_bytes, rc.interrupted);
+    else
+        log_ring_printf("sync done: %u uploaded, %u skipped, %u failed, %llu bytes", (unsigned)st.run_done, (unsigned)st.run_skipped, (unsigned)st.run_failed, (unsigned long long)st.run_bytes);
     ST_UNLOCK();
 }
 
