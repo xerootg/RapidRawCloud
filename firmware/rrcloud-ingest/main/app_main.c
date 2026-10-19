@@ -66,11 +66,11 @@ static const char *reset_reason_str(esp_reset_reason_t r)
 static void health_tick(void *arg)
 {
     (void)arg;
-    ESP_LOGD("health", "up %llu s; internal free %u min %u largest %u; psram free %u; usb devices %d faults %u chan irqs %u",
+    ESP_LOGD("health", "up %llu s; internal free %u min %u largest %u; psram free %u; usb devices %d faults %u chan irqs %u; eth rx frames %u",
              (unsigned long long)(esp_timer_get_time() / 1000000),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-             usb_diag_device_count(), (unsigned)usb_fault_count(), (unsigned)usb_fault_decode_calls());
+             usb_diag_device_count(), (unsigned)usb_fault_count(), (unsigned)usb_fault_decode_calls(), (unsigned)net_eth_rx_frames());
 }
 
 void app_main(void)

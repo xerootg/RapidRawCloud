@@ -119,6 +119,13 @@ static int cmd_sync(int argc, char **argv) { (void)argc; (void)argv; sync_reques
 static int cmd_sync_cancel(int argc, char **argv) { (void)argc; (void)argv; sync_cancel(); printf("cancelling\n"); return 0; }
 static int cmd_usb_reset(int argc, char **argv) { (void)argc; (void)argv; return usb_diag_power_cycle() == ESP_OK ? 0 : 1; }
 static int cmd_reboot(int argc, char **argv) { (void)argc; (void)argv; printf("rebooting\n"); vTaskDelay(pdMS_TO_TICKS(200)); esp_restart(); return 0; }
+static int cmd_eth_rx_stall_test(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    net_eth_rx_drop_test(true);
+    printf("dropping every received ethernet frame; the receive watchdog should restart the dock in about 70 s\n");
+    return 0;
+}
 
 static int cmd_pair(int argc, char **argv)
 {
@@ -385,6 +392,7 @@ esp_err_t console_start(void)
         {.command = "c6-update", .help = "c6-update [url [sha256]]: install an ESP-Hosted co-processor image over SDIO (default: the pinned " COPROC_HOST_LIB_VERSION " image); the dock restarts afterwards", .func = cmd_c6_update},
         {.command = "log", .help = "The web UI's log ring", .func = cmd_log},
         {.command = "reboot", .help = "Restart the dock", .func = cmd_reboot},
+        {.command = "eth-rx-stall-test", .help = "Drop every received ethernet frame to test the receive watchdog (the dock restarts itself)", .func = cmd_eth_rx_stall_test},
     };
     for (size_t i = 0; i < sizeof cmds / sizeof cmds[0]; i++) esp_console_cmd_register(&cmds[i]);
     e = esp_console_start_repl(repl);

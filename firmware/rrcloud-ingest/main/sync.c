@@ -596,24 +596,33 @@ static bool run_submit(run_t *rc, const enum_ctx_t *ec, size_t item, bool may_de
  * loss; the ledger makes the resumed run skip everything already uploaded. */
 #define RUN_MAGIC 0x52554e31u   /* "RUN1" */
 #define RESUME_MAX_TRIES 3
+#define RECOVERY_MAGIC 0x52435652u   /* "RCVR" */
 static RTC_NOINIT_ATTR uint32_t rtc_run_magic;
 static RTC_NOINIT_ATTR uint32_t rtc_resume_tries;
+static RTC_NOINIT_ATTR uint32_t rtc_recovery_restart;
 static bool resume_pending;
+
+void sync_mark_recovery_restart(void) { rtc_recovery_restart = RECOVERY_MAGIC; }
 
 static void resume_check_at_boot(void)
 {
     esp_reset_reason_t r = esp_reset_reason();
-    bool crash = r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+    /* A software restart counts like a crash only when the firmware itself
+     * restarted to recover (sync_mark_recovery_restart, e.g. the Ethernet
+     * receive watchdog); a console or web-UI reboot never resumes. */
+    bool recovery = r == ESP_RST_SW && rtc_recovery_restart == RECOVERY_MAGIC;
+    rtc_recovery_restart = 0;
+    bool crash = recovery || r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
     if (!crash) { rtc_run_magic = 0; rtc_resume_tries = 0; return; }
     if (rtc_run_magic != RUN_MAGIC) return;
     rtc_run_magic = 0;
     if (rtc_resume_tries >= RESUME_MAX_TRIES) {
-        log_ring_printf("sync: not resuming the run interrupted by a crash (%u restarts in a row)", (unsigned)rtc_resume_tries);
+        log_ring_printf("sync: not resuming the interrupted run (%u restarts in a row)", (unsigned)rtc_resume_tries);
         return;
     }
     rtc_resume_tries++;
     resume_pending = true;
-    log_ring_printf("sync: restarted after a crash during a run; it resumes when the camera is back");
+    log_ring_printf("sync: restarted %s during a run; it resumes when the camera is back", recovery ? "to recover the network" : "after a crash");
 }
 
 static void sync_run_impl(cam_source_t *src);
