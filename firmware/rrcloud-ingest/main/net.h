@@ -48,3 +48,11 @@ typedef struct {
 int net_wifi_scan_json(char *out, size_t cap);
 const char *net_wifi_authmode_str(int authmode);
 const char *net_wifi_reason_str(int reason);
+
+/* Frames the Ethernet driver has handed to the IP stack since boot, and how
+ * many times in a row the receive watchdog has restarted the dock (see net.c). */
+uint32_t net_eth_rx_frames(void);
+uint32_t net_eth_rx_restarts(void);
+/* Test hook: drop every received frame before the stack sees it, which is what
+ * the EMAC lockup looks like from above. The watchdog then restarts the dock. */
+void net_eth_rx_drop_test(bool on);

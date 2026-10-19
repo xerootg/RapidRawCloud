@@ -19,6 +19,7 @@
 #include "net.h"
 #include "pairing.h"
 #include "usb_diag.h"
+#include "usb_fault.h"
 #include "log_ring.h"
 #include "store.h"
 #include "coproc.h"
@@ -106,11 +107,12 @@ static void r_status(api_resp_t *out)
     rrc_json_quote(iso, q_time, sizeof q_time);
     int n = snprintf(buf, 6144,
         "{\"sync\":%s,\"network\":%s,\"eth_link\":%s,\"wifi\":%s,\"time_synced\":%s,\"time\":%s,\"version\":%s,\"hostname\":%s,\"device_id\":%s,"
-        "\"storage_total\":%u,\"storage_used\":%u,\"heap_free\":%u,\"psram_free\":%u,\"uptime_s\":%lld,\"usb_devices\":%d,\"coproc\":%s,\"ble\":%s,"
+        "\"storage_total\":%u,\"storage_used\":%u,\"heap_free\":%u,\"psram_free\":%u,\"uptime_s\":%lld,\"usb_devices\":%d,\"usb_faults\":%u,\"usb_chan_irqs\":%u,\"eth_rx_frames\":%u,\"eth_rx_restarts\":%u,\"coproc\":%s,\"ble\":%s,"
         "\"board\":\"%s\",\"has_ethernet\":%s,\"wifi_enabled\":%s,\"wifi_ssid\":%s,\"wifi_rssi\":%d,\"power\":%s}",
         sync_json, q_net, net_eth_link() ? "true" : "false", net_wifi_connected() ? "true" : "false", net_time_synced() ? "true" : "false", q_time, q_ver, q_host, q_dev,
         (unsigned)total, (unsigned)used, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-        (long long)(esp_timer_get_time() / 1000000), usb_diag_device_count(), coproc_json, ble_json,
+        (long long)(esp_timer_get_time() / 1000000), usb_diag_device_count(), (unsigned)usb_fault_count(), (unsigned)usb_fault_decode_calls(),
+        (unsigned)net_eth_rx_frames(), (unsigned)net_eth_rx_restarts(), coproc_json, ble_json,
         BOARD_NAME, net_has_ethernet() ? "true" : "false", app_config_get()->wifi_enabled ? "true" : "false", q_ssid, net_wifi_rssi(), power_json);
     free(sync_json);
     if (n < 0 || n >= 6144) { free(buf); err(out, 500, "status too large"); return; }

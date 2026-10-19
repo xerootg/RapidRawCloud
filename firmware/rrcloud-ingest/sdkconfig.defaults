@@ -158,3 +158,8 @@ CONFIG_LWIP_MAX_SOCKETS=16
 
 # USB mass-storage disks use 512-byte sectors; the 4096 default makes f_mount reject them
 CONFIG_FATFS_SECTOR_512=y
+
+# IDF asserts in the USB host channel interrupt on a buffer-not-available error even though its own
+# comments say the channel halt bit is absent then (usb_dwc_hal.c, still so in 5.5.2). That reboots the
+# dock mid-sync (seen once in ~100 GB). With HAL asserts off the error takes the normal failed-transfer path.
+CONFIG_HAL_ASSERTION_DISABLE=y

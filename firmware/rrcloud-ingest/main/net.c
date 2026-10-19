@@ -6,12 +6,17 @@
 #include "freertos/semphr.h"
 #include "util.h"
 #include <string.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <time.h>
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_event.h"
 #include "esp_netif_sntp.h"
+#include "esp_netif_net_stack.h"
+#include "esp_attr.h"
+#include "esp_system.h"
+#include "lwip/etharp.h"
 #include "esp_wifi.h"
 #include "mdns.h"
 #include "sdkconfig.h"
@@ -24,6 +29,7 @@
 #include "esp_eth_mac_esp.h"
 #include "esp_eth_phy.h"
 #endif
+#include "sync.h"
 #if CONFIG_ESP_WIFI_REMOTE_ENABLED
 #include "esp_hosted.h"
 #include "coproc.h"
@@ -59,6 +65,108 @@ static const char *TAG = "net";
 static esp_netif_t *eth_netif;
 static esp_eth_handle_t eth_handle;
 
+/* ---- Ethernet receive watchdog ---------------------------------------------
+ * The ESP32-P4 EMAC can stop delivering received frames for good while the
+ * MAC keeps transmitting: after an RX FIFO overflow (receive descriptors
+ * exhausted while the RX task is starved, e.g. through flash-cache-disabled
+ * windows during littlefs writes) the MTL FIFO latches and no further receive
+ * interrupt ever fires (espressif/esp-idf#18800; reproduces on IDF master).
+ * Upstream found no recovery short of a full DMA software reset with complete
+ * MAC/DMA reconfiguration; esp_eth_stop()/start() and receive poll demand do
+ * not help. On the dock it looked like a hang: DNS and the web UI dead, the
+ * serial console fine, a sync run aborting on timeouts (issue #39).
+ *
+ * Every received frame is counted at the driver-to-netif boundary. When the
+ * link is up and nothing has arrived for a while, the gateway is probed with
+ * ARP, which it must answer; when even that draws nothing, the dock restarts,
+ * marking the restart so an interrupted sync run resumes on its own. Three
+ * such restarts in a row without ten minutes of healthy receive stop it from
+ * looping. */
+#define RX_WD_PERIOD_S      10
+#define RX_WD_PROBE_AFTER_S 20
+#define RX_WD_STALL_AFTER_S 60
+#define RX_WD_MAX_RESTARTS  3
+#define RX_WD_HEALTHY_S     600
+#define RX_WD_MAGIC         0x45525831u   /* "ERX1" */
+
+static volatile uint32_t eth_rx_frames;
+static volatile bool eth_rx_drop_test;
+static RTC_NOINIT_ATTR uint32_t rtc_rx_magic, rtc_rx_restarts, rtc_rx_restart_pending;
+
+/* Replaces the netif glue's input callback (esp_eth_netif_glue.c,
+ * eth_input_to_netif) after esp_netif_attach installed it: the same
+ * esp_netif_receive call, plus the frame count. The glue's only other work
+ * there is the L2 TAP filter, which this build does not enable. */
+static esp_err_t eth_input_counted(esp_eth_handle_t h, uint8_t *buffer, uint32_t length, void *priv, void *info)
+{
+    (void)h; (void)info;
+    if (eth_rx_drop_test) { free(buffer); return ESP_OK; }   /* emulate the lockup: nothing reaches the stack */
+    eth_rx_frames++;
+    return esp_netif_receive((esp_netif_t *)priv, buffer, length, NULL);
+}
+
+static esp_err_t arp_probe(void *ctx)
+{
+    struct netif *n = esp_netif_get_netif_impl(eth_netif);
+    if (n) etharp_request(n, (const ip4_addr_t *)ctx);
+    return ESP_OK;
+}
+
+static void eth_rx_watchdog_task(void *arg)
+{
+    (void)arg;
+    uint32_t last = eth_rx_frames;
+    int quiet_s = 0, healthy_s = 0;
+    bool gave_up = false;
+    for (;;) {
+        vTaskDelay(pdMS_TO_TICKS(RX_WD_PERIOD_S * 1000));
+        uint32_t now = eth_rx_frames;
+        if (!eth_link || !eth_ip) { last = now; quiet_s = 0; continue; }
+        if (now != last) {
+            last = now;
+            quiet_s = 0;
+            if (rtc_rx_restarts && (healthy_s += RX_WD_PERIOD_S) >= RX_WD_HEALTHY_S) { rtc_rx_restarts = 0; gave_up = false; }
+            continue;
+        }
+        quiet_s += RX_WD_PERIOD_S;
+        healthy_s = 0;
+        if (quiet_s < RX_WD_STALL_AFTER_S) {
+            if (quiet_s >= RX_WD_PROBE_AFTER_S) {
+                esp_netif_ip_info_t ip;
+                if (esp_netif_get_ip_info(eth_netif, &ip) == ESP_OK && ip.gw.addr) esp_netif_tcpip_exec(arp_probe, &ip.gw);
+            }
+            continue;
+        }
+        if (rtc_rx_restarts >= RX_WD_MAX_RESTARTS) {
+            if (!gave_up) log_ring_printf("net: ethernet still receives nothing after %u restarts; not restarting again (power-cycle the dock)", (unsigned)rtc_rx_restarts);
+            gave_up = true;
+            continue;
+        }
+        rtc_rx_restarts++;
+        rtc_rx_restart_pending = 1;
+        log_ring_printf("net: ethernet has received nothing for %d s with the link up, gateway ARP unanswered; restarting to recover (%u of %u)",
+                        quiet_s, (unsigned)rtc_rx_restarts, (unsigned)RX_WD_MAX_RESTARTS);
+        sync_mark_recovery_restart();
+        vTaskDelay(pdMS_TO_TICKS(300));   /* let the line reach the console */
+        esp_restart();
+    }
+}
+
+static void eth_rx_watchdog_start(void)
+{
+    if (rtc_rx_magic != RX_WD_MAGIC) { rtc_rx_magic = RX_WD_MAGIC; rtc_rx_restarts = 0; rtc_rx_restart_pending = 0; }
+    if (rtc_rx_restart_pending) {
+        rtc_rx_restart_pending = 0;
+        if (esp_reset_reason() == ESP_RST_SW)
+            log_ring_printf("net: restarted to recover from an ethernet receive lockup (%u in a row)", (unsigned)rtc_rx_restarts);
+    }
+    xTaskCreate(eth_rx_watchdog_task, "eth_rx_wd", 3072, NULL, 3, NULL);
+}
+
+uint32_t net_eth_rx_frames(void) { return eth_rx_frames; }
+uint32_t net_eth_rx_restarts(void) { return rtc_rx_magic == RX_WD_MAGIC ? rtc_rx_restarts : 0; }
+void net_eth_rx_drop_test(bool on) { eth_rx_drop_test = on; }
+
 static void eth_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base; (void)data;
@@ -68,6 +176,12 @@ static void eth_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     default: break;
     }
 }
+#endif
+#if !CONFIG_RRC_HAS_ETHERNET
+/* No Ethernet on this board: nothing to count, nothing to watch. */
+uint32_t net_eth_rx_frames(void) { return 0; }
+uint32_t net_eth_rx_restarts(void) { return 0; }
+void net_eth_rx_drop_test(bool on) { (void)on; }
 #endif
 
 static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -165,7 +279,9 @@ static esp_err_t eth_init(void)
     eth_netif = esp_netif_new(&ncfg);
     esp_netif_set_hostname(eth_netif, app_config_get()->hostname);
     ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth)));
+    ESP_ERROR_CHECK(esp_eth_update_input_path_info(eth, eth_input_counted, eth_netif));
     ESP_ERROR_CHECK(esp_event_handler_register(ETH_EVENT, ESP_EVENT_ANY_ID, eth_event, NULL));
+    eth_rx_watchdog_start();
     return esp_eth_start(eth);
 }
 #endif

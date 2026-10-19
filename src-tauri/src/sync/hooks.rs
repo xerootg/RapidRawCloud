@@ -115,6 +115,24 @@ pub fn is_stub(path: &Path) -> bool {
     }
 }
 
+/// Whether `path` is a 0-byte file while sync is configured: the on-disk
+/// shape of a placeholder even when the in-memory stub mirror does not list
+/// it (a reseed between the journal apply and the §3.5 policy pass, issue
+/// #37). Readers treat it like a stub and hydrate through `ensure_local`,
+/// which consults the durable record, instead of decoding an empty file.
+/// Always `false` when sync is off or unconfigured.
+pub fn is_empty_placeholder(path: &Path) -> bool {
+    #[cfg(feature = "sync")]
+    {
+        imp::is_empty_placeholder(path)
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 /// A locally present smart preview for a sync stub (ARCHITECTURE.md §4.4).
 /// Carries the proxy DNG path and the **original** (journal) dimensions the
 /// proxy-mode load must report, plus the proxy's own long edge so the loader
@@ -288,6 +306,11 @@ mod imp {
         global_manager()
             .map(|mgr| mgr.is_stub(path))
             .unwrap_or(false)
+    }
+
+    pub fn is_empty_placeholder(path: &Path) -> bool {
+        global_manager().is_some_and(|mgr| mgr.is_configured())
+            && std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() == 0)
     }
 
     pub fn proxy_handle(path: &Path) -> Option<super::ProxyHandle> {

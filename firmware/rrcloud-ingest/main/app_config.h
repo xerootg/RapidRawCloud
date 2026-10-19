@@ -21,7 +21,7 @@ typedef struct {
     bool s3_tls_insecure;
     char pairing_url[CFG_STR];        /* e.g. https://rrc.themissing.xyz — informational after pairing */
     /* What to sync */
-    char include_globs[256];          /* "*.nef *.nrw *.dng *.jpg *.jpeg *.heif *.hif *.tif *.tiff" */
+    char include_globs[256];          /* default: every RAW extension RapidRAW decodes (formats.rs), plus JPEG/HEIF/TIFF (app_config.c) */
     char exclude_globs[256];
     char key_template[CFG_STR];       /* relkey template under library/ */
     char msc_root[64];                /* e.g. "DCIM" ("" = whole card) */

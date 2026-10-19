@@ -1,4 +1,6 @@
 #include "usb_diag.h"
+#include "usb_fault.h"
+#include "hcd.h"   /* IDF private header, for the root-port event guard below */
 #include <stdio.h>
 #include <string.h>
 #include "esp_log.h"
@@ -87,11 +89,53 @@ int usb_diag_device_count(void)
     return usb_host_lib_info(&li) == ESP_OK ? li.num_devices : -1;
 }
 
+/* Guard for an IDF hub-driver abort (hub.c, root_port_handle_events, the
+ * ESP_ERROR_CHECK around dev_tree_node_dev_gone; espressif/esp-idf#18366 is the
+ * same check hit from another direction). Powering the root port off while a
+ * device is physically attached makes the controller raise a disconnection.
+ * The hub driver, now in its NOT_POWERED state, assumes that device had been
+ * enumerated and tells the device layer it is gone; when the device never got
+ * that far (a camera plugged in mid-cycle, or one whose bus reset had failed,
+ * which is what the power cycle exists to clear) there is no device node and
+ * the lookup's ESP_ERR_NOT_FOUND aborts the firmware.
+ *
+ * hcd_port_handle_event is where the hub driver collects the port event, so it
+ * is wrapped at link time. During a power cycle, with nothing enumerated, a
+ * disconnection or error event is consumed here: the port is recovered (the
+ * same hcd_port_recover the hub driver would run, which also returns it to the
+ * not-powered state the hub driver believes it is in) and the hub driver sees
+ * no event. Everything else passes through untouched. */
+/* Set for the power-off half of a cycle that started with nothing enumerated.
+ * Decided before the cycle, in the caller's task: usb_host_lib_info takes the
+ * USBH mutex, which is not something to do from inside the hub driver's event
+ * path. With a device enumerated (the web UI's retry button) the hub driver's
+ * own path is the right one and the wrapper stays out of it. */
+static volatile bool cycling_empty;
+
+hcd_port_event_t __real_hcd_port_handle_event(hcd_port_handle_t port_hdl);
+
+hcd_port_event_t __wrap_hcd_port_handle_event(hcd_port_handle_t port_hdl)
+{
+    hcd_port_event_t ev = __real_hcd_port_handle_event(port_hdl);
+    if (!cycling_empty || (ev != HCD_PORT_EVENT_DISCONNECTION && ev != HCD_PORT_EVENT_ERROR)) return ev;
+    esp_err_t e = hcd_port_recover(port_hdl);
+    if (e != ESP_OK) {
+        ESP_LOGW(TAG, "root port event %d during the power cycle with nothing enumerated; recover failed: %s", (int)ev, esp_err_to_name(e));
+        return ev;
+    }
+    log_ring_printf("usb: an unenumerated device dropped off during the root port power cycle; port recovered (guards an IDF hub.c abort)");
+    return HCD_PORT_EVENT_NONE;
+}
+
 esp_err_t usb_diag_power_cycle(void)
 {
+    cycling_empty = usb_diag_device_count() == 0;
     esp_err_t e = usb_host_lib_set_root_port_power(false);
-    if (e != ESP_OK) { ESP_LOGW(TAG, "root port power off: %s", esp_err_to_name(e)); return e; }
+    if (e != ESP_OK) { cycling_empty = false; ESP_LOGW(TAG, "root port power off: %s", esp_err_to_name(e)); return e; }
     vTaskDelay(pdMS_TO_TICKS(500));
+    /* Cleared before power-on: a stale event handled after that point must
+     * reach the hub driver, whose recovery then re-powers the port itself. */
+    cycling_empty = false;
     e = usb_host_lib_set_root_port_power(true);
     if (e != ESP_OK) ESP_LOGW(TAG, "root port power on: %s", esp_err_to_name(e));
     last_cycle_us = esp_timer_get_time();
@@ -104,6 +148,7 @@ static void watchdog_task(void *arg)
     int idle_polls = 0;
     for (;;) {
         vTaskDelay(pdMS_TO_TICKS(WATCHDOG_POLL_MS));
+        usb_fault_drain();
         int n = usb_diag_device_count();
         if (n != 0) { idle_polls = 0; continue; }
         if (++idle_polls * WATCHDOG_POLL_MS < WATCHDOG_IDLE_S * 1000) continue;

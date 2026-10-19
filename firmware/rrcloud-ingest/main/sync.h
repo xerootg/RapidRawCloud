@@ -43,6 +43,10 @@ void sync_get_status(sync_status_t *out);
 int sync_status_json(char *out, size_t cap);
 void sync_request_now(void);
 void sync_cancel(void);
+/* Call right before esp_restart() when the firmware restarts itself to recover
+ * (not on a user reboot): a run in progress then resumes after the restart the
+ * same way it does after a crash. */
+void sync_mark_recovery_restart(void);
 void sync_config_changed(void);
 /* Console diagnostics, executed on the sync task (output goes to the console UART):
  * list the attached camera's objects; hash one object `repeat` times. */

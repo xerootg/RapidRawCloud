@@ -1,6 +1,6 @@
 set(srcs
     "app_main.c" "app_config.c" "store.c" "log_ring.c" "net.c" "sync.c" "pairing.c" "web.c"
-    "source_msc.c" "upload_engine.c" "source_ptp.c" "usb_diag.c" "console.c" "coproc.c" "api.c" "ble.c" "power.c")
+    "source_msc.c" "upload_engine.c" "source_ptp.c" "usb_diag.c" "usb_fault.c" "console.c" "coproc.c" "api.c" "ble.c" "power.c")
 # On-screen UI glue (panel, touch, backlight, LVGL) only for boards with a display
 # (CONFIG_RRC_HAS_DISPLAY, main/Kconfig.projbuild). The requirements stay
 # unconditional: IDF resolves them before Kconfig values are final.
@@ -19,3 +19,10 @@ idf_component_register(
     EMBED_TXTFILES
         "../www/index.html"
 )
+
+# usb_fault.c wraps the IDF HAL channel-interrupt decoder to record raw fault bits;
+# usb_diag.c wraps the HCD port-event collector to guard a hub-driver abort during
+# the root port power cycle (it needs the usb component's private hcd.h for that).
+target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=usb_dwc_hal_chan_decode_intr" "-Wl,--wrap=hcd_port_handle_event")
+idf_component_get_property(usb_component_dir usb COMPONENT_DIR)
+target_include_directories(${COMPONENT_LIB} PRIVATE "${usb_component_dir}/private_include")

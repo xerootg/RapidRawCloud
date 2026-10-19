@@ -73,7 +73,7 @@ available in the UI for buckets without a pairing service.
 cloud, network and upload progress; configures what to sync:
 
 - **Include / exclude patterns** — case-insensitive globs (`*`, `**`, `?`, `[abc]`).
-  Default `*.nef *.nrw *.dng *.jpg *.jpeg *.heif *.hif *.tif *.tiff`; a *videos* toggle adds `*.mov *.mp4`.
+  Default: every RAW extension RapidRAW decodes (`src-tauri/src/formats.rs`: Nikon, Canon, Sony, Fujifilm, OM/Olympus, Panasonic, Pentax, Samsung, Sigma, Hasselblad, Phase One, Leica, Kodak, Minolta, Mamiya and the rest) plus `*.jpg *.jpeg *.heif *.hif *.tif *.tiff`; matching ignores case. A dock configured before this default keeps its own list, so check it when adding a camera of a new brand (a Canon on the old list synced its JPEGs and skipped every `.CR3`);
 - **Library path template** — default `Camera Import/{model}/{yyyy}/{mm}/{dd}/{name}`;
   placeholders `{name} {stem} {ext} {path} {model} {serial} {yyyy} {mm} {dd} {hh}`.
   Output is sanitized to the §1.1 relkey rules (no `\` `:`, control chars, reserved names, `.rr.` segments).
@@ -458,6 +458,7 @@ times out: **did any packet reach the dock?**
 | `http: connection from …` but no request line | The TCP connection opened and the browser sent nothing we parsed — almost always a TLS ClientHello to port 80 (an HTTPS-only browser setting). | Open `http://` explicitly. |
 | request lines appear, page still blank | The HTML loaded but an `/api/*` call failed. | The log panel is `/api/log`; open `/api/status` directly in the browser. |
 | no IP line at all, `ethernet link up` missing | No link partner: cable, switch port, or the PoE injector's data pass-through. | The RMII pins are fixed by the board (MDC 31, MDIO 52, PHY reset 51, REF_CLK in on 50). |
+| everything on the network dead (web UI, DNS: `rrc_s3: cannot resolve …`) while the console works, after hours of uptime | The ESP32-P4 EMAC receive lockup (espressif/esp-idf#18800): after an RX FIFO overflow the MAC keeps transmitting but never delivers another received frame. `net` shows `ip rx` frozen while `tx` climbs; other hosts see the dock's ARP entry as `INCOMPLETE`. | Automatic: a receive watchdog counts frames at the driver boundary, ARP-probes the gateway after 20 s of silence and restarts the dock after 60 s (`net: ethernet has received nothing for 60 s …`), marking the restart so a sync run in progress resumes by itself. It gives up after three restarts in a row without ten minutes of healthy receive. `eth_rx_frames` / `eth_rx_restarts` in `/api/status` and the `health` line show it; console `eth-rx-stall-test` simulates the lockup. |
 
 `rrcloud-ingest.local` needs an mDNS resolver on the client (macOS, iOS, Windows 10+, Linux
 with Avahi); on Android use the IP address.
@@ -496,10 +497,46 @@ Sigma fp exposing `08/06/50` is mass storage; `ff/..` with three endpoints is MT
 | Device dumped, no `camera attached` | Enumerated, but neither driver matched the interface classes. | Compare the `intf` lines with the table above and switch the camera's USB mode. |
 | `W rrc_ptp: … is not a PTP device` at DEBUG only | Normal for the mass-storage path (the MSC driver owns it). | — |
 | `I usb: addr … full-speed` for a Sigma fp | The card reader fell back to USB 1.1 (12 Mbit/s): a bad cable or hub. | Use a direct USB 2.0 cable. |
+| `W HUB: Device tree node (parent_port=0): not found` followed by `ESP_ERROR_CHECK failed … hub.c` and a reboot | An IDF hub-driver abort (espressif/esp-idf#18366 is the same check): the root port was powered off while a device was attached but not yet enumerated, so the driver reported a device gone that it never had. The dock's own power-cycle watchdog can trigger it when a camera is plugged in at the wrong moment or after a failed bus reset. | The firmware wraps the HCD's port-event collector (`main/usb_diag.c`) and, during its own power cycle with nothing enumerated, recovers the port itself instead of handing the event to the hub driver; the log says `usb: an unenumerated device dropped off during the root port power cycle; port recovered`. If the abort still appears, the log around it is worth keeping. |
 
 The root-port timings are set above the IDF defaults in `sdkconfig.defaults`
 (debounce 500 ms, reset hold 50 ms, recovery 100 ms) because cameras are slow to settle
 compared with flash drives.
+
+## Troubleshooting a transfer that dies mid-sync
+
+A failed bulk transfer surfaces at three levels, from the controller up:
+
+- `W src_msc: read10 lba … x…: ESP_ERR_…` — the SCSI read the engine asked for failed; the
+  engine retries the file and the run aborts after seven failures in a row.
+- `I rrc: usb: channel fault at … ms: hcint 0x… [bnaintr] without a halt (buffer not
+  available); halted it in N us, failed the transfer` — the raw channel interrupt bits
+  the DWC controller raised, captured in `main/usb_fault.c` by wrapping IDF's HAL
+  decoder at link time. Buffer Not Available is the one channel error that does not halt
+  the channel; IDF's HAL asserted on exactly that (`usb_dwc_hal.c`,
+  `usb_dwc_hal_chan_decode_intr`; espressif/esp-idf#19111) and, with the assert off
+  (`CONFIG_HAL_ASSERTION_DISABLE`), its HCD aborted on the same error one layer up
+  (`_buffer_parse`). Each one rebooted the dock mid-sync, about once per 10–100 GB on a
+  Sigma fp L. The wrapper now halts the channel itself and reports a plain transaction
+  error, so the HCD fails the one transfer, `src_msc` resets the device and retries the
+  read, and the sync carries on. Other bit names in the brackets are the ordinary errors
+  (`stall`, `xcs_xact_err`, `bblerr`), which come with `chhltd` and need no help. A
+  `stray channel halt … ignored` line means the hardware halted a channel the HAL had
+  already finished with; it is dropped rather than parsed as a completion.
+- `usb_faults` and `usb_chan_irqs` in `/api/status`: faults recorded since boot, and
+  channel interrupts decoded since boot (every transfer counts, so a non-zero value proves
+  the recorder is in the build).
+
+If the dock does reset during a run, the boot line says why
+(`rrcloud-ingest starting after panic reset (4)`), and a run interrupted by a panic or
+watchdog reset restarts by itself when the camera is next seen, even with auto-sync off,
+up to three times in a row (`sync: restarted after a crash during a run`). A power-on or
+console `reboot` reset does not resume.
+
+Every five minutes the serial console gets a `D health:` line with uptime, internal heap
+free/minimum/largest block, PSRAM free and the USB counters. It is debug level so it stays
+out of the web UI log; it is there to tell a quiet dock from a dead one when reading a
+long serial capture.
 
 ## Known limitations
 
