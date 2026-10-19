@@ -21,7 +21,7 @@ static void defaults(app_config_t *c)
 {
     memset(c, 0, sizeof *c);
     strcpy(c->s3_region, "garage");
-    strcpy(c->include_globs, "*.nef *.nrw *.dng *.jpg *.jpeg *.heif *.hif *.tif *.tiff");
+    strcpy(c->include_globs, "*.nef *.nrw *.dng *.cr3 *.cr2 *.crw *.arw *.srf *.sr2 *.raf *.orf *.rw2 *.pef *.srw *.x3f *.pro *.ari *.bay *.raw *.erf *.3fr *.fff *.iiq *.kdc *.k25 *.dcs *.dcr *.mos *.rwl *.mef *.mrw *.ptx *.jpg *.jpeg *.heif *.hif *.tif *.tiff");
     strcpy(c->exclude_globs, "");
     strcpy(c->key_template, "Camera Import/{model}/{yyyy}/{mm}/{dd}/{name}");
     strcpy(c->msc_root, "DCIM");

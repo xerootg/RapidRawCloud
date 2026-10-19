@@ -69,7 +69,7 @@ available in the UI for buckets without a pairing service.
 cloud, network and upload progress; configures what to sync:
 
 - **Include / exclude patterns** — case-insensitive globs (`*`, `**`, `?`, `[abc]`).
-  Default `*.nef *.nrw *.dng *.jpg *.jpeg *.heif *.hif *.tif *.tiff`; a *videos* toggle adds `*.mov *.mp4`.
+  Default: every RAW extension RapidRAW decodes (`src-tauri/src/formats.rs`: Nikon, Canon, Sony, Fujifilm, OM/Olympus, Panasonic, Pentax, Samsung, Sigma, Hasselblad, Phase One, Leica, Kodak, Minolta, Mamiya and the rest) plus `*.jpg *.jpeg *.heif *.hif *.tif *.tiff`; matching ignores case. A dock configured before this default keeps its own list, so check it when adding a camera of a new brand (a Canon on the old list synced its JPEGs and skipped every `.CR3`);
 - **Library path template** — default `Camera Import/{model}/{yyyy}/{mm}/{dd}/{name}`;
   placeholders `{name} {stem} {ext} {path} {model} {serial} {yyyy} {mm} {dd} {hh}`.
   Output is sanitized to the §1.1 relkey rules (no `\` `:`, control chars, reserved names, `.rr.` segments).
