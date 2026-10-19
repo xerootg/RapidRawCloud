@@ -1,6 +1,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 esp_err_t net_init(void);                 /* Ethernet + optional Wi-Fi STA + SNTP + mDNS */
@@ -16,3 +17,11 @@ bool net_wifi_connected(void);
 bool net_time_synced(void);
 /* Re-applies Wi-Fi credentials from config (after the UI changed them). */
 esp_err_t net_wifi_reconfigure(void);
+
+/* Frames the Ethernet driver has handed to the IP stack since boot, and how
+ * many times in a row the receive watchdog has restarted the dock (see net.c). */
+uint32_t net_eth_rx_frames(void);
+uint32_t net_eth_rx_restarts(void);
+/* Test hook: drop every received frame before the stack sees it, which is what
+ * the EMAC lockup looks like from above. The watchdog then restarts the dock. */
+void net_eth_rx_drop_test(bool on);
