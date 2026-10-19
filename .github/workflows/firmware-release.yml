@@ -77,7 +77,7 @@ jobs:
     needs: meta
     strategy:
       matrix:
-        board: [poe-eth, touch-lcd-43, touch-lcd-43-rev3]
+        board: [poe-eth, poe-eth-dsi5, touch-lcd-43, touch-lcd-43-rev3]
     uses: ./.github/workflows/firmware-build.yml
     with:
       board: ${{ matrix.board }}
@@ -95,6 +95,10 @@ jobs:
             suffix: esp32p4
             title: ESP32-P4-WIFI6-POE-ETH
             then: "Then open http://rrcloud-ingest.local/ (or the DHCP address printed on the console)."
+          - board: poe-eth-dsi5
+            suffix: esp32p4-poe-eth-dsi5
+            title: "ESP32-P4-WIFI6-POE-ETH with a 5-inch Raspberry Pi DSI touch display"
+            then: "Then mount the display standing up (portrait) and set up pairing on the touchscreen or at http://rrcloud-ingest.local/. Without a display attached the image runs headless, like the plain PoE-ETH one."
           - board: touch-lcd-43
             suffix: esp32p4-touch-lcd-4.3-chip-v1
             title: "ESP32-P4-WIFI6-Touch-LCD-4.3, ESP32-P4 chip revision v0.x/v1.x"

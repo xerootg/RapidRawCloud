@@ -7,6 +7,9 @@ set(srcs
 if(CONFIG_RRC_HAS_DISPLAY)
     list(APPEND srcs "display.c")
 endif()
+if(CONFIG_RRC_DISPLAY_RPI_DSI)
+    list(APPEND srcs "panel_rpi_dsi.c")
+endif()
 idf_component_register(
     SRCS ${srcs}
     INCLUDE_DIRS "."
@@ -15,7 +18,7 @@ idf_component_register(
         esp_eth esp_netif esp_event esp_timer nvs_flash esp_http_server esp_http_client
         esp-tls mbedtls json usb fatfs vfs esp_wifi app_update esp_partition driver spi_flash esp_hw_support esp_psram
         usb_host_msc littlefs mdns esp_wifi_remote esp_hosted console lwip bt
-        esp_adc esp_lcd lvgl esp_lcd_st7701 esp_lcd_touch esp_lcd_touch_gt911
+        esp_adc esp_lcd lvgl esp_lcd_st7701 esp_lcd_touch esp_lcd_touch_gt911 esp_lcd_touch_ft5x06 hal esp_mm
     EMBED_TXTFILES
         "../www/index.html"
 )

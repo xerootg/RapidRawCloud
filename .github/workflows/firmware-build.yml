@@ -17,7 +17,7 @@ on:
         type: string
         default: v5.5.5
       board:
-        description: "poe-eth (ESP32-P4-WIFI6-POE-ETH), touch-lcd-43 (ESP32-P4-WIFI6-Touch-LCD-4.3, chip rev < 3) or touch-lcd-43-rev3 (same board, chip rev >= 3)"
+        description: "poe-eth (ESP32-P4-WIFI6-POE-ETH), poe-eth-dsi5 (the same board with a 5-inch Raspberry Pi DSI touch display), touch-lcd-43 (ESP32-P4-WIFI6-Touch-LCD-4.3, chip rev < 3) or touch-lcd-43-rev3 (same board, chip rev >= 3)"
         type: string
         default: poe-eth
     outputs:
@@ -44,6 +44,7 @@ jobs:
           cd firmware/rrcloud-ingest
           case "${{ inputs.board }}" in
             poe-eth) DEFAULTS="sdkconfig.defaults" ;;
+            poe-eth-dsi5) DEFAULTS="sdkconfig.defaults;sdkconfig.board.poe_eth_dsi5" ;;
             touch-lcd-43) DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43" ;;
             touch-lcd-43-rev3) DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43;sdkconfig.chip_rev3" ;;
             *) echo "::error::unknown board ${{ inputs.board }}"; exit 1 ;;

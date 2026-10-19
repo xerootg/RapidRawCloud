@@ -64,7 +64,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        board: [poe-eth, touch-lcd-43, touch-lcd-43-rev3]
+        board: [poe-eth, poe-eth-dsi5, touch-lcd-43, touch-lcd-43-rev3]
     uses: ./.github/workflows/firmware-build.yml
     with:
       board: ${{ matrix.board }}

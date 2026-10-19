@@ -19,6 +19,8 @@ always on; Wi‑Fi 6 via the on-board ESP32‑C6 is optional.
 The same firmware also builds for the **Waveshare ESP32-P4-WIFI6-Touch-LCD-4.3**: Wi‑Fi
 only, battery-capable, with a 4.3" touchscreen running a Material 3 interface that does
 everything the web page does (see [On-screen UI](#on-screen-ui-esp32-p4-wifi6-touch-lcd-43)).
+The PoE board can carry the same interface on a **5-inch 800×480 Raspberry Pi DSI touch
+display** plugged into its DSI connector (see [Raspberry Pi DSI display on the PoE board](#raspberry-pi-dsi-display-on-the-poe-board)).
 
 ## How it maps onto the sync protocol
 
@@ -92,7 +94,7 @@ never returned by the API.
 
 Requirements: ESP-IDF **v5.5.5** (`idf.py`; 5.5.1 is the first 5.5.x that supports ESP32-P4 rev 3 silicon), target `esp32p4`. Managed components
 (`usb_host_msc`, `esp_wifi_remote`/`esp_hosted`, `littlefs`, `mdns`, and for the display
-`lvgl`, `esp_lcd_st7701`, `esp_lcd_touch_gt911`) are fetched by the component manager on
+`lvgl`, `esp_lcd_st7701`, `esp_lcd_touch_gt911`, `esp_lcd_touch_ft5x06`) are fetched by the component manager on
 first build.
 
 The board is a build-time choice (`main/Kconfig.projbuild`), made by the sdkconfig overlay
@@ -103,6 +105,9 @@ cd firmware/rrcloud-ingest
 # ESP32-P4-WIFI6-POE-ETH (the default)
 idf.py set-target esp32p4
 idf.py build
+# ESP32-P4-WIFI6-POE-ETH with a 5-inch Raspberry Pi DSI touch display
+idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.poe_eth_dsi5" set-target esp32p4
+idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.poe_eth_dsi5" build
 # ESP32-P4-WIFI6-Touch-LCD-4.3
 idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43" set-target esp32p4
 idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43" build
@@ -126,6 +131,7 @@ revision before you flash.
 | Board | Chip | Overlays | Release zip |
 |---|---|---|---|
 | ESP32-P4-WIFI6-POE-ETH | v0.x/v1.x | — | `rrcloud-ingest-<v>-esp32p4.zip` |
+| ESP32-P4-WIFI6-POE-ETH + 5-inch DSI display | v0.x/v1.x | `sdkconfig.board.poe_eth_dsi5` | `…-esp32p4-poe-eth-dsi5.zip` |
 | ESP32-P4-WIFI6-Touch-LCD-4.3 | v0.x/v1.x | `sdkconfig.board.touch_lcd_43` | `…-esp32p4-touch-lcd-4.3-chip-v1.zip` |
 | ESP32-P4-WIFI6-Touch-LCD-4.3 | v3.x | `sdkconfig.board.touch_lcd_43`, `sdkconfig.chip_rev3` | `…-esp32p4-touch-lcd-4.3-chip-v3.zip` |
 
@@ -139,6 +145,38 @@ table: two 4 MB OTA slots + 8 MB LittleFS (`storage`) for the ledger and frozen 
 
 Wi‑Fi requires the factory ESP‑Hosted slave firmware on the ESP32‑C6 (Waveshare ships it);
 Ethernet works regardless.
+
+## Raspberry Pi DSI display on the PoE board
+
+`sdkconfig.board.poe_eth_dsi5` builds the PoE-ETH image with the on-screen UI for an
+**800×480 "driver-free" Raspberry Pi DSI touch display** on the board's 15-pin DSI connector,
+for example the Hosyond 5-inch (Amazon B0CXTFN8K9) or the OSOYOO 5-inch. Everything else is the
+plain PoE-ETH build, and without a display attached the image runs headless
+(`display: no DSI display answers on I2C 0x45; running headless`).
+
+"Driver-free" Pi displays emulate the official Raspberry Pi 7" Touch Display, which is what
+`main/panel_rpi_dsi.c` talks to:
+
+- a TC358762-compatible DSI-to-DPI bridge on **one** data lane, configured with DSI Generic
+  Long Writes before video starts. It derives its pixel clock from the DSI clock lane, so the
+  clock lane stays in high-speed mode and the lane runs at exactly 24 × the pixel clock
+  (26.67 MHz from PLL_F240M / 9, so 640 Mbit/s and 61.6 Hz);
+- a controller at **I2C 0x45** for power, resets and backlight. `REG_ID` (0x80) reads 0xde on
+  firmware revision 1 and 0xc3 on revision 2, which take different power sequences; the log
+  line `display: Raspberry Pi DSI protocol, controller id 0x…` says which one answered;
+- an **FT5x06** touch controller at I2C 0x38.
+
+The I2C bus is the board's internal one (SDA 7, SCL 8), which the DSI connector carries; the
+D-PHY is powered from the P4's LDO_VO3 at 2.5 V. Panels with their own driver IC and a
+different controller protocol (Waveshare's 720×1280 DSI panels, for instance) are not
+supported by this build.
+
+The UI is laid out for a 480×800 portrait screen, so the panel is **mounted standing up** and
+the UI is rotated onto it: LVGL renders into two 76 KB draw buffers in PSRAM and each dirty
+area is rotated into the single 800×480 framebuffer (LVGL rotates touch points back). Which
+way is up is `Display orientation` in `idf.py menuconfig` (`RRC_DISPLAY_ROTATION_90` or
+`_270`). The PoE board has no free user key, so the BOOT-key screen toggle of the 4.3" board
+is absent; the screen sleeps and wakes on touch.
 
 ## On-screen UI (ESP32-P4-WIFI6-Touch-LCD-4.3)
 

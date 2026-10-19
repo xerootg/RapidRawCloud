@@ -1,14 +1,21 @@
 /*
- * display — hardware glue for the on-screen UI on the ESP32-P4-WIFI6-Touch-LCD-4.3:
- * ST7701 over 2-lane MIPI-DSI, GT911 touch, PWM backlight, the BOOT key, LVGL 9
- * and the bridge between components/rrc_ui and the admin API.
+ * display — hardware glue for the on-screen UI, LVGL 9 and the bridge between
+ * components/rrc_ui and the admin API. Two display drivers, chosen by board
+ * capability (main/Kconfig.projbuild):
+ *   - CONFIG_RRC_DISPLAY_ST7701 (ESP32-P4-WIFI6-Touch-LCD-4.3): 480x800 ST7701 over
+ *     2-lane MIPI-DSI, GT911 touch, PWM backlight, the BOOT key. The UI's own
+ *     orientation; LVGL renders straight into the DPI framebuffers.
+ *   - CONFIG_RRC_DISPLAY_RPI_DSI (PoE-ETH + 5-inch Pi DSI display): an 800x480
+ *     landscape panel (main/panel_rpi_dsi.c) mounted standing up. LVGL renders the
+ *     480x800 UI into small draw buffers and each dirty area is rotated into the
+ *     single DPI framebuffer; FT5x06 touch points are rotated back by LVGL.
  *
  * Rendering budget. The dock's real job is moving photos: uploads keep both
  * cores busy with BLAKE3, TLS and lwIP, and internal RAM is the scarcest
  * resource on the board (README "Throughput notes"). So the UI:
- *   - renders straight into the two DPI framebuffers in PSRAM (LVGL direct mode,
- *     only dirty areas, buffers swapped on vsync): no extra draw buffers and no
- *     internal RAM for pixels;
+ *   - keeps every pixel buffer in PSRAM (the ST7701 path renders straight into the
+ *     two DPI framebuffers, LVGL direct mode, swapped on vsync; the rotated path
+ *     draws into two 76 KB buffers): no internal RAM for pixels;
  *   - keeps LVGL's heap and its task stack in PSRAM (lv_*_core below);
  *   - runs at a priority below the sync and upload tasks, on one draw unit, so a
  *     busy dock renders a little later rather than uploading slower;
@@ -40,9 +47,16 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_io_i2c.h"
+#if CONFIG_RRC_DISPLAY_ST7701
 #include "esp_lcd_st7701.h"
 #include "esp_lcd_touch_gt911.h"
+#endif
+#if CONFIG_RRC_DISPLAY_RPI_DSI
+#include "esp_cache.h"
+#include "panel_rpi_dsi.h"
+#endif
 #include "lvgl.h"
+#include "src/draw/sw/lv_draw_sw_utils.h"
 #include "src/stdlib/lv_mem.h"
 #include "rrc_ui.h"
 #include "board.h"
@@ -53,9 +67,12 @@ static const char *TAG = "display";
 
 static esp_lcd_panel_handle_t panel;
 static esp_lcd_touch_handle_t touch;
+#if CONFIG_RRC_DISPLAY_ST7701
 static SemaphoreHandle_t vsync_sem;
+#endif
 static lv_display_t *disp;
 
+#if CONFIG_RRC_DISPLAY_ST7701
 /* ---- panel ----------------------------------------------------------------------------
  * Vendor initialisation sequence for this panel, from the board's BSP
  * (waveshare esp32_p4_wifi6_touch_lcd_4_3 1.0.1). */
@@ -211,9 +228,59 @@ static esp_err_t touch_init(void)
     return esp_lcd_touch_new_i2c_gt911(io, &tc, &touch);
 }
 
+#endif /* CONFIG_RRC_DISPLAY_ST7701 */
+
+#if CONFIG_RRC_DISPLAY_RPI_DSI
+/* ---- Raspberry Pi DSI display --------------------------------------------------------- */
+static rpi_dsi_t rpi;
+static uint8_t *rpi_fb;   /* the DPI framebuffer, 800x480 RGB565, native orientation */
+
+static void backlight_set(int pct) { rpi_dsi_set_backlight(pct); }
+
+static esp_err_t rpi_panel_init(void)
+{
+    i2c_master_bus_handle_t bus;
+    i2c_master_bus_config_t bc = {
+        .i2c_port = -1, .sda_io_num = BOARD_I2C_SDA_GPIO, .scl_io_num = BOARD_I2C_SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = true,
+    };
+    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bc, &bus), TAG, "I2C bus");
+    esp_err_t e = rpi_dsi_start(bus, &rpi);
+    if (e != ESP_OK) { i2c_del_master_bus(bus); return e; }
+    panel = rpi.panel;
+    touch = rpi.touch;
+    void *fb = NULL;
+    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(panel, 1, &fb), TAG, "framebuffer");
+    rpi_fb = fb;
+    memset(rpi_fb, 0, BOARD_LCD_H_RES * BOARD_LCD_V_RES * 2);
+    esp_cache_msync(rpi_fb, BOARD_LCD_H_RES * BOARD_LCD_V_RES * 2, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    return ESP_OK;
+}
+
+/* Partial mode: `area` is in the UI's portrait coordinates and `px` holds it
+ * row by row. Rotate it straight into its place in the landscape framebuffer,
+ * then write the touched rows back from the cache (the DPI DMA reads PSRAM). */
+static void flush_rotated_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px)
+{
+    lv_area_t a = *area;
+    int32_t w = lv_area_get_width(&a), h = lv_area_get_height(&a);
+    lv_color_format_t cf = lv_display_get_color_format(d);
+    uint32_t src_stride = lv_draw_buf_width_to_stride(w, cf);
+    lv_display_rotate_area(d, &a);
+    const uint32_t row = BOARD_LCD_H_RES * 2;
+    uint8_t *dst = rpi_fb + a.y1 * row + a.x1 * 2;
+    lv_draw_sw_rotate(px, dst, w, h, src_stride, row, lv_display_get_rotation(d), cf);
+    esp_cache_msync(rpi_fb + a.y1 * row, (size_t)(a.y2 - a.y1 + 1) * row,
+                    ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    lv_display_flush_ready(d);
+}
+
+#endif /* CONFIG_RRC_DISPLAY_RPI_DSI */
+
 /* ---- LVGL glue -------------------------------------------------------------------------- */
 static uint32_t tick_ms(void) { return (uint32_t)(esp_timer_get_time() / 1000); }
 
+#if CONFIG_RRC_DISPLAY_ST7701
 static void flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px)
 {
     (void)area;
@@ -227,6 +294,8 @@ static void flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px)
     }
     lv_display_flush_ready(d);
 }
+
+#endif
 
 static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
@@ -250,6 +319,7 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     last_state = data->state;
 }
 
+#ifdef BOARD_USER_KEY_GPIO
 /* BOOT key, active low, debounced over three 20 ms samples. */
 static void key_timer_cb(lv_timer_t *t)
 {
@@ -260,6 +330,7 @@ static void key_timer_cb(lv_timer_t *t)
     if (!down && (hist & 0x07) == 0x00) { down = true; rrc_ui_user_key(); }
     else if (down && (hist & 0x07) == 0x07) down = false;
 }
+#endif
 
 /* LVGL heap in PSRAM (CONFIG_LV_USE_CUSTOM_MALLOC): malloc() would put every
  * small widget allocation in internal RAM (CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL). */
@@ -335,28 +406,54 @@ static const rrc_ui_host_t host = {.request = host_request, .set_backlight = bac
 
 esp_err_t display_start(void)
 {
+#if CONFIG_RRC_DISPLAY_ST7701
     esp_err_t e = backlight_init();
     if (e == ESP_OK) e = panel_init();
     if (e != ESP_OK) { log_ring_printf("display: panel init failed (%s); running headless", esp_err_to_name(e)); return e; }
     if (touch_init() != ESP_OK) log_ring_printf("display: GT911 touch controller not found; the screen is view-only");
+#elif CONFIG_RRC_DISPLAY_RPI_DSI
+    esp_err_t e = rpi_panel_init();
+    if (e == ESP_ERR_NOT_FOUND) { log_ring_printf("display: no DSI display answers on I2C 0x45; running headless"); return e; }
+    if (e != ESP_OK) { log_ring_printf("display: panel init failed (%s); running headless", esp_err_to_name(e)); return e; }
+    if (!touch) log_ring_printf("display: FT5x06 touch controller not found; the screen is view-only");
+#endif
+#ifdef BOARD_USER_KEY_GPIO
     gpio_config_t key = {.pin_bit_mask = 1ULL << BOARD_USER_KEY_GPIO, .mode = GPIO_MODE_INPUT, .pull_up_en = GPIO_PULLUP_ENABLE};
     gpio_config(&key);
+#endif
 
     lv_init();
     lv_tick_set_cb(tick_ms);
     disp = lv_display_create(BOARD_LCD_H_RES, BOARD_LCD_V_RES);
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
+#if CONFIG_RRC_DISPLAY_ST7701
     void *fb0 = NULL, *fb1 = NULL;
     ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(panel, 2, &fb0, &fb1), TAG, "framebuffers");
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(disp, fb0, fb1, BOARD_LCD_H_RES * BOARD_LCD_V_RES * 2, LV_DISPLAY_RENDER_MODE_DIRECT);
     lv_display_set_flush_cb(disp, flush_cb);
+#elif CONFIG_RRC_DISPLAY_RPI_DSI
+    /* The UI is 480x800 portrait; LVGL swaps the resolutions and rotates touch. */
+#if CONFIG_RRC_DISPLAY_ROTATION_270
+    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
+#else
+    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
+#endif
+    const size_t buf_bytes = 480 * 80 * 2;   /* 80 UI rows per pass */
+    void *b0 = heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    void *b1 = heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!b0 || !b1) { free(b0); free(b1); log_ring_printf("display: no memory for draw buffers"); return ESP_ERR_NO_MEM; }
+    lv_display_set_buffers(disp, b0, b1, buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_flush_cb(disp, flush_rotated_cb);
+#endif
     if (touch) {
         lv_indev_t *in = lv_indev_create();
         lv_indev_set_type(in, LV_INDEV_TYPE_POINTER);
         lv_indev_set_read_cb(in, touch_read_cb);
         lv_indev_set_display(in, disp);
     }
+#ifdef BOARD_USER_KEY_GPIO
     lv_timer_create(key_timer_cb, 20, NULL);
+#endif
 
     job_q = xQueueCreate(16, sizeof(ui_job_t));
     /* Below the sync/upload tasks; the worker's stack is internal RAM because
@@ -368,5 +465,8 @@ esp_err_t display_start(void)
         return ESP_ERR_NO_MEM;
     }
     log_ring_printf("display: %dx%d MIPI-DSI panel up, touch %s", BOARD_LCD_H_RES, BOARD_LCD_V_RES, touch ? "ok" : "absent");
+#if CONFIG_RRC_DISPLAY_RPI_DSI
+    log_ring_printf("display: Raspberry Pi DSI protocol, controller id 0x%02x", rpi.controller_id);
+#endif
     return ESP_OK;
 }

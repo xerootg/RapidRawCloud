@@ -4,7 +4,7 @@ menu "rrcloud-ingest board"
         prompt "Target board"
         default RRC_BOARD_P4_POE_ETH
         help
-            The Waveshare ESP32-P4 board this image is built for. Both share the ESP32-C6
+            The Waveshare ESP32-P4 board this image is built for. They share the ESP32-C6
             radio wiring (SDIO slot 1, CLK 18, CMD 19, D0-D3 14-17, reset 54), the 32 MB
             flash / 32 MB PSRAM and the microSD pins; they differ in Ethernet, display,
             touch, battery and USB host power. Pick the matching sdkconfig overlay rather
@@ -15,15 +15,48 @@ menu "rrcloud-ingest board"
 
         config RRC_BOARD_P4_TOUCH_LCD_43
             bool "ESP32-P4-WIFI6-Touch-LCD-4.3 (Wi-Fi only, 480x800 touch display, Li-ion battery)"
+
+        config RRC_BOARD_P4_POE_ETH_DSI5
+            bool "ESP32-P4-WIFI6-POE-ETH + 5-inch 800x480 Raspberry Pi DSI touch display"
+            help
+                The PoE-ETH board with a "driver-free" Raspberry Pi DSI touch display on its
+                DSI connector: 800x480, the Pi 7" Touch Display protocol (TC358762-compatible
+                bridge on one lane, controller at I2C 0x45, FT5x06 touch at 0x38), e.g. the
+                Hosyond and OSOYOO 5-inch panels. Without a display attached the image runs
+                headless, like the plain PoE-ETH build.
     endchoice
 
     config RRC_HAS_ETHERNET
         bool
-        default y if RRC_BOARD_P4_POE_ETH
+        default y if RRC_BOARD_P4_POE_ETH || RRC_BOARD_P4_POE_ETH_DSI5
 
     config RRC_HAS_DISPLAY
         bool
+        default y if RRC_BOARD_P4_TOUCH_LCD_43 || RRC_BOARD_P4_POE_ETH_DSI5
+
+    # Which display driver main/display.c builds (board capabilities, not board names).
+    config RRC_DISPLAY_ST7701
+        bool
         default y if RRC_BOARD_P4_TOUCH_LCD_43
+
+    config RRC_DISPLAY_RPI_DSI
+        bool
+        default y if RRC_BOARD_P4_POE_ETH_DSI5
+
+    choice RRC_DISPLAY_ROTATION
+        prompt "Display orientation"
+        depends on RRC_DISPLAY_RPI_DSI
+        default RRC_DISPLAY_ROTATION_90
+        help
+            The on-screen UI is laid out for a 480x800 portrait screen; the 800x480 panel is
+            mounted standing up and the UI is rotated onto it. Pick the direction that puts
+            the panel's flex cable where your mount needs it.
+
+        config RRC_DISPLAY_ROTATION_90
+            bool "Portrait, rotated 90 degrees"
+        config RRC_DISPLAY_ROTATION_270
+            bool "Portrait, rotated 270 degrees"
+    endchoice
 
     config RRC_HAS_BATTERY
         bool
