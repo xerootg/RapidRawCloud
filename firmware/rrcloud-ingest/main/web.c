@@ -12,6 +12,9 @@
  *   POST /api/pair/cancel
  *   GET  /api/log
  *   POST /api/reboot
+ *   GET  /api/wifi              Wi-Fi station state and association details
+ *   POST /api/wifi/scan         start a scan (409 while Wi-Fi is off or a scan runs)
+ *   GET  /api/wifi/scan         scan state and results
  *
  * Optional HTTP Basic auth (user "admin") when admin_auth is enabled and a
  * password is set. The UI is meant for the LAN; put it behind your own TLS
@@ -243,6 +246,9 @@ esp_err_t web_start(void)
         {.uri = "/api/reboot", .method = HTTP_POST, .handler = h_api},
         {.uri = "/api/coproc/update", .method = HTTP_POST, .handler = h_api},
         {.uri = "/api/ble/forget", .method = HTTP_POST, .handler = h_api},
+        {.uri = "/api/wifi", .method = HTTP_GET, .handler = h_api},
+        {.uri = "/api/wifi/scan", .method = HTTP_GET, .handler = h_api},
+        {.uri = "/api/wifi/scan", .method = HTTP_POST, .handler = h_api},
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++) httpd_register_uri_handler(s, &routes[i]);
     log_ring_printf("web ui listening on port 80");

@@ -32,6 +32,10 @@ static void defaults(app_config_t *c)
     c->admin_auth = false;
     c->usb_debug = true;   /* pre-release default: camera bring-up is the open question */
     c->ble_enabled = true;
+    c->wifi_enabled = true;
+    c->display_brightness = 80;
+    c->display_timeout_s = 60;
+    c->display_dark = true;
 }
 
 static esp_err_t nvs_get_string(nvs_handle_t h, const char *key, char *out, size_t cap)
@@ -132,11 +136,15 @@ static int to_json(const app_config_t *c, char *out, size_t cap, bool for_ui)
     put_bool(&w, "upload_videos", c->upload_videos);
     rrc_jsonw_key(&w, "min_size_kb", false); rrc_jsonw_u64(&w, c->min_size_kb);
     put_str(&w, "device_name", c->device_name, false);
+    put_bool(&w, "wifi_enabled", c->wifi_enabled);
     put_str(&w, "wifi_ssid", c->wifi_ssid, false);
     put_str(&w, "hostname", c->hostname, false);
     put_bool(&w, "admin_auth", c->admin_auth);
     put_bool(&w, "usb_debug", c->usb_debug);
     put_bool(&w, "ble_enabled", c->ble_enabled);
+    rrc_jsonw_key(&w, "display_brightness", false); rrc_jsonw_u64(&w, c->display_brightness);
+    rrc_jsonw_key(&w, "display_timeout_s", false); rrc_jsonw_u64(&w, c->display_timeout_s);
+    put_bool(&w, "display_dark", c->display_dark);
     if (for_ui) {
         char tmp[APP_SECRET_MAX + 1];
         put_bool(&w, "has_s3_secret", app_config_get_secret(tmp, sizeof tmp) == ESP_OK && tmp[0]);
@@ -238,11 +246,17 @@ esp_err_t app_config_apply_json(const char *json, size_t len, char *err, size_t 
     cJSON *ms = cJSON_GetObjectItemCaseSensitive(o, "min_size_kb");
     if (cJSON_IsNumber(ms) && ms->valuedouble >= 0) c.min_size_kb = (uint32_t)ms->valuedouble;
     copy_str(o, "device_name", c.device_name, sizeof c.device_name);
+    copy_bool(o, "wifi_enabled", &c.wifi_enabled);
     copy_str(o, "wifi_ssid", c.wifi_ssid, sizeof c.wifi_ssid);
     copy_str(o, "hostname", c.hostname, sizeof c.hostname);
     copy_bool(o, "admin_auth", &c.admin_auth);
     copy_bool(o, "usb_debug", &c.usb_debug);
     copy_bool(o, "ble_enabled", &c.ble_enabled);
+    cJSON *db = cJSON_GetObjectItemCaseSensitive(o, "display_brightness");
+    if (cJSON_IsNumber(db)) c.display_brightness = db->valuedouble < 5 ? 5 : db->valuedouble > 100 ? 100 : (uint8_t)db->valuedouble;
+    cJSON *dt = cJSON_GetObjectItemCaseSensitive(o, "display_timeout_s");
+    if (cJSON_IsNumber(dt)) c.display_timeout_s = dt->valuedouble < 0 ? 0 : dt->valuedouble > 3600 ? 3600 : (uint16_t)dt->valuedouble;
+    copy_bool(o, "display_dark", &c.display_dark);
     /* trim trailing slash on endpoint */
     size_t n = strlen(c.s3_endpoint);
     while (n && c.s3_endpoint[n - 1] == '/') c.s3_endpoint[--n] = 0;

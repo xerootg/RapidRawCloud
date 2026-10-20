@@ -1,10 +1,12 @@
 /*
  * rrcloud-ingest — RapidRawCloud camera-ingest dock for the Waveshare
- * ESP32-P4-WIFI6-POE-ETH. Plug a camera into the USB-A port; new photos are
- * uploaded into the library bucket as journaled originals (architecture §2.2),
- * exactly as a phone or desktop would publish them.
+ * ESP32-P4-WIFI6-POE-ETH (and the ESP32-P4-WIFI6-Touch-LCD-4.3, which adds an
+ * on-screen UI; main/board.h). Plug a camera into the USB host port; new photos
+ * are uploaded into the library bucket as journaled originals (architecture
+ * §2.2), exactly as a phone or desktop would publish them.
  */
 #include <stdio.h>
+#include "sdkconfig.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_heap_caps.h"
@@ -22,6 +24,10 @@
 #include "coproc.h"
 #include "ble.h"
 #include "console.h"
+#include "power.h"
+#if CONFIG_RRC_HAS_DISPLAY
+#include "display.h"
+#endif
 #include "usb_fault.h"
 #include "esp_timer.h"
 
@@ -87,15 +93,20 @@ void app_main(void)
     esp_timer_handle_t health;
     if (esp_timer_create(&ht, &health) == ESP_OK) esp_timer_start_periodic(health, HEALTH_PERIOD_US);
 
+    power_init();
+#if CONFIG_RRC_HAS_DISPLAY
+    /* First, so the screen shows progress while the rest comes up; a dead panel
+     * or touch controller is logged and the dock carries on headless. */
+    display_start();
+#endif
     ESP_ERROR_CHECK(net_init());
     coproc_start(); /* ESP32-C6 link for BLE/version reporting, with or without Wi-Fi */
     ble_start();    /* BLE admin service once the C6 is linked */
 
     /* The host library's default peripheral on the P4 is the USB 2.0 High-Speed
      * OTG controller (UTMI PHY), which is what the board's USB-A port is wired
-     * to; the Full-Speed OTG 1.1 controller (GPIO 26/27) is unused. The
-     * `peripheral_map` selector only exists in IDF ≥ 5.5.1, so the default is
-     * relied on rather than spelled out (CI builds with the 5.5.0 image). */
+     * to; the Full-Speed OTG 1.1 controller (GPIO 26/27) is unused.
+     * `peripheral_map` = 0 selects exactly that default. */
     usb_diag_set_verbose(app_config_get()->usb_debug);
     const usb_host_config_t host_cfg = {.skip_phy_setup = false, .intr_flags = ESP_INTR_FLAG_LEVEL1};
     ESP_ERROR_CHECK(usb_host_install(&host_cfg));

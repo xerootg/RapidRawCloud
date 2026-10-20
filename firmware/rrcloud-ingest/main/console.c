@@ -26,6 +26,10 @@
 #include "mbedtls/md5.h"
 #include "mbedtls/aes.h"
 #include "rrc_hash.h"
+#include "board.h"
+#ifdef BOARD_I2C_SDA_GPIO
+#include "driver/i2c_master.h"
+#endif
 
 static const char *TAG = "console";
 
@@ -119,6 +123,31 @@ static int cmd_sync(int argc, char **argv) { (void)argc; (void)argv; sync_reques
 static int cmd_sync_cancel(int argc, char **argv) { (void)argc; (void)argv; sync_cancel(); printf("cancelling\n"); return 0; }
 static int cmd_usb_reset(int argc, char **argv) { (void)argc; (void)argv; return usb_diag_power_cycle() == ESP_OK ? 0 : 1; }
 static int cmd_reboot(int argc, char **argv) { (void)argc; (void)argv; printf("rebooting\n"); vTaskDelay(pdMS_TO_TICKS(200)); esp_restart(); return 0; }
+#ifdef BOARD_I2C_SDA_GPIO
+/* Lists every 7-bit address that ACKs on the board's internal I2C bus (the one
+ * the DSI/CSI connectors carry). A temporary bus on the same pins: run it while
+ * nothing else owns them (on a display build, only when the display was not found). */
+static int cmd_i2c_scan(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    i2c_master_bus_handle_t bus;
+    i2c_master_bus_config_t bc = {
+        .i2c_port = -1, .sda_io_num = BOARD_I2C_SDA_GPIO, .scl_io_num = BOARD_I2C_SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = true,
+    };
+    esp_err_t e = i2c_new_master_bus(&bc, &bus);
+    if (e != ESP_OK) { printf("i2c bus on SDA %d SCL %d: %s\n", BOARD_I2C_SDA_GPIO, BOARD_I2C_SCL_GPIO, esp_err_to_name(e)); return 1; }
+    int found = 0;
+    printf("scanning I2C on SDA %d SCL %d\n", BOARD_I2C_SDA_GPIO, BOARD_I2C_SCL_GPIO);
+    for (uint16_t a = 0x08; a < 0x78; a++) {
+        if (i2c_master_probe(bus, a, 20) == ESP_OK) { printf("  0x%02x\n", a); found++; }
+    }
+    printf("%d device(s)\n", found);
+    i2c_del_master_bus(bus);
+    return 0;
+}
+#endif
+
 static int cmd_eth_rx_stall_test(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -392,6 +421,9 @@ esp_err_t console_start(void)
         {.command = "c6-update", .help = "c6-update [url [sha256]]: install an ESP-Hosted co-processor image over SDIO (default: the pinned " COPROC_HOST_LIB_VERSION " image); the dock restarts afterwards", .func = cmd_c6_update},
         {.command = "log", .help = "The web UI's log ring", .func = cmd_log},
         {.command = "reboot", .help = "Restart the dock", .func = cmd_reboot},
+#ifdef BOARD_I2C_SDA_GPIO
+        {.command = "i2c-scan", .help = "List the devices that answer on the internal I2C bus (DSI/CSI connectors)", .func = cmd_i2c_scan},
+#endif
         {.command = "eth-rx-stall-test", .help = "Drop every received ethernet frame to test the receive watchdog (the dock restarts itself)", .func = cmd_eth_rx_stall_test},
     };
     for (size_t i = 0; i < sizeof cmds / sizeof cmds[0]; i++) esp_console_cmd_register(&cmds[i]);

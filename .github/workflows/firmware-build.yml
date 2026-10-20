@@ -2,7 +2,9 @@ name: 'Reusable: ESP-IDF build of rrcloud-ingest (esp32p4)'
 
 # The one definition of "build the firmware": the CI workflow (firmware.yml) and the release
 # workflow (firmware-release.yml) both call it, so the container image, target and the set of
-# artifacts cannot drift between a PR check and a release.
+# artifacts cannot drift between a PR check and a release. One call builds one board
+# (firmware/rrcloud-ingest/main/Kconfig.projbuild) for one ESP32-P4 chip generation: the
+# board's sdkconfig overlay, then sdkconfig.chip_rev3 for rev 3 silicon, on sdkconfig.defaults.
 on:
   workflow_call:
     inputs:
@@ -13,7 +15,11 @@ on:
       idf-image:
         description: espressif/idf container tag
         type: string
-        default: v5.5
+        default: v5.5.5
+      board:
+        description: "poe-eth (ESP32-P4-WIFI6-POE-ETH), poe-eth-dsi5 (the same board with a 5-inch Raspberry Pi DSI touch display), touch-lcd-43 (ESP32-P4-WIFI6-Touch-LCD-4.3, chip rev < 3) or touch-lcd-43-rev3 (same board, chip rev >= 3)"
+        type: string
+        default: poe-eth
     outputs:
       version:
         description: firmware/rrcloud-ingest/version.txt as built
@@ -21,7 +27,7 @@ on:
 
 jobs:
   build:
-    name: ESP-IDF build (esp32p4)
+    name: ESP-IDF build (esp32p4, ${{ inputs.board }})
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:${{ inputs.idf-image }}
@@ -36,9 +42,18 @@ jobs:
           git config --global --add safe.directory '*'
           . $IDF_PATH/export.sh
           cd firmware/rrcloud-ingest
-          idf.py set-target esp32p4
-          idf.py build
+          case "${{ inputs.board }}" in
+            poe-eth) DEFAULTS="sdkconfig.defaults" ;;
+            poe-eth-dsi5) DEFAULTS="sdkconfig.defaults;sdkconfig.board.poe_eth_dsi5" ;;
+            touch-lcd-43) DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43" ;;
+            touch-lcd-43-rev3) DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43;sdkconfig.chip_rev3" ;;
+            *) echo "::error::unknown board ${{ inputs.board }}"; exit 1 ;;
+          esac
+          idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" set-target esp32p4
+          idf.py -DSDKCONFIG_DEFAULTS="$DEFAULTS" build
           idf.py size
+          # The component manager must not need to change the committed lock for either board.
+          git diff --exit-code -- dependencies.lock
           echo "version=$(tr -d ' \n\r' < version.txt)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:

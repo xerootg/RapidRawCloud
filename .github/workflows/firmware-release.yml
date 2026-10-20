@@ -75,20 +75,45 @@ jobs:
 
   build:
     needs: meta
+    strategy:
+      matrix:
+        board: [poe-eth, poe-eth-dsi5, touch-lcd-43, touch-lcd-43-rev3]
     uses: ./.github/workflows/firmware-build.yml
     with:
-      artifact-name: rrcloud-ingest-build-${{ needs.meta.outputs.version }}
+      board: ${{ matrix.board }}
+      artifact-name: rrcloud-ingest-build-${{ needs.meta.outputs.version }}-${{ matrix.board }}
 
   package:
-    name: Package flashable zip
+    name: Package flashable zip (${{ matrix.board }})
     needs: [meta, build]
+    strategy:
+      matrix:
+        include:
+          # The PoE board keeps the original zip name. The touch board ships one image per
+          # ESP32-P4 chip generation (an image for one is refused by the other's bootloader).
+          - board: poe-eth
+            suffix: esp32p4
+            title: ESP32-P4-WIFI6-POE-ETH
+            then: "Then open http://rrcloud-ingest.local/ (or the DHCP address printed on the console)."
+          - board: poe-eth-dsi5
+            suffix: esp32p4-poe-eth-dsi5
+            title: "ESP32-P4-WIFI6-POE-ETH with a 5-inch Raspberry Pi DSI touch display"
+            then: "Then mount the display standing up (portrait) and set up pairing on the touchscreen or at http://rrcloud-ingest.local/. Without a display attached the image runs headless, like the plain PoE-ETH one."
+          - board: touch-lcd-43
+            suffix: esp32p4-touch-lcd-4.3-chip-v1
+            title: "ESP32-P4-WIFI6-Touch-LCD-4.3, ESP32-P4 chip revision v0.x/v1.x"
+            then: "Then set up Wi-Fi and pairing on the touchscreen. If the boot log says the chip revision is not supported, the board has a v3 chip: flash the -chip-v3 zip instead ("esptool.py chip_id" prints the revision)."
+          - board: touch-lcd-43-rev3
+            suffix: esp32p4-touch-lcd-4.3-chip-v3
+            title: "ESP32-P4-WIFI6-Touch-LCD-4.3, ESP32-P4 chip revision v3.x"
+            then: "Then set up Wi-Fi and pairing on the touchscreen. If the boot log says the chip revision is not supported, the board has an older chip: flash the -chip-v1 zip instead ("esptool.py chip_id" prints the revision)."
     runs-on: ubuntu-latest
     container:
-      image: espressif/idf:v5.5
+      image: espressif/idf:v5.5.5
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: rrcloud-ingest-build-${{ needs.meta.outputs.version }}
+          name: rrcloud-ingest-build-${{ needs.meta.outputs.version }}-${{ matrix.board }}
           path: build
       - name: Package
         shell: bash
@@ -100,14 +125,14 @@ jobs:
             echo "::error::built version ${{ needs.build.outputs.version }} differs from resolved ${VERSION}"
             exit 1
           fi
-          OUT=../dist/rrcloud-ingest-${VERSION}-esp32p4
+          OUT=../dist/rrcloud-ingest-${VERSION}-${{ matrix.suffix }}
           mkdir -p "$OUT"
           # One image flashable at offset 0 (bootloader, partition table, OTA data, app)…
           esptool.py --chip esp32p4 merge_bin -o "$OUT/rrcloud-ingest-merged.bin" @flash_args
           # …plus the individual parts and the exact flash arguments idf.py would use.
           cp rrcloud-ingest.bin bootloader/bootloader.bin partition_table/partition-table.bin ota_data_initial.bin flasher_args.json flash_args "$OUT/"
           cat > "$OUT/FLASH.md" <<MD
-          # Flashing rrcloud-ingest ${VERSION} (ESP32-P4-WIFI6-POE-ETH)
+          # Flashing rrcloud-ingest ${VERSION} (${{ matrix.title }})
 
           Connect the board's USB-C console port, hold BOOT while pressing RST if it does not enter download mode automatically, then:
 
@@ -118,16 +143,13 @@ jobs:
 
               esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 921600 write_flash 0x20000 rrcloud-ingest.bin
 
-          Then open http://rrcloud-ingest.local/ (or the DHCP address printed on the console).
+          ${{ matrix.then }}
           MD
-          cd ../dist && zip -r "rrcloud-ingest-${VERSION}-esp32p4.zip" "rrcloud-ingest-${VERSION}-esp32p4"
-          sha256sum *.zip > SHA256SUMS
+          cd ../dist && zip -r "rrcloud-ingest-${VERSION}-${{ matrix.suffix }}.zip" "rrcloud-ingest-${VERSION}-${{ matrix.suffix }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: rrcloud-ingest-${{ needs.meta.outputs.version }}-esp32p4
-          path: |
-            dist/*.zip
-            dist/SHA256SUMS
+          name: rrcloud-ingest-${{ needs.meta.outputs.version }}-${{ matrix.suffix }}
+          path: dist/*.zip
 
   release:
     name: Publish GitHub release
@@ -140,15 +162,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: rrcloud-ingest-${{ needs.meta.outputs.version }}-esp32p4
+          pattern: rrcloud-ingest-${{ needs.meta.outputs.version }}-esp32p4*
+          merge-multiple: true
           path: dist
+      - name: Checksums
+        run: cd dist && sha256sum *.zip > SHA256SUMS
       - name: Release notes
         run: |
           VERSION="${{ needs.meta.outputs.version }}"
           {
             echo "# rrcloud-ingest ${VERSION} — camera ingest dock firmware"
             echo
-            echo "Target: Waveshare ESP32-P4-WIFI6-POE-ETH (ESP-IDF 5.5). Built from \`${GITHUB_SHA}\`."
+            echo "Targets: Waveshare ESP32-P4-WIFI6-POE-ETH (\`…-esp32p4.zip\`) and ESP32-P4-WIFI6-Touch-LCD-4.3 (\`…-touch-lcd-4.3-chip-v3.zip\` for ESP32-P4 chip v3.x, \`…-chip-v1.zip\` for v0.x/v1.x), ESP-IDF 5.5.5. Built from \`${GITHUB_SHA}\`."
             echo
             echo "Flash with \`esptool.py --chip esp32p4 -p PORT write_flash 0x0 rrcloud-ingest-merged.bin\` — full instructions in FLASH.md inside the zip,"
             echo "setup and pairing in [firmware/rrcloud-ingest/README.md](https://github.com/${GITHUB_REPOSITORY}/blob/${GITHUB_SHA}/firmware/rrcloud-ingest/README.md)."

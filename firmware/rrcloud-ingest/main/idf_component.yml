@@ -10,3 +10,13 @@ dependencies:
   joltwallet/littlefs: "^1.14"
   # rrcloud-ingest.local
   espressif/mdns: "^1.4"
+  # On-screen UI (ESP32-P4-WIFI6-Touch-LCD-4.3; compiled for every board, linked only where
+  # CONFIG_RRC_HAS_DISPLAY pulls it in). LVGL 9 + the ST7701 MIPI-DSI panel and GT911 touch drivers.
+  # Exact pin, the same version ui_sim/ fetches: the UI is tested against it. 9.6+ also
+  # declares Kconfig-conditional dependencies that fail to resolve here (IDF 5.5.0's
+  # component manager: MissingKconfigError LV_USE_FREETYPE; 5.5.5's: a failed re-run).
+  lvgl/lvgl: "==9.5.0"
+  espressif/esp_lcd_st7701: "^2.0.2"
+  espressif/esp_lcd_touch_gt911: "^1.2.1"
+  # FT5x06 touch of the Raspberry Pi DSI displays (PoE-ETH + 5-inch DSI build).
+  espressif/esp_lcd_touch_ft5x06: "^1.1.1"

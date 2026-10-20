@@ -3,16 +3,19 @@ CONFIG_IDF_TARGET="esp32p4"
 CONFIG_ESPTOOLPY_FLASHSIZE_32MB=y
 CONFIG_ESPTOOLPY_FLASHSIZE="32MB"
 CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
-# IDF >= 6.0 only (ignored with a warning on 5.x): keep booting on rev 0.x/1.x modules.
+# ESP32-P4 silicon before rev 3.0 (this board's module). IDF >= 5.5.1 builds for either
+# rev < 3 or rev >= 3, never both: an image for one generation is refused by the other's
+# bootloader check.
 CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0x8000
 
 # ---- PSRAM: transfer buffers (8 MiB upload parts) live here.
-# 200 MHz hex PSRAM is gated behind IDF_EXPERIMENTAL_FEATURES on IDF 5.5; without
+# 200 MHz hex PSRAM was gated behind IDF_EXPERIMENTAL_FEATURES on IDF 5.5.0; without
 # the flag the choice silently fell back to 20 MHz (boot log "Speed: 20MHz") and
-# every pass over a part buffer crawled. The board's module is rated for 200 MHz.
+# every pass over a part buffer crawled. 5.5.5 no longer gates it; the flag stays so
+# an older IDF cannot silently drop back. The board's module is rated for 200 MHz.
 CONFIG_IDF_EXPERIMENTAL_FEATURES=y
 CONFIG_SPIRAM=y
 CONFIG_SPIRAM_MODE_HEX=y

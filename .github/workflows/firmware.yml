@@ -44,5 +44,28 @@ jobs:
           cd src-tauri/crates/rrcloud-core
           cargo test --test firmware_interop
 
+  ui-sim:
+    name: On-screen UI simulator (LVGL on the host)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and run (renders every screen, drives it with touches, ASan/UBSan, leak check)
+        run: |
+          cmake -S firmware/rrcloud-ingest/ui_sim -B /tmp/ui_sim
+          cmake --build /tmp/ui_sim -j"$(nproc)"
+          /tmp/ui_sim/rrc_ui_sim /tmp/ui_sim/shots
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rrc-ui-screenshots
+          path: /tmp/ui_sim/shots/*.png
+
   esp-idf-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        board: [poe-eth, poe-eth-dsi5, touch-lcd-43, touch-lcd-43-rev3]
     uses: ./.github/workflows/firmware-build.yml
+    with:
+      board: ${{ matrix.board }}
+      artifact-name: rrcloud-ingest-esp32p4-${{ matrix.board }}
