@@ -281,6 +281,12 @@ jobs:
           ORT_SKIP_DOWNLOAD: '1'
           ORT_LIB_LOCATION: ${{ format('{0}/src-tauri/libs/arm64-v8a', github.workspace) }}
           ORT_STRATEGY: manual
+          # Keep symbols and line tables in the Rust library so native crash
+          # backtraces (tombstones) can be symbolized. Gradle still strips the
+          # copy it packages into the APK; the unstripped one is published as
+          # a separate release asset by "Prepare Android Release Assets".
+          CARGO_PROFILE_RELEASE_STRIP: 'false'
+          CARGO_PROFILE_RELEASE_DEBUG: line-tables-only
         run: |
           npx tauri android build --verbose ${{ inputs.build-args }}
 
@@ -322,6 +328,19 @@ jobs:
             asset_name="${asset_name//\[ext\]/$ext}"
             cp "$file" "$stage_dir/$asset_name"
           done
+
+          # Unstripped Rust library for symbolizing tombstones. Its GNU
+          # build-id matches the stripped copy inside the APK.
+          lib="src-tauri/target/${{ inputs.target }}/release/librapidraw_lib.so"
+          file "$lib"
+          sym_name="${template//\[name\]/$app_name}"
+          sym_name="${sym_name//\[version\]/$version}"
+          sym_name="${sym_name//\[arch\]/$arch}"
+          sym_name="${sym_name//\[ext\]/_native-debug-symbols.zip}"
+          sym_dir="$RUNNER_TEMP/native-debug-symbols/arm64-v8a"
+          mkdir -p "$sym_dir"
+          cp "$lib" "$sym_dir/"
+          (cd "$RUNNER_TEMP/native-debug-symbols" && zip -r -9 "$stage_dir/$sym_name" arm64-v8a)
 
       - name: Upload Android Release Assets
         if: ${{ inputs.mobile == 'android' && inputs.release-id != '' }}
