@@ -42,6 +42,13 @@ static volatile uint32_t decode_calls;
 
 usb_dwc_hal_chan_event_t __real_usb_dwc_hal_chan_decode_intr(usb_dwc_hal_chan_t *chan_obj);
 
+/* Runs in the USB host interrupt, from flash (no IRAM_ATTR), as does IDF's own handler
+ * that calls it (hcd_dwc.c intr_hdlr_main). That is safe only because app_main installs
+ * the USB host without ESP_INTR_FLAG_IRAM: a non-IRAM interrupt is masked while the
+ * flash cache is off (esp_intr_noniram_disable), so neither runs then. Adding the flag
+ * would need this function, everything it calls (esp_timer_get_time, esp_rom_delay_us)
+ * and the HCD's handler in IRAM. */
+
 usb_dwc_hal_chan_event_t __wrap_usb_dwc_hal_chan_decode_intr(usb_dwc_hal_chan_t *chan_obj)
 {
     /* The decoder reads HCINT and clears it, so copy it first. */

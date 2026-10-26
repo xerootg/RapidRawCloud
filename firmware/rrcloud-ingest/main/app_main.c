@@ -108,6 +108,8 @@ void app_main(void)
      * to; the Full-Speed OTG 1.1 controller (GPIO 26/27) is unused.
      * `peripheral_map` = 0 selects exactly that default. */
     usb_diag_set_verbose(app_config_get()->usb_debug);
+    /* No ESP_INTR_FLAG_IRAM: the interrupt is then masked while the flash cache is off,
+     * which usb_fault.c's channel-interrupt wrapper (in flash) relies on. */
     const usb_host_config_t host_cfg = {.skip_phy_setup = false, .intr_flags = ESP_INTR_FLAG_LEVEL1};
     ESP_ERROR_CHECK(usb_host_install(&host_cfg));
     xTaskCreate(usb_lib_task, "usb_lib", 4096, NULL, 7, NULL);
