@@ -1,0 +1,9 @@
+# Vendored copy of https://github.com/kurozz/esp_lcd_rpi_dsi 0.1.0 (see CMakeLists.txt).
+# rrcloud: upstream pins `idf: ">=6.0"` because the DSI HAL moved into `esp_hal_lcd` there;
+# CMakeLists.txt picks the right component for either generation, so the pin is dropped.
+version: "0.1.0"
+description: Raspberry Pi DSI touch display (and clones) on the ESP32-P4
+license: "GPL-2.0-only"
+url: "https://github.com/kurozz/esp_lcd_rpi_dsi"
+dependencies:
+  espressif/esp_lcd_touch_ft5x06: "^1.0.6"

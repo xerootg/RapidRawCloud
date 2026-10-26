@@ -18,5 +18,6 @@ dependencies:
   lvgl/lvgl: "==9.5.0"
   espressif/esp_lcd_st7701: "^2.0.2"
   espressif/esp_lcd_touch_gt911: "^1.2.1"
-  # FT5x06 touch of the Raspberry Pi DSI displays (PoE-ETH + 5-inch DSI build).
+  # FT5x06 touch of the Raspberry Pi DSI displays (PoE-ETH + 5-inch DSI build); the panel
+  # driver itself is the vendored components/esp_lcd_rpi_dsi.
   espressif/esp_lcd_touch_ft5x06: "^1.1.1"

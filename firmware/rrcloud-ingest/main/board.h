@@ -38,15 +38,15 @@
 /* USB-A: USB 2.0 OTG High-Speed, host role. VBUS is always on (no enable GPIO). */
 #if CONFIG_RRC_BOARD_P4_POE_ETH_DSI5
 /* 15-pin MIPI-DSI connector (Raspberry Pi pinout) with an 800x480 "driver-free" Pi
- * touch display (main/panel_rpi_dsi.c): one data lane, the controller at 0x45 and
- * the FT5x06 touch at 0x38 on the internal I2C bus, which also reaches the DSI
- * connector (shared with the unused ES8311 codec at 0x18). VDD_MIPI_DPHY comes from
- * the P4's LDO_VO3 at 2.5 V (Waveshare BSP for the ESP32-P4-WIFI6 PoE boards). No
- * display reset or backlight GPIO: the panel's own controller does both. No user
- * key: BOOT (GPIO35) is RMII TXD1 once Ethernet runs. */
+ * touch display (components/esp_lcd_rpi_dsi, which owns the lane rate and video
+ * timing): one data lane, the controller at 0x45 and the FT5x06 touch at 0x38 on
+ * the internal I2C bus, which also reaches the DSI connector (shared with the
+ * unused ES8311 codec at 0x18). VDD_MIPI_DPHY comes from the P4's LDO_VO3 at 2.5 V
+ * (Waveshare BSP for the ESP32-P4-WIFI6 PoE boards). No display reset or backlight
+ * GPIO: the panel's own controller does both. No user key: BOOT (GPIO35) is RMII
+ * TXD1 once Ethernet runs. */
 #define BOARD_LCD_H_RES         800
 #define BOARD_LCD_V_RES         480
-#define BOARD_LCD_DPI_CLK_MHZ   (240.0f / 9.0f)   /* PLL_F240M / 9; the DSI lane runs at 24x this */
 #define BOARD_DSI_PHY_LDO_CHAN  3
 #define BOARD_DSI_PHY_LDO_MV    2500
 #define BOARD_I2C_SDA_GPIO      7

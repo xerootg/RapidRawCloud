@@ -154,17 +154,20 @@ for example the Hosyond 5-inch (Amazon B0CXTFN8K9) or the OSOYOO 5-inch. Everyth
 plain PoE-ETH build, and without a display attached the image runs headless
 (`display: no DSI display answers on I2C 0x45; running headless`).
 
-"Driver-free" Pi displays emulate the official Raspberry Pi 7" Touch Display, which is what
-`main/panel_rpi_dsi.c` talks to:
+"Driver-free" Pi displays emulate the official Raspberry Pi 7" Touch Display. The panel
+driver is `components/esp_lcd_rpi_dsi`, a vendored copy of
+[kurozz/esp_lcd_rpi_dsi](https://github.com/kurozz/esp_lcd_rpi_dsi) 0.1.0 (**GPL-2.0-only**,
+its `LICENSE` is in the directory; the two local changes for ESP-IDF 5.5 are marked
+`rrcloud:` in its `CMakeLists.txt` and `esp_lcd_rpi_dsi.c`). It brings up, in one call:
 
-- a TC358762-compatible DSI-to-DPI bridge on **one** data lane, configured with DSI Generic
-  Long Writes before video starts. It derives its pixel clock from the DSI clock lane, so the
-  clock lane stays in high-speed mode and the lane runs at exactly 24 × the pixel clock
-  (26.67 MHz from PLL_F240M / 9, so 640 Mbit/s and 61.6 Hz);
-- a controller at **I2C 0x45** for power, resets and backlight. `REG_ID` (0x80) reads 0xde on
-  firmware revision 1 and 0xc3 on revision 2, which take different power sequences; the log
-  line `display: Raspberry Pi DSI protocol, controller id 0x…` says which one answered;
-- an **FT5x06** touch controller at I2C 0x38.
+- a TC358762-compatible DSI-to-DPI bridge on **one** data lane at 700 Mbit/s, fed RGB888 and
+  configured with DSI Generic Long Writes (the legacy Linux `panel-raspberrypi-touchscreen.c`
+  sequence) before video starts. It derives its pixel clock from the DSI clock lane, so the
+  clock lane stays in high-speed mode continuously;
+- the controller at **I2C 0x45** for power sequencing, the bridge/LCD/touch resets and the
+  backlight PWM. `REG_ID` (0x80) reads 0xde on firmware revision 1 and 0xc3 on revision 2; the
+  driver logs which one answered (`rpi_dsi: ATTINY firmware revision …`);
+- the **FT5x06** touch controller at I2C 0x38 (`espressif/esp_lcd_touch_ft5x06`).
 
 The I2C bus is the board's internal one (SDA 7, SCL 8), which the DSI connector carries; the
 D-PHY is powered from the P4's LDO_VO3 at 2.5 V. Panels with their own driver IC and a
@@ -172,8 +175,9 @@ different controller protocol (Waveshare's 720×1280 DSI panels, for instance) a
 supported by this build.
 
 The UI is laid out for a 480×800 portrait screen, so the panel is **mounted standing up** and
-the UI is rotated onto it: LVGL renders into two 76 KB draw buffers in PSRAM and each dirty
-area is rotated into the single 800×480 framebuffer (LVGL rotates touch points back). Which
+the UI is rotated onto it: LVGL draws RGB888 (`CONFIG_LV_COLOR_DEPTH_24`) into two 113 KB draw
+buffers in PSRAM and each dirty area is rotated into the single 800×480 framebuffer (LVGL
+rotates touch points back). Which
 way is up is `Display orientation` in `idf.py menuconfig` (`RRC_DISPLAY_ROTATION_90` or
 `_270`). The PoE board has no free user key, so the BOOT-key screen toggle of the 4.3" board
 is absent; the screen sleeps and wakes on touch.

@@ -24,7 +24,7 @@ dependencies:
       type: service
     version: 1.1.6
   espressif/esp_hosted:
-    component_hash: d72bce4d4a9fd6d4b610f3437735f58c70cfe40abfc969b53396dbb2e1d4c49b
+    component_hash: c88052665d8df3c7185cb5e34327d77674599006bbbbe4bfdb43c44f9a2a73a3
     dependencies:
     - name: idf
       require: private
@@ -45,7 +45,7 @@ dependencies:
     - esp32h4
     - esp32h21
     - esp32p4
-    version: 3.0.9
+    version: 3.0.10
   espressif/esp_lcd_st7701:
     component_hash: 5ccac8c0bcc58273df2c149aa40e607ebaac70bb53f5bc40c4d07e2e3f667fee
     dependencies:
@@ -211,6 +211,6 @@ direct_dependencies:
 - idf
 - joltwallet/littlefs
 - lvgl/lvgl
-manifest_hash: f3cb2b1843281f82115d2780a32efe3b30420ddff41eb399239664b32569d860
+manifest_hash: 7745f2d1131c79829e4e6d207c72d7ff5f65ee334a868b224a4bf621c52a29ce
 target: esp32p4
 version: 2.0.0

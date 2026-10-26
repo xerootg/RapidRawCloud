@@ -6,16 +6,18 @@
  *     2-lane MIPI-DSI, GT911 touch, PWM backlight, the BOOT key. The UI's own
  *     orientation; LVGL renders straight into the DPI framebuffers.
  *   - CONFIG_RRC_DISPLAY_RPI_DSI (PoE-ETH + 5-inch Pi DSI display): an 800x480
- *     landscape panel (main/panel_rpi_dsi.c) mounted standing up. LVGL renders the
- *     480x800 UI into small draw buffers and each dirty area is rotated into the
- *     single DPI framebuffer; FT5x06 touch points are rotated back by LVGL.
+ *     landscape panel speaking the Raspberry Pi touch-display protocol, brought up
+ *     by components/esp_lcd_rpi_dsi (one DSI lane, RGB888 framebuffer, the panel's
+ *     own controller doing power and backlight, FT5x06 touch), mounted standing up.
+ *     LVGL renders the 480x800 UI into small draw buffers and each dirty area is
+ *     rotated into the single DPI framebuffer; touch points are rotated back by LVGL.
  *
  * Rendering budget. The dock's real job is moving photos: uploads keep both
  * cores busy with BLAKE3, TLS and lwIP, and internal RAM is the scarcest
  * resource on the board (README "Throughput notes"). So the UI:
  *   - keeps every pixel buffer in PSRAM (the ST7701 path renders straight into the
  *     two DPI framebuffers, LVGL direct mode, swapped on vsync; the rotated path
- *     draws into two 76 KB buffers): no internal RAM for pixels;
+ *     draws into two 113 KB buffers): no internal RAM for pixels;
  *   - keeps LVGL's heap and its task stack in PSRAM (lv_*_core below);
  *   - runs at a priority below the sync and upload tasks, on one draw unit, so a
  *     busy dock renders a little later rather than uploading slower;
@@ -53,7 +55,7 @@
 #endif
 #if CONFIG_RRC_DISPLAY_RPI_DSI
 #include "esp_cache.h"
-#include "panel_rpi_dsi.h"
+#include "esp_lcd_rpi_dsi.h"
 #endif
 #include "lvgl.h"
 #include "src/draw/sw/lv_draw_sw_utils.h"
@@ -231,11 +233,22 @@ static esp_err_t touch_init(void)
 #endif /* CONFIG_RRC_DISPLAY_ST7701 */
 
 #if CONFIG_RRC_DISPLAY_RPI_DSI
-/* ---- Raspberry Pi DSI display --------------------------------------------------------- */
-static rpi_dsi_t rpi;
-static uint8_t *rpi_fb;   /* the DPI framebuffer, 800x480 RGB565, native orientation */
+/* ---- Raspberry Pi DSI display ---------------------------------------------------------
+ * components/esp_lcd_rpi_dsi owns the D-PHY, the DSI bus, the panel's controller at
+ * I2C 0x45 (power sequence, bridge reset, backlight PWM) and the FT5x06. The dock
+ * only brings the I2C bus, which is the board's internal one (shared with the codec)
+ * and the place to find out whether a display is plugged in at all. */
+#define RPI_BPP 3   /* the driver feeds the bridge RGB888: three bytes per pixel, blue first */
 
-static void backlight_set(int pct) { rpi_dsi_set_backlight(pct); }
+static esp_lcd_rpi_dsi_handle_t rpi;
+static uint8_t *rpi_fb;   /* the DPI framebuffer, 800x480 RGB888, native orientation */
+
+static void backlight_set(int pct)
+{
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    if (rpi) esp_lcd_rpi_dsi_set_brightness(rpi, (uint8_t)(255 * pct / 100));
+}
 
 static esp_err_t rpi_panel_init(void)
 {
@@ -245,15 +258,39 @@ static esp_err_t rpi_panel_init(void)
         .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = true,
     };
     ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bc, &bus), TAG, "I2C bus");
-    esp_err_t e = rpi_dsi_start(bus, &rpi);
+    /* Nothing at 0x45 means no display on the connector: run headless rather than
+     * bring up a DSI bus with nobody listening. */
+    if (i2c_master_probe(bus, ESP_LCD_RPI_DSI_ATTINY_ADDR, 50) != ESP_OK) {
+        i2c_del_master_bus(bus);
+        return ESP_ERR_NOT_FOUND;
+    }
+    esp_lcd_rpi_dsi_config_t cfg = ESP_LCD_RPI_DSI_DEFAULT_CONFIG();
+    cfg.i2c.bus = bus;
+    cfg.ldo_chan = BOARD_DSI_PHY_LDO_CHAN;
+    cfg.ldo_voltage_mv = BOARD_DSI_PHY_LDO_MV;
+    cfg.brightness = 255;
+    /* Link timing, as Linux drives this panel: non-burst video with sync pulses
+     * (MIPI_DSI_MODE_VIDEO_SYNC_PULSE) at a lane rate of exactly 24x the pixel clock,
+     * because the bridge derives its DPI pixel clock from the DSI clock lane (lane
+     * rate / 24 for RGB888 on one lane). Any other ratio leaves the bridge clocking
+     * pixels out at a different rate than they arrive: the driver's defaults (burst,
+     * 700 Mbit/s, 26 MHz) drop every other pixel on the Hosyond panel. The porches
+     * are the roomy ones (hfp 59, CONFIG_ESP_LCD_RPI_DSI_TIMING_WAVESHARE): the host
+     * programs its line in lane byte clocks, 3 per pixel here, and the legacy hfp of 1
+     * pixel leaves no room for even one blanking packet. The P4 makes the pixel clock
+     * from PLL_F240M with an integer divider, so ask for the value it can produce and
+     * size the lane from that: 26.67 MHz x 24 = 640 Mbit/s, 57.6 Hz. */
+    cfg.dpi_clock_freq_mhz = 240.0f / 9.0f;
+    cfg.lane_bit_rate_mbps = 24.0f * cfg.dpi_clock_freq_mhz;
+    esp_err_t e = esp_lcd_rpi_dsi_start(&cfg, &rpi);
     if (e != ESP_OK) { i2c_del_master_bus(bus); return e; }
-    panel = rpi.panel;
-    touch = rpi.touch;
+    panel = esp_lcd_rpi_dsi_get_panel(rpi);
+    touch = esp_lcd_rpi_dsi_get_touch(rpi);
     void *fb = NULL;
     ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(panel, 1, &fb), TAG, "framebuffer");
     rpi_fb = fb;
-    memset(rpi_fb, 0, BOARD_LCD_H_RES * BOARD_LCD_V_RES * 2);
-    esp_cache_msync(rpi_fb, BOARD_LCD_H_RES * BOARD_LCD_V_RES * 2, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    memset(rpi_fb, 0, BOARD_LCD_H_RES * BOARD_LCD_V_RES * RPI_BPP);
+    esp_cache_msync(rpi_fb, BOARD_LCD_H_RES * BOARD_LCD_V_RES * RPI_BPP, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
     return ESP_OK;
 }
 
@@ -267,8 +304,8 @@ static void flush_rotated_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px
     lv_color_format_t cf = lv_display_get_color_format(d);
     uint32_t src_stride = lv_draw_buf_width_to_stride(w, cf);
     lv_display_rotate_area(d, &a);
-    const uint32_t row = BOARD_LCD_H_RES * 2;
-    uint8_t *dst = rpi_fb + a.y1 * row + a.x1 * 2;
+    const uint32_t row = BOARD_LCD_H_RES * RPI_BPP;
+    uint8_t *dst = rpi_fb + a.y1 * row + a.x1 * RPI_BPP;
     lv_draw_sw_rotate(px, dst, w, h, src_stride, row, lv_display_get_rotation(d), cf);
     esp_cache_msync(rpi_fb + a.y1 * row, (size_t)(a.y2 - a.y1 + 1) * row,
                     ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
@@ -353,6 +390,7 @@ typedef struct {
 } ui_job_t;
 
 static QueueHandle_t job_q;
+static SemaphoreHandle_t api_ready;   /* given by display_set_api_ready() */
 
 static void host_request(const char *method, const char *path, const char *body, uint32_t token)
 {
@@ -366,10 +404,19 @@ static void host_request(const char *method, const char *path, const char *body,
     }
 }
 
+void display_set_api_ready(void)
+{
+    if (api_ready) xSemaphoreGive(api_ready);
+}
+
 static void worker_task(void *arg)
 {
     (void)arg;
     ui_job_t j;
+    /* The panel comes up before the sync engine and camera sources exist; the
+     * first /api/status would take a mutex that is not created yet. Requests
+     * queue up until app_main says the dock is ready. */
+    xSemaphoreTake(api_ready, portMAX_DELAY);
     for (;;) {
         if (xQueueReceive(job_q, &j, portMAX_DELAY) != pdTRUE) continue;
         api_resp_t r = {0};
@@ -425,20 +472,23 @@ esp_err_t display_start(void)
     lv_init();
     lv_tick_set_cb(tick_ms);
     disp = lv_display_create(BOARD_LCD_H_RES, BOARD_LCD_V_RES);
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
 #if CONFIG_RRC_DISPLAY_ST7701
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB565);
     void *fb0 = NULL, *fb1 = NULL;
     ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(panel, 2, &fb0, &fb1), TAG, "framebuffers");
     lv_display_set_buffers(disp, fb0, fb1, BOARD_LCD_H_RES * BOARD_LCD_V_RES * 2, LV_DISPLAY_RENDER_MODE_DIRECT);
     lv_display_set_flush_cb(disp, flush_cb);
 #elif CONFIG_RRC_DISPLAY_RPI_DSI
-    /* The UI is 480x800 portrait; LVGL swaps the resolutions and rotates touch. */
+    /* RGB888 end to end: LVGL draws the format the bridge is fed (CONFIG_LV_COLOR_DEPTH_24
+     * in sdkconfig.board.poe_eth_dsi5), so the rotate is a plain copy.
+     * The UI is 480x800 portrait; LVGL swaps the resolutions and rotates touch. */
+    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB888);
 #if CONFIG_RRC_DISPLAY_ROTATION_270
     lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
 #else
     lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
 #endif
-    const size_t buf_bytes = 480 * 80 * 2;   /* 80 UI rows per pass */
+    const size_t buf_bytes = 480 * 80 * RPI_BPP;   /* 80 UI rows per pass */
     void *b0 = heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     void *b1 = heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!b0 || !b1) { free(b0); free(b1); log_ring_printf("display: no memory for draw buffers"); return ESP_ERR_NO_MEM; }
@@ -456,6 +506,7 @@ esp_err_t display_start(void)
 #endif
 
     job_q = xQueueCreate(16, sizeof(ui_job_t));
+    api_ready = xSemaphoreCreateBinary();
     /* Below the sync/upload tasks; the worker's stack is internal RAM because
      * api_dispatch can write NVS (flash operations need an internal stack). */
     xTaskCreatePinnedToCore(worker_task, "ui_api", 6144, NULL, 3, NULL, 1);
@@ -465,8 +516,5 @@ esp_err_t display_start(void)
         return ESP_ERR_NO_MEM;
     }
     log_ring_printf("display: %dx%d MIPI-DSI panel up, touch %s", BOARD_LCD_H_RES, BOARD_LCD_V_RES, touch ? "ok" : "absent");
-#if CONFIG_RRC_DISPLAY_RPI_DSI
-    log_ring_printf("display: Raspberry Pi DSI protocol, controller id 0x%02x", rpi.controller_id);
-#endif
     return ESP_OK;
 }

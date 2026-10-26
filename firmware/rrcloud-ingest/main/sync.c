@@ -1208,7 +1208,12 @@ esp_err_t sync_init(void)
     return ESP_OK;
 }
 
-void sync_get_status(sync_status_t *out) { ST_LOCK(); *out = st; out->pending_entries = 0; ST_UNLOCK(); out->pending_entries = store_journal_pending_entries(); }
+void sync_get_status(sync_status_t *out)
+{
+    if (!st_mtx) { memset(out, 0, sizeof *out); return; }   /* asked before sync_init() */
+    ST_LOCK(); *out = st; out->pending_entries = 0; ST_UNLOCK();
+    out->pending_entries = store_journal_pending_entries();
+}
 void sync_request_now(void) { msg_t m = {.cmd = CMD_SYNC_NOW}; xQueueSend(q, &m, 0); }
 void sync_cancel(void) { cancel_flag = true; msg_t m = {.cmd = CMD_CANCEL}; xQueueSend(q, &m, 0); }
 void sync_config_changed(void) { msg_t m = {.cmd = CMD_CONFIG}; xQueueSend(q, &m, 0); }

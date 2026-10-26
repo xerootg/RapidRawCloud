@@ -119,5 +119,8 @@ void app_main(void)
 
     ESP_ERROR_CHECK(web_start());
     console_start();
+#if CONFIG_RRC_HAS_DISPLAY
+    display_set_api_ready();
+#endif
     log_ring_printf("ready — plug in a camera");
 }

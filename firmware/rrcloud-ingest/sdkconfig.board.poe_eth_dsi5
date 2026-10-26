@@ -5,10 +5,24 @@
 # a display attached the image runs headless.
 CONFIG_RRC_BOARD_P4_POE_ETH_DSI5=y
 
-# ---- LVGL 9 (the on-screen UI, components/rrc_ui), the same settings as the Touch-LCD-4.3
-# build: the UI renders at 480x800 portrait into draw buffers in PSRAM and is rotated onto the
+# ---- Panel driver (components/esp_lcd_rpi_dsi). Non-burst video with the long porches, at a
+# lane rate main/display.c sets to exactly 24x the pixel clock (the bridge clocks pixels out
+# at lane rate / 24; the comment there has the details). DMA2D copies need the driver's IDF 6
+# API; the dock builds on 5.5.5 and rotates into the framebuffer with the CPU anyway.
+CONFIG_ESP_LCD_RPI_DSI_TIMING_WAVESHARE=y
+CONFIG_ESP_LCD_RPI_DSI_NON_BURST_VIDEO=y
+CONFIG_ESP_LCD_RPI_DSI_USE_DMA2D=n
+# The FT5x06 reports panel-native 800x480 coordinates with its origin at the opposite corner
+# from the framebuffer's (measured on the Hosyond: a tap at the UI's top-left read x=789 y=28);
+# LVGL then rotates the mirrored point with the display (main/display.c).
+CONFIG_ESP_LCD_RPI_DSI_TOUCH_INVERT_X=y
+CONFIG_ESP_LCD_RPI_DSI_TOUCH_INVERT_Y=y
+
+# ---- LVGL 9 (the on-screen UI, components/rrc_ui), the Touch-LCD-4.3 settings except the
+# colour depth: the bridge is fed RGB888, so LVGL draws RGB888 and the rotate is a plain copy.
+# The UI renders at 480x800 portrait into draw buffers in PSRAM and is rotated onto the
 # 800x480 panel (main/display.c); internal RAM stays with TLS, AES-DMA and the task stacks.
-CONFIG_LV_COLOR_DEPTH_16=y
+CONFIG_LV_COLOR_DEPTH_24=y
 # LVGL's heap comes from PSRAM through main/display.c (malloc would place every
 # small widget allocation in internal RAM: SPIRAM_MALLOC_ALWAYSINTERNAL=16384).
 CONFIG_LV_USE_CUSTOM_MALLOC=y
