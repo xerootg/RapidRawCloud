@@ -16,6 +16,12 @@ Supported cameras:
 The board runs on PoE (or USB-C), so the dock is a single cable on a shelf: Ethernet is
 always on; Wi‑Fi 6 via the on-board ESP32‑C6 is optional.
 
+The same firmware also builds for the **Waveshare ESP32-P4-WIFI6-Touch-LCD-4.3**: Wi‑Fi
+only, battery-capable, with a 4.3" touchscreen running a Material 3 interface that does
+everything the web page does (see [On-screen UI](#on-screen-ui-esp32-p4-wifi6-touch-lcd-43)).
+The PoE board can carry the same interface on a **5-inch 800×480 Raspberry Pi DSI touch
+display** plugged into its DSI connector (see [Raspberry Pi DSI display on the PoE board](#raspberry-pi-dsi-display-on-the-poe-board)).
+
 ## How it maps onto the sync protocol
 
 This device is a **write-mostly participant**. It never materializes a library
@@ -75,6 +81,9 @@ cloud, network and upload progress; configures what to sync:
   Output is sanitized to the §1.1 relkey rules (no `\` `:`, control chars, reserved names, `.rr.` segments).
 - **Auto sync on plug-in**, minimum size, mass-storage scan folder, device name, hostname,
   optional Wi‑Fi credentials, optional Basic-auth password for the page.
+- Wi‑Fi details and scanning: `GET /api/wifi` (association, address, signal, last disconnect
+  reason), `POST /api/wifi/scan` then `GET /api/wifi/scan`; `wifi_enabled` in the config is the
+  radio switch.
 - JSON API under `/api/…` (see `main/web.c`). State-changing calls must send `Content-Type: application/json`;
   that requirement is the CSRF gate (an HTML form cannot send it without a CORS preflight the dock never approves).
 
@@ -83,16 +92,51 @@ never returned by the API.
 
 ## Building and flashing
 
-Requirements: ESP-IDF **v5.5** (`idf.py`), target `esp32p4`. Managed components
-(`usb_host_msc`, `esp_wifi_remote`/`esp_hosted`, `littlefs`, `mdns`) are fetched by the
-component manager on first build.
+Requirements: ESP-IDF **v5.5.5** (`idf.py`; 5.5.1 is the first 5.5.x that supports ESP32-P4 rev 3 silicon), target `esp32p4`. Managed components
+(`usb_host_msc`, `esp_wifi_remote`/`esp_hosted`, `littlefs`, `mdns`, and for the display
+`lvgl`, `esp_lcd_st7701`, `esp_lcd_touch_gt911`, `esp_lcd_touch_ft5x06`) are fetched by the component manager on
+first build.
+
+The board is a build-time choice (`main/Kconfig.projbuild`), made by the sdkconfig overlay
+layered on `sdkconfig.defaults`:
 
 ```sh
 cd firmware/rrcloud-ingest
+# ESP32-P4-WIFI6-POE-ETH (the default)
 idf.py set-target esp32p4
 idf.py build
-idf.py -p /dev/ttyACM0 flash monitor      # USB-C console port (CH343)
+# ESP32-P4-WIFI6-POE-ETH with a 5-inch Raspberry Pi DSI touch display
+idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.poe_eth_dsi5" set-target esp32p4
+idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.poe_eth_dsi5" build
+# ESP32-P4-WIFI6-Touch-LCD-4.3
+idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43" set-target esp32p4
+idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43" build
+
+idf.py -p /dev/ttyACM0 flash monitor      # USB-C console port (CH343 / the "USB to UART" port)
 ```
+
+Switching boards in one checkout: delete `sdkconfig` (or use separate `-B` build dirs with
+`-DSDKCONFIG=<dir>/sdkconfig`), otherwise the old board's configuration is reused. CI builds
+every variant (`.github/workflows/firmware.yml`) and a release ships one zip per variant.
+
+### Which image for which chip
+
+ESP32-P4 silicon comes in two generations, and ESP-IDF builds an image for one of them:
+revisions v0.x/v1.x (`sdkconfig.defaults`) or v3.x (add `sdkconfig.chip_rev3` last). Rev 3
+runs the cores at 400 MHz instead of 360 and the PSRAM at 250 MHz instead of 200. Flashing
+the wrong image is harmless: the bootloader refuses it and the boot log says the chip
+revision is not supported. `esptool.py chip_id` (on the USB-to-UART port) prints the
+revision before you flash.
+
+| Board | Chip | Overlays | Release zip |
+|---|---|---|---|
+| ESP32-P4-WIFI6-POE-ETH | v0.x/v1.x | — | `rrcloud-ingest-<v>-esp32p4.zip` |
+| ESP32-P4-WIFI6-POE-ETH + 5-inch DSI display | v0.x/v1.x | `sdkconfig.board.poe_eth_dsi5` | `…-esp32p4-poe-eth-dsi5.zip` |
+| ESP32-P4-WIFI6-Touch-LCD-4.3 | v0.x/v1.x | `sdkconfig.board.touch_lcd_43` | `…-esp32p4-touch-lcd-4.3-chip-v1.zip` |
+| ESP32-P4-WIFI6-Touch-LCD-4.3 | v3.x | `sdkconfig.board.touch_lcd_43`, `sdkconfig.chip_rev3` | `…-esp32p4-touch-lcd-4.3-chip-v3.zip` |
+
+A PoE-ETH board with a v3 chip would build the same way (`sdkconfig.chip_rev3` on top of the
+defaults); it is not built by CI because none has been tested.
 
 Board facts baked into `sdkconfig.defaults` / `main/board.h`: 32 MB flash, 32 MB PSRAM
 (hex, 200 MHz), IP101GRI RMII PHY (addr 1, MDC 31, MDIO 52, RST 51, REF_CLK in on 50),
@@ -101,6 +145,144 @@ table: two 4 MB OTA slots + 8 MB LittleFS (`storage`) for the ledger and frozen 
 
 Wi‑Fi requires the factory ESP‑Hosted slave firmware on the ESP32‑C6 (Waveshare ships it);
 Ethernet works regardless.
+
+## Raspberry Pi DSI display on the PoE board
+
+`sdkconfig.board.poe_eth_dsi5` builds the PoE-ETH image with the on-screen UI for an
+**800×480 "driver-free" Raspberry Pi DSI touch display** on the board's 15-pin DSI connector,
+for example the Hosyond 5-inch (Amazon B0CXTFN8K9) or the OSOYOO 5-inch. Everything else is the
+plain PoE-ETH build, and without a display attached the image runs headless
+(`display: no DSI display answers on I2C 0x45; running headless`).
+
+"Driver-free" Pi displays emulate the official Raspberry Pi 7" Touch Display. The panel
+driver is `components/esp_lcd_rpi_dsi`, a vendored copy of
+[kurozz/esp_lcd_rpi_dsi](https://github.com/kurozz/esp_lcd_rpi_dsi) 0.1.0 (**GPL-2.0-only**,
+its `LICENSE` is in the directory; every local change is marked `rrcloud:` where it sits, and
+the header of its `CMakeLists.txt` lists them). It brings up, in one call:
+
+- a TC358762-compatible DSI-to-DPI bridge on **one** data lane, fed RGB888 and configured
+  with DSI Generic Long Writes (the legacy Linux `panel-raspberrypi-touchscreen.c` sequence)
+  before video starts. It derives its pixel clock from the DSI clock lane (lane rate / 24), so
+  the clock lane stays in high-speed mode continuously and the dock runs the lane at exactly
+  24 × the pixel clock: 40 MHz / 960 Mbit/s, 1056 × 631 porches, 60 Hz, burst mode (the
+  comment in `main/display.c` records what was tried on the Hosyond panel and why);
+- the controller at **I2C 0x45** for power sequencing, the bridge/LCD/touch resets and the
+  backlight PWM. `REG_ID` (0x80) reads 0xde on firmware revision 1 and 0xc3 on revision 2; the
+  driver logs which one answered (`rpi_dsi: ATTINY firmware revision …`);
+- the **FT5x06** touch controller at I2C 0x38 (`espressif/esp_lcd_touch_ft5x06`).
+
+The I2C bus is the board's internal one (SDA 7, SCL 8), which the DSI connector carries; the
+D-PHY is powered from the P4's LDO_VO3 at 2.5 V. Panels with their own driver IC and a
+different controller protocol (Waveshare's 720×1280 DSI panels, for instance) are not
+supported by this build.
+
+The UI has a landscape layout (navigation rail on the left) for the panel lying flat and the
+portrait one of the 4.3" board for the panel standing up; **Device › Display › Orientation**
+on the screen (config key `display_rotation`: 0, 90, 180 or 270 degrees from the panel's
+native landscape) picks which, and which way is up, at runtime. LVGL draws RGB565 into a
+96 KB draw buffer in PSRAM and each dirty area is expanded to RGB888 and copied, rotated as
+needed, into the single 800×480 framebuffer (LVGL rotates touch points back; the P4's own
+RGB565-to-RGB888 expansion in the DSI bridge gives this panel a stream it cannot lock to). The
+touch controller is polled from its own task, so I2C never stalls rendering. The PoE board has no free user key, so the BOOT-key screen toggle
+of the 4.3" board is absent; the screen sleeps and wakes on touch.
+
+Bringing up another clone of the Pi display is done from the serial console, without
+reflashing: `dsi-timing` shows or changes the lane rate, pixel clock, porches and video mode
+live; `dsi-reg` writes a bridge register; `fb-pattern` holds a known-clean test pattern in the
+framebuffer (so a smear or stripe that survives it is the panel's, one that does not is the
+renderer's) and `fb-dump` prints the framebuffer as base64 rows.
+
+## On-screen UI (ESP32-P4-WIFI6-Touch-LCD-4.3)
+
+A Material 3 interface on the 480×800 portrait panel, with an on-screen keyboard. It covers
+everything the web page does — status and progress, sync now / cancel / retry USB, what to
+sync, pairing (with a QR code of the sign-in link, so a phone can approve by scanning the
+screen), manual S3, Wi‑Fi, device name / hostname, admin password, Bluetooth, radio firmware,
+USB logging, the log, reboot — plus what a screen needs: Wi‑Fi on/off, association details
+(IP, gateway, DNS, signal, channel, security, Wi‑Fi standard, BSSID, MAC, connected time,
+last disconnect reason), a scan of networks in range, brightness, screen timeout, dark/light.
+
+| Destination | Contents |
+|---|---|
+| **Status** | sync phase, progress, rate and ETA; camera, cloud, network, clock; library counters |
+| **Sync** | sync on plug-in, include/exclude patterns, videos, minimum size, card folder, path template; *Pair with cloud*; *Manual S3* |
+| **Wi‑Fi** | the radio switch, the current network with its details, *Forget*, networks in range, *Add network* |
+| **Device** | display, identity, security, Bluetooth, radio co-processor, diagnostics, *Log*, *About*, restart |
+
+**One API, three transports.** The screen is a client of the same `/api/…` routes as the web
+page and the BLE app (`main/api.c`): `main/display.c` queues each request to a worker task
+that calls `api_dispatch()` and hands the JSON back to the UI. Validation therefore lives in
+one place — a bad template or a 5-character Wi‑Fi password shows the dock's own error message
+under the field. `components/rrc_ui` is pure LVGL + cJSON with no ESP-IDF calls, which is
+what lets `ui_sim/` run it on a PC.
+
+**Rendering budget.** The dock's job is moving photos, which keeps both cores busy and
+internal RAM scarce, so LVGL renders straight into the two MIPI-DSI framebuffers in PSRAM
+(direct mode, dirty areas only, buffers swapped on vsync: no extra draw buffers), its heap
+and task stack live in PSRAM, it runs below the sync and upload tasks with one draw unit,
+and nothing is polled while the screen is off. The UI adds ~11 KB of static internal RAM and
+one 8 KB internal stack (the API worker: a config save writes NVS, which needs it).
+Fonts are Roboto and Material Symbols (`components/rrc_ui/fonts/gen_fonts.py`), so SSIDs and
+camera names in Latin scripts render properly; the image is ~2.8 MB of the 4 MB app slot.
+
+**Hardware, as wired on this board** (`main/board.h`; schematic in Waveshare's
+`ESP32-P4-WIFI6-Touch-LCD-4.3` repository):
+
+- **POWER key** — wired only to an EC23001 push-button power latch: a short press powers
+  the board on, a 2 s press cuts power. The P4 cannot see it, so it cannot sleep the screen.
+- **BOOT key** (GPIO35) — free after reset: it turns the screen off and on. A touch on the
+  dark screen wakes it too; that touch is swallowed so it cannot press anything. The screen
+  also sleeps after the timeout set under *Device → Display* (backlight boost converter off).
+- **Battery** — Li-ion cell on the MX1.25 `BAT` header, ETA6098 charger. The cell voltage is
+  measured on GPIO20 through a 1/3 divider and shown as a percentage. The charger's status pin
+  goes to a test pad only, so the dock cannot tell charging from discharging, and with no cell
+  fitted the charger idles at ~4.2 V (reported as "no battery detected" when it never moves).
+- **Camera port** — the "USB" Type-C is the P4's USB 2.0 HS OTG port, but the board wires it
+  as a power *sink* (5.1 kΩ Rd on CC, VBUS into the 5 V rail through an ideal diode): it never
+  supplies VBUS. A camera there needs a USB-C OTG adapter that injects 5 V (a "Y"/power-pass-
+  through OTG adapter); a plain C-to-C cable leaves both ends waiting for the other to power the
+  bus. Camera support is otherwise identical to the PoE board.
+- **No Ethernet** — Wi‑Fi comes up at boot. Wi‑Fi off means offline (the screen still works).
+
+**Admin lock.** With *Require a password* on, the Status page stays visible and every other
+page asks for the admin password (the web page's). The unlock lasts until the screen sleeps;
+after five wrong attempts input is refused for 30 s, doubling to 15 minutes. Setting the
+password from the screen keeps you unlocked until it sleeps.
+
+**Simulator.** `ui_sim/` builds the UI against a fake dock on the host, drives it with
+synthetic touches through LVGL's own input path, and writes a PNG per screen:
+
+```sh
+cmake -S firmware/rrcloud-ingest/ui_sim -B /tmp/ui_sim && cmake --build /tmp/ui_sim -j
+/tmp/ui_sim/rrc_ui_sim /tmp/ui_sim/shots
+```
+
+It fails on behaviour regressions (editors, validation errors, Wi‑Fi join/forget/off, theme,
+lock and unlock, sleep and wake), on any character the drawing font lacks, on LVGL asserts,
+ASan/UBSan reports, warnings in the UI sources, and on LVGL memory that grows across page
+cycles. CI uploads the screenshots as the `rrc-ui-screenshots` artifact.
+
+### Toward a field cache
+
+Not built yet; the interface and firmware are shaped so it slots in. The plan: the microSD
+slot (SDMMC slot 0 — the C6 uses slot 1 of the same host, so the host driver is shared) holds
+originals copied off the camera immediately, with the same `(camera, path, size)` ledger
+semantics; the existing sync engine then uploads *from the card* whenever a known network is
+up. What is already in place for that:
+
+- **The UI talks only to the API.** A *Cache* destination (card state, queued files and bytes,
+  last upload) is one more page over new `/api/cache/…` routes, available to the web page and
+  the BLE app at the same time.
+- **Wi‑Fi state is explicit.** `/api/wifi` reports association, attempts and the last
+  disconnect reason; reconnects back off (immediately ×3, then 2 → 30 s) instead of spinning,
+  and re-saving identical credentials no longer drops the link. Roaming between known
+  networks replaces the single `wifi_ssid` with a list (priority, last seen, per-network
+  "upload over this network" policy); the Wi‑Fi page's *Current network* card already sits
+  above the scan list where *Saved networks* would go, and the scan reports how many access
+  points share each SSID.
+- **Uploads already survive interruption.** Journaled originals are appended before an upload
+  counts, frozen segments replay byte-identically, and the ledger skips what is in the
+  library — exactly the semantics a cache that loses its network mid-file needs.
 
 ## Host tests
 
@@ -128,8 +310,11 @@ components/rrcloud_proto the generated protocol SDK (protocol/gen/c) as an IDF c
 components/rrc_proto    firmware conveniences over it: relkey sanitizer, templates, stored-deflate gzip, ledger codec
 components/rrc_glob     case-insensitive glob matcher
 components/rrc_ptp      PTP codec (pure) + USB still-image-class host driver
-main/                   app_config (NVS), store (LittleFS ledger/segments), net, sync engine, camera sources, pairing, web UI
+components/rrc_ui       the on-screen Material 3 UI (pure LVGL + cJSON) and its Roboto / Material Symbols fonts
+main/                   app_config (NVS), store (LittleFS ledger/segments), net, sync engine, camera sources, pairing, web UI,
+                        board.h + Kconfig.projbuild (board choice), display (panel/touch/LVGL glue), power (battery)
 www/index.html          the admin page (embedded)
+ui_sim/                 host simulator for components/rrc_ui (screenshots + behaviour checks)
 host_tests/             gcc/ctest suite + reference vectors + Rust interop fixtures
 ```
 

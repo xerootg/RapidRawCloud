@@ -24,6 +24,8 @@
 #include "store.h"
 #include "coproc.h"
 #include "ble.h"
+#include "power.h"
+#include "board.h"
 #include "rrc_proto.h"
 #include "util.h"
 
@@ -80,34 +82,40 @@ bool api_password_ok(const char *password)
 /* ---- routes ---------------------------------------------------------------- */
 static void r_status(api_resp_t *out)
 {
-    char *buf = malloc(4096);
+    char *buf = malloc(6144);
     char *sync_json = malloc(1800);
-    char coproc_json[640], ble_json[400];
+    char coproc_json[640], ble_json[400], power_json[96];
     if (!buf || !sync_json) { free(buf); free(sync_json); set(out, 500, NULL, 0); return; }
     sync_status_json(sync_json, 1800);
     if (coproc_status_json(coproc_json, sizeof coproc_json) < 0) strcpy(coproc_json, "{}");
     if (ble_status_json(ble_json, sizeof ble_json) < 0) strcpy(ble_json, "{}");
+    int pn = power_status_json(power_json, sizeof power_json);
+    if (pn < 0 || pn >= (int)sizeof power_json) strcpy(power_json, "{}");
     char netd[64];
     net_describe(netd, sizeof netd);
     size_t total = 0, used = 0;
     store_usage(&total, &used);
     const esp_app_desc_t *app = esp_app_get_description();
-    char q_net[80], q_ver[48], q_host[48], q_dev[48], q_time[24];
+    char q_net[80], q_ver[48], q_host[48], q_dev[48], q_time[24], q_ssid[200];
     rrc_json_quote(netd, q_net, sizeof q_net);
     rrc_json_quote(app->version, q_ver, sizeof q_ver);
     rrc_json_quote(app_config_get()->hostname, q_host, sizeof q_host);
     rrc_json_quote(app_device_id(), q_dev, sizeof q_dev);
+    rrc_json_quote(app_config_get()->wifi_ssid, q_ssid, sizeof q_ssid);
     char iso[21] = "";
     if (net_time_synced()) rrc_format_iso8601((int64_t)time(NULL), iso);
     rrc_json_quote(iso, q_time, sizeof q_time);
-    int n = snprintf(buf, 4096,
+    int n = snprintf(buf, 6144,
         "{\"sync\":%s,\"network\":%s,\"eth_link\":%s,\"wifi\":%s,\"time_synced\":%s,\"time\":%s,\"version\":%s,\"hostname\":%s,\"device_id\":%s,"
-        "\"storage_total\":%u,\"storage_used\":%u,\"heap_free\":%u,\"psram_free\":%u,\"uptime_s\":%lld,\"usb_devices\":%d,\"usb_faults\":%u,\"usb_chan_irqs\":%u,\"eth_rx_frames\":%u,\"eth_rx_restarts\":%u,\"coproc\":%s,\"ble\":%s}",
+        "\"storage_total\":%u,\"storage_used\":%u,\"heap_free\":%u,\"psram_free\":%u,\"uptime_s\":%lld,\"usb_devices\":%d,\"usb_faults\":%u,\"usb_chan_irqs\":%u,\"eth_rx_frames\":%u,\"eth_rx_restarts\":%u,\"coproc\":%s,\"ble\":%s,"
+        "\"board\":\"%s\",\"has_ethernet\":%s,\"wifi_enabled\":%s,\"wifi_ssid\":%s,\"wifi_rssi\":%d,\"power\":%s}",
         sync_json, q_net, net_eth_link() ? "true" : "false", net_wifi_connected() ? "true" : "false", net_time_synced() ? "true" : "false", q_time, q_ver, q_host, q_dev,
         (unsigned)total, (unsigned)used, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-        (long long)(esp_timer_get_time() / 1000000), usb_diag_device_count(), (unsigned)usb_fault_count(), (unsigned)usb_fault_decode_calls(), (unsigned)net_eth_rx_frames(), (unsigned)net_eth_rx_restarts(), coproc_json, ble_json);
+        (long long)(esp_timer_get_time() / 1000000), usb_diag_device_count(), (unsigned)usb_fault_count(), (unsigned)usb_fault_decode_calls(),
+        (unsigned)net_eth_rx_frames(), (unsigned)net_eth_rx_restarts(), coproc_json, ble_json,
+        BOARD_NAME, net_has_ethernet() ? "true" : "false", app_config_get()->wifi_enabled ? "true" : "false", q_ssid, net_wifi_rssi(), power_json);
     free(sync_json);
-    if (n < 0 || n >= 4096) { free(buf); err(out, 500, "status too large"); return; }
+    if (n < 0 || n >= 6144) { free(buf); err(out, 500, "status too large"); return; }
     set(out, 200, buf, n);
 }
 
@@ -177,6 +185,24 @@ static void r_log(api_resp_t *out)
     set(out, 200, buf, n);
 }
 
+static void r_json(api_resp_t *out, size_t cap, int (*fn)(char *, size_t))
+{
+    char *buf = malloc(cap);
+    if (!buf) { set(out, 500, NULL, 0); return; }
+    int n = fn(buf, cap);
+    if (n < 0 || (size_t)n >= cap) { free(buf); err(out, 500, "encode"); return; }
+    set(out, 200, buf, n);
+}
+
+static void r_wifi_scan(api_resp_t *out)
+{
+    esp_err_t e = net_wifi_scan_start();
+    if (e == ESP_ERR_NOT_SUPPORTED) { err(out, 409, "Wi-Fi is turned off"); return; }
+    if (e == ESP_ERR_INVALID_STATE) { err(out, 409, "a scan is already running"); return; }
+    if (e != ESP_OK) { err(out, 500, esp_err_to_name(e)); return; }
+    ok(out);
+}
+
 static void restart_cb(void *arg) { (void)arg; esp_restart(); }
 
 static void r_reboot(api_resp_t *out)
@@ -222,6 +248,10 @@ void api_dispatch(const char *method, const char *path, const char *body, size_t
     else if (post && !strcmp(path, "/api/reboot")) r_reboot(out);
     else if (post && !strcmp(path, "/api/coproc/update")) r_coproc_update(body, body_len, out);
     else if (post && !strcmp(path, "/api/ble/forget")) { ble_forget_bonds(); ok(out); }
+    else if (get && !strcmp(path, "/api/wifi")) r_json(out, 1024, net_wifi_json);
+    else if (post && !strcmp(path, "/api/wifi/scan")) r_wifi_scan(out);
+    /* worst case: NET_SCAN_MAX SSIDs of 32 bytes, each escaped up to \u00XX (6x) */
+    else if (get && !strcmp(path, "/api/wifi/scan")) r_json(out, 10240, net_wifi_scan_json);
     else err(out, 404, "unknown endpoint");
     if (!out->json) set(out, 500, NULL, 0);
 }

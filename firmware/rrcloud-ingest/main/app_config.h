@@ -31,12 +31,18 @@ typedef struct {
     /* Device identity shown in the registry */
     char device_name[48];
     /* Network */
+    bool wifi_enabled;                /* master switch for the Wi-Fi station */
     char wifi_ssid[33];
     char hostname[32];
     /* Admin UI */
     bool admin_auth;                  /* require HTTP basic auth (user "admin") */
     bool usb_debug;                   /* DEBUG-level logs from the USB host stack */
     bool ble_enabled;                 /* advertise the BLE admin service (RapidRAW app) */
+    /* On-device display (boards with CONFIG_RRC_HAS_DISPLAY; stored everywhere) */
+    uint8_t display_brightness;       /* 5..100 % */
+    uint16_t display_timeout_s;       /* screen off after this much inactivity, 0 = never */
+    bool display_dark;                /* Material 3 dark scheme */
+    uint16_t display_rotation;        /* 0, 90, 180 or 270 degrees from the panel's native orientation */
 } app_config_t;
 
 esp_err_t app_config_init(void);                     /* nvs_flash_init + load (defaults when empty) */

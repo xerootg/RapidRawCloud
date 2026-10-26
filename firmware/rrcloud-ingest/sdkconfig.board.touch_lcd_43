@@ -1,0 +1,48 @@
+# Overlay for the Waveshare ESP32-P4-WIFI6-Touch-LCD-4.3, applied on top of sdkconfig.defaults:
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43" build
+# (README "Building and flashing"). Same SoC, flash, PSRAM and C6 wiring as the PoE board.
+CONFIG_RRC_BOARD_P4_TOUCH_LCD_43=y
+
+# ---- No Ethernet on this board: the EMAC driver is not linked.
+CONFIG_ETH_USE_ESP32_EMAC=n
+
+# ---- LVGL 9 (the on-screen UI, components/rrc_ui). Colors, memory and fonts are
+# chosen for a 480x800 MIPI-DSI panel rendered straight into the DPI framebuffers
+# in PSRAM: internal RAM stays with TLS, AES-DMA and the task stacks (README
+# "Internal RAM is the scarce resource").
+CONFIG_LV_COLOR_DEPTH_16=y
+# LVGL's heap comes from PSRAM through main/display.c (malloc would place every
+# small widget allocation in internal RAM: SPIRAM_MALLOC_ALWAYSINTERNAL=16384).
+CONFIG_LV_USE_CUSTOM_MALLOC=y
+CONFIG_LV_DEF_REFR_PERIOD=16
+CONFIG_LV_DPI_DEF=217
+CONFIG_LV_USE_LOG=y
+CONFIG_LV_LOG_LEVEL_WARN=y
+CONFIG_LV_LOG_PRINTF=y
+CONFIG_LV_USE_ASSERT_NULL=y
+CONFIG_LV_USE_ASSERT_MALLOC=y
+CONFIG_LV_USE_SYSMON=n
+CONFIG_LV_OS_FREERTOS=y
+CONFIG_LV_DRAW_SW_DRAW_UNIT_CNT=1
+# Text is Roboto + Material Symbols, compiled into components/rrc_ui/fonts; LVGL's own
+# Montserrat 14 only backs the theme default and is never shown.
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_DEFAULT_MONTSERRAT_14=y
+CONFIG_LV_USE_THEME_DEFAULT=y
+CONFIG_LV_THEME_DEFAULT_DARK=n
+CONFIG_LV_USE_QRCODE=y
+# Widgets the UI does not use stay out of the image.
+CONFIG_LV_USE_CALENDAR=n
+CONFIG_LV_USE_CHART=n
+CONFIG_LV_USE_IMAGEBUTTON=n
+CONFIG_LV_USE_LED=n
+CONFIG_LV_USE_MENU=n
+CONFIG_LV_USE_SPAN=n
+CONFIG_LV_USE_SPINBOX=n
+CONFIG_LV_USE_TABVIEW=n
+CONFIG_LV_USE_TILEVIEW=n
+CONFIG_LV_USE_WIN=n
+CONFIG_LV_USE_ANIMIMG=n
+CONFIG_LV_USE_SCALE=n
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_LV_BUILD_DEMOS=n

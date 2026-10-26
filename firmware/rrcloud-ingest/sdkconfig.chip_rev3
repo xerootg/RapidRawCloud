@@ -1,0 +1,15 @@
+# Overlay for ESP32-P4 rev 3.x silicon, layered last (after the board overlay):
+#   idf.py -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;sdkconfig.board.touch_lcd_43;sdkconfig.chip_rev3" build
+# ESP-IDF builds an image for either rev < 3 (sdkconfig.defaults) or rev >= 3, never both;
+# the bootloader refuses an image for the other generation, so flashing the wrong one is
+# harmless (README "Which image for which chip").
+# CONFIG_ESP32P4_SELECTS_REV_LESS_V3 is not set
+CONFIG_ESP32P4_REV_MIN_300=y
+# Rev 3 runs the cores at 400 MHz (360 MHz before) and the hex PSRAM at 250 MHz (200 MHz).
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_400=y
+CONFIG_SPIRAM_SPEED_250M=y
+# The rev 3 second-stage bootloader is ~0x60c0 bytes at INFO logging, over the 0x6000 that
+# fits below the partition table at 0x8000 (partitions.csv is shared by every image, so its
+# layout stays put). WARN drops the informational boot lines; errors, including the "chip
+# revision not supported" refusal, still print. The application's own logging is unchanged.
+CONFIG_BOOTLOADER_LOG_LEVEL_WARN=y

@@ -26,6 +26,11 @@
 #include "mbedtls/md5.h"
 #include "mbedtls/aes.h"
 #include "rrc_hash.h"
+#include "board.h"
+#include "display.h"
+#ifdef BOARD_I2C_SDA_GPIO
+#include "driver/i2c_master.h"
+#endif
 
 static const char *TAG = "console";
 
@@ -119,6 +124,86 @@ static int cmd_sync(int argc, char **argv) { (void)argc; (void)argv; sync_reques
 static int cmd_sync_cancel(int argc, char **argv) { (void)argc; (void)argv; sync_cancel(); printf("cancelling\n"); return 0; }
 static int cmd_usb_reset(int argc, char **argv) { (void)argc; (void)argv; return usb_diag_power_cycle() == ESP_OK ? 0 : 1; }
 static int cmd_reboot(int argc, char **argv) { (void)argc; (void)argv; printf("rebooting\n"); vTaskDelay(pdMS_TO_TICKS(200)); esp_restart(); return 0; }
+#if CONFIG_RRC_DISPLAY_RPI_DSI
+static int cmd_dsi_timing(int argc, char **argv)
+{
+    display_dsi_timing_t t;
+    display_dsi_get_timing(&t);
+    if (argc == 11) {
+        char *end[8];
+        t.lane_mbps = strtof(argv[1], &end[0]); t.dpi_mhz = strtof(argv[2], &end[1]);
+        t.hsw = (int)strtol(argv[3], &end[2], 10); t.hbp = (int)strtol(argv[4], &end[3], 10); t.hfp = (int)strtol(argv[5], &end[4], 10);
+        t.vsw = (int)strtol(argv[6], &end[5], 10); t.vbp = (int)strtol(argv[7], &end[6], 10); t.vfp = (int)strtol(argv[8], &end[7], 10);
+        bool numeric = true;
+        for (int i = 0; i < 8; i++) if (*end[i] || !argv[i + 1][0]) numeric = false;
+        /* the D-PHY's range, a pixel clock the panel could take, and porches that
+         * keep a frame a frame: checked before the link is torn down */
+        if (!numeric || t.lane_mbps < 80 || t.lane_mbps > 1500 || t.dpi_mhz < 5 || t.dpi_mhz > 120
+            || t.hsw < 1 || t.hsw > 255 || t.hbp < 1 || t.hbp > 1023 || t.hfp < 1 || t.hfp > 1023
+            || t.vsw < 1 || t.vsw > 255 || t.vbp < 0 || t.vbp > 1023 || t.vfp < 0 || t.vfp > 1023
+            || (strcmp(argv[9], "burst") && strcmp(argv[9], "nonburst")) || (strcmp(argv[10], "lp") && strcmp(argv[10], "nolp"))) {
+            printf("out of range: lane 80..1500 Mbit/s, dpi 5..120 MHz, hsw/vsw 1..255, porches up to 1023, burst|nonburst, lp|nolp\n");
+            return 1;
+        }
+        t.non_burst = !strcmp(argv[9], "nonburst");
+        t.disable_lp = !strcmp(argv[10], "nolp");
+        esp_err_t e = display_dsi_retime(&t);
+        printf("retime: %s\n", esp_err_to_name(e));
+        display_dsi_get_timing(&t);
+    } else if (argc != 1) {
+        printf("usage: dsi-timing lane_mbps dpi_mhz hsw hbp hfp vsw vbp vfp burst|nonburst lp|nolp\n");
+        return 1;
+    }
+    int ht = 800 + t.hsw + t.hbp + t.hfp, vt = 480 + t.vsw + t.vbp + t.vfp;
+    printf("lane %.1f Mbit/s, dpi %.3f MHz (lane/dpi = %.2f), h %d/%d/%d (%d), v %d/%d/%d (%d), %s, %s, %.1f Hz\n",
+           t.lane_mbps, t.dpi_mhz, t.lane_mbps / t.dpi_mhz, t.hsw, t.hbp, t.hfp, ht, t.vsw, t.vbp, t.vfp, vt,
+           t.non_burst ? "non-burst" : "burst", t.disable_lp ? "no LP" : "LP in blanking", t.dpi_mhz * 1e6f / ht / vt);
+    return 0;
+}
+static int cmd_dsi_reg(int argc, char **argv)
+{
+    if (argc != 3) { printf("usage: dsi-reg <reg hex> <value hex>\n"); return 1; }
+    char *e1, *e2;
+    unsigned long r = strtoul(argv[1], &e1, 16), v = strtoul(argv[2], &e2, 16);
+    if (!argv[1][0] || !argv[2][0] || *e1 || *e2 || r > 0xFFFF || v > 0xFFFFFFFFul) {
+        printf("dsi-reg: register 0000..ffff and a 32-bit value, both hex\n");   /* a typo must not write register 0 */
+        return 1;
+    }
+    uint16_t reg = (uint16_t)r;
+    uint32_t val = (uint32_t)v;
+    esp_err_t e = display_dsi_bridge_write(reg, val);
+    printf("bridge 0x%04x <= 0x%08lx: %s\n", reg, (unsigned long)val, esp_err_to_name(e));
+    return e == ESP_OK ? 0 : 1;
+}
+static int cmd_fb_pattern(int argc, char **argv) { display_dsi_test_pattern(!(argc > 1 && !strcmp(argv[1], "off"))); return 0; }
+static int cmd_fb_dump(int argc, char **argv) { (void)argc; (void)argv; display_dsi_dump_framebuffer(); return 0; }
+static int cmd_touch_poll(int argc, char **argv) { display_touch_poll(!(argc > 1 && !strcmp(argv[1], "off"))); printf("touch polling %s\n", argc > 1 && !strcmp(argv[1], "off") ? "off" : "on"); return 0; }
+#endif
+#ifdef BOARD_I2C_SDA_GPIO
+/* Lists every 7-bit address that ACKs on the board's internal I2C bus (the one
+ * the DSI/CSI connectors carry). A temporary bus on the same pins: run it while
+ * nothing else owns them (on a display build, only when the display was not found). */
+static int cmd_i2c_scan(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    i2c_master_bus_handle_t bus;
+    i2c_master_bus_config_t bc = {
+        .i2c_port = -1, .sda_io_num = BOARD_I2C_SDA_GPIO, .scl_io_num = BOARD_I2C_SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = true,
+    };
+    esp_err_t e = i2c_new_master_bus(&bc, &bus);
+    if (e != ESP_OK) { printf("i2c bus on SDA %d SCL %d: %s\n", BOARD_I2C_SDA_GPIO, BOARD_I2C_SCL_GPIO, esp_err_to_name(e)); return 1; }
+    int found = 0;
+    printf("scanning I2C on SDA %d SCL %d\n", BOARD_I2C_SDA_GPIO, BOARD_I2C_SCL_GPIO);
+    for (uint16_t a = 0x08; a < 0x78; a++) {
+        if (i2c_master_probe(bus, a, 20) == ESP_OK) { printf("  0x%02x\n", a); found++; }
+    }
+    printf("%d device(s)\n", found);
+    i2c_del_master_bus(bus);
+    return 0;
+}
+#endif
+
 static int cmd_eth_rx_stall_test(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -392,6 +477,16 @@ esp_err_t console_start(void)
         {.command = "c6-update", .help = "c6-update [url [sha256]]: install an ESP-Hosted co-processor image over SDIO (default: the pinned " COPROC_HOST_LIB_VERSION " image); the dock restarts afterwards", .func = cmd_c6_update},
         {.command = "log", .help = "The web UI's log ring", .func = cmd_log},
         {.command = "reboot", .help = "Restart the dock", .func = cmd_reboot},
+#ifdef BOARD_I2C_SDA_GPIO
+        {.command = "i2c-scan", .help = "List the devices that answer on the internal I2C bus (DSI/CSI connectors)", .func = cmd_i2c_scan},
+#endif
+#if CONFIG_RRC_DISPLAY_RPI_DSI
+        {.command = "dsi-reg", .help = "dsi-reg <reg> <value>: write a TC358762 bridge register (hex) over DSI (bring-up tool)", .func = cmd_dsi_reg},
+        {.command = "fb-pattern", .help = "fb-pattern [off]: hold a test pattern in the Pi DSI framebuffer, bypassing LVGL, until `fb-pattern off` (bring-up tool)", .func = cmd_fb_pattern},
+        {.command = "fb-dump", .help = "Print the Pi DSI framebuffer as base64 rows (bring-up tool, ~1.5 MB on the console)", .func = cmd_fb_dump},
+        {.command = "touch-poll", .help = "touch-poll [off]: stop or resume polling the touch controller over I2C (bring-up tool)", .func = cmd_touch_poll},
+        {.command = "dsi-timing", .help = "dsi-timing [lane_mbps dpi_mhz hsw hbp hfp vsw vbp vfp burst|nonburst lp|nolp]: show or change the Pi DSI panel's link timing live (bring-up tool)", .func = cmd_dsi_timing},
+#endif
         {.command = "eth-rx-stall-test", .help = "Drop every received ethernet frame to test the receive watchdog (the dock restarts itself)", .func = cmd_eth_rx_stall_test},
     };
     for (size_t i = 0; i < sizeof cmds / sizeof cmds[0]; i++) esp_console_cmd_register(&cmds[i]);

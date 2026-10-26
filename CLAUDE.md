@@ -45,7 +45,7 @@ Design docs (read the relevant section before touching sync logic):
 | `tauri-plugin-rrcloud/`             | Android plugin: Kotlin WorkManager jobs, Keystore credentials, DCIM observer, BLE dock client, JNI bridge            | fork                      | built through the app       |
 | `protocol/`                         | Wire-format definition (`rrcloud.protocol.toml`) + Python generator `rrcgen` + generated Rust/C/C++/JSON Schema SDKs | fork                      | repo root (`python3`)       |
 | `pairing/`                          | Pairing/discovery microservice (axum), standalone crate                                                              | fork                      | `pairing/`                  |
-| `firmware/rrcloud-ingest/`          | ESP32-P4 ingest dock firmware (ESP-IDF 5.5, C)                                                                       | fork                      | that dir                    |
+| `firmware/rrcloud-ingest/`          | ESP32-P4 ingest dock firmware (ESP-IDF 5.5.5, C)                                                                     | fork                      | that dir                    |
 | `worker/Dockerfile`, `deploy/helm/` | Worker image + Helm chart                                                                                            | fork                      | —                           |
 | `bench/`                            | Sync replay/benchmark scripts                                                                                        | fork                      | —                           |
 | `packaging/`, `data/`               | Flatpak packaging (upstream)                                                                                         | upstream                  | —                           |
@@ -135,7 +135,7 @@ Pairing (`cd pairing`): `cargo fmt --check && cargo clippy --all-targets -- -D w
 | anything (PR)                      | `lint.yml`                | frontend lint/format/i18n (non-blocking), `cargo fmt`, `cargo clippy -D warnings` on `src-tauri` |
 | `src-tauri/crates/rrcloud-core/**` | `rrcloud.yml`             | fmt, clippy, tests with Garage                                                                   |
 | `protocol/**`                      | `protocol.yml`            | generated output up to date, Rust + C/C++ conformance, engine-vs-SDK conformance                 |
-| `firmware/**` or `protocol/**`     | `firmware.yml`            | host tests, committed interop fixtures up to date, ESP-IDF build                                 |
+| `firmware/**` or `protocol/**`     | `firmware.yml`            | host tests, interop fixtures up to date, UI simulator, ESP-IDF build of both boards              |
 
 Run the matching local commands before pushing.
 
