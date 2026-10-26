@@ -898,24 +898,59 @@ fn apply_color_grading(color: vec3<f32>, shadows: ColorGradeSettings, midtones: 
     return graded_color;
 }
 
-fn sample_gf_tex(tex: texture_2d<f32>, abs_coord: vec2<u32>) -> vec4<f32> {
+// Mali Vulkan drivers (e.g. r54p3 on Pixel 7-10) segfault in
+// vkCreateComputePipelines when a texture is passed as a function
+// argument, so each guided-filter texture gets its own copy (#1954).
+fn sample_gf_tex_coeffs(abs_coord: vec2<u32>) -> vec4<f32> {
     let full = vec2<f32>(textureDimensions(input_texture));
-    let low_i = vec2<i32>(textureDimensions(tex));
+    let low_i = vec2<i32>(textureDimensions(gf_coeffs_texture));
     let p = (vec2<f32>(abs_coord) + 0.5) / full * vec2<f32>(low_i) - 0.5;
     let fl = floor(p);
     let w = p - fl;
     let max_idx = low_i - vec2<i32>(1);
     let c0 = clamp(vec2<i32>(fl), vec2<i32>(0), max_idx);
     let c1 = clamp(vec2<i32>(fl) + vec2<i32>(1), vec2<i32>(0), max_idx);
-    let v00 = textureLoad(tex, c0, 0);
-    let v10 = textureLoad(tex, vec2<i32>(c1.x, c0.y), 0);
-    let v01 = textureLoad(tex, vec2<i32>(c0.x, c1.y), 0);
-    let v11 = textureLoad(tex, c1, 0);
+    let v00 = textureLoad(gf_coeffs_texture, c0, 0);
+    let v10 = textureLoad(gf_coeffs_texture, vec2<i32>(c1.x, c0.y), 0);
+    let v01 = textureLoad(gf_coeffs_texture, vec2<i32>(c0.x, c1.y), 0);
+    let v11 = textureLoad(gf_coeffs_texture, c1, 0);
+    return mix(mix(v00, v10, w.x), mix(v01, v11, w.x), w.y);
+}
+
+fn sample_gf_tex_haze(abs_coord: vec2<u32>) -> vec4<f32> {
+    let full = vec2<f32>(textureDimensions(input_texture));
+    let low_i = vec2<i32>(textureDimensions(haze_texture));
+    let p = (vec2<f32>(abs_coord) + 0.5) / full * vec2<f32>(low_i) - 0.5;
+    let fl = floor(p);
+    let w = p - fl;
+    let max_idx = low_i - vec2<i32>(1);
+    let c0 = clamp(vec2<i32>(fl), vec2<i32>(0), max_idx);
+    let c1 = clamp(vec2<i32>(fl) + vec2<i32>(1), vec2<i32>(0), max_idx);
+    let v00 = textureLoad(haze_texture, c0, 0);
+    let v10 = textureLoad(haze_texture, vec2<i32>(c1.x, c0.y), 0);
+    let v01 = textureLoad(haze_texture, vec2<i32>(c0.x, c1.y), 0);
+    let v11 = textureLoad(haze_texture, c1, 0);
+    return mix(mix(v00, v10, w.x), mix(v01, v11, w.x), w.y);
+}
+
+fn sample_gf_tex_structure(abs_coord: vec2<u32>) -> vec4<f32> {
+    let full = vec2<f32>(textureDimensions(input_texture));
+    let low_i = vec2<i32>(textureDimensions(gf_structure_texture));
+    let p = (vec2<f32>(abs_coord) + 0.5) / full * vec2<f32>(low_i) - 0.5;
+    let fl = floor(p);
+    let w = p - fl;
+    let max_idx = low_i - vec2<i32>(1);
+    let c0 = clamp(vec2<i32>(fl), vec2<i32>(0), max_idx);
+    let c1 = clamp(vec2<i32>(fl) + vec2<i32>(1), vec2<i32>(0), max_idx);
+    let v00 = textureLoad(gf_structure_texture, c0, 0);
+    let v10 = textureLoad(gf_structure_texture, vec2<i32>(c1.x, c0.y), 0);
+    let v01 = textureLoad(gf_structure_texture, vec2<i32>(c0.x, c1.y), 0);
+    let v11 = textureLoad(gf_structure_texture, c1, 0);
     return mix(mix(v00, v10, w.x), mix(v01, v11, w.x), w.y);
 }
 
 fn sample_gf_coeffs(abs_coord: vec2<u32>) -> vec4<f32> {
-    return sample_gf_tex(gf_coeffs_texture, abs_coord);
+    return sample_gf_tex_coeffs(abs_coord);
 }
 
 fn shape_detail(d: f32, sigma: f32) -> f32 {
@@ -1064,7 +1099,7 @@ fn apply_dehaze(color: vec3<f32>, abs_coord: vec2<u32>, local_luma: f32, amount:
     let air = textureLoad(airlight_texture, vec2<i32>(0, 0), 0);
     let rgb = max(color, vec3<f32>(0.0));
     let guide = min(pow(get_luma(rgb) / air.w, HZ_GUIDE_GAMMA), HZ_GUIDE_MAX);
-    let ab = sample_gf_tex(haze_texture, abs_coord).xy;
+    let ab = sample_gf_tex_haze(abs_coord).xy;
     let veil = clamp(ab.x * guide + ab.y, 0.0, 1.0);
 
     if (amount < 0.0) {
@@ -1905,7 +1940,7 @@ fn main(
     let detail_clarity = gf_i - (gf.x * gf_i + gf.y);
     var detail_structure = 0.0;
     if (t_structure != 0.0) {
-        let gf_s = sample_gf_tex(gf_structure_texture, absolute_coord).xy;
+        let gf_s = sample_gf_tex_structure(absolute_coord).xy;
         detail_structure = gf_i - (gf_s.x * gf_i + gf_s.y);
     }
 
@@ -1969,7 +2004,7 @@ fn main(
     var tonal_mid_detail = 0.0;
     if (t_shadows != 0.0 || t_blacks != 0.0 || t_highlights != 0.0 || t_whites != 0.0) {
         tonal_log_detail = (gf_i - (gf.z * gf_i + gf.w)) + lc_log_gain;
-        let gf_broad = sample_gf_tex(gf_structure_texture, absolute_coord).xy;
+        let gf_broad = sample_gf_tex_structure(absolute_coord).xy;
         tonal_mid_detail = (gf.z * gf_i + gf.w) - (gf_broad.x * gf_i + gf_broad.y);
     }
     composite_rgb_linear = apply_tonal_adjustments(composite_rgb_linear, tonal_log_detail, tonal_mid_detail, is_raw, t_contrast, t_shadows, t_whites, t_blacks);
