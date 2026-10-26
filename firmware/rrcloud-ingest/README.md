@@ -160,10 +160,12 @@ driver is `components/esp_lcd_rpi_dsi`, a vendored copy of
 its `LICENSE` is in the directory; the two local changes for ESP-IDF 5.5 are marked
 `rrcloud:` in its `CMakeLists.txt` and `esp_lcd_rpi_dsi.c`). It brings up, in one call:
 
-- a TC358762-compatible DSI-to-DPI bridge on **one** data lane at 700 Mbit/s, fed RGB888 and
-  configured with DSI Generic Long Writes (the legacy Linux `panel-raspberrypi-touchscreen.c`
-  sequence) before video starts. It derives its pixel clock from the DSI clock lane, so the
-  clock lane stays in high-speed mode continuously;
+- a TC358762-compatible DSI-to-DPI bridge on **one** data lane, fed RGB888 and configured
+  with DSI Generic Long Writes (the legacy Linux `panel-raspberrypi-touchscreen.c` sequence)
+  before video starts. It derives its pixel clock from the DSI clock lane (lane rate / 24), so
+  the clock lane stays in high-speed mode continuously and the dock runs the lane at exactly
+  24 × the pixel clock: 40 MHz / 960 Mbit/s, 1056 × 631 porches, 60 Hz, burst mode (the
+  comment in `main/display.c` records what was tried on the Hosyond panel and why);
 - the controller at **I2C 0x45** for power sequencing, the bridge/LCD/touch resets and the
   backlight PWM. `REG_ID` (0x80) reads 0xde on firmware revision 1 and 0xc3 on revision 2; the
   driver logs which one answered (`rpi_dsi: ATTINY firmware revision …`);
@@ -181,6 +183,12 @@ rotates touch points back). Which
 way is up is `Display orientation` in `idf.py menuconfig` (`RRC_DISPLAY_ROTATION_90` or
 `_270`). The PoE board has no free user key, so the BOOT-key screen toggle of the 4.3" board
 is absent; the screen sleeps and wakes on touch.
+
+Bringing up another clone of the Pi display is done from the serial console, without
+reflashing: `dsi-timing` shows or changes the lane rate, pixel clock, porches and video mode
+live; `dsi-reg` writes a bridge register; `fb-pattern` holds a known-clean test pattern in the
+framebuffer (so a smear or stripe that survives it is the panel's, one that does not is the
+renderer's) and `fb-dump` prints the framebuffer as base64 rows.
 
 ## On-screen UI (ESP32-P4-WIFI6-Touch-LCD-4.3)
 

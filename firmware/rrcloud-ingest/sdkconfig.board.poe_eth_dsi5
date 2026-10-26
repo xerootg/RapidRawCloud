@@ -5,12 +5,10 @@
 # a display attached the image runs headless.
 CONFIG_RRC_BOARD_P4_POE_ETH_DSI5=y
 
-# ---- Panel driver (components/esp_lcd_rpi_dsi). Non-burst video with the long porches, at a
-# lane rate main/display.c sets to exactly 24x the pixel clock (the bridge clocks pixels out
-# at lane rate / 24; the comment there has the details). DMA2D copies need the driver's IDF 6
-# API; the dock builds on 5.5.5 and rotates into the framebuffer with the CPU anyway.
-CONFIG_ESP_LCD_RPI_DSI_TIMING_WAVESHARE=y
-CONFIG_ESP_LCD_RPI_DSI_NON_BURST_VIDEO=y
+# ---- Panel driver (components/esp_lcd_rpi_dsi). The porches, pixel clock, lane rate and video
+# mode are set in main/display.c (the comment there has the measurements). DMA2D copies need
+# the driver's IDF 6 API; the dock builds on 5.5.5 and rotates into the framebuffer with the
+# CPU anyway.
 CONFIG_ESP_LCD_RPI_DSI_USE_DMA2D=n
 # The FT5x06 reports panel-native 800x480 coordinates with its origin at the opposite corner
 # from the framebuffer's (measured on the Hosyond: a tap at the UI's top-left read x=789 y=28);

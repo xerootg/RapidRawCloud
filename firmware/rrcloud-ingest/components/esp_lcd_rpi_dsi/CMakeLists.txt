@@ -12,6 +12,7 @@ else()
 endif()
 
 idf_component_register(SRCS "esp_lcd_rpi_dsi.c" "esp_lcd_rpi_dsi_panel.c"
-                       INCLUDE_DIRS "include"
+                       # rrcloud: the panel-level header too, for the bring-up register writes (console dsi-reg)
+                       INCLUDE_DIRS "include" "."
                        REQUIRES esp_lcd esp_driver_i2c esp_hw_support esp_lcd_touch_ft5x06
                        PRIV_REQUIRES ${dsi_hal_component})

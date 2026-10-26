@@ -337,4 +337,11 @@ esp_err_t esp_lcd_panel_rpi_dsi_set_brightness(esp_lcd_panel_handle_t panel, uin
     return rpi_dsi_attiny_write(ctx, REG_PWM, brightness);
 }
 
+esp_err_t esp_lcd_panel_rpi_dsi_bridge_write(esp_lcd_panel_handle_t panel, uint16_t reg, uint32_t val)
+{
+    ESP_RETURN_ON_FALSE(panel, ESP_ERR_INVALID_ARG, TAG, "invalid panel handle");
+    rpi_dsi_bridge_write(panel->user_data, reg, val);   // rrcloud
+    return ESP_OK;
+}
+
 #endif // SOC_MIPI_DSI_SUPPORTED

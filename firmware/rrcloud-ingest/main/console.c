@@ -27,6 +27,7 @@
 #include "mbedtls/aes.h"
 #include "rrc_hash.h"
 #include "board.h"
+#include "display.h"
 #ifdef BOARD_I2C_SDA_GPIO
 #include "driver/i2c_master.h"
 #endif
@@ -123,6 +124,42 @@ static int cmd_sync(int argc, char **argv) { (void)argc; (void)argv; sync_reques
 static int cmd_sync_cancel(int argc, char **argv) { (void)argc; (void)argv; sync_cancel(); printf("cancelling\n"); return 0; }
 static int cmd_usb_reset(int argc, char **argv) { (void)argc; (void)argv; return usb_diag_power_cycle() == ESP_OK ? 0 : 1; }
 static int cmd_reboot(int argc, char **argv) { (void)argc; (void)argv; printf("rebooting\n"); vTaskDelay(pdMS_TO_TICKS(200)); esp_restart(); return 0; }
+#if CONFIG_RRC_DISPLAY_RPI_DSI
+static int cmd_dsi_timing(int argc, char **argv)
+{
+    display_dsi_timing_t t;
+    display_dsi_get_timing(&t);
+    if (argc == 11) {
+        t.lane_mbps = strtof(argv[1], NULL); t.dpi_mhz = strtof(argv[2], NULL);
+        t.hsw = atoi(argv[3]); t.hbp = atoi(argv[4]); t.hfp = atoi(argv[5]);
+        t.vsw = atoi(argv[6]); t.vbp = atoi(argv[7]); t.vfp = atoi(argv[8]);
+        t.non_burst = !strcmp(argv[9], "nonburst");
+        t.disable_lp = !strcmp(argv[10], "nolp");
+        esp_err_t e = display_dsi_retime(&t);
+        printf("retime: %s\n", esp_err_to_name(e));
+        display_dsi_get_timing(&t);
+    } else if (argc != 1) {
+        printf("usage: dsi-timing lane_mbps dpi_mhz hsw hbp hfp vsw vbp vfp burst|nonburst lp|nolp\n");
+        return 1;
+    }
+    int ht = 800 + t.hsw + t.hbp + t.hfp, vt = 480 + t.vsw + t.vbp + t.vfp;
+    printf("lane %.1f Mbit/s, dpi %.3f MHz (lane/dpi = %.2f), h %d/%d/%d (%d), v %d/%d/%d (%d), %s, %s, %.1f Hz\n",
+           t.lane_mbps, t.dpi_mhz, t.lane_mbps / t.dpi_mhz, t.hsw, t.hbp, t.hfp, ht, t.vsw, t.vbp, t.vfp, vt,
+           t.non_burst ? "non-burst" : "burst", t.disable_lp ? "no LP" : "LP in blanking", t.dpi_mhz * 1e6f / ht / vt);
+    return 0;
+}
+static int cmd_dsi_reg(int argc, char **argv)
+{
+    if (argc != 3) { printf("usage: dsi-reg <reg hex> <value hex>\n"); return 1; }
+    uint16_t reg = (uint16_t)strtoul(argv[1], NULL, 16);
+    uint32_t val = (uint32_t)strtoul(argv[2], NULL, 16);
+    esp_err_t e = display_dsi_bridge_write(reg, val);
+    printf("bridge 0x%04x <= 0x%08lx: %s\n", reg, (unsigned long)val, esp_err_to_name(e));
+    return e == ESP_OK ? 0 : 1;
+}
+static int cmd_fb_pattern(int argc, char **argv) { display_dsi_test_pattern(!(argc > 1 && !strcmp(argv[1], "off"))); return 0; }
+static int cmd_fb_dump(int argc, char **argv) { (void)argc; (void)argv; display_dsi_dump_framebuffer(); return 0; }
+#endif
 #ifdef BOARD_I2C_SDA_GPIO
 /* Lists every 7-bit address that ACKs on the board's internal I2C bus (the one
  * the DSI/CSI connectors carry). A temporary bus on the same pins: run it while
@@ -423,6 +460,12 @@ esp_err_t console_start(void)
         {.command = "reboot", .help = "Restart the dock", .func = cmd_reboot},
 #ifdef BOARD_I2C_SDA_GPIO
         {.command = "i2c-scan", .help = "List the devices that answer on the internal I2C bus (DSI/CSI connectors)", .func = cmd_i2c_scan},
+#endif
+#if CONFIG_RRC_DISPLAY_RPI_DSI
+        {.command = "dsi-reg", .help = "dsi-reg <reg> <value>: write a TC358762 bridge register (hex) over DSI (bring-up tool)", .func = cmd_dsi_reg},
+        {.command = "fb-pattern", .help = "fb-pattern [off]: hold a test pattern in the Pi DSI framebuffer, bypassing LVGL, until `fb-pattern off` (bring-up tool)", .func = cmd_fb_pattern},
+        {.command = "fb-dump", .help = "Print the Pi DSI framebuffer as base64 rows (bring-up tool, ~1.5 MB on the console)", .func = cmd_fb_dump},
+        {.command = "dsi-timing", .help = "dsi-timing [lane_mbps dpi_mhz hsw hbp hfp vsw vbp vfp burst|nonburst lp|nolp]: show or change the Pi DSI panel's link timing live (bring-up tool)", .func = cmd_dsi_timing},
 #endif
         {.command = "eth-rx-stall-test", .help = "Drop every received ethernet frame to test the receive watchdog (the dock restarts itself)", .func = cmd_eth_rx_stall_test},
     };

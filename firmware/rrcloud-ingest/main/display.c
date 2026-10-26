@@ -56,6 +56,7 @@
 #if CONFIG_RRC_DISPLAY_RPI_DSI
 #include "esp_cache.h"
 #include "esp_lcd_rpi_dsi.h"
+#include "esp_lcd_rpi_dsi_panel.h"
 #endif
 #include "lvgl.h"
 #include "src/draw/sw/lv_draw_sw_utils.h"
@@ -241,6 +242,8 @@ static esp_err_t touch_init(void)
 #define RPI_BPP 3   /* the driver feeds the bridge RGB888: three bytes per pixel, blue first */
 
 static esp_lcd_rpi_dsi_handle_t rpi;
+static i2c_master_bus_handle_t rpi_i2c;
+static esp_lcd_rpi_dsi_config_t rpi_cfg;
 static uint8_t *rpi_fb;   /* the DPI framebuffer, 800x480 RGB888, native orientation */
 
 static void backlight_set(int pct)
@@ -250,40 +253,10 @@ static void backlight_set(int pct)
     if (rpi) esp_lcd_rpi_dsi_set_brightness(rpi, (uint8_t)(255 * pct / 100));
 }
 
-static esp_err_t rpi_panel_init(void)
+/* Bring the driver up on the bus with rpi_cfg and take the framebuffer. */
+static esp_err_t rpi_panel_up(void)
 {
-    i2c_master_bus_handle_t bus;
-    i2c_master_bus_config_t bc = {
-        .i2c_port = -1, .sda_io_num = BOARD_I2C_SDA_GPIO, .scl_io_num = BOARD_I2C_SCL_GPIO,
-        .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = true,
-    };
-    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bc, &bus), TAG, "I2C bus");
-    /* Nothing at 0x45 means no display on the connector: run headless rather than
-     * bring up a DSI bus with nobody listening. */
-    if (i2c_master_probe(bus, ESP_LCD_RPI_DSI_ATTINY_ADDR, 50) != ESP_OK) {
-        i2c_del_master_bus(bus);
-        return ESP_ERR_NOT_FOUND;
-    }
-    esp_lcd_rpi_dsi_config_t cfg = ESP_LCD_RPI_DSI_DEFAULT_CONFIG();
-    cfg.i2c.bus = bus;
-    cfg.ldo_chan = BOARD_DSI_PHY_LDO_CHAN;
-    cfg.ldo_voltage_mv = BOARD_DSI_PHY_LDO_MV;
-    cfg.brightness = 255;
-    /* Link timing, as Linux drives this panel: non-burst video with sync pulses
-     * (MIPI_DSI_MODE_VIDEO_SYNC_PULSE) at a lane rate of exactly 24x the pixel clock,
-     * because the bridge derives its DPI pixel clock from the DSI clock lane (lane
-     * rate / 24 for RGB888 on one lane). Any other ratio leaves the bridge clocking
-     * pixels out at a different rate than they arrive: the driver's defaults (burst,
-     * 700 Mbit/s, 26 MHz) drop every other pixel on the Hosyond panel. The porches
-     * are the roomy ones (hfp 59, CONFIG_ESP_LCD_RPI_DSI_TIMING_WAVESHARE): the host
-     * programs its line in lane byte clocks, 3 per pixel here, and the legacy hfp of 1
-     * pixel leaves no room for even one blanking packet. The P4 makes the pixel clock
-     * from PLL_F240M with an integer divider, so ask for the value it can produce and
-     * size the lane from that: 26.67 MHz x 24 = 640 Mbit/s, 57.6 Hz. */
-    cfg.dpi_clock_freq_mhz = 240.0f / 9.0f;
-    cfg.lane_bit_rate_mbps = 24.0f * cfg.dpi_clock_freq_mhz;
-    esp_err_t e = esp_lcd_rpi_dsi_start(&cfg, &rpi);
-    if (e != ESP_OK) { i2c_del_master_bus(bus); return e; }
+    ESP_RETURN_ON_ERROR(esp_lcd_rpi_dsi_start(&rpi_cfg, &rpi), TAG, "rpi_dsi");
     panel = esp_lcd_rpi_dsi_get_panel(rpi);
     touch = esp_lcd_rpi_dsi_get_touch(rpi);
     void *fb = NULL;
@@ -294,11 +267,161 @@ static esp_err_t rpi_panel_init(void)
     return ESP_OK;
 }
 
+static esp_err_t rpi_panel_init(void)
+{
+    i2c_master_bus_config_t bc = {
+        .i2c_port = -1, .sda_io_num = BOARD_I2C_SDA_GPIO, .scl_io_num = BOARD_I2C_SCL_GPIO,
+        .clk_source = I2C_CLK_SRC_DEFAULT, .glitch_ignore_cnt = 7, .flags.enable_internal_pullup = true,
+    };
+    ESP_RETURN_ON_ERROR(i2c_new_master_bus(&bc, &rpi_i2c), TAG, "I2C bus");
+    /* Nothing at 0x45 means no display on the connector: run headless rather than
+     * bring up a DSI bus with nobody listening. */
+    if (i2c_master_probe(rpi_i2c, ESP_LCD_RPI_DSI_ATTINY_ADDR, 50) != ESP_OK) {
+        i2c_del_master_bus(rpi_i2c);
+        rpi_i2c = NULL;
+        return ESP_ERR_NOT_FOUND;
+    }
+    rpi_cfg = (esp_lcd_rpi_dsi_config_t)ESP_LCD_RPI_DSI_DEFAULT_CONFIG();
+    rpi_cfg.i2c.bus = rpi_i2c;
+    rpi_cfg.ldo_chan = BOARD_DSI_PHY_LDO_CHAN;
+    rpi_cfg.ldo_voltage_mv = BOARD_DSI_PHY_LDO_MV;
+    rpi_cfg.brightness = 255;
+    /* Link timing, measured on the Hosyond 5-inch panel with the console's
+     * `dsi-timing` (every setting below was A/B'd by eye on the panel):
+     *   - the lane rate is exactly 24x the pixel clock. The bridge derives its DPI
+     *     pixel clock from the DSI clock lane (lane / 24 for RGB888 on one lane); any
+     *     other ratio has it clocking pixels out at a different rate than they
+     *     arrive, and the driver's defaults (700 Mbit/s for 26 MHz) dropped every
+     *     other pixel;
+     *   - the P4 makes the pixel clock from PLL_F240M with an integer divider and the
+     *     D-PHY PLL from 20 MHz in even multiples, so the exact-24x pairs are
+     *     26.67/640, 30/720 and 40/960. Faint column banding on this glass got weaker
+     *     with every step up; 40 MHz is where it was no longer visible;
+     *   - the porches are then stretched to hold the glass at 60 Hz (1056 x 631; the
+     *     2026 kernel fix for the genuine panel's timing uses the same 20/26/210 line).
+     *     They also matter for the host: it programs its line in lane byte clocks,
+     *     and the legacy hfp of 1 pixel (3 bytes) cannot hold a blanking packet;
+     *   - burst mode. Non-burst with sync pulses worked just as well and LP
+     *     excursions in blanking made no difference either way. */
+    rpi_cfg.timing = (esp_lcd_video_timing_t){
+        .h_size = ESP_LCD_RPI_DSI_H_RES, .v_size = ESP_LCD_RPI_DSI_V_RES,
+        .hsync_pulse_width = 20, .hsync_back_porch = 26, .hsync_front_porch = 210,
+        .vsync_pulse_width = 2, .vsync_back_porch = 21, .vsync_front_porch = 128,
+    };
+    rpi_cfg.dpi_clock_freq_mhz = 40.0f;
+    rpi_cfg.lane_bit_rate_mbps = 24.0f * rpi_cfg.dpi_clock_freq_mhz;
+    rpi_cfg.flags.non_burst_video = 0;
+    rpi_cfg.flags.disable_lp = 0;
+    esp_err_t e = rpi_panel_up();
+    if (e != ESP_OK) { i2c_del_master_bus(rpi_i2c); rpi_i2c = NULL; }
+    return e;
+}
+
+void display_dsi_get_timing(display_dsi_timing_t *out)
+{
+    const esp_lcd_video_timing_t *t = &rpi_cfg.timing;
+    *out = (display_dsi_timing_t){
+        .lane_mbps = rpi_cfg.lane_bit_rate_mbps, .dpi_mhz = rpi_cfg.dpi_clock_freq_mhz,
+        .hsw = t->hsync_pulse_width, .hbp = t->hsync_back_porch, .hfp = t->hsync_front_porch,
+        .vsw = t->vsync_pulse_width, .vbp = t->vsync_back_porch, .vfp = t->vsync_front_porch,
+        .non_burst = rpi_cfg.flags.non_burst_video, .disable_lp = rpi_cfg.flags.disable_lp,
+    };
+}
+
+/* Bring-up: a known-clean pattern straight into the framebuffer, bypassing LVGL
+ * (which overwrites it on its next redraw): black, a white 1-px grid every 100 px,
+ * a white box, and R/G/B bars at the top. Whatever smears on this is the panel. */
+static bool pattern_hold;   /* flushes are dropped while the pattern is up */
+
+void display_dsi_test_pattern(bool on)
+{
+    if (!rpi_fb) return;
+    lv_lock();
+    pattern_hold = on;
+    if (!on) { lv_obj_invalidate(lv_screen_active()); lv_unlock(); return; }
+    memset(rpi_fb, 0, BOARD_LCD_H_RES * BOARD_LCD_V_RES * RPI_BPP);
+    for (int y = 0; y < BOARD_LCD_V_RES; y++) {
+        uint8_t *row = rpi_fb + (size_t)y * BOARD_LCD_H_RES * RPI_BPP;
+        for (int x = 0; x < BOARD_LCD_H_RES; x++) {
+            uint8_t b = 0, g = 0, r = 0;
+            if (y < 40) { if (x < 266) r = 255; else if (x < 533) g = 255; else b = 255; }
+            else if (x % 100 == 0 || y % 100 == 0) r = g = b = 255;
+            else if (x >= 300 && x < 500 && y >= 200 && y < 300) r = g = b = 255;
+            row[x * 3] = b; row[x * 3 + 1] = g; row[x * 3 + 2] = r;
+        }
+    }
+    esp_cache_msync(rpi_fb, BOARD_LCD_H_RES * BOARD_LCD_V_RES * RPI_BPP, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
+    lv_unlock();
+}
+
+/* Bring-up: the framebuffer as it is, base64, one native row per line, under the
+ * LVGL lock so the dump is one consistent frame. */
+void display_dsi_dump_framebuffer(void)
+{
+    if (!rpi_fb) return;
+    static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const size_t row_bytes = BOARD_LCD_H_RES * RPI_BPP;   /* 2400: a multiple of 3 */
+    char *line = malloc(row_bytes / 3 * 4 + 1);
+    if (!line) return;
+    lv_lock();
+    printf("FBDUMP BEGIN %dx%d rgb888\n", BOARD_LCD_H_RES, BOARD_LCD_V_RES);
+    for (int y = 0; y < BOARD_LCD_V_RES; y++) {
+        const uint8_t *p = rpi_fb + (size_t)y * row_bytes;
+        char *o = line;
+        for (size_t i = 0; i < row_bytes; i += 3) {
+            uint32_t v = (p[i] << 16) | (p[i + 1] << 8) | p[i + 2];
+            *o++ = b64[(v >> 18) & 63]; *o++ = b64[(v >> 12) & 63]; *o++ = b64[(v >> 6) & 63]; *o++ = b64[v & 63];
+        }
+        *o = 0;
+        printf("FB %s\n", line);
+        vTaskDelay(1);   /* let the console UART drain */
+    }
+    printf("FBDUMP END\n");
+    lv_unlock();
+    free(line);
+}
+
+esp_err_t display_dsi_bridge_write(uint16_t reg, uint32_t val)
+{
+    if (!panel) return ESP_ERR_INVALID_STATE;
+    return esp_lcd_panel_rpi_dsi_bridge_write(panel, reg, val);
+}
+
+esp_err_t display_dsi_retime(const display_dsi_timing_t *t)
+{
+    if (!rpi || !disp) return ESP_ERR_INVALID_STATE;
+    esp_lcd_rpi_dsi_config_t keep = rpi_cfg;
+    rpi_cfg.lane_bit_rate_mbps = t->lane_mbps;
+    rpi_cfg.dpi_clock_freq_mhz = t->dpi_mhz;
+    rpi_cfg.timing.hsync_pulse_width = t->hsw; rpi_cfg.timing.hsync_back_porch = t->hbp; rpi_cfg.timing.hsync_front_porch = t->hfp;
+    rpi_cfg.timing.vsync_pulse_width = t->vsw; rpi_cfg.timing.vsync_back_porch = t->vbp; rpi_cfg.timing.vsync_front_porch = t->vfp;
+    rpi_cfg.flags.non_burst_video = t->non_burst;
+    rpi_cfg.flags.disable_lp = t->disable_lp;
+    /* Under the LVGL lock nothing flushes into the framebuffer the driver is about
+     * to free, and touch_read_cb sees touch == NULL meanwhile. */
+    lv_lock();
+    touch = NULL;
+    panel = NULL;
+    rpi_fb = NULL;
+    esp_lcd_rpi_dsi_stop(rpi);
+    rpi = NULL;
+    esp_err_t e = rpi_panel_up();
+    if (e != ESP_OK) {
+        log_ring_printf("display: dsi-timing failed (%s), restoring the previous link", esp_err_to_name(e));
+        rpi_cfg = keep;
+        e = rpi_panel_up();
+    }
+    if (e == ESP_OK) lv_obj_invalidate(lv_screen_active());
+    lv_unlock();
+    return e;
+}
+
 /* Partial mode: `area` is in the UI's portrait coordinates and `px` holds it
  * row by row. Rotate it straight into its place in the landscape framebuffer,
  * then write the touched rows back from the cache (the DPI DMA reads PSRAM). */
 static void flush_rotated_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px)
 {
+    if (pattern_hold) { lv_display_flush_ready(d); return; }
     lv_area_t a = *area;
     int32_t w = lv_area_get_width(&a), h = lv_area_get_height(&a);
     lv_color_format_t cf = lv_display_get_color_format(d);
@@ -342,6 +465,7 @@ static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     /* Asleep: sample at 10 Hz instead of every LVGL read (the INT line is not
      * routed, so the controller is polled over I2C either way). */
     int64_t now = esp_timer_get_time();
+    if (!touch) { data->state = last_state = LV_INDEV_STATE_RELEASED; return; }   /* link being re-timed */
     if (rrc_ui_asleep() && now - last_us < 100000) { data->state = last_state; return; }
     last_us = now;
     esp_lcd_touch_point_data_t pt[1];

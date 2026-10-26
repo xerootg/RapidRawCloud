@@ -45,6 +45,10 @@ esp_err_t esp_lcd_new_panel_rpi_dsi(esp_lcd_panel_io_handle_t io,
 
 esp_err_t esp_lcd_panel_rpi_dsi_set_brightness(esp_lcd_panel_handle_t panel, uint8_t brightness);
 
+/* rrcloud: one generic long write to a bridge register, for bring-up of clone
+ * panels (LCDCTRL polarities, the video timing generator registers 0x0424..0x0434). */
+esp_err_t esp_lcd_panel_rpi_dsi_bridge_write(esp_lcd_panel_handle_t panel, uint16_t reg, uint32_t val);
+
 #ifdef __cplusplus
 }
 #endif
