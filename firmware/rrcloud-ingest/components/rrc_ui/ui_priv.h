@@ -49,12 +49,23 @@ LV_FONT_DECLARE(ui_font_icon28);
 #define UI_FONT_ICON      (&ui_font_icon28)  /* 24 dp icons: navigation, list leading, app bar */
 
 /* Geometry (px), M3 dp × ~1.2–1.36: touch targets ≥ 48 dp while 480 px still fits a
- * ten-key keyboard row. */
-#define UI_W              480
-#define UI_H              800
+ * ten-key keyboard row. The screen size comes from the display at rrc_ui_start()
+ * and again after each rotation: 480x800 portrait gets the bottom navigation bar,
+ * 800x480 landscape a navigation rail on the left and a shorter app bar
+ * (ui_core.c build_shell). */
+extern int ui_w, ui_h;
+extern bool ui_landscape;
+#define UI_W              ui_w
+#define UI_H              ui_h
 #define UI_STATUS_H       40
-#define UI_APPBAR_H       80
-#define UI_NAVBAR_H       104
+#define UI_APPBAR_H       (ui_landscape ? 64 : 80)
+#define UI_NAVBAR_H       104      /* portrait: bottom navigation bar */
+#define UI_RAIL_W         96       /* landscape: navigation rail */
+#define UI_RAIL_ITEM_H    96       /* rail destinations: fixed pitch from the top (ui_sim taps them by position) */
+/* The content area's origin and width (right of the rail in landscape). */
+#define UI_CONTENT_X      (ui_landscape ? UI_RAIL_W : 0)
+#define UI_CONTENT_Y      (UI_STATUS_H + UI_APPBAR_H)
+#define UI_CONTENT_W      (UI_W - UI_CONTENT_X)
 #define UI_PAD            20       /* screen margin */
 #define UI_GAP            14
 #define UI_RADIUS_CARD    20
@@ -109,6 +120,8 @@ void ui_appbar_action(const char *symbol, void (*fn)(void));
 
 /* Applies a backlight level now without saving it (brightness slider while dragging). */
 void ui_preview_backlight(int percent);
+/* True when the host can rotate the screen (the Orientation setting is shown). */
+bool ui_can_rotate(void);
 
 /* ---- admin lock ------------------------------------------------------------- */
 bool ui_lock_required(void);    /* admin_auth on and a password stored */

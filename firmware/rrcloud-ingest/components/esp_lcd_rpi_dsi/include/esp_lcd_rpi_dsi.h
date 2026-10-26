@@ -126,6 +126,13 @@ typedef struct {
     float dpi_clock_freq_mhz;         /*!< Pixel clock */
     esp_lcd_video_timing_t timing;    /*!< Video timing */
     uint8_t brightness;               /*!< Backlight PWM applied once the panel is up, 0-255 */
+    /* rrcloud: the frame buffer's pixel format (0 = RGB888, the bridge's own). RGB565 halves
+     * the memory the DSI DMA streams; the ESP32-P4's DSI bridge expands it to the RGB888 the
+     * panel is fed. */
+    lcd_color_format_t in_color_format;
+    /* rrcloud: I2C clock for the FT5x06 (0 = 100 kHz). The controller runs at 400 kHz; the
+     * panel's ATTINY, which bit-bangs, stays at 100 kHz regardless. */
+    uint32_t touch_scl_speed_hz;
     struct {
         uint32_t continuous_clock: 1; /*!< Keep the clock lane in HS. Required, see the notes above */
         uint32_t non_burst_video: 1;  /*!< Non-burst with sync pulses instead of the IDF's burst default */

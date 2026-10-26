@@ -28,4 +28,5 @@ void display_dsi_get_timing(display_dsi_timing_t *out);
 esp_err_t display_dsi_bridge_write(uint16_t reg, uint32_t val);
 void display_dsi_test_pattern(bool on);
 void display_dsi_dump_framebuffer(void);
+void display_touch_poll(bool on);
 #endif

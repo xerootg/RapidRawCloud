@@ -194,15 +194,28 @@ static void pairing_build(lv_obj_t *c)
     ui_button(row, BTN_FILLED, ICON_QR, "Start pairing", pair_start_cb, NULL);
 
     pr.card = ui_card(c);
-    lv_obj_set_flex_align(pr.card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    pr.chip = ui_chip(pr.card, "…", TONE_PRIMARY);
-    pr.msg = ui_label(pr.card, UI_FONT_SMALL, M.on_surface_variant, "");
+    /* Portrait stacks everything; landscape has the room for the QR code beside the
+     * text, and not the height for the code and the QR code one above the other. */
+    lv_obj_t *text = pr.card;
+    if (ui_landscape) {
+        lv_obj_set_flex_flow(pr.card, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(pr.card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_column(pr.card, 24, 0);
+        text = ui_column(pr.card, 10);
+        lv_obj_set_width(text, LV_SIZE_CONTENT);
+        lv_obj_set_flex_grow(text, 1);
+        lv_obj_set_flex_align(text, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    } else {
+        lv_obj_set_flex_align(pr.card, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    }
+    pr.chip = ui_chip(text, "…", TONE_PRIMARY);
+    pr.msg = ui_label(text, UI_FONT_SMALL, M.on_surface_variant, "");
     lv_obj_set_width(pr.msg, LV_PCT(100));
     lv_label_set_long_mode(pr.msg, LV_LABEL_LONG_MODE_WRAP);
-    pr.uri = ui_label(pr.card, UI_FONT_BODY, M.on_surface, "");
+    pr.uri = ui_label(text, UI_FONT_BODY, M.on_surface, "");
     lv_obj_set_width(pr.uri, LV_PCT(100));
     lv_label_set_long_mode(pr.uri, LV_LABEL_LONG_MODE_WRAP);
-    pr.code = ui_label(pr.card, UI_FONT_DISPLAY, M.primary, "");
+    pr.code = ui_label(text, UI_FONT_DISPLAY, M.primary, "");
     lv_obj_set_style_text_letter_space(pr.code, 4, 0);
     pr.qr = lv_qrcode_create(pr.card);
     lv_qrcode_set_size(pr.qr, 220);
@@ -210,7 +223,7 @@ static void pairing_build(lv_obj_t *c)
     lv_qrcode_set_light_color(pr.qr, lv_color_hex(0xFFFFFF));
     lv_obj_set_style_border_color(pr.qr, lv_color_hex(0xFFFFFF), 0);
     lv_obj_set_style_border_width(pr.qr, 10, 0);
-    pr.btn_cancel = ui_button(pr.card, BTN_TONAL, NULL, "Cancel pairing", pair_cancel_cb, NULL);
+    pr.btn_cancel = ui_button(text, BTN_TONAL, NULL, "Cancel pairing", pair_cancel_cb, NULL);
     lv_obj_add_flag(pr.card, LV_OBJ_FLAG_HIDDEN);
     pairing_tick();
 }

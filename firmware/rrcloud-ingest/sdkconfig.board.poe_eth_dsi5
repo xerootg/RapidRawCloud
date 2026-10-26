@@ -16,11 +16,12 @@ CONFIG_ESP_LCD_RPI_DSI_USE_DMA2D=n
 CONFIG_ESP_LCD_RPI_DSI_TOUCH_INVERT_X=y
 CONFIG_ESP_LCD_RPI_DSI_TOUCH_INVERT_Y=y
 
-# ---- LVGL 9 (the on-screen UI, components/rrc_ui), the Touch-LCD-4.3 settings except the
-# colour depth: the bridge is fed RGB888, so LVGL draws RGB888 and the rotate is a plain copy.
-# The UI renders at 480x800 portrait into draw buffers in PSRAM and is rotated onto the
-# 800x480 panel (main/display.c); internal RAM stays with TLS, AES-DMA and the task stacks.
-CONFIG_LV_COLOR_DEPTH_24=y
+# ---- LVGL 9 (the on-screen UI, components/rrc_ui), the same settings as the Touch-LCD-4.3
+# build. LVGL renders RGB565 (its fast path, half the draw-buffer traffic of RGB888) into a
+# draw buffer in PSRAM; main/display.c expands it to the RGB888 framebuffer the bridge needs
+# while copying it, rotated as the user set, onto the 800x480 panel. Internal RAM stays with
+# TLS, AES-DMA and the task stacks.
+CONFIG_LV_COLOR_DEPTH_16=y
 # LVGL's heap comes from PSRAM through main/display.c (malloc would place every
 # small widget allocation in internal RAM: SPIRAM_MALLOC_ALWAYSINTERNAL=16384).
 CONFIG_LV_USE_CUSTOM_MALLOC=y

@@ -37,9 +37,10 @@ struct esp_lcd_rpi_dsi_t {
  * espressif/esp_lcd_touch_ft5x06 rather than reimplemented here. Its reset line is
  * the one thing that is ours: PC_RST_TP_N on the ATTINY, released by the panel's
  * power-on sequence, so this has to run after the panel is up. */
-static esp_err_t rpi_dsi_touch_start(esp_lcd_rpi_dsi_handle_t disp, uint16_t h_res, uint16_t v_res)
+static esp_err_t rpi_dsi_touch_start(esp_lcd_rpi_dsi_handle_t disp, uint16_t h_res, uint16_t v_res, uint32_t scl_speed_hz)
 {
     esp_lcd_panel_io_i2c_config_t io_config = ESP_LCD_TOUCH_IO_I2C_FT5x06_CONFIG();
+    if (scl_speed_hz) io_config.scl_speed_hz = scl_speed_hz;   // rrcloud
     ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_i2c(disp->i2c_bus, &io_config, &disp->touch_io), TAG,
                         "creating the touch panel IO failed");
 
@@ -128,7 +129,9 @@ esp_err_t esp_lcd_rpi_dsi_start(const esp_lcd_rpi_dsi_config_t *config,
         .virtual_channel = 0,
         .dpi_clk_src = MIPI_DSI_DPI_CLK_SRC_DEFAULT,
         .dpi_clock_freq_mhz = config->dpi_clock_freq_mhz,
-        .in_color_format = LCD_COLOR_FMT_RGB888,
+        // rrcloud: the frame buffer may be RGB565; the output to the panel stays RGB888
+        .in_color_format = config->in_color_format ? config->in_color_format : LCD_COLOR_FMT_RGB888,
+        .out_color_format = LCD_COLOR_FMT_RGB888,
         .video_timing = config->timing,
         .flags.disable_lp = config->flags.disable_lp,
     };
@@ -144,7 +147,7 @@ esp_err_t esp_lcd_rpi_dsi_start(const esp_lcd_rpi_dsi_config_t *config,
     esp_lcd_panel_dev_config_t panel_dev_config = {
         .reset_gpio_num = -1,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
-        .bits_per_pixel = 24,
+        .bits_per_pixel = config->in_color_format == LCD_COLOR_FMT_RGB565 ? 16 : 24,   // rrcloud
         .vendor_config = &vendor_config,
     };
     ESP_GOTO_ON_ERROR(esp_lcd_new_panel_rpi_dsi(disp->dbi_io, &panel_dev_config, &disp->panel), err, TAG,
@@ -165,7 +168,7 @@ esp_err_t esp_lcd_rpi_dsi_start(const esp_lcd_rpi_dsi_config_t *config,
 
     if (config->flags.enable_touch) {
         // Non-fatal: a display with a dead or absent touch controller is still a display
-        if (rpi_dsi_touch_start(disp, config->timing.h_size, config->timing.v_size) != ESP_OK) {
+        if (rpi_dsi_touch_start(disp, config->timing.h_size, config->timing.v_size, config->touch_scl_speed_hz) != ESP_OK) {
             ESP_LOGW(TAG, "no touch controller found, continuing without it");
             disp->touch = NULL;
         }

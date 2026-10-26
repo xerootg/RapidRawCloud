@@ -43,21 +43,6 @@ menu "rrcloud-ingest board"
         bool
         default y if RRC_BOARD_P4_POE_ETH_DSI5
 
-    choice RRC_DISPLAY_ROTATION
-        prompt "Display orientation"
-        depends on RRC_DISPLAY_RPI_DSI
-        default RRC_DISPLAY_ROTATION_90
-        help
-            The on-screen UI is laid out for a 480x800 portrait screen; the 800x480 panel is
-            mounted standing up and the UI is rotated onto it. Pick the direction that puts
-            the panel's flex cable where your mount needs it.
-
-        config RRC_DISPLAY_ROTATION_90
-            bool "Portrait, rotated 90 degrees"
-        config RRC_DISPLAY_ROTATION_270
-            bool "Portrait, rotated 270 degrees"
-    endchoice
-
     config RRC_HAS_BATTERY
         bool
         default y if RRC_BOARD_P4_TOUCH_LCD_43

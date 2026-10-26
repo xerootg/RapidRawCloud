@@ -1,7 +1,14 @@
 /*
- * rrc_ui host simulator: runs the on-device UI against fake_dock.c on a 480x800 RGB565
+ * rrc_ui host simulator: runs the on-device UI against fake_dock.c on an RGB565
  * display in LVGL direct mode (as the firmware does), drives it with synthetic touches
  * through LVGL's pointer input, checks behaviour, and writes a PNG per screen.
+ *
+ *   rrc_ui_sim <outdir>            480x800 portrait (bottom navigation bar)
+ *   rrc_ui_sim <outdir> landscape  800x480 landscape (navigation rail), as a panel
+ *                                  that is landscape by nature at display_rotation 0
+ *
+ * The same scenario runs in both; the Orientation setting is exercised in each, which
+ * turns the "panel" (the display's resolution) the way main/display.c does.
  *
  * Exit status is non-zero when a check fails; LVGL asserts abort (lv_conf.h), and the
  * build runs under ASan/UBSan.
@@ -18,10 +25,12 @@
 #include "fake_dock.h"
 #include "png.h"
 
-#define W 480
-#define H 800
+#define PIXELS (480 * 800)   /* both orientations: the buffers are the same size */
 
-static uint16_t fb[2][W * H], shown[W * H];
+static int W = 480, H = 800;          /* the display's current logical size */
+static bool native_landscape;         /* what the "panel" is at rotation 0 */
+static lv_display_t *d;
+static uint16_t fb[2][PIXELS], shown[PIXELS];
 static uint32_t now_ms;
 static struct { int x, y; bool pressed; } ptr;
 static const char *outdir;
@@ -64,6 +73,20 @@ static void host_request(const char *method, const char *path, const char *body,
 }
 
 static void host_backlight(int pct) { fake.backlight = pct; }
+
+/* What the UI sees of main/display.c's display_rotation: the display reports the
+ * other resolution for 90/270. The rotation itself (LVGL's lv_display_set_rotation
+ * plus the rotated flush) is the firmware's; LVGL's direct render mode, which the
+ * simulator uses, does not rotate, so here the "panel" simply turns. */
+static void host_rotation(int deg)
+{
+    bool land = (deg == 90 || deg == 270) ? !native_landscape : native_landscape;
+    lv_display_set_resolution(d, land ? 800 : 480, land ? 480 : 800);
+    W = lv_display_get_horizontal_resolution(d);
+    H = lv_display_get_vertical_resolution(d);
+    lv_display_set_buffers(d, fb[0], fb[1], sizeof fb[0], LV_DISPLAY_RENDER_MODE_DIRECT);   /* stride follows the width */
+    lv_obj_invalidate(lv_screen_active());
+}
 
 static void pump(void)
 {
@@ -195,9 +218,16 @@ static bool tap(const char *text)
     return true;
 }
 
-/* Navigation-bar destination i (0 Status, 1 Sync, 2 Wi-Fi, 3 Device): by position,
- * because the same words also title the top app bar. */
-static void nav(int i) { tap_at(W / 8 + i * W / 4, H - 48); run(200); }
+/* Navigation destination i (0 Status, 1 Sync, 2 Wi-Fi, 3 Device): by position,
+ * because the same words also title the top app bar. Portrait: the bar along the
+ * bottom; landscape: the rail down the left, items of UI_RAIL_ITEM_H from the top
+ * (ui_core.c build_navbar). */
+static void nav(int i)
+{
+    if (W > H) tap_at(48, 40 + 8 + 48 + i * 96);
+    else tap_at(W / 8 + i * W / 4, H - 48);
+    run(200);
+}
 
 static lv_obj_t *find_class(lv_obj_t *o, const lv_obj_class_t *cls)
 {
@@ -269,19 +299,21 @@ static size_t lv_used(void)
 int main(int argc, char **argv)
 {
     outdir = argc > 1 ? argv[1] : "shots";
+    native_landscape = argc > 2 && !strcmp(argv[2], "landscape");
+    if (native_landscape) { W = 800; H = 480; }
     mkdir(outdir, 0755);
     fake_dock_init();
 
     lv_init();
     lv_tick_set_cb(tick_cb);
-    lv_display_t *d = lv_display_create(W, H);
+    d = lv_display_create(W, H);
     lv_display_set_color_format(d, LV_COLOR_FORMAT_RGB565);
     lv_display_set_buffers(d, fb[0], fb[1], sizeof fb[0], LV_DISPLAY_RENDER_MODE_DIRECT);
     lv_display_set_flush_cb(d, flush_cb);
     lv_indev_t *in = lv_indev_create();
     lv_indev_set_type(in, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(in, read_cb);
-    static const rrc_ui_host_t host = {.request = host_request, .set_backlight = host_backlight};
+    static const rrc_ui_host_t host = {.request = host_request, .set_backlight = host_backlight, .set_rotation = host_rotation};
     rrc_ui_start(&host, d);
 
     /* Status */
@@ -391,6 +423,26 @@ int main(int argc, char **argv)
     tap("5 minutes");
     run(300);
     CHECK(cfg_n("display_timeout_s") == 300, "timeout not saved (%g)", cfg_n("display_timeout_s"));
+    /* Orientation: turn the panel 90 degrees and back; the shell is rebuilt each time */
+    tap("Orientation");
+    run(200);
+    shot("dialog_orientation");
+    tap(native_landscape ? "Portrait, 90°" : "Landscape, 90°");
+    run(600);
+    CHECK(cfg_n("display_rotation") == 90, "rotation not saved (%g)", cfg_n("display_rotation"));
+    CHECK((W > H) != native_landscape, "display not turned (now %dx%d)", W, H);
+    CHECK(find("Orientation"), "Device page not rebuilt after the turn");
+    shot("device_turned");
+    nav(0);
+    run(600);
+    shot("status_turned");
+    nav(3);
+    run(300);
+    tap("Orientation");
+    run(200);
+    tap(native_landscape ? "Landscape, 0°" : "Portrait, 0°");
+    run(600);
+    CHECK((W > H) == native_landscape, "display not turned back (now %dx%d)", W, H);
     tap("About this dock");
     run(300);
     shot("about");

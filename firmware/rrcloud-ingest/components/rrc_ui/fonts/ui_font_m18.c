@@ -1,7 +1,7 @@
 /*******************************************************************************
  * Size: 18 px
  * Bpp: 4
- * Opts: --bpp 4 --size 18 --format lvgl --lv-include lvgl.h --lv-font-name ui_font_m18 --no-compress -o /home/user/RapidRawCloud/firmware/rrcloud-ingest/components/rrc_ui/fonts/ui_font_m18.c --font /tmp/tmpijioiyda/Roboto-Medium.ttf -r 0x20-0x7E,0xA0-0x17F,0x2010-0x2027,0x2030-0x203A,0x20AC,0x2122,0x2190-0x2193,0x2212,0x2264-0x2265
+ * Opts: --bpp 4 --size 18 --format lvgl --lv-include lvgl.h --lv-font-name ui_font_m18 --no-compress -o /home/xero/repos/rrc-fw-wt/firmware/rrcloud-ingest/components/rrc_ui/fonts/ui_font_m18.c --font /claude/tmp4_6b0ag6/Roboto-Medium.ttf -r 0x20-0x7E,0xA0-0x17F,0x2010-0x2027,0x2030-0x203A,0x20AC,0x2122,0x2190-0x2193,0x2212,0x2264-0x2265
  ******************************************************************************/
 
 #ifdef LV_LVGL_H_INCLUDE_SIMPLE

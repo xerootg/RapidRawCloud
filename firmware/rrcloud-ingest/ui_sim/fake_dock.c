@@ -19,7 +19,7 @@ void fake_dock_init(void)
         "\"s3_tls_insecure\":false,\"pairing_url\":\"rrc.example.net\",\"include_globs\":\"*.nef *.nrw *.dng *.jpg *.jpeg *.heif *.hif *.tif *.tiff\","
         "\"exclude_globs\":\"\",\"key_template\":\"Camera Import/{model}/{yyyy}/{mm}/{dd}/{name}\",\"msc_root\":\"DCIM\",\"auto_sync\":true,"
         "\"upload_videos\":false,\"min_size_kb\":64,\"device_name\":\"Field dock\",\"wifi_enabled\":true,\"wifi_ssid\":\"Basecamp\",\"hostname\":\"rrcloud-ingest\","
-        "\"admin_auth\":false,\"usb_debug\":true,\"ble_enabled\":true,\"display_brightness\":80,\"display_timeout_s\":60,\"display_dark\":true}");
+        "\"admin_auth\":false,\"usb_debug\":true,\"ble_enabled\":true,\"display_brightness\":80,\"display_timeout_s\":60,\"display_dark\":true,\"display_rotation\":0}");
     has_admin_pw = false;
     scan_state = 0;
 }

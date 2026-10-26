@@ -54,11 +54,14 @@ jobs:
           cmake -S firmware/rrcloud-ingest/ui_sim -B /tmp/ui_sim
           cmake --build /tmp/ui_sim -j"$(nproc)"
           /tmp/ui_sim/rrc_ui_sim /tmp/ui_sim/shots
+          /tmp/ui_sim/rrc_ui_sim /tmp/ui_sim/shots-landscape landscape
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: rrc-ui-screenshots
-          path: /tmp/ui_sim/shots/*.png
+          path: |
+            /tmp/ui_sim/shots/*.png
+            /tmp/ui_sim/shots-landscape/*.png
 
   esp-idf-build:
     strategy:

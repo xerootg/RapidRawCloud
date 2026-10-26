@@ -8,9 +8,11 @@
  *   - CONFIG_RRC_DISPLAY_RPI_DSI (PoE-ETH + 5-inch Pi DSI display): an 800x480
  *     landscape panel speaking the Raspberry Pi touch-display protocol, brought up
  *     by components/esp_lcd_rpi_dsi (one DSI lane, RGB888 framebuffer, the panel's
- *     own controller doing power and backlight, FT5x06 touch), mounted standing up.
- *     LVGL renders the 480x800 UI into small draw buffers and each dirty area is
- *     rotated into the single DPI framebuffer; touch points are rotated back by LVGL.
+ *     own controller doing power and backlight, FT5x06 touch). The user picks the
+ *     orientation on the Device page (config display_rotation: 0 or 180 for the
+ *     landscape UI, 90 or 270 for the portrait one). LVGL renders into small draw
+ *     buffers and each dirty area is copied, rotated as needed, into the single DPI
+ *     framebuffer; touch points are rotated back by LVGL.
  *
  * Rendering budget. The dock's real job is moving photos: uploads keep both
  * cores busy with BLAKE3, TLS and lwIP, and internal RAM is the scarcest
@@ -64,6 +66,7 @@
 #include "rrc_ui.h"
 #include "board.h"
 #include "api.h"
+#include "app_config.h"
 #include "log_ring.h"
 
 static const char *TAG = "display";
@@ -74,6 +77,7 @@ static esp_lcd_touch_handle_t touch;
 static SemaphoreHandle_t vsync_sem;
 #endif
 static lv_display_t *disp;
+static SemaphoreHandle_t touch_mtx;   /* the touch handle is replaced while the DSI link is re-timed */
 
 #if CONFIG_RRC_DISPLAY_ST7701
 /* ---- panel ----------------------------------------------------------------------------
@@ -239,12 +243,22 @@ static esp_err_t touch_init(void)
  * I2C 0x45 (power sequence, bridge reset, backlight PWM) and the FT5x06. The dock
  * only brings the I2C bus, which is the board's internal one (shared with the codec)
  * and the place to find out whether a display is plugged in at all. */
-#define RPI_BPP 3   /* the driver feeds the bridge RGB888: three bytes per pixel, blue first */
+/* The framebuffer is RGB888, three bytes per pixel, blue first: the only format this
+ * bridge takes (the P4's own RGB565-to-RGB888 expansion gives it a stream it cannot
+ * lock to: solid blue). LVGL still renders RGB565 (sdkconfig.board.poe_eth_dsi5,
+ * CONFIG_LV_COLOR_DEPTH_16: its fast path, and half the draw-buffer traffic); the
+ * flush expands each pixel while it copies, which it was touching anyway. */
+#define RPI_BPP   3
+#if LV_COLOR_DEPTH == 16
+#define RPI_LV_CF LV_COLOR_FORMAT_RGB565
+#else
+#define RPI_LV_CF LV_COLOR_FORMAT_RGB888
+#endif
 
 static esp_lcd_rpi_dsi_handle_t rpi;
 static i2c_master_bus_handle_t rpi_i2c;
 static esp_lcd_rpi_dsi_config_t rpi_cfg;
-static uint8_t *rpi_fb;   /* the DPI framebuffer, 800x480 RGB888, native orientation */
+static uint8_t *rpi_fb;   /* the DPI framebuffer, 800x480, native orientation */
 
 static void backlight_set(int pct)
 {
@@ -286,6 +300,7 @@ static esp_err_t rpi_panel_init(void)
     rpi_cfg.ldo_chan = BOARD_DSI_PHY_LDO_CHAN;
     rpi_cfg.ldo_voltage_mv = BOARD_DSI_PHY_LDO_MV;
     rpi_cfg.brightness = 255;
+    rpi_cfg.touch_scl_speed_hz = 400000;
     /* Link timing, measured on the Hosyond 5-inch panel with the console's
      * `dsi-timing` (every setting below was A/B'd by eye on the panel):
      *   - the lane rate is exactly 24x the pixel clock. The bridge derives its DPI
@@ -400,6 +415,7 @@ esp_err_t display_dsi_retime(const display_dsi_timing_t *t)
     /* Under the LVGL lock nothing flushes into the framebuffer the driver is about
      * to free, and touch_read_cb sees touch == NULL meanwhile. */
     lv_lock();
+    xSemaphoreTake(touch_mtx, portMAX_DELAY);
     touch = NULL;
     panel = NULL;
     rpi_fb = NULL;
@@ -411,14 +427,16 @@ esp_err_t display_dsi_retime(const display_dsi_timing_t *t)
         rpi_cfg = keep;
         e = rpi_panel_up();
     }
+    xSemaphoreGive(touch_mtx);
     if (e == ESP_OK) lv_obj_invalidate(lv_screen_active());
     lv_unlock();
     return e;
 }
 
-/* Partial mode: `area` is in the UI's portrait coordinates and `px` holds it
- * row by row. Rotate it straight into its place in the landscape framebuffer,
- * then write the touched rows back from the cache (the DPI DMA reads PSRAM). */
+/* Partial mode: `area` is in the UI's (rotated) coordinates and `px` holds it row
+ * by row. Copy it, turned as the display rotation says, straight into its place in
+ * the native-orientation framebuffer, then write the touched rows back from the
+ * cache (the DPI DMA reads PSRAM). */
 static void flush_rotated_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px)
 {
     if (pattern_hold) { lv_display_flush_ready(d); return; }
@@ -426,10 +444,35 @@ static void flush_rotated_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px
     int32_t w = lv_area_get_width(&a), h = lv_area_get_height(&a);
     lv_color_format_t cf = lv_display_get_color_format(d);
     uint32_t src_stride = lv_draw_buf_width_to_stride(w, cf);
+    lv_display_rotation_t rot = lv_display_get_rotation(d);
     lv_display_rotate_area(d, &a);
     const uint32_t row = BOARD_LCD_H_RES * RPI_BPP;
     uint8_t *dst = rpi_fb + a.y1 * row + a.x1 * RPI_BPP;
-    lv_draw_sw_rotate(px, dst, w, h, src_stride, row, lv_display_get_rotation(d), cf);
+    if (cf == LV_COLOR_FORMAT_RGB565) {
+        /* Expand 565 to 888 on the way in, placed as lv_draw_sw_rotate() would place it:
+         * 90: (x,y) -> (y, w-1-x); 180: (w-1-x, h-1-y); 270: (h-1-y, x). */
+        for (int32_t y = 0; y < h; y++) {
+            const uint16_t *s = (const uint16_t *)(px + (size_t)y * src_stride);
+            for (int32_t x = 0; x < w; x++) {
+                uint16_t p = s[x];
+                uint8_t *o;
+                switch (rot) {
+                case LV_DISPLAY_ROTATION_90:  o = dst + (size_t)(w - 1 - x) * row + (size_t)y * RPI_BPP; break;
+                case LV_DISPLAY_ROTATION_180: o = dst + (size_t)(h - 1 - y) * row + (size_t)(w - 1 - x) * RPI_BPP; break;
+                case LV_DISPLAY_ROTATION_270: o = dst + (size_t)x * row + (size_t)(h - 1 - y) * RPI_BPP; break;
+                default:                      o = dst + (size_t)y * row + (size_t)x * RPI_BPP; break;
+                }
+                uint8_t r5 = p >> 11, g6 = (p >> 5) & 0x3F, b5 = p & 0x1F;
+                o[0] = (uint8_t)(b5 << 3 | b5 >> 2);
+                o[1] = (uint8_t)(g6 << 2 | g6 >> 4);
+                o[2] = (uint8_t)(r5 << 3 | r5 >> 2);
+            }
+        }
+    } else if (rot == LV_DISPLAY_ROTATION_0) {
+        for (int32_t y = 0; y < h; y++) memcpy(dst + (size_t)y * row, px + (size_t)y * src_stride, (size_t)w * RPI_BPP);
+    } else {
+        lv_draw_sw_rotate(px, dst, w, h, src_stride, row, rot, cf);
+    }
     esp_cache_msync(rpi_fb + a.y1 * row, (size_t)(a.y2 - a.y1 + 1) * row,
                     ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
     lv_display_flush_ready(d);
@@ -457,27 +500,39 @@ static void flush_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px)
 
 #endif
 
+/* The touch controller has no INT line routed, so it is polled over I2C: from its
+ * own task, never from the LVGL task, so a slow transaction cannot stall rendering.
+ * The task parks the latest point; LVGL's read callback copies it. Asleep, the
+ * poll slows to 10 Hz. */
+static bool touch_poll = true;   /* console `touch-poll off`: a bring-up test for I2C-induced panel glitches */
+void display_touch_poll(bool on) { touch_poll = on; }
+static struct { volatile uint16_t x, y; volatile bool pressed; } touch_pt;
+
+static void touch_task(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        bool pressed = false;
+        esp_lcd_touch_point_data_t pt[1];
+        uint8_t n = 0;
+        xSemaphoreTake(touch_mtx, portMAX_DELAY);
+        if (touch && touch_poll && esp_lcd_touch_read_data(touch) == ESP_OK && esp_lcd_touch_get_data(touch, pt, &n, 1) == ESP_OK && n > 0) {
+            touch_pt.x = pt[0].x;
+            touch_pt.y = pt[0].y;
+            pressed = true;
+        }
+        xSemaphoreGive(touch_mtx);
+        touch_pt.pressed = pressed;
+        vTaskDelay(pdMS_TO_TICKS(rrc_ui_asleep() ? 100 : 20));
+    }
+}
+
 static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
     (void)indev;
-    static int64_t last_us;
-    static lv_indev_state_t last_state = LV_INDEV_STATE_RELEASED;
-    /* Asleep: sample at 10 Hz instead of every LVGL read (the INT line is not
-     * routed, so the controller is polled over I2C either way). */
-    int64_t now = esp_timer_get_time();
-    if (!touch) { data->state = last_state = LV_INDEV_STATE_RELEASED; return; }   /* link being re-timed */
-    if (rrc_ui_asleep() && now - last_us < 100000) { data->state = last_state; return; }
-    last_us = now;
-    esp_lcd_touch_point_data_t pt[1];
-    uint8_t n = 0;
-    if (esp_lcd_touch_read_data(touch) == ESP_OK && esp_lcd_touch_get_data(touch, pt, &n, 1) == ESP_OK && n > 0) {
-        data->point.x = pt[0].x;
-        data->point.y = pt[0].y;
-        data->state = LV_INDEV_STATE_PRESSED;
-    } else {
-        data->state = LV_INDEV_STATE_RELEASED;
-    }
-    last_state = data->state;
+    data->point.x = touch_pt.x;
+    data->point.y = touch_pt.y;
+    data->state = touch_pt.pressed ? LV_INDEV_STATE_PRESSED : LV_INDEV_STATE_RELEASED;
 }
 
 #ifdef BOARD_USER_KEY_GPIO
@@ -573,7 +628,23 @@ static void lvgl_task(void *arg)
     }
 }
 
+#if CONFIG_RRC_DISPLAY_RPI_DSI
+/* The rrc_ui host hook for the Orientation setting (and the boot-time value). Under
+ * the LVGL lock; the flush path reads the rotation per area, so nothing else changes. */
+static void display_set_rotation(int degrees)
+{
+    lv_display_rotation_t r = degrees == 90 ? LV_DISPLAY_ROTATION_90 : degrees == 180 ? LV_DISPLAY_ROTATION_180
+                            : degrees == 270 ? LV_DISPLAY_ROTATION_270 : LV_DISPLAY_ROTATION_0;
+    if (lv_display_get_rotation(disp) == r) return;
+    lv_display_set_rotation(disp, r);
+    if (lv_display_get_screen_active(disp)) lv_obj_invalidate(lv_display_get_screen_active(disp));
+}
+static const rrc_ui_host_t host = {.request = host_request, .set_backlight = backlight_set, .set_rotation = display_set_rotation};
+#else
+/* The ST7701 path renders straight into the DPI framebuffers (direct mode), which
+ * cannot be rotated in software: no Orientation setting on that board. */
 static const rrc_ui_host_t host = {.request = host_request, .set_backlight = backlight_set};
+#endif
 
 esp_err_t display_start(void)
 {
@@ -603,23 +674,22 @@ esp_err_t display_start(void)
     lv_display_set_buffers(disp, fb0, fb1, BOARD_LCD_H_RES * BOARD_LCD_V_RES * 2, LV_DISPLAY_RENDER_MODE_DIRECT);
     lv_display_set_flush_cb(disp, flush_cb);
 #elif CONFIG_RRC_DISPLAY_RPI_DSI
-    /* RGB888 end to end: LVGL draws the format the bridge is fed (CONFIG_LV_COLOR_DEPTH_24
-     * in sdkconfig.board.poe_eth_dsi5), so the rotate is a plain copy.
-     * The UI is 480x800 portrait; LVGL swaps the resolutions and rotates touch. */
-    lv_display_set_color_format(disp, LV_COLOR_FORMAT_RGB888);
-#if CONFIG_RRC_DISPLAY_ROTATION_270
-    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
-#else
-    lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_90);
-#endif
-    const size_t buf_bytes = 480 * 80 * RPI_BPP;   /* 80 UI rows per pass */
+    /* LVGL draws the framebuffer's own format (RPI_FMT), so the copy into it converts
+     * nothing. The saved orientation is applied before the UI is built, so the first
+     * frame is already the right way up; LVGL swaps the resolutions and rotates touch. */
+    lv_display_set_color_format(disp, RPI_LV_CF);
+    display_set_rotation(app_config_get()->display_rotation);
+    /* One draw buffer: the flush copies synchronously, so a second one would only
+     * cost PSRAM. 60 landscape rows or 100 portrait rows per pass. */
+    const size_t buf_bytes = 800 * 60 * RPI_BPP;
     void *b0 = heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    void *b1 = heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!b0 || !b1) { free(b0); free(b1); log_ring_printf("display: no memory for draw buffers"); return ESP_ERR_NO_MEM; }
-    lv_display_set_buffers(disp, b0, b1, buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    if (!b0) { log_ring_printf("display: no memory for the draw buffer"); return ESP_ERR_NO_MEM; }
+    lv_display_set_buffers(disp, b0, NULL, buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(disp, flush_rotated_cb);
 #endif
+    touch_mtx = xSemaphoreCreateMutex();
     if (touch) {
+        xTaskCreatePinnedToCore(touch_task, "touch", 3072, NULL, 2, NULL, 1);
         lv_indev_t *in = lv_indev_create();
         lv_indev_set_type(in, LV_INDEV_TYPE_POINTER);
         lv_indev_set_read_cb(in, touch_read_cb);
@@ -632,8 +702,10 @@ esp_err_t display_start(void)
     job_q = xQueueCreate(16, sizeof(ui_job_t));
     api_ready = xSemaphoreCreateBinary();
     /* Below the sync/upload tasks; the worker's stack is internal RAM because
-     * api_dispatch can write NVS (flash operations need an internal stack). */
-    xTaskCreatePinnedToCore(worker_task, "ui_api", 6144, NULL, 3, NULL, 1);
+     * api_dispatch can write NVS (flash operations need an internal stack). Sized
+     * like the web server's handler task: a config save (NVS write, then the sync
+     * engine and Wi-Fi re-reading the config) overran 6 KB. */
+    xTaskCreatePinnedToCore(worker_task, "ui_api", 8192, NULL, 3, NULL, 1);
     rrc_ui_start(&host, disp);
     if (xTaskCreatePinnedToCoreWithCaps(lvgl_task, "lvgl", 16384, NULL, 2, NULL, 1, MALLOC_CAP_SPIRAM) != pdPASS) {
         log_ring_printf("display: could not start the LVGL task");

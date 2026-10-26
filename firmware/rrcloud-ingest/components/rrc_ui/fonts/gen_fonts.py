@@ -45,6 +45,7 @@ TEXT_RANGES = "0x20-0x7E,0xA0-0x17F,0x2010-0x2027,0x2030-0x203A,0x20AC,0x2122,0x
 # Icon macro → Material Symbols name. Add an icon here, rerun, and use ICON_<NAME>.
 ICONS = {
     "HOME": "home", "UPLOAD": "cloud_upload", "WIFI": "wifi", "WIFI_OFF": "wifi_off", "SETTINGS": "settings", "USB": "usb",
+    "SCREEN_ROTATION": "screen_rotation",
     "BLUETOOTH": "bluetooth", "BACK": "arrow_back", "CHEVRON": "chevron_right", "REFRESH": "refresh", "CLOSE": "close",
     "VISIBILITY": "visibility", "VISIBILITY_OFF": "visibility_off", "BACKSPACE": "backspace", "SHIFT": "shift", "CHECK": "check",
     "SCHEDULE": "schedule", "PHOTO_LIBRARY": "photo_library", "HISTORY": "history", "INVENTORY": "inventory_2", "ADD": "add",

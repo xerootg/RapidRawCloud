@@ -18,6 +18,17 @@
 static const rrc_ui_host_t *host;
 static lv_display_t *disp;
 
+int ui_w = 480, ui_h = 800;
+bool ui_landscape;
+static int applied_rotation = -1;   /* display_rotation the host was last asked for */
+
+static void read_display_size(void)
+{
+    ui_w = lv_display_get_horizontal_resolution(disp);
+    ui_h = lv_display_get_vertical_resolution(disp);
+    ui_landscape = ui_w > ui_h;
+}
+
 /* ---- JSON helpers ----------------------------------------------------------------- */
 const cJSON *jobj(const cJSON *o, const char *k) { return o ? cJSON_GetObjectItemCaseSensitive(o, k) : NULL; }
 const char *jstr(const cJSON *o, const char *k)
@@ -166,8 +177,8 @@ static void build_appbar(lv_obj_t *scr)
 {
     appbar = lv_obj_create(scr);
     style_bar(appbar, M.surface);
-    lv_obj_set_size(appbar, UI_W, UI_APPBAR_H);
-    lv_obj_set_pos(appbar, 0, UI_STATUS_H);
+    lv_obj_set_size(appbar, UI_CONTENT_W, UI_APPBAR_H);
+    lv_obj_set_pos(appbar, UI_CONTENT_X, UI_STATUS_H);
     lv_obj_set_style_pad_hor(appbar, 8, 0);
     lv_obj_set_flex_flow(appbar, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(appbar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
@@ -184,19 +195,29 @@ static void build_appbar(lv_obj_t *scr)
     lv_obj_set_style_text_color(ab_action, M.on_surface_variant, 0);
 }
 
+/* Portrait: an M3 navigation bar along the bottom. Landscape: a navigation rail
+ * down the left edge, destinations at a fixed pitch from the top. */
 static void build_navbar(lv_obj_t *scr)
 {
     static const char *const icons[4] = {ICON_HOME, ICON_UPLOAD, ICON_WIFI, ICON_SETTINGS};
     static const char *const names[4] = {"Status", "Sync", "Wi-Fi", "Device"};
     navbar = lv_obj_create(scr);
     style_bar(navbar, M.surface_container);
-    lv_obj_set_size(navbar, UI_W, UI_NAVBAR_H);
-    lv_obj_align(navbar, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_flex_flow(navbar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(navbar, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    if (ui_landscape) {
+        lv_obj_set_size(navbar, UI_RAIL_W, UI_H - UI_STATUS_H);
+        lv_obj_set_pos(navbar, 0, UI_STATUS_H);
+        lv_obj_set_flex_flow(navbar, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(navbar, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+        lv_obj_set_style_pad_top(navbar, 8, 0);
+    } else {
+        lv_obj_set_size(navbar, UI_W, UI_NAVBAR_H);
+        lv_obj_align(navbar, LV_ALIGN_BOTTOM_MID, 0, 0);
+        lv_obj_set_flex_flow(navbar, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(navbar, LV_FLEX_ALIGN_SPACE_EVENLY, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+    }
     for (int i = 0; i < 4; i++) {
         lv_obj_t *it = ui_column(navbar, 6);
-        lv_obj_set_width(it, UI_W / 4);
+        if (ui_landscape) lv_obj_set_size(it, UI_RAIL_W, UI_RAIL_ITEM_H); else lv_obj_set_width(it, UI_W / 4);
         lv_obj_set_flex_align(it, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
         lv_obj_add_flag(it, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(it, nav_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
@@ -237,8 +258,8 @@ static void build_shell(void)
     build_appbar(scr);
     content = lv_obj_create(scr);
     lv_obj_remove_style_all(content);
-    lv_obj_set_pos(content, 0, UI_STATUS_H + UI_APPBAR_H);
-    lv_obj_set_width(content, UI_W);
+    lv_obj_set_pos(content, UI_CONTENT_X, UI_CONTENT_Y);
+    lv_obj_set_width(content, UI_CONTENT_W);
     lv_obj_set_flex_flow(content, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_style_pad_hor(content, 16, 0);
     lv_obj_set_style_pad_top(content, 4, 0);
@@ -466,21 +487,23 @@ static void show_page(void)
     lv_label_set_text(ab_title, p->title);
     if (depth) lv_obj_remove_flag(ab_back, LV_OBJ_FLAG_HIDDEN); else lv_obj_add_flag(ab_back, LV_OBJ_FLAG_HIDDEN);
     lv_obj_set_style_pad_left(ab_title, depth ? 0 : 12, 0);
-    int h = UI_H - UI_STATUS_H - UI_APPBAR_H - (depth ? 0 : UI_NAVBAR_H);
+    /* Sub-pages take the navigation bar's rows in portrait; the rail stays (width is
+     * what landscape has plenty of, height is not). */
+    int h = UI_H - UI_CONTENT_Y - (depth || ui_landscape ? 0 : UI_NAVBAR_H);
     lv_obj_set_height(content, h);
-    if (depth) lv_obj_add_flag(navbar, LV_OBJ_FLAG_HIDDEN); else lv_obj_remove_flag(navbar, LV_OBJ_FLAG_HIDDEN);
+    if (depth && !ui_landscape) lv_obj_add_flag(navbar, LV_OBJ_FLAG_HIDDEN); else lv_obj_remove_flag(navbar, LV_OBJ_FLAG_HIDDEN);
     nav_highlight();
     showing_placeholder = false;
     if (p->locked && (!config_doc || (ui_lock_required() && !unlocked))) {
         showing_placeholder = true;
         lv_obj_t *col = ui_column(content, 16);
         lv_obj_set_flex_align(col, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-        lv_obj_set_style_pad_top(col, 120, 0);
+        lv_obj_set_style_pad_top(col, ui_landscape ? 24 : 120, 0);
         if (!config_doc) { ui_label(col, UI_FONT_BODY, M.on_surface_variant, "Loading…"); return; }
         ui_icon_circle(col, ICON_LOCK, TONE_PRIMARY);
         ui_label(col, UI_FONT_TITLE, M.on_surface, "Settings are locked");
         lv_obj_t *l = ui_label(col, UI_FONT_BODY, M.on_surface_variant, "Enter the admin password to change settings on this screen. Status stays visible.");
-        lv_obj_set_width(l, UI_W - 80);
+        lv_obj_set_width(l, UI_CONTENT_W - 80);
         lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
         lv_obj_set_style_text_align(l, LV_TEXT_ALIGN_CENTER, 0);
         ui_button(col, BTN_FILLED, NULL, "Unlock", unlock_cb, NULL);
@@ -577,12 +600,26 @@ void ui_unlock_prompt(void)
 }
 
 /* ---- sleep ----------------------------------------------------------------------------- */
+bool ui_can_rotate(void) { return host && host->set_rotation; }
+
 static void apply_display_config(void)
 {
     if (!config_doc) return;
     bool dark = jobj(config_doc, "display_dark") ? jbool(config_doc, "display_dark") : true;
-    if (dark != ui_dark) {
-        ui_theme_init(disp, dark);
+    bool rebuild = dark != ui_dark;
+    if (rebuild) ui_theme_init(disp, dark);
+    /* Orientation: the host turns the panel, then the shell is laid out again for
+     * whatever size the display reports (portrait bar or landscape rail). */
+    int rot = jobj(config_doc, "display_rotation") ? (int)jnum(config_doc, "display_rotation") : 0;
+    if (ui_can_rotate() && rot != applied_rotation) {
+        applied_rotation = rot;
+        host->set_rotation(rot);
+        bool was = ui_landscape;
+        read_display_size();
+        if (was != ui_landscape) rebuild = true;
+        if (ui_editor_is_open()) ui_editor_done(NULL);   /* laid out for the old size */
+    }
+    if (rebuild) {
         int tab = cur_tab, d = depth;
         const ui_page_t *st[STACK_MAX];
         memcpy(st, stack, sizeof st);
@@ -631,7 +668,7 @@ static void go_sleep(void)
     if (!shield) {
         shield = lv_obj_create(lv_layer_sys());
         lv_obj_remove_style_all(shield);
-        lv_obj_set_size(shield, UI_W, UI_H);
+        lv_obj_set_size(shield, LV_PCT(100), LV_PCT(100));
         lv_obj_add_flag(shield, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_event_cb(shield, shield_cb, LV_EVENT_ALL, NULL);
     }
@@ -665,6 +702,15 @@ void rrc_ui_start(const rrc_ui_host_t *h, lv_display_t *d)
 {
     host = h;
     disp = d;
+    read_display_size();
+    /* The host already turned the panel the way the saved config says (so there is
+     * no flash of the other layout at boot); the first config load confirms it. */
+    switch (lv_display_get_rotation(disp)) {
+    case LV_DISPLAY_ROTATION_90: applied_rotation = 90; break;
+    case LV_DISPLAY_ROTATION_180: applied_rotation = 180; break;
+    case LV_DISPLAY_ROTATION_270: applied_rotation = 270; break;
+    default: applied_rotation = 0; break;
+    }
     ui_theme_init(disp, true);
     build_shell();
     cur_tab = 0;

@@ -1,5 +1,7 @@
 /*
- * rrc_ui — the dock's on-screen Material 3 interface (LVGL 9, 480x800 portrait).
+ * rrc_ui — the dock's on-screen Material 3 interface (LVGL 9; 480x800 portrait with a
+ * bottom navigation bar, or 800x480 landscape with a navigation rail, chosen from the
+ * display's size at start and after each rotation).
  *
  * The UI is a third transport for the admin API, next to the web page (web.c)
  * and BLE (ble.c): every read and every change goes through the same
@@ -33,6 +35,10 @@ typedef struct {
     /* Backlight level 0..100 (0 = off). Applied immediately; persistence goes through
      * /api/config like every other setting. */
     void (*set_backlight)(int percent);
+    /* Optional. Turns the panel: 0, 90, 180 or 270 degrees (the config's display_rotation).
+     * Called with the LVGL lock held; afterwards the display reports the new resolution
+     * and the UI lays itself out again. NULL hides the Orientation setting. */
+    void (*set_rotation)(int degrees);
 } rrc_ui_host_t;
 
 /* Builds the interface on `disp`'s active screen. `host` must outlive the UI. */

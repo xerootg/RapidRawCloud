@@ -22,8 +22,34 @@ static const ui_setting_t s_usbdbg = {.symbol = ICON_BUG, .headline = "Verbose U
                                       .help = "DEBUG-level USB host logs on the serial console (camera detection)"};
 
 static struct {
-    lv_obj_t *slider, *it_timeout, *it_blestate, *it_radio, *btn_radio, *it_update;
+    lv_obj_t *slider, *it_timeout, *it_rotation, *it_blestate, *it_radio, *btn_radio, *it_update;
 } w;
+
+/* Orientation, as degrees of rotation from the panel's native orientation. The
+ * names say what each one looks like on this panel: whether 0 is landscape or
+ * portrait depends on how the panel is built, and the UI knows which it is from
+ * the size it was given and the rotation it was given it at. */
+static const int rotation_values[] = {0, 90, 180, 270};
+#define N_ROTATIONS 4
+static const char *rotation_names[N_ROTATIONS];
+static char rotation_text[N_ROTATIONS][40];
+
+static void rotation_names_fill(void)
+{
+    int cur = (int)jnum(ui_config(), "display_rotation");
+    bool native_landscape = ((cur / 90) % 2 == 0) == ui_landscape;
+    for (int i = 0; i < N_ROTATIONS; i++) {
+        bool land = ((i % 2) == 0) == native_landscape;
+        snprintf(rotation_text[i], sizeof rotation_text[i], "%s, %d°", land ? "Landscape" : "Portrait", rotation_values[i]);
+        rotation_names[i] = rotation_text[i];
+    }
+}
+
+static int rotation_index(double deg)
+{
+    for (int i = 0; i < N_ROTATIONS; i++) if (rotation_values[i] == (int)deg) return i;
+    return 0;
+}
 
 static const char *const timeout_names[] = {"15 seconds", "30 seconds", "1 minute", "2 minutes", "5 minutes", "10 minutes", "Never"};
 static const int timeout_values[] = {15, 30, 60, 120, 300, 600, 0};
@@ -75,6 +101,22 @@ static void timeout_cb(lv_event_t *e)
     ui_choose("Screen timeout", timeout_names, N_TIMEOUTS, timeout_index(jnum(ui_config(), "display_timeout_s")), timeout_picked, NULL);
 }
 
+static void rotation_picked(int idx, void *ud)
+{
+    (void)ud;
+    if (idx < 0 || idx >= N_ROTATIONS) return;
+    cJSON *p = cJSON_CreateObject();
+    cJSON_AddNumberToObject(p, "display_rotation", rotation_values[idx]);
+    ui_config_patch(p, saved_quiet, NULL);
+}
+
+static void rotation_cb(lv_event_t *e)
+{
+    (void)e;
+    rotation_names_fill();
+    ui_choose("Orientation", rotation_names, N_ROTATIONS, rotation_index(jnum(ui_config(), "display_rotation")), rotation_picked, NULL);
+}
+
 static void forget_ok(void *ud) { (void)ud; ui_req_global("POST", "/api/ble/forget", "{}", posted, "Paired phones forgotten"); }
 static void forget_cb(lv_event_t *e) { (void)e; ui_dialog("Forget paired phones?", "Every bonded phone has to pair again before it can configure the dock.", "Forget", true, forget_ok, NULL); }
 static void radio_ok(void *ud) { (void)ud; ui_req_global("POST", "/api/coproc/update", "{}", posted, "Radio update started"); }
@@ -119,6 +161,7 @@ static void build(lv_obj_t *c)
     lv_obj_add_event_cb(w.slider, slider_cb, LV_EVENT_VALUE_CHANGED, NULL);
     lv_obj_add_event_cb(w.slider, slider_cb, LV_EVENT_RELEASED, NULL);
     w.it_timeout = action_item(l, ICON_TIMER, "Screen timeout", "", timeout_cb, false);
+    if (ui_can_rotate()) w.it_rotation = action_item(l, ICON_SCREEN_ROTATION, "Orientation", "", rotation_cb, false);
     ui_setting(l, &s_dark);
     lv_obj_t *hint = ui_label(c, UI_FONT_SMALL, M.on_surface_variant, "The BOOT key turns the screen off and on. The POWER key switches the whole board (hold 2 s to power off).");
     lv_obj_set_width(hint, LV_PCT(100));
@@ -158,6 +201,7 @@ static void on_config(const cJSON *cfg)
     double b = jnum(cfg, "display_brightness");
     if (w.slider && !lv_obj_has_state(w.slider, LV_STATE_PRESSED)) lv_slider_set_value(w.slider, b > 0 ? (int32_t)b : 80, LV_ANIM_OFF);
     if (w.it_timeout) ui_item_supporting(w.it_timeout, timeout_names[timeout_index(jnum(cfg, "display_timeout_s"))]);
+    if (w.it_rotation) { rotation_names_fill(); ui_item_supporting(w.it_rotation, rotation_names[rotation_index(jnum(cfg, "display_rotation"))]); }
 }
 
 static void on_status(const cJSON *s)

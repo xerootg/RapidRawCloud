@@ -159,6 +159,7 @@ static int cmd_dsi_reg(int argc, char **argv)
 }
 static int cmd_fb_pattern(int argc, char **argv) { display_dsi_test_pattern(!(argc > 1 && !strcmp(argv[1], "off"))); return 0; }
 static int cmd_fb_dump(int argc, char **argv) { (void)argc; (void)argv; display_dsi_dump_framebuffer(); return 0; }
+static int cmd_touch_poll(int argc, char **argv) { display_touch_poll(!(argc > 1 && !strcmp(argv[1], "off"))); printf("touch polling %s\n", argc > 1 && !strcmp(argv[1], "off") ? "off" : "on"); return 0; }
 #endif
 #ifdef BOARD_I2C_SDA_GPIO
 /* Lists every 7-bit address that ACKs on the board's internal I2C bus (the one
@@ -465,6 +466,7 @@ esp_err_t console_start(void)
         {.command = "dsi-reg", .help = "dsi-reg <reg> <value>: write a TC358762 bridge register (hex) over DSI (bring-up tool)", .func = cmd_dsi_reg},
         {.command = "fb-pattern", .help = "fb-pattern [off]: hold a test pattern in the Pi DSI framebuffer, bypassing LVGL, until `fb-pattern off` (bring-up tool)", .func = cmd_fb_pattern},
         {.command = "fb-dump", .help = "Print the Pi DSI framebuffer as base64 rows (bring-up tool, ~1.5 MB on the console)", .func = cmd_fb_dump},
+        {.command = "touch-poll", .help = "touch-poll [off]: stop or resume polling the touch controller over I2C (bring-up tool)", .func = cmd_touch_poll},
         {.command = "dsi-timing", .help = "dsi-timing [lane_mbps dpi_mhz hsw hbp hfp vsw vbp vfp burst|nonburst lp|nolp]: show or change the Pi DSI panel's link timing live (bring-up tool)", .func = cmd_dsi_timing},
 #endif
         {.command = "eth-rx-stall-test", .help = "Drop every received ethernet frame to test the receive watchdog (the dock restarts itself)", .func = cmd_eth_rx_stall_test},

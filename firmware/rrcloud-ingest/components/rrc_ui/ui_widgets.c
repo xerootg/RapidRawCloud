@@ -373,8 +373,12 @@ void ui_snackbar(const char *fmt, ...)
     va_end(ap);
     if (!snack) {
         snack = bare(lv_layer_top());
-        lv_obj_set_size(snack, UI_W - 2 * 16, LV_SIZE_CONTENT);
-        lv_obj_align(snack, LV_ALIGN_BOTTOM_MID, 0, -(UI_NAVBAR_H + 12));
+        /* above the navigation bar in portrait; in landscape at the bottom of the
+         * content area, right of the rail, no wider than a comfortable line */
+        int w = UI_CONTENT_W - 2 * 16;
+        if (w > 560) w = 560;
+        lv_obj_set_size(snack, w, LV_SIZE_CONTENT);
+        lv_obj_align(snack, LV_ALIGN_BOTTOM_MID, UI_CONTENT_X / 2, -(ui_landscape ? 12 : UI_NAVBAR_H + 12));
         lv_obj_set_style_bg_color(snack, M.inverse_surface, 0);
         lv_obj_set_style_bg_opa(snack, LV_OPA_COVER, 0);
         lv_obj_set_style_radius(snack, 6, 0);
@@ -402,7 +406,7 @@ typedef struct {
 static lv_obj_t *scrim_create(void)
 {
     lv_obj_t *s = bare(lv_layer_top());
-    lv_obj_set_size(s, UI_W, UI_H);
+    lv_obj_set_size(s, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_bg_color(s, M.scrim, 0);
     lv_obj_set_style_bg_opa(s, LV_OPA_50, 0);
     lv_obj_add_flag(s, LV_OBJ_FLAG_CLICKABLE);   /* swallow taps behind the dialog */
@@ -414,7 +418,7 @@ static void dlg_free(lv_event_t *e) { lv_free(lv_event_get_user_data(e)); }
 static lv_obj_t *dialog_box(lv_obj_t *scrim, const char *title)
 {
     lv_obj_t *d = ui_column(scrim, 16);
-    lv_obj_set_width(d, UI_W - 2 * 40);
+    lv_obj_set_width(d, UI_W - 2 * 40 > 560 ? 560 : UI_W - 2 * 40);   /* M3: 280..560 dp */
     lv_obj_set_style_bg_color(d, M.surface_container_high, 0);
     lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(d, 28, 0);
@@ -488,6 +492,10 @@ void ui_choose(const char *title, const char *const *options, int n, int selecte
     lv_obj_add_event_cb(s, dlg_free, LV_EVENT_DELETE, c);
     lv_obj_t *d = dialog_box(s, title);
     lv_obj_t *list = ui_column(d, 0);
+    /* seven timeouts do not fit a landscape screen: the list scrolls inside the dialog */
+    lv_obj_set_style_max_height(list, UI_H - 2 * 24 - 56 - 2 * 40 - 56, 0);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);
     for (int i = 0; i < n; i++) {
         lv_obj_t *r = ui_row(list, 16);
         lv_obj_set_height(r, 56);
@@ -518,8 +526,11 @@ void ui_choose(const char *title, const char *const *options, int n, int selecte
 /* ---- editor + keyboard -------------------------------------------------------------
  * A full-screen dialog: app bar (close, title, Save), one outlined text field,
  * supporting/error text, and the keyboard docked at the bottom. The field never
- * hides behind the keyboard because nothing scrolls. */
-#define KB_H 330
+ * hides behind the keyboard because nothing scrolls: in landscape the keyboard is
+ * shorter and no wider than it needs to be, and the field is a single line. */
+#define KB_H      (ui_landscape ? 232 : 330)
+#define KB_W      (ui_landscape ? 640 : UI_W)
+#define KB_NUM_W  (ui_landscape ? 360 : UI_W)
 
 static const char *const kb_lower[] = {
     "q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "\n",
@@ -695,10 +706,10 @@ void ui_editor_open(const ui_editor_t *spec)
     if (ed.label) ui_label(body, UI_FONT_LABEL, M.primary, ed.label);
     lv_obj_t *fieldrow = ui_row(body, 8);
     ed.ta = lv_textarea_create(fieldrow);
-    bool multiline = spec->mode == EDIT_TEXT && spec->max_len > 64;
+    bool multiline = spec->mode == EDIT_TEXT && spec->max_len > 64 && !ui_landscape;
     lv_textarea_set_one_line(ed.ta, !multiline);
     lv_obj_set_flex_grow(ed.ta, 1);
-    lv_obj_set_height(ed.ta, multiline ? 120 : 60);
+    lv_obj_set_height(ed.ta, multiline ? 120 : ui_landscape ? 52 : 60);
     lv_obj_set_style_text_font(ed.ta, UI_FONT_TITLE, 0);
     lv_obj_set_style_text_color(ed.ta, M.on_surface, 0);
     lv_obj_set_style_bg_color(ed.ta, M.surface, 0);
@@ -730,7 +741,7 @@ void ui_editor_open(const ui_editor_t *spec)
 
     /* keyboard */
     ed.kb = lv_buttonmatrix_create(ed.root);
-    lv_obj_set_size(ed.kb, UI_W, KB_H);
+    lv_obj_set_size(ed.kb, spec->mode == EDIT_NUMBER ? KB_NUM_W : KB_W, KB_H);
     lv_obj_align(ed.kb, LV_ALIGN_BOTTOM_MID, 0, 0);
     lv_obj_set_style_bg_color(ed.kb, M.surface_container_high, 0);
     lv_obj_set_style_bg_opa(ed.kb, LV_OPA_COVER, 0);

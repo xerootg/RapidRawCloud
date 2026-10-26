@@ -8,6 +8,7 @@
 #define ICON_WIFI_OFF        "\xEE\x99\x88"  /* wifi_off U+E648 */
 #define ICON_SETTINGS        "\xEE\xA2\xB8"  /* settings U+E8B8 */
 #define ICON_USB             "\xEE\x87\xA0"  /* usb U+E1E0 */
+#define ICON_SCREEN_ROTATION "\xEE\x87\x81"  /* screen_rotation U+E1C1 */
 #define ICON_BLUETOOTH       "\xEE\x86\xA7"  /* bluetooth U+E1A7 */
 #define ICON_BACK            "\xEE\x97\x84"  /* arrow_back U+E5C4 */
 #define ICON_CHEVRON         "\xEE\x90\x89"  /* chevron_right U+E409 */

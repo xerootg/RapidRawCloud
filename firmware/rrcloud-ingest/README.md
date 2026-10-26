@@ -176,13 +176,15 @@ D-PHY is powered from the P4's LDO_VO3 at 2.5 V. Panels with their own driver IC
 different controller protocol (Waveshare's 720×1280 DSI panels, for instance) are not
 supported by this build.
 
-The UI is laid out for a 480×800 portrait screen, so the panel is **mounted standing up** and
-the UI is rotated onto it: LVGL draws RGB888 (`CONFIG_LV_COLOR_DEPTH_24`) into two 113 KB draw
-buffers in PSRAM and each dirty area is rotated into the single 800×480 framebuffer (LVGL
-rotates touch points back). Which
-way is up is `Display orientation` in `idf.py menuconfig` (`RRC_DISPLAY_ROTATION_90` or
-`_270`). The PoE board has no free user key, so the BOOT-key screen toggle of the 4.3" board
-is absent; the screen sleeps and wakes on touch.
+The UI has a landscape layout (navigation rail on the left) for the panel lying flat and the
+portrait one of the 4.3" board for the panel standing up; **Device › Display › Orientation**
+on the screen (config key `display_rotation`: 0, 90, 180 or 270 degrees from the panel's
+native landscape) picks which, and which way is up, at runtime. LVGL draws RGB565 into a
+96 KB draw buffer in PSRAM and each dirty area is expanded to RGB888 and copied, rotated as
+needed, into the single 800×480 framebuffer (LVGL rotates touch points back; the P4's own
+RGB565-to-RGB888 expansion in the DSI bridge gives this panel a stream it cannot lock to). The
+touch controller is polled from its own task, so I2C never stalls rendering. The PoE board has no free user key, so the BOOT-key screen toggle
+of the 4.3" board is absent; the screen sleeps and wakes on touch.
 
 Bringing up another clone of the Pi display is done from the serial console, without
 reflashing: `dsi-timing` shows or changes the lane rate, pixel clock, porches and video mode
