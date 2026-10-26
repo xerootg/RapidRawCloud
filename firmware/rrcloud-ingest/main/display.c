@@ -180,6 +180,7 @@ static esp_err_t panel_init(void)
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(panel), TAG, "panel reset");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(panel), TAG, "panel init");
     vsync_sem = xSemaphoreCreateBinary();
+    ESP_RETURN_ON_FALSE(vsync_sem, ESP_ERR_NO_MEM, TAG, "vsync semaphore");
     esp_lcd_dpi_panel_event_callbacks_t cbs = {.on_refresh_done = on_refresh_done};
     ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_register_event_callbacks(panel, &cbs, NULL), TAG, "vsync callback");
     return ESP_OK;
@@ -384,13 +385,19 @@ void display_dsi_dump_framebuffer(void)
 {
     static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const size_t row_bytes = BOARD_LCD_H_RES * RPI_BPP;   /* 2400: a multiple of 3 */
+    const size_t fb_bytes = row_bytes * BOARD_LCD_V_RES;
     char *line = malloc(row_bytes / 3 * 4 + 1);
-    if (!line) return;
+    /* A snapshot: the print takes a minute on the console, and the LVGL lock must
+     * not be held that long (rendering and every UI request would stall). */
+    uint8_t *snap = heap_caps_malloc(fb_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!line || !snap) { free(line); free(snap); return; }
     lv_lock();
-    if (!rpi_fb) { lv_unlock(); free(line); return; }
+    if (!rpi_fb) { lv_unlock(); free(line); free(snap); return; }
+    memcpy(snap, rpi_fb, fb_bytes);
+    lv_unlock();
     printf("FBDUMP BEGIN %dx%d rgb888\n", BOARD_LCD_H_RES, BOARD_LCD_V_RES);
     for (int y = 0; y < BOARD_LCD_V_RES; y++) {
-        const uint8_t *p = rpi_fb + (size_t)y * row_bytes;
+        const uint8_t *p = snap + (size_t)y * row_bytes;
         char *o = line;
         for (size_t i = 0; i < row_bytes; i += 3) {
             uint32_t v = (p[i] << 16) | (p[i + 1] << 8) | p[i + 2];
@@ -401,8 +408,8 @@ void display_dsi_dump_framebuffer(void)
         vTaskDelay(1);   /* let the console UART drain */
     }
     printf("FBDUMP END\n");
-    lv_unlock();
     free(line);
+    free(snap);
 }
 
 esp_err_t display_dsi_bridge_write(uint16_t reg, uint32_t val)
@@ -675,6 +682,31 @@ esp_err_t display_start(void)
     gpio_config(&key);
 #endif
 
+    /* Everything that can fail for lack of memory comes before lv_init(), so a
+     * failure leaves no half-built LVGL behind: the touch lock (the touch task and
+     * the re-time path need it on every board), the API worker's queue, gate and
+     * task (it only runs once display_set_api_ready() is given, after this returns),
+     * and the Pi DSI draw buffer. */
+    touch_mtx = xSemaphoreCreateMutex();
+    job_q = xQueueCreate(16, sizeof(ui_job_t));
+    api_ready = xSemaphoreCreateBinary();
+    /* Below the sync/upload tasks; the worker's stack is internal RAM because
+     * api_dispatch can write NVS (flash operations need an internal stack). Sized
+     * like the web server's handler task: a config save (NVS write, then the sync
+     * engine and Wi-Fi re-reading the config) overran 6 KB. */
+    if (!touch_mtx || !job_q || !api_ready || xTaskCreatePinnedToCore(worker_task, "ui_api", 8192, NULL, 3, NULL, 1) != pdPASS) {
+        log_ring_printf("display: could not start the UI's API worker");
+        return ESP_ERR_NO_MEM;
+    }
+#if CONFIG_RRC_DISPLAY_RPI_DSI
+    /* One draw buffer: the flush copies synchronously, so a second one would only
+     * cost PSRAM. 60 landscape rows or 100 portrait rows per pass, in LVGL's own
+     * (RGB565) format. */
+    const size_t buf_bytes = 800 * 60 * lv_color_format_get_size(RPI_LV_CF);
+    void *b0 = heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!b0) { log_ring_printf("display: no memory for the draw buffer"); return ESP_ERR_NO_MEM; }
+#endif
+
     lv_init();
     lv_tick_set_cb(tick_ms);
     disp = lv_display_create(BOARD_LCD_H_RES, BOARD_LCD_V_RES);
@@ -689,14 +721,7 @@ esp_err_t display_start(void)
      * nothing. The saved orientation is applied before the UI is built, so the first
      * frame is already the right way up; LVGL swaps the resolutions and rotates touch. */
     lv_display_set_color_format(disp, RPI_LV_CF);
-    touch_mtx = xSemaphoreCreateMutex();
-    if (!touch_mtx) { log_ring_printf("display: no memory for the touch lock"); return ESP_ERR_NO_MEM; }
     display_set_rotation(app_config_get()->display_rotation);
-    /* One draw buffer: the flush copies synchronously, so a second one would only
-     * cost PSRAM. 60 landscape rows or 100 portrait rows per pass. */
-    const size_t buf_bytes = 800 * 60 * RPI_BPP;
-    void *b0 = heap_caps_aligned_alloc(64, buf_bytes, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (!b0) { log_ring_printf("display: no memory for the draw buffer"); return ESP_ERR_NO_MEM; }
     lv_display_set_buffers(disp, b0, NULL, buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(disp, flush_rotated_cb);
 #endif
@@ -714,16 +739,6 @@ esp_err_t display_start(void)
     lv_timer_create(key_timer_cb, 20, NULL);
 #endif
 
-    job_q = xQueueCreate(16, sizeof(ui_job_t));
-    api_ready = xSemaphoreCreateBinary();
-    /* Below the sync/upload tasks; the worker's stack is internal RAM because
-     * api_dispatch can write NVS (flash operations need an internal stack). Sized
-     * like the web server's handler task: a config save (NVS write, then the sync
-     * engine and Wi-Fi re-reading the config) overran 6 KB. */
-    if (!job_q || !api_ready || xTaskCreatePinnedToCore(worker_task, "ui_api", 8192, NULL, 3, NULL, 1) != pdPASS) {
-        log_ring_printf("display: could not start the UI's API worker");
-        return ESP_ERR_NO_MEM;
-    }
     rrc_ui_start(&host, disp);
     if (xTaskCreatePinnedToCoreWithCaps(lvgl_task, "lvgl", 16384, NULL, 2, NULL, 1, MALLOC_CAP_SPIRAM) != pdPASS) {
         log_ring_printf("display: could not start the LVGL task");

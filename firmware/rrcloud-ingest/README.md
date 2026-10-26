@@ -157,8 +157,8 @@ plain PoE-ETH build, and without a display attached the image runs headless
 "Driver-free" Pi displays emulate the official Raspberry Pi 7" Touch Display. The panel
 driver is `components/esp_lcd_rpi_dsi`, a vendored copy of
 [kurozz/esp_lcd_rpi_dsi](https://github.com/kurozz/esp_lcd_rpi_dsi) 0.1.0 (**GPL-2.0-only**,
-its `LICENSE` is in the directory; the two local changes for ESP-IDF 5.5 are marked
-`rrcloud:` in its `CMakeLists.txt` and `esp_lcd_rpi_dsi.c`). It brings up, in one call:
+its `LICENSE` is in the directory; every local change is marked `rrcloud:` where it sits, and
+the header of its `CMakeLists.txt` lists them). It brings up, in one call:
 
 - a TC358762-compatible DSI-to-DPI bridge on **one** data lane, fed RGB888 and configured
   with DSI Generic Long Writes (the legacy Linux `panel-raspberrypi-touchscreen.c` sequence)
@@ -221,7 +221,7 @@ internal RAM scarce, so LVGL renders straight into the two MIPI-DSI framebuffers
 (direct mode, dirty areas only, buffers swapped on vsync: no extra draw buffers), its heap
 and task stack live in PSRAM, it runs below the sync and upload tasks with one draw unit,
 and nothing is polled while the screen is off. The UI adds ~11 KB of static internal RAM and
-one 6 KB internal stack (the API worker: a config save writes NVS, which needs it).
+one 8 KB internal stack (the API worker: a config save writes NVS, which needs it).
 Fonts are Roboto and Material Symbols (`components/rrc_ui/fonts/gen_fonts.py`), so SSIDs and
 camera names in Latin scripts render properly; the image is ~2.8 MB of the 4 MB app slot.
 

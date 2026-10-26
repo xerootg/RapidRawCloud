@@ -663,7 +663,7 @@ static void kb_event(lv_event_t *e)
 static void ed_close_cb(lv_event_t *e)
 {
     (void)e;
-    if (!ed.root) return;
+    if (!ed.root || ed.busy) return;   /* a save in flight answers through ui_editor_done() */
     lv_obj_t *root = ed.root;
     lv_free(ed.initial); lv_free(ed.title); lv_free(ed.label); lv_free(ed.help); lv_free(ed.placeholder);
     memset(&ed, 0, sizeof ed);

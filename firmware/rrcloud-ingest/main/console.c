@@ -130,9 +130,21 @@ static int cmd_dsi_timing(int argc, char **argv)
     display_dsi_timing_t t;
     display_dsi_get_timing(&t);
     if (argc == 11) {
-        t.lane_mbps = strtof(argv[1], NULL); t.dpi_mhz = strtof(argv[2], NULL);
-        t.hsw = atoi(argv[3]); t.hbp = atoi(argv[4]); t.hfp = atoi(argv[5]);
-        t.vsw = atoi(argv[6]); t.vbp = atoi(argv[7]); t.vfp = atoi(argv[8]);
+        char *end[8];
+        t.lane_mbps = strtof(argv[1], &end[0]); t.dpi_mhz = strtof(argv[2], &end[1]);
+        t.hsw = (int)strtol(argv[3], &end[2], 10); t.hbp = (int)strtol(argv[4], &end[3], 10); t.hfp = (int)strtol(argv[5], &end[4], 10);
+        t.vsw = (int)strtol(argv[6], &end[5], 10); t.vbp = (int)strtol(argv[7], &end[6], 10); t.vfp = (int)strtol(argv[8], &end[7], 10);
+        bool numeric = true;
+        for (int i = 0; i < 8; i++) if (*end[i] || !argv[i + 1][0]) numeric = false;
+        /* the D-PHY's range, a pixel clock the panel could take, and porches that
+         * keep a frame a frame: checked before the link is torn down */
+        if (!numeric || t.lane_mbps < 80 || t.lane_mbps > 1500 || t.dpi_mhz < 5 || t.dpi_mhz > 120
+            || t.hsw < 1 || t.hsw > 255 || t.hbp < 1 || t.hbp > 1023 || t.hfp < 1 || t.hfp > 1023
+            || t.vsw < 1 || t.vsw > 255 || t.vbp < 0 || t.vbp > 1023 || t.vfp < 0 || t.vfp > 1023
+            || (strcmp(argv[9], "burst") && strcmp(argv[9], "nonburst")) || (strcmp(argv[10], "lp") && strcmp(argv[10], "nolp"))) {
+            printf("out of range: lane 80..1500 Mbit/s, dpi 5..120 MHz, hsw/vsw 1..255, porches up to 1023, burst|nonburst, lp|nolp\n");
+            return 1;
+        }
         t.non_burst = !strcmp(argv[9], "nonburst");
         t.disable_lp = !strcmp(argv[10], "nolp");
         esp_err_t e = display_dsi_retime(&t);
@@ -151,8 +163,14 @@ static int cmd_dsi_timing(int argc, char **argv)
 static int cmd_dsi_reg(int argc, char **argv)
 {
     if (argc != 3) { printf("usage: dsi-reg <reg hex> <value hex>\n"); return 1; }
-    uint16_t reg = (uint16_t)strtoul(argv[1], NULL, 16);
-    uint32_t val = (uint32_t)strtoul(argv[2], NULL, 16);
+    char *e1, *e2;
+    unsigned long r = strtoul(argv[1], &e1, 16), v = strtoul(argv[2], &e2, 16);
+    if (!argv[1][0] || !argv[2][0] || *e1 || *e2 || r > 0xFFFF || v > 0xFFFFFFFFul) {
+        printf("dsi-reg: register 0000..ffff and a 32-bit value, both hex\n");   /* a typo must not write register 0 */
+        return 1;
+    }
+    uint16_t reg = (uint16_t)r;
+    uint32_t val = (uint32_t)v;
     esp_err_t e = display_dsi_bridge_write(reg, val);
     printf("bridge 0x%04x <= 0x%08lx: %s\n", reg, (unsigned long)val, esp_err_to_name(e));
     return e == ESP_OK ? 0 : 1;

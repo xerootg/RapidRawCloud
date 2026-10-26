@@ -79,7 +79,12 @@ static void join(const char *ssid, const char *password)
     ui_config_patch(p, joined, NULL);
 }
 
-static void password_entered(const char *pw, void *ud) { (void)ud; join(w.pending_ssid, pw); }
+static void password_entered(const char *pw, void *ud)
+{
+    (void)ud;
+    if (!w.pending_ssid[0]) { ui_editor_done("Pick the network again"); return; }   /* never post an empty SSID: that is the forget path */
+    join(w.pending_ssid, pw);
+}
 
 static void ask_password(const char *ssid, bool may_be_open)
 {

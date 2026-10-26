@@ -103,6 +103,7 @@ static bool showing_placeholder;
 
 static cJSON *status_doc, *config_doc;
 static bool status_inflight, config_inflight;
+static bool local_patch;   /* the config reload in flight follows a change made on this screen */
 static bool unlocked, asleep;
 static uint32_t auth_failures, auth_block_until;
 static lv_obj_t *shield;
@@ -323,6 +324,7 @@ void ui_config_patch(cJSON *patch, ui_resp_fn fn, void *ud)
     patch_ctx_t *c = lv_malloc(sizeof *c);
     c->fn = fn;
     c->ud = ud;
+    local_patch = true;
     ui_req_global("POST", "/api/config", body, patch_done, c);
     cJSON_free(body);
 }
@@ -413,8 +415,10 @@ static void config_loaded(int status, const cJSON *json, void *ud)
     bool was_locked = was_required && !unlocked;
     cJSON_Delete(config_doc);
     config_doc = cJSON_Duplicate(json, true);
-    /* Whoever just set the password from this screen stays in until it sleeps. */
-    if (had && !was_required && ui_lock_required()) unlocked = true;
+    /* Whoever just set the password from this screen stays in until it sleeps; a
+     * password set from the web page or the app locks the screen like everything else. */
+    if (had && !was_required && ui_lock_required() && local_patch) unlocked = true;
+    local_patch = false;
     apply_display_config();
     bool now_locked = ui_lock_required() && !unlocked;
     if (showing_placeholder || (had && was_locked != now_locked && cur_page()->locked)) { ui_nav_rebuild(); return; }
@@ -516,6 +520,9 @@ static void show_page(void)
 
 static void leave_page(void)
 {
+    /* An editor belongs to the page that opened it (its save callback reads page
+     * state): it goes with the page, whatever triggered the change. */
+    if (ui_editor_is_open()) ui_editor_done(NULL);
     if (!showing_placeholder && cur_page()->destroy) cur_page()->destroy();
 }
 

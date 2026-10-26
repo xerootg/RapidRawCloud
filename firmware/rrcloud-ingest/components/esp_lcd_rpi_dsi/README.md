@@ -78,6 +78,9 @@ GPL-2.0-only.
 
 ## Requirements
 
+> rrcloud: this vendored copy also builds on ESP-IDF 5.5.5 (see the `rrcloud:` notes in
+> `CMakeLists.txt`); on 5.x the DMA2D copy is unavailable and the CPU copies instead.
+
 ESP-IDF v6.0 or newer, ESP32-P4. Pulls in `espressif/esp_lcd_touch_ft5x06` for the
 touch controller.
 

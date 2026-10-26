@@ -284,6 +284,25 @@ static void clear_field(void)
     for (size_t i = 0; i < n; i++) key(ICON_BACKSPACE);
 }
 
+/* Where the navigation lives: the rail hugs the left edge in landscape, the bar the
+ * bottom in portrait. The "Status" label is the nav item's (the app bar says "Device"). */
+static bool nav_is_rail(void)
+{
+    lv_obj_t *l = find("Status");
+    if (!l) return false;
+    lv_area_t a;
+    lv_obj_get_coords(l, &a);
+    return a.x2 <= 96;
+}
+static bool nav_is_bar(void)
+{
+    lv_obj_t *l = find("Status");
+    if (!l) return false;
+    lv_area_t a;
+    lv_obj_get_coords(l, &a);
+    return a.y1 >= H - 104;
+}
+
 static const char *cfg_s(const char *k) { const cJSON *v = cJSON_GetObjectItem(fake_config, k); return cJSON_IsString(v) ? v->valuestring : "?"; }
 static double cfg_n(const char *k) { return cJSON_GetNumberValue(cJSON_GetObjectItem(fake_config, k)); }
 static bool cfg_b(const char *k) { return cJSON_IsTrue(cJSON_GetObjectItem(fake_config, k)); }
@@ -431,7 +450,7 @@ int main(int argc, char **argv)
     run(600);
     CHECK(cfg_n("display_rotation") == 90, "rotation not saved (%g)", cfg_n("display_rotation"));
     CHECK((W > H) != native_landscape, "display not turned (now %dx%d)", W, H);
-    CHECK(find("Orientation"), "Device page not rebuilt after the turn");
+    CHECK((W > H) ? nav_is_rail() : nav_is_bar(), "shell not rebuilt for the new orientation (nav not where %s puts it)", W > H ? "landscape" : "portrait");
     shot("device_turned");
     nav(0);
     run(600);
@@ -443,6 +462,7 @@ int main(int argc, char **argv)
     tap(native_landscape ? "Landscape, 0°" : "Portrait, 0°");
     run(600);
     CHECK((W > H) == native_landscape, "display not turned back (now %dx%d)", W, H);
+    CHECK((W > H) ? nav_is_rail() : nav_is_bar(), "shell not rebuilt after turning back");
     tap("About this dock");
     run(300);
     shot("about");

@@ -6,6 +6,9 @@ dependencies:
   espressif/usb_host_msc: "^1.1.1"
   # Wi-Fi API proxied over SDIO to the on-board ESP32-C6 (pulls in esp_hosted on esp32p4).
   espressif/esp_wifi_remote: "*"
+  # Pinned to the host library the C6 image is pinned to (main/coproc.h); re-resolving
+  # the manifest must not move it on its own.
+  espressif/esp_hosted: "==3.0.9"
   # Power-loss-safe filesystem for the sync ledger and frozen journal segments.
   joltwallet/littlefs: "^1.14"
   # rrcloud-ingest.local
