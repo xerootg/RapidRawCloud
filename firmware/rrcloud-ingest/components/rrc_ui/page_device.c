@@ -384,7 +384,8 @@ static void fw_loaded(int status, const cJSON *o, void *ud)
     }
     ui_item_supporting(fw.it_avail, buf);
     const char *st = jstr(o, "state"), *msg = jstr(o, "message"), *rb = jstr(o, "rolled_back");
-    if (jbool(o, "trial")) snprintf(buf, sizeof buf, "On trial: kept after a minute with the network up");
+    if (jbool(o, "trial")) snprintf(buf, sizeof buf, "On trial: kept after a minute if the dock can be reached");
+    else if (jobj(o, "rollback") && !jbool(o, "rollback")) snprintf(buf, sizeof buf, "The bootloader cannot roll back a bad update: flash it over USB once");
     else if (rb[0] && !strcmp(st, "idle") && !msg[0]) snprintf(buf, sizeof buf, "%s did not start cleanly and was rolled back", rb);
     else snprintf(buf, sizeof buf, "%s%s%s", st, msg[0] ? ": " : "", msg);
     ui_item_supporting(fw.it_state, buf);

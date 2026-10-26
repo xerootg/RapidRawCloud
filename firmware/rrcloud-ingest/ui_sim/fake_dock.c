@@ -180,7 +180,7 @@ char *fake_dock_handle(const char *method, const char *path, const char *body, i
     if (get && !strcmp(path, "/api/ota")) {
         char *b = malloc(640);
         snprintf(b, 640, "{\"running\":\"0.4.0\",\"built\":\"Oct 26 2026 10:00:00\",\"hardware\":\"touch-lcd-43\",\"variant\":\"touch-lcd-43\",\"chip_rev\":301,"
-                 "\"channel\":\"%s\",\"state\":\"%s\",\"message\":\"%s\",\"done\":0,\"total\":0,\"trial\":false,\"rolled_back\":\"\",\"checked\":%s,\"available\":%s}",
+                 "\"channel\":\"%s\",\"state\":\"%s\",\"message\":\"%s\",\"done\":0,\"total\":0,\"upload_sha256\":\"\",\"trial\":false,\"rollback\":true,\"rolled_back\":\"\",\"checked\":%s,\"available\":%s}",
                  cfg_bool("ota_dev_channel") ? "dev" : "release", fake.ota_checked ? "idle" : "idle",
                  fake.ota_checked ? "release 0.5.0 is available (running 0.4.0)" : "", fake.ota_checked ? "true" : "false",
                  fake.ota_checked ? "{\"version\":\"0.5.0\",\"tag\":\"firmware-v0.5.0\",\"commit\":\"68e11af\",\"channel\":\"release\",\"size\":2859008,\"newer\":true}" : "null");

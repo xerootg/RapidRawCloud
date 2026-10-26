@@ -234,7 +234,8 @@ static void ota_err(api_resp_t *out, esp_err_t e)
     switch (e) {
     case ESP_ERR_INVALID_STATE: err(out, 409, "a firmware update is already in progress"); break;
     case ESP_ERR_NOT_ALLOWED: err(out, 409, "a sync is running; update when it is done"); break;
-    case ESP_ERR_NOT_FOUND: err(out, 409, "no update known yet: check for one first"); break;
+    case ESP_ERR_NOT_FOUND: err(out, 409, "no update known for this channel yet: check for one first"); break;
+    case ESP_ERR_NOT_FINISHED: err(out, 409, "the running firmware is still on trial; install again once it is kept (about a minute after it started)"); break;
     case ESP_ERR_NO_MEM: err(out, 500, "not enough free memory for the image (restart the dock and try again)"); break;
     case ESP_ERR_INVALID_ARG: err(out, 400, "invalid request"); break;
     default: err(out, 500, esp_err_to_name(e)); break;
@@ -246,6 +247,8 @@ static void r_ota_install(const char *body, size_t len, api_resp_t *out)
     char url[300], sha[80];
     json_string_field(body, len, "url", url, sizeof url);
     json_string_field(body, len, "sha256", sha, sizeof sha);
+    /* json_string_field truncates: a URL that filled the buffer may have lost its end */
+    if (strlen(url) >= sizeof url - 1 || strlen(sha) >= sizeof sha - 1) { err(out, 400, "url or sha256 too long"); return; }
     esp_err_t e = url[0] ? ota_install_url(url, sha) : ota_install_available();
     if (e == ESP_ERR_INVALID_ARG) { err(out, 400, "need an http(s) url and an optional 64-hex sha256"); return; }
     if (e != ESP_OK) { ota_err(out, e); return; }
@@ -277,16 +280,19 @@ static void r_ota_chunk(const char *body, size_t len, api_resp_t *out)
     const char *data = cJSON_GetStringValue(cJSON_GetObjectItemCaseSensitive(o, "data"));
     uint8_t *raw = NULL;
     size_t raw_len = 0, expected = 0;
+    bool out_of_order = false;
     esp_err_t e = ESP_ERR_INVALID_ARG;
     if (cJSON_IsNumber(off) && off->valuedouble >= 0 && off->valuedouble <= 64.0 * 1024 * 1024 && data && strlen(data) <= (OTA_UPLOAD_CHUNK + 2) / 3 * 4) {
         raw = malloc(OTA_UPLOAD_CHUNK);
         if (!raw) e = ESP_ERR_NO_MEM;
-        else if (mbedtls_base64_decode(raw, OTA_UPLOAD_CHUNK, &raw_len, (const unsigned char *)data, strlen(data)) == 0 && raw_len)
+        else if (mbedtls_base64_decode(raw, OTA_UPLOAD_CHUNK, &raw_len, (const unsigned char *)data, strlen(data)) == 0 && raw_len) {
             e = ota_upload_chunk((size_t)off->valuedouble, raw, raw_len, &expected);
+            out_of_order = e == ESP_ERR_INVALID_ARG;   /* well-formed, at the wrong offset */
+        }
     }
     free(raw);
     cJSON_Delete(o);
-    if (e == ESP_ERR_INVALID_ARG && expected) {
+    if (out_of_order) {
         /* out of order: tell the client where to resume */
         char *b = malloc(96);
         if (b) snprintf(b, 96, "{\"ok\":false,\"error\":\"out of order\",\"expected\":%u}", (unsigned)expected);
@@ -343,7 +349,7 @@ void api_dispatch(const char *method, const char *path, const char *body, size_t
     else if (post && !strcmp(path, "/api/ota/upload/begin")) r_ota_begin(body, body_len, out);
     else if (post && !strcmp(path, "/api/ota/upload/chunk")) r_ota_chunk(body, body_len, out);
     else if (post && !strcmp(path, "/api/ota/upload/finish")) r_ota_finish(out);
-    else if (post && !strcmp(path, "/api/ota/cancel")) { ota_cancel(); ok(out); }
+    else if (post && !strcmp(path, "/api/ota/cancel")) { if (ota_cancel() == ESP_OK) ok(out); else err(out, 409, "the image is being written; it cannot be stopped now"); }
     else err(out, 404, "unknown endpoint");
     if (!out->json) set(out, 500, NULL, 0);
 }

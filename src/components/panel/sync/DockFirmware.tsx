@@ -27,7 +27,9 @@ export interface DockOta {
   message: string;
   done: number;
   total: number;
+  upload_sha256: string;
   trial: boolean;
+  rollback: boolean;
   rolled_back: string;
   checked: boolean;
   available: { version: string; tag: string; commit: string; channel: string; size: number; newer: boolean } | null;
@@ -174,6 +176,10 @@ export default function DockFirmware({
         return;
       // the versioned release, not the rolling one: it cannot change under the download
       const release = ota.channel === 'dev' || !m.tag ? tag : m.tag;
+      // from here on the panel stays mounted (a dropped link must not orphan the transfer)
+      // and the buttons stay disabled
+      onSending(true);
+      setSending({ done: 0, from: 0, total: img.size, started: Date.now(), version: m.version, reconnects: 0 });
       onMessage(`Downloading ${m.version}…`);
       const ir = await fetch(`${base}/${release}/${img.file}`);
       if (!ir.ok) throw new Error(`download failed (HTTP ${ir.status})`);
@@ -187,7 +193,8 @@ export default function DockFirmware({
       // two minutes) and carries on from its offset instead of starting over.
       const resumeAt = async (): Promise<number | null> => {
         const now = await rpc<DockOta>('GET', '/api/ota');
-        return now.state === 'receiving' && now.total === bytes.length ? now.done : null;
+        // only this image: another one of the same size would fail the dock's SHA-256 check at the end
+        return now.state === 'receiving' && now.total === bytes.length && now.upload_sha256 === sha ? now.done : null;
       };
       let off = (await resumeAt()) ?? -1;
       if (off < 0) {
@@ -197,7 +204,7 @@ export default function DockFirmware({
       let started = Date.now();
       let from = off;
       let reconnects = 0;
-      onSending(true);
+      let stalled = 0; // reconnects in a row that brought no progress
       setSending({ done: off, from, total: bytes.length, started, version: m.version, reconnects });
       while (off < bytes.length) {
         if (cancelRef.current) throw new Error('cancelled');
@@ -218,6 +225,9 @@ export default function DockFirmware({
           }
           const at = back ? await resumeAt().catch(() => null) : null;
           if (at === null) throw e;
+          stalled = at > off ? 0 : stalled + 1;
+          if (stalled >= 3)
+            throw new Error('the dock stopped taking the image (three reconnects without progress)', { cause: e });
           off = from = at;
           started = Date.now();
           reconnects++;
@@ -252,8 +262,9 @@ export default function DockFirmware({
       <h4 className="text-text-primary text-sm font-medium pt-1">Dock firmware</h4>
       <p className="text-text-secondary text-sm">
         {ota.running} · {ota.variant} · chip v{Math.floor(ota.chip_rev / 100)}.{ota.chip_rev % 100}
-        {ota.trial && ' · on trial (kept after a minute with the network up)'}
+        {ota.trial && ' · on trial (kept after a minute if the dock can be reached)'}
         {ota.rolled_back && ` · ${ota.rolled_back} did not start cleanly and was rolled back`}
+        {!ota.rollback && " · this dock's bootloader cannot roll back a bad update (flash it over USB once)"}
       </p>
       {ota.available && (
         <p className="text-text-secondary text-sm">

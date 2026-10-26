@@ -139,9 +139,16 @@ jobs:
               pip install esptool
               esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 921600 write_flash 0x0 rrcloud-ingest-merged.bin
 
-          Updating the app only (keeps NVS config and the LittleFS ledger):
+          The merged image fills the gaps between the parts with 0xFF, which **erases the NVS
+          configuration (cloud, pairing, Wi-Fi)**: use it for a first install only. To update a
+          configured dock over USB, write the parts (this also installs the bootloader that rolls
+          back a bad over-the-air update, and resets the boot slot, which an over-the-air update
+          may have moved to ota_1):
 
-              esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 921600 write_flash 0x20000 rrcloud-ingest.bin
+              esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 921600 write_flash 0x2000 bootloader.bin 0x8000 partition-table.bin 0x19000 ota_data_initial.bin 0x20000 rrcloud-ingest.bin
+
+          After that, the dock updates itself: Device › Firmware on the screen, the Firmware card on
+          its web page, or the RapidRAW app.
 
           ${{ matrix.then }}
           MD
@@ -174,8 +181,11 @@ jobs:
 
   release:
     name: Publish GitHub release
-    if: needs.meta.outputs.release == 'true'
+    if: success() && needs.meta.outputs.release == 'true'
     needs: [meta, tests, package, ota]
+    concurrency:
+      group: firmware-release   # firmware-latest is deleted and re-created below
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write

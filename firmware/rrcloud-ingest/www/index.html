@@ -154,7 +154,7 @@
       <div><input id="otasha" type="text" placeholder="SHA-256 (optional)"></div>
     </div>
     <button id="otaurlgo" class="secondary" type="button">Install from URL</button>
-    <div class="note">A new firmware starts on trial: it is kept once it has run for a minute with the network up; if it crashes or never reaches the network, the dock goes back to the current one by itself. The dock refuses images for another board, and installs nothing while a sync runs.</div>
+    <div class="note">A new firmware starts on trial: it is kept once it has run for a minute and can be reached (network or Bluetooth); if it crashes or cannot be reached, the dock goes back to the current one by itself. The dock refuses images for another board, and installs nothing while a sync runs.</div>
   </section>
 
   <section class="card" style="margin-top:14px">
@@ -270,7 +270,7 @@ async function refreshOta(){
   try {
     const o = await api('/api/ota');
     const st = $('otastate'); st.textContent = o.trial ? 'on trial' : o.state; st.className = 'pill ' + (o.trial ? 'warn' : (otaClass[o.state] || 'warn'));
-    $('otarun').textContent = `${o.running} (${o.variant}, built ${o.built}, chip v${Math.floor(o.chip_rev/100)}.${o.chip_rev%100})` + (o.rolled_back ? ` — ${o.rolled_back} did not start cleanly and was rolled back` : '');
+    $('otarun').textContent = `${o.running} (${o.variant}, built ${o.built}, chip v${Math.floor(o.chip_rev/100)}.${o.chip_rev%100})` + (o.rolled_back ? ` — ${o.rolled_back} did not start cleanly and was rolled back` : '') + (o.rollback ? '' : " — this dock's bootloader cannot roll back a bad update: flash it over USB once (README)");
     const a = o.available;
     $('otaavail').textContent = a ? `${a.channel === 'dev' ? 'test build' : 'release'} ${a.version}${a.commit ? ' ('+a.commit+')' : ''} · ${fmtBytes(a.size)}${a.newer ? '' : ' · already running'}` : (o.checked ? 'nothing for this board' : 'not checked');
     $('otamsg').textContent = o.message || '';

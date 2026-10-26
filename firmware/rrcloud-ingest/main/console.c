@@ -210,7 +210,7 @@ static int cmd_ota(int argc, char **argv)
     esp_err_t e = ESP_OK;
     if (argc >= 2 && !strcmp(argv[1], "check")) e = ota_check();
     else if (argc >= 2 && !strcmp(argv[1], "install")) e = argc >= 3 ? ota_install_url(argv[2], argc >= 4 ? argv[3] : "") : ota_install_available();
-    else if (argc >= 2 && !strcmp(argv[1], "cancel")) ota_cancel();
+    else if (argc >= 2 && !strcmp(argv[1], "cancel")) e = ota_cancel();
     else if (argc >= 2) { printf("usage: ota [check | install [url [sha256]] | cancel]\n"); return 1; }
     if (e != ESP_OK) { printf("ota: %s\n", esp_err_to_name(e)); return 1; }
     char buf[1024];

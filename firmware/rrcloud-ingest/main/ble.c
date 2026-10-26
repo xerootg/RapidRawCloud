@@ -462,6 +462,15 @@ void ble_forget_bonds(void)
     log_ring_printf("ble: forgot all paired phones");
 }
 
+bool ble_reachable(void)
+{
+    if (!mtx) return false;
+    LOCK();
+    bool r = st.up && (st.advertising || st.connected);
+    UNLOCK();
+    return r;
+}
+
 int ble_status_json(char *out, size_t cap)
 {
     rrc_jsonw w;

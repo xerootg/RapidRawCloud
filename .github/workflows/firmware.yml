@@ -99,7 +99,8 @@ jobs:
   publish-dev:
     name: Publish to the firmware-dev test channel
     needs: [meta, host-tests, ui-sim, esp-idf-build]
-    if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'workflow_dispatch'
+    # success(): a red test or board build must not replace the channel
+    if: success() && ((github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     concurrency:
       group: firmware-dev
@@ -113,20 +114,23 @@ jobs:
           pattern: rrcloud-ingest-esp32p4-*
           path: artifacts
       - name: Images and manifest
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mkdir -p builds
           for d in artifacts/rrcloud-ingest-esp32p4-*; do mkdir -p "builds/${d#artifacts/rrcloud-ingest-esp32p4-}"; cp "$d/rrcloud-ingest.bin" "builds/${d#artifacts/rrcloud-ingest-esp32p4-}/"; done
-          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
-          python3 .github/scripts/ota_manifest.py builds dist "${{ needs.meta.outputs.version }}" firmware-dev "${SHA:0:7}"
+          python3 .github/scripts/ota_manifest.py builds dist "$VERSION" firmware-dev "${SHA:0:7}"
       - name: Replace the firmware-dev prerelease
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ github.head_ref || github.ref_name }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
-          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
           gh release delete firmware-dev --cleanup-tag --yes -R "${GITHUB_REPOSITORY}" || true
           {
-            echo "Test build of \`${BRANCH}\` at ${SHA} (version ${{ needs.meta.outputs.version }})."
+            echo "Test build of \`${BRANCH}\` at ${SHA} (version ${VERSION})."
             echo
             echo "Rolling: replaced by every build of a firmware pull request. A dock installs it with Device › Firmware › Test builds on, or from its web page."
           } > notes.md
