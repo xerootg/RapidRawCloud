@@ -102,11 +102,11 @@ jobs:
           - board: touch-lcd-43
             suffix: esp32p4-touch-lcd-4.3-chip-v1
             title: "ESP32-P4-WIFI6-Touch-LCD-4.3, ESP32-P4 chip revision v0.x/v1.x"
-            then: "Then set up Wi-Fi and pairing on the touchscreen. If the boot log says the chip revision is not supported, the board has a v3 chip: flash the -chip-v3 zip instead ("esptool.py chip_id" prints the revision)."
+            then: "Then set up Wi-Fi and pairing on the touchscreen. If the boot log says the chip revision is not supported, the board has a v3 chip: flash the -chip-v3 zip instead (esptool.py chip_id prints the revision)."
           - board: touch-lcd-43-rev3
             suffix: esp32p4-touch-lcd-4.3-chip-v3
             title: "ESP32-P4-WIFI6-Touch-LCD-4.3, ESP32-P4 chip revision v3.x"
-            then: "Then set up Wi-Fi and pairing on the touchscreen. If the boot log says the chip revision is not supported, the board has an older chip: flash the -chip-v1 zip instead ("esptool.py chip_id" prints the revision)."
+            then: "Then set up Wi-Fi and pairing on the touchscreen. If the boot log says the chip revision is not supported, the board has an older chip: flash the -chip-v1 zip instead (esptool.py chip_id prints the revision)."
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:v5.5.5

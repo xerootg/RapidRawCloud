@@ -18,8 +18,8 @@
  * cores busy with BLAKE3, TLS and lwIP, and internal RAM is the scarcest
  * resource on the board (README "Throughput notes"). So the UI:
  *   - keeps every pixel buffer in PSRAM (the ST7701 path renders straight into the
- *     two DPI framebuffers, LVGL direct mode, swapped on vsync; the rotated path
- *     draws into two 113 KB buffers): no internal RAM for pixels;
+ *     two DPI framebuffers, LVGL direct mode, swapped on vsync; the Pi DSI path
+ *     draws into one 96 KB partial buffer): no internal RAM for pixels;
  *   - keeps LVGL's heap and its task stack in PSRAM (lv_*_core below);
  *   - runs at a priority below the sync and upload tasks, on one draw unit, so a
  *     busy dock renders a little later rather than uploading slower;
@@ -224,15 +224,18 @@ static esp_err_t touch_init(void)
     /* The GT911 latches 0x5D or 0x14 from INT at reset; INT is not routed here. */
     if (i2c_master_probe(bus, ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS, 50) == ESP_OK) io_cfg.dev_addr = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS;
     else if (i2c_master_probe(bus, ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP, 50) == ESP_OK) io_cfg.dev_addr = ESP_LCD_TOUCH_IO_I2C_GT911_ADDRESS_BACKUP;
-    else return ESP_ERR_NOT_FOUND;
+    else { i2c_del_master_bus(bus); return ESP_ERR_NOT_FOUND; }   /* release the pins for the console's i2c-scan */
     io_cfg.scl_speed_hz = 400000;
     esp_lcd_panel_io_handle_t io;
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_i2c_v2(bus, &io_cfg, &io), TAG, "touch io");
+    esp_err_t e = esp_lcd_new_panel_io_i2c_v2(bus, &io_cfg, &io);
+    if (e != ESP_OK) { i2c_del_master_bus(bus); return e; }
     esp_lcd_touch_config_t tc = {
         .x_max = BOARD_LCD_H_RES, .y_max = BOARD_LCD_V_RES,
         .rst_gpio_num = BOARD_TOUCH_RST_GPIO, .int_gpio_num = GPIO_NUM_NC,
     };
-    return esp_lcd_touch_new_i2c_gt911(io, &tc, &touch);
+    e = esp_lcd_touch_new_i2c_gt911(io, &tc, &touch);
+    if (e != ESP_OK) { esp_lcd_panel_io_del(io); i2c_del_master_bus(bus); }
+    return e;
 }
 
 #endif /* CONFIG_RRC_DISPLAY_ST7701 */
@@ -271,10 +274,16 @@ static void backlight_set(int pct)
 static esp_err_t rpi_panel_up(void)
 {
     ESP_RETURN_ON_ERROR(esp_lcd_rpi_dsi_start(&rpi_cfg, &rpi), TAG, "rpi_dsi");
+    void *fb = NULL;
+    esp_err_t e = esp_lcd_dpi_panel_get_frame_buffer(esp_lcd_rpi_dsi_get_panel(rpi), 1, &fb);
+    if (e != ESP_OK) {   /* a driver left running would keep the I2C bus and the DSI host */
+        ESP_LOGE(TAG, "framebuffer: %s", esp_err_to_name(e));
+        esp_lcd_rpi_dsi_stop(rpi);
+        rpi = NULL;
+        return e;
+    }
     panel = esp_lcd_rpi_dsi_get_panel(rpi);
     touch = esp_lcd_rpi_dsi_get_touch(rpi);
-    void *fb = NULL;
-    ESP_RETURN_ON_ERROR(esp_lcd_dpi_panel_get_frame_buffer(panel, 1, &fb), TAG, "framebuffer");
     rpi_fb = fb;
     memset(rpi_fb, 0, BOARD_LCD_H_RES * BOARD_LCD_V_RES * RPI_BPP);
     esp_cache_msync(rpi_fb, BOARD_LCD_H_RES * BOARD_LCD_V_RES * RPI_BPP, ESP_CACHE_MSYNC_FLAG_DIR_C2M | ESP_CACHE_MSYNC_FLAG_UNALIGNED);
@@ -350,8 +359,8 @@ static bool pattern_hold;   /* flushes are dropped while the pattern is up */
 
 void display_dsi_test_pattern(bool on)
 {
-    if (!rpi_fb) return;
     lv_lock();
+    if (!rpi_fb) { lv_unlock(); return; }
     pattern_hold = on;
     if (!on) { lv_obj_invalidate(lv_screen_active()); lv_unlock(); return; }
     memset(rpi_fb, 0, BOARD_LCD_H_RES * BOARD_LCD_V_RES * RPI_BPP);
@@ -373,12 +382,12 @@ void display_dsi_test_pattern(bool on)
  * LVGL lock so the dump is one consistent frame. */
 void display_dsi_dump_framebuffer(void)
 {
-    if (!rpi_fb) return;
     static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     const size_t row_bytes = BOARD_LCD_H_RES * RPI_BPP;   /* 2400: a multiple of 3 */
     char *line = malloc(row_bytes / 3 * 4 + 1);
     if (!line) return;
     lv_lock();
+    if (!rpi_fb) { lv_unlock(); free(line); return; }
     printf("FBDUMP BEGIN %dx%d rgb888\n", BOARD_LCD_H_RES, BOARD_LCD_V_RES);
     for (int y = 0; y < BOARD_LCD_V_RES; y++) {
         const uint8_t *p = rpi_fb + (size_t)y * row_bytes;
@@ -398,13 +407,15 @@ void display_dsi_dump_framebuffer(void)
 
 esp_err_t display_dsi_bridge_write(uint16_t reg, uint32_t val)
 {
-    if (!panel) return ESP_ERR_INVALID_STATE;
-    return esp_lcd_panel_rpi_dsi_bridge_write(panel, reg, val);
+    lv_lock();   /* display_dsi_retime() replaces the panel under this lock */
+    esp_err_t e = panel ? esp_lcd_panel_rpi_dsi_bridge_write(panel, reg, val) : ESP_ERR_INVALID_STATE;
+    lv_unlock();
+    return e;
 }
 
 esp_err_t display_dsi_retime(const display_dsi_timing_t *t)
 {
-    if (!rpi || !disp) return ESP_ERR_INVALID_STATE;
+    if (!rpi || !disp || !touch_mtx) return ESP_ERR_INVALID_STATE;
     esp_lcd_rpi_dsi_config_t keep = rpi_cfg;
     rpi_cfg.lane_bit_rate_mbps = t->lane_mbps;
     rpi_cfg.dpi_clock_freq_mhz = t->dpi_mhz;
@@ -439,7 +450,7 @@ esp_err_t display_dsi_retime(const display_dsi_timing_t *t)
  * cache (the DPI DMA reads PSRAM). */
 static void flush_rotated_cb(lv_display_t *d, const lv_area_t *area, uint8_t *px)
 {
-    if (pattern_hold) { lv_display_flush_ready(d); return; }
+    if (pattern_hold || !rpi_fb) { lv_display_flush_ready(d); return; }   /* held pattern, or a re-time that failed */
     lv_area_t a = *area;
     int32_t w = lv_area_get_width(&a), h = lv_area_get_height(&a);
     lv_color_format_t cf = lv_display_get_color_format(d);
@@ -578,7 +589,7 @@ static void host_request(const char *method, const char *path, const char *body,
     strlcpy(j.path, path, sizeof j.path);
     j.body = body ? strdup(body) : NULL;
     if (xQueueSend(job_q, &j, 0) != pdTRUE) {
-        free(j.body);
+        if (j.body) { memset(j.body, 0, strlen(j.body)); free(j.body); }   /* may hold a password */
         rrc_ui_complete(token, 503, "{\"ok\":false,\"error\":\"busy\"}", 28);   /* caller holds the LVGL lock */
     }
 }
@@ -678,6 +689,8 @@ esp_err_t display_start(void)
      * nothing. The saved orientation is applied before the UI is built, so the first
      * frame is already the right way up; LVGL swaps the resolutions and rotates touch. */
     lv_display_set_color_format(disp, RPI_LV_CF);
+    touch_mtx = xSemaphoreCreateMutex();
+    if (!touch_mtx) { log_ring_printf("display: no memory for the touch lock"); return ESP_ERR_NO_MEM; }
     display_set_rotation(app_config_get()->display_rotation);
     /* One draw buffer: the flush copies synchronously, so a second one would only
      * cost PSRAM. 60 landscape rows or 100 portrait rows per pass. */
@@ -687,9 +700,11 @@ esp_err_t display_start(void)
     lv_display_set_buffers(disp, b0, NULL, buf_bytes, LV_DISPLAY_RENDER_MODE_PARTIAL);
     lv_display_set_flush_cb(disp, flush_rotated_cb);
 #endif
-    touch_mtx = xSemaphoreCreateMutex();
+    if (touch && xTaskCreatePinnedToCore(touch_task, "touch", 3072, NULL, 2, NULL, 1) != pdPASS) {
+        log_ring_printf("display: could not start the touch task; the screen is view-only");
+        touch = NULL;
+    }
     if (touch) {
-        xTaskCreatePinnedToCore(touch_task, "touch", 3072, NULL, 2, NULL, 1);
         lv_indev_t *in = lv_indev_create();
         lv_indev_set_type(in, LV_INDEV_TYPE_POINTER);
         lv_indev_set_read_cb(in, touch_read_cb);
@@ -705,7 +720,10 @@ esp_err_t display_start(void)
      * api_dispatch can write NVS (flash operations need an internal stack). Sized
      * like the web server's handler task: a config save (NVS write, then the sync
      * engine and Wi-Fi re-reading the config) overran 6 KB. */
-    xTaskCreatePinnedToCore(worker_task, "ui_api", 8192, NULL, 3, NULL, 1);
+    if (!job_q || !api_ready || xTaskCreatePinnedToCore(worker_task, "ui_api", 8192, NULL, 3, NULL, 1) != pdPASS) {
+        log_ring_printf("display: could not start the UI's API worker");
+        return ESP_ERR_NO_MEM;
+    }
     rrc_ui_start(&host, disp);
     if (xTaskCreatePinnedToCoreWithCaps(lvgl_task, "lvgl", 16384, NULL, 2, NULL, 1, MALLOC_CAP_SPIRAM) != pdPASS) {
         log_ring_printf("display: could not start the LVGL task");

@@ -261,7 +261,7 @@ esp_err_t app_config_apply_json(const char *json, size_t len, char *err, size_t 
     copy_bool(o, "display_dark", &c.display_dark);
     cJSON *dr = cJSON_GetObjectItemCaseSensitive(o, "display_rotation");
     if (cJSON_IsNumber(dr)) {
-        int r = (int)dr->valuedouble;
+        double r = dr->valuedouble;   /* compared as a double: casting 1e30 to int is undefined */
         if (r != 0 && r != 90 && r != 180 && r != 270) { snprintf(err, err_cap, "display_rotation: 0, 90, 180 or 270"); cJSON_Delete(o); return ESP_ERR_INVALID_ARG; }
         c.display_rotation = (uint16_t)r;
     }

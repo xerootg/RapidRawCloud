@@ -49,7 +49,7 @@ static char applied_ssid[33], applied_pw[65];
  * Ethernet Wi-Fi is the only path and comes up at boot. */
 typedef enum { WIFI_POLICY_UP, WIFI_POLICY_DOWN, WIFI_POLICY_REAPPLY, WIFI_POLICY_CONNECT, WIFI_POLICY_SCAN } wifi_policy_t;
 static QueueHandle_t policy_q;
-static void policy_post(wifi_policy_t p) { if (policy_q) xQueueSend(policy_q, &p, 0); }
+static bool policy_post(wifi_policy_t p) { return policy_q && xQueueSend(policy_q, &p, 0) == pdTRUE; }
 static char eth_ip_str[16], wifi_ip_str[16];
 
 /* Association bookkeeping for the UI (/api/wifi). */
@@ -468,7 +468,7 @@ esp_err_t net_wifi_scan_start(void)
     if (!app_config_get()->wifi_enabled) return ESP_ERR_NOT_SUPPORTED;
     if (scan_state == NET_SCAN_RUNNING) return ESP_ERR_INVALID_STATE;
     scan_state = NET_SCAN_RUNNING;
-    policy_post(WIFI_POLICY_SCAN);
+    if (!policy_post(WIFI_POLICY_SCAN)) { scan_state = NET_SCAN_IDLE; return ESP_FAIL; }   /* a full queue must not leave "running" stuck */
     return ESP_OK;
 }
 

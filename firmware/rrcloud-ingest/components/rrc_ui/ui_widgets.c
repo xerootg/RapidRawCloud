@@ -658,7 +658,17 @@ static void kb_event(lv_event_t *e)
     if (ed.error_shown) ed_message(ed.help, false);   /* typing clears a validation error */
 }
 
-static void ed_close_cb(lv_event_t *e) { (void)e; ed_close(); }
+/* From the close button's own click: the root (its ancestor) is deleted once the
+ * event has finished dispatching, as the dialogs do. */
+static void ed_close_cb(lv_event_t *e)
+{
+    (void)e;
+    if (!ed.root) return;
+    lv_obj_t *root = ed.root;
+    lv_free(ed.initial); lv_free(ed.title); lv_free(ed.label); lv_free(ed.help); lv_free(ed.placeholder);
+    memset(&ed, 0, sizeof ed);
+    lv_obj_delete_async(root);
+}
 static void ed_save_cb(lv_event_t *e) { (void)e; ed_save(); }
 
 static void ed_eye_cb(lv_event_t *e)
