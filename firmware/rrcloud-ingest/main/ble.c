@@ -303,7 +303,24 @@ static int gap_event(struct ble_gap_event *ev, void *arg)
     case BLE_GAP_EVENT_ENC_CHANGE:
         LOCK(); st.encrypted = ev->enc_change.status == 0; UNLOCK();
         log_ring_printf("ble: link %s", ev->enc_change.status == 0 ? "encrypted (bonded)" : "encryption failed");
+        if (ev->enc_change.status == 0) {
+            /* Ask for a short connection interval: every request fragment is a write
+             * with response, one round trip per connection event, so the interval sets
+             * the throughput (a firmware image is ~700 requests). Centrals default to
+             * 30-50 ms; 7.5-15 ms, no latency, 4 s supervision timeout. The central may
+             * decline; nothing depends on it. */
+            struct ble_gap_upd_params p = {.itvl_min = 6, .itvl_max = 12, .latency = 0, .supervision_timeout = 400,
+                                           .min_ce_len = 0, .max_ce_len = 0};
+            int rc = ble_gap_update_params(ev->enc_change.conn_handle, &p);
+            if (rc != 0) ESP_LOGW(TAG, "connection parameter update request: rc=%d", rc);
+        }
         return 0;
+    case BLE_GAP_EVENT_CONN_UPDATE: {
+        struct ble_gap_conn_desc d;
+        if (ev->conn_update.status == 0 && ble_gap_conn_find(ev->conn_update.conn_handle, &d) == 0)
+            ESP_LOGI(TAG, "connection interval %u.%02u ms, latency %u", d.conn_itvl * 125 / 100, d.conn_itvl * 125 % 100, d.conn_latency);
+        return 0;
+    }
     case BLE_GAP_EVENT_MTU:
         LOCK(); st.mtu = ev->mtu.value; UNLOCK();
         ESP_LOGI(TAG, "mtu %u", ev->mtu.value);

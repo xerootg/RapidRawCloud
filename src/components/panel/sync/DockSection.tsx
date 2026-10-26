@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { addPluginListener, invoke, PluginListener } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
 import { Invokes } from '../../ui/AppProperties';
+import DockFirmware from './DockFirmware';
 import { useSettingsStore } from '../../../store/useSettingsStore';
 
 /**
@@ -10,7 +11,7 @@ import { useSettingsStore } from '../../../store/useSettingsStore';
  * The dock exposes the same `/api/…` operations as its web UI through one GATT
  * service (protocol `DOCK_BLE_*`); `dock_rpc` carries them. Everything the web
  * page does is here: status, what to sync, cloud (manual S3 or pairing with the
- * cloud through the pairing service), device settings, radio firmware, log.
+ * cloud through the pairing service), device settings, radio and dock firmware, log.
  * Android only — the plugin rejects the commands elsewhere.
  */
 
@@ -163,6 +164,8 @@ export default function DockSection() {
   const authRef = useRef(auth);
   authRef.current = auth;
   const connected = info !== null;
+  const lastAddress = useRef<string | null>(null);
+  const [otaSending, setOtaSending] = useState(false);
 
   const say = (m: string) => {
     setMessage(m);
@@ -263,6 +266,7 @@ export default function DockSection() {
       setScanning(false);
       const i = await invoke<DockInfo>(Invokes.DockConnect, { address });
       setInfo(i);
+      lastAddress.current = address;
       say(`Connected to ${i.hostname} (firmware ${i.version})`);
       try {
         await loadConfig();
@@ -275,6 +279,18 @@ export default function DockSection() {
       setConnecting(null);
     }
   };
+
+  // For the firmware upload, which reconnects by itself when the link drops mid-transfer.
+  const reconnect = useCallback(async () => {
+    if (!lastAddress.current) return false;
+    try {
+      setInfo(await invoke<DockInfo>(Invokes.DockConnect, { address: lastAddress.current }));
+      void loadConfig().catch(() => undefined); // the disconnect cleared the rest of the section
+      return true;
+    } catch {
+      return false;
+    }
+  }, [loadConfig]);
 
   const disconnect = async () => {
     await invoke(Invokes.DockDisconnect).catch(() => undefined);
@@ -636,6 +652,17 @@ export default function DockSection() {
             </>
           )}
         </div>
+      )}
+
+      {((connected && config) || otaSending) && (
+        <DockFirmware
+          rpc={rpc}
+          connected={connected}
+          reconnect={reconnect}
+          onSending={setOtaSending}
+          onError={fail}
+          onMessage={say}
+        />
       )}
 
       {message && !error && <p className="text-sm text-text-secondary">{message}</p>}

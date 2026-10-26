@@ -63,7 +63,25 @@ jobs:
             /tmp/ui_sim/shots/*.png
             /tmp/ui_sim/shots-landscape/*.png
 
+  # Builds of a pull request (or of any branch, run by hand) carry their commit in the
+  # version, because they also become the dock's test-build channel (publish-dev below).
+  meta:
+    name: Resolve the build's version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          V="$(tr -d ' \n\r' < firmware/rrcloud-ingest/version.txt)"
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ] || [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then V="${V}-dev.${SHA:0:7}"; fi
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          echo "building ${V}"
+
   esp-idf-build:
+    needs: meta
     strategy:
       fail-fast: false
       matrix:
@@ -71,4 +89,46 @@ jobs:
     uses: ./.github/workflows/firmware-build.yml
     with:
       board: ${{ matrix.board }}
+      version: ${{ needs.meta.outputs.version }}
       artifact-name: rrcloud-ingest-esp32p4-${{ matrix.board }}
+
+  # The dock's test-build channel: every green build of a pull request from this
+  # repository (or a hand-run build of any branch) replaces the rolling firmware-dev
+  # prerelease, which a dock with "Test builds" on installs from (main/ota.c). The last
+  # build wins; the manifest and release notes say which branch and commit it is.
+  publish-dev:
+    name: Publish to the firmware-dev test channel
+    needs: [meta, host-tests, ui-sim, esp-idf-build]
+    if: (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: firmware-dev
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rrcloud-ingest-esp32p4-*
+          path: artifacts
+      - name: Images and manifest
+        run: |
+          mkdir -p builds
+          for d in artifacts/rrcloud-ingest-esp32p4-*; do mkdir -p "builds/${d#artifacts/rrcloud-ingest-esp32p4-}"; cp "$d/rrcloud-ingest.bin" "builds/${d#artifacts/rrcloud-ingest-esp32p4-}/"; done
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          python3 .github/scripts/ota_manifest.py builds dist "${{ needs.meta.outputs.version }}" firmware-dev "${SHA:0:7}"
+      - name: Replace the firmware-dev prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: |
+          SHA="${{ github.event.pull_request.head.sha || github.sha }}"
+          gh release delete firmware-dev --cleanup-tag --yes -R "${GITHUB_REPOSITORY}" || true
+          {
+            echo "Test build of \`${BRANCH}\` at ${SHA} (version ${{ needs.meta.outputs.version }})."
+            echo
+            echo "Rolling: replaced by every build of a firmware pull request. A dock installs it with Device › Firmware › Test builds on, or from its web page."
+          } > notes.md
+          gh release create firmware-dev -R "${GITHUB_REPOSITORY}" --target "${SHA}" --prerelease --latest=false \
+            --title "rrcloud-ingest test build (${BRANCH})" --notes-file notes.md dist/*

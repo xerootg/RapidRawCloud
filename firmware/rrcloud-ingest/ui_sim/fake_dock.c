@@ -19,7 +19,7 @@ void fake_dock_init(void)
         "\"s3_tls_insecure\":false,\"pairing_url\":\"rrc.example.net\",\"include_globs\":\"*.nef *.nrw *.dng *.jpg *.jpeg *.heif *.hif *.tif *.tiff\","
         "\"exclude_globs\":\"\",\"key_template\":\"Camera Import/{model}/{yyyy}/{mm}/{dd}/{name}\",\"msc_root\":\"DCIM\",\"auto_sync\":true,"
         "\"upload_videos\":false,\"min_size_kb\":64,\"device_name\":\"Field dock\",\"wifi_enabled\":true,\"wifi_ssid\":\"Basecamp\",\"hostname\":\"rrcloud-ingest\","
-        "\"admin_auth\":false,\"usb_debug\":true,\"ble_enabled\":true,\"display_brightness\":80,\"display_timeout_s\":60,\"display_dark\":true,\"display_rotation\":0}");
+        "\"admin_auth\":false,\"usb_debug\":true,\"ble_enabled\":true,\"display_brightness\":80,\"display_timeout_s\":60,\"display_dark\":true,\"display_rotation\":0,\"ota_dev_channel\":false}");
     has_admin_pw = false;
     scan_state = 0;
 }
@@ -177,6 +177,16 @@ char *fake_dock_handle(const char *method, const char *path, const char *body, i
                    "\"2026-10-16T14:02:17Z I rrc: time synchronized (sntp)\",\"2026-10-16T14:05:40Z I rrc: camera attached: Z 7II via PTP\","
                    "\"2026-10-16T14:05:41Z I rrc: sync: 40 objects match, 23 new\"]");
     }
-    if (!get) return ok(st);   /* sync/now, sync/cancel, usb/reset, reboot, ble/forget, coproc/update */
+    if (get && !strcmp(path, "/api/ota")) {
+        char *b = malloc(640);
+        snprintf(b, 640, "{\"running\":\"0.4.0\",\"built\":\"Oct 26 2026 10:00:00\",\"hardware\":\"touch-lcd-43\",\"variant\":\"touch-lcd-43\",\"chip_rev\":301,"
+                 "\"channel\":\"%s\",\"state\":\"%s\",\"message\":\"%s\",\"done\":0,\"total\":0,\"trial\":false,\"rolled_back\":\"\",\"checked\":%s,\"available\":%s}",
+                 cfg_bool("ota_dev_channel") ? "dev" : "release", fake.ota_checked ? "idle" : "idle",
+                 fake.ota_checked ? "release 0.5.0 is available (running 0.4.0)" : "", fake.ota_checked ? "true" : "false",
+                 fake.ota_checked ? "{\"version\":\"0.5.0\",\"tag\":\"firmware-v0.5.0\",\"commit\":\"68e11af\",\"channel\":\"release\",\"size\":2859008,\"newer\":true}" : "null");
+        return b;
+    }
+    if (!get && !strcmp(path, "/api/ota/check")) { fake.ota_checked = true; return ok(st); }
+    if (!get) return ok(st);   /* sync/now, sync/cancel, usb/reset, reboot, ble/forget, coproc/update, ota/install */
     return err(st, 404, "unknown endpoint");
 }

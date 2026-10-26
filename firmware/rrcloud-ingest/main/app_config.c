@@ -37,6 +37,7 @@ static void defaults(app_config_t *c)
     c->display_timeout_s = 60;
     c->display_dark = true;
     c->display_rotation = 0;
+    c->ota_dev_channel = false;
 }
 
 static esp_err_t nvs_get_string(nvs_handle_t h, const char *key, char *out, size_t cap)
@@ -147,6 +148,7 @@ static int to_json(const app_config_t *c, char *out, size_t cap, bool for_ui)
     rrc_jsonw_key(&w, "display_timeout_s", false); rrc_jsonw_u64(&w, c->display_timeout_s);
     put_bool(&w, "display_dark", c->display_dark);
     rrc_jsonw_key(&w, "display_rotation", false); rrc_jsonw_u64(&w, c->display_rotation);
+    put_bool(&w, "ota_dev_channel", c->ota_dev_channel);
     if (for_ui) {
         char tmp[APP_SECRET_MAX + 1];
         put_bool(&w, "has_s3_secret", app_config_get_secret(tmp, sizeof tmp) == ESP_OK && tmp[0]);
@@ -265,6 +267,7 @@ esp_err_t app_config_apply_json(const char *json, size_t len, char *err, size_t 
         if (r != 0 && r != 90 && r != 180 && r != 270) { snprintf(err, err_cap, "display_rotation: 0, 90, 180 or 270"); cJSON_Delete(o); return ESP_ERR_INVALID_ARG; }
         c.display_rotation = (uint16_t)r;
     }
+    copy_bool(o, "ota_dev_channel", &c.ota_dev_channel);
     /* trim trailing slash on endpoint */
     size_t n = strlen(c.s3_endpoint);
     while (n && c.s3_endpoint[n - 1] == '/') c.s3_endpoint[--n] = 0;

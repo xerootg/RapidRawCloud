@@ -47,4 +47,12 @@ menu "rrcloud-ingest board"
         bool
         default y if RRC_BOARD_P4_TOUCH_LCD_43
 
+    config RRC_OTA_GITHUB_REPO
+        string "GitHub repository firmware updates come from"
+        default "xerootg/RapidRawCloud"
+        help
+            owner/name of the repository whose rolling firmware-latest release (and
+            firmware-dev, the test builds) the dock checks for updates. Each carries an
+            rrcloud-ingest-ota.json manifest (.github/scripts/ota_manifest.py).
+
 endmenu

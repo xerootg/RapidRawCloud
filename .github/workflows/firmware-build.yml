@@ -16,13 +16,17 @@ on:
         description: espressif/idf container tag
         type: string
         default: v5.5.5
+      version:
+        description: Version string to build in instead of version.txt (test builds; empty = version.txt)
+        type: string
+        default: ''
       board:
         description: "poe-eth (ESP32-P4-WIFI6-POE-ETH), poe-eth-dsi5 (the same board with a 5-inch Raspberry Pi DSI touch display), touch-lcd-43 (ESP32-P4-WIFI6-Touch-LCD-4.3, chip rev < 3) or touch-lcd-43-rev3 (same board, chip rev >= 3)"
         type: string
         default: poe-eth
     outputs:
       version:
-        description: firmware/rrcloud-ingest/version.txt as built
+        description: The version the image reports (the version input, else version.txt)
         value: ${{ jobs.build.outputs.version }}
 
 jobs:
@@ -38,6 +42,8 @@ jobs:
       - name: idf.py build
         id: build
         shell: bash
+        env:
+          RRC_FW_VERSION: ${{ inputs.version }}   # CMakeLists.txt prefers it over version.txt
         run: |
           git config --global --add safe.directory '*'
           . $IDF_PATH/export.sh
@@ -54,7 +60,7 @@ jobs:
           idf.py size
           # The component manager must not need to change the committed lock for either board.
           git diff --exit-code -- dependencies.lock
-          echo "version=$(tr -d ' \n\r' < version.txt)" >> "$GITHUB_OUTPUT"
+          echo "version=${RRC_FW_VERSION:-$(tr -d ' \n\r' < version.txt)}" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ inputs.artifact-name }}

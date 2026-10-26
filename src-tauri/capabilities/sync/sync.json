@@ -1,7 +1,17 @@
 {
   "$schema": "../../gen/schemas/desktop-schema.json",
   "identifier": "sync",
-  "description": "Capability for the rrcloud sync plugin (ARCHITECTURE.md §5/§7) — only loaded when the `sync` Cargo feature links `tauri-plugin-rrcloud` (see build.rs's feature-conditional `capabilities_path_pattern`); a `--no-default-features` build never reads this file.",
+  "description": "Capability for the rrcloud sync plugin (ARCHITECTURE.md §5/§7) — only loaded when the `sync` Cargo feature links `tauri-plugin-rrcloud` (see build.rs's feature-conditional `capabilities_path_pattern`); a `--no-default-features` build never reads this file. The http scope lets the dock panel download dock firmware releases (src/components/panel/sync/DockFirmware.tsx) to send them over Bluetooth.",
   "windows": ["main"],
-  "permissions": ["rrcloud:default"]
+  "permissions": [
+    "rrcloud:default",
+    {
+      "identifier": "http:default",
+      "allow": [
+        { "url": "https://github.com/xerootg/RapidRawCloud/releases/download/*" },
+        { "url": "https://release-assets.githubusercontent.com/*" },
+        { "url": "https://objects.githubusercontent.com/*" }
+      ]
+    }
+  ]
 }

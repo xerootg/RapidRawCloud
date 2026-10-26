@@ -10,6 +10,10 @@ CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 CONFIG_PARTITION_TABLE_OFFSET=0x8000
+# Firmware updates (main/ota.c): a new image boots on trial and is kept only once the
+# app marks it valid; a reset before that brings the previous image back. This lives in
+# the bootloader, which over-the-air updates do not replace: flash it over USB once.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 
 # ---- PSRAM: transfer buffers (8 MiB upload parts) live here.
 # 200 MHz hex PSRAM was gated behind IDF_EXPERIMENTAL_FEATURES on IDF 5.5.0; without

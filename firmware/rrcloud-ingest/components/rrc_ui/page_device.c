@@ -130,6 +130,7 @@ static void usb_cb(lv_event_t *e) { (void)e; ui_req_global("POST", "/api/usb/res
 static void reboot_ok(void *ud) { (void)ud; ui_req_global("POST", "/api/reboot", "{}", posted, "Restarting…"); }
 static void reboot_cb(lv_event_t *e) { (void)e; ui_dialog("Restart the dock?", "A sync in progress is interrupted and resumes after the restart.", "Restart", true, reboot_ok, NULL); }
 static void log_cb(lv_event_t *e) { (void)e; ui_nav_push(&page_log); }
+static void firmware_cb(lv_event_t *e) { (void)e; ui_nav_push(&page_firmware); }
 static void about_cb(lv_event_t *e) { (void)e; ui_nav_push(&page_about); }
 
 static lv_obj_t *action_item(lv_obj_t *list, const char *sym, const char *head, const char *sup, lv_event_cb_t cb, bool chevron)
@@ -188,6 +189,7 @@ static void build(lv_obj_t *c)
     l = ui_section(c, "Diagnostics");
     ui_setting(l, &s_usbdbg);
     action_item(l, ICON_USB, "Retry USB", "Power-cycle the camera port so it is detected again", usb_cb, false);
+    action_item(l, ICON_SYSTEM_UPDATE, "Firmware", "Version, updates, test builds", firmware_cb, true);
     action_item(l, ICON_ARTICLE, "Log", "Recent messages from the dock", log_cb, true);
     action_item(l, ICON_INFO, "About this dock", "Firmware, board, memory, storage, battery", about_cb, true);
 
@@ -347,3 +349,102 @@ static void about_status(const cJSON *s)
 static void about_destroy(void) { memset(&ab, 0, sizeof ab); }
 
 const ui_page_t page_about = {.title = "About", .build = about_build, .on_status = about_status, .destroy = about_destroy};
+
+/* ---- Firmware ------------------------------------------------------------------------
+ * The dock's own firmware: version, the update check (release, or the rolling test
+ * build when that switch is on) and the install, all through /api/ota (main/ota.c).
+ * Uploading a file and installing from a URL stay on the web page and in the app. */
+static const ui_setting_t s_devch = {.symbol = ICON_BUG, .headline = "Test builds", .key = "ota_dev_channel", .kind = BIND_SWITCH,
+                                     .help = "Check the rolling firmware-dev prerelease instead of releases"};
+static struct { lv_obj_t *it_run, *it_avail, *it_state, *bar, *btn_check, *btn_install; bool inflight; } fw;
+
+static bool fw_busy(const char *st)
+{
+    static const char *const b[] = {"checking", "downloading", "receiving", "verifying", "writing", "restarting"};
+    for (size_t i = 0; i < sizeof b / sizeof b[0]; i++) if (!strcmp(st, b[i])) return true;
+    return false;
+}
+
+static void fw_loaded(int status, const cJSON *o, void *ud)
+{
+    (void)ud;
+    fw.inflight = false;
+    if (status != 200 || !o || !fw.it_run) return;
+    char buf[200], a[24];
+    double rev = jnum(o, "chip_rev");
+    snprintf(buf, sizeof buf, "%s · %s · chip v%d.%d", jstr(o, "running"), jstr(o, "variant"), (int)rev / 100, (int)rev % 100);
+    ui_item_supporting(fw.it_run, buf);
+    const cJSON *av = jobj(o, "available");
+    if (cJSON_IsObject(av)) {
+        ui_fmt_bytes(a, sizeof a, jnum(av, "size"));
+        snprintf(buf, sizeof buf, "%s %s%s%s · %s%s", !strcmp(jstr(av, "channel"), "dev") ? "Test build" : "Release", jstr(av, "version"),
+                 jstr(av, "commit")[0] ? " · " : "", jstr(av, "commit"), a, jbool(av, "newer") ? "" : " · already running");
+    } else {
+        snprintf(buf, sizeof buf, "%s", jbool(o, "checked") ? "Nothing for this board" : "Not checked yet");
+    }
+    ui_item_supporting(fw.it_avail, buf);
+    const char *st = jstr(o, "state"), *msg = jstr(o, "message"), *rb = jstr(o, "rolled_back");
+    if (jbool(o, "trial")) snprintf(buf, sizeof buf, "On trial: kept after a minute with the network up");
+    else if (rb[0] && !strcmp(st, "idle") && !msg[0]) snprintf(buf, sizeof buf, "%s did not start cleanly and was rolled back", rb);
+    else snprintf(buf, sizeof buf, "%s%s%s", st, msg[0] ? ": " : "", msg);
+    ui_item_supporting(fw.it_state, buf);
+    ui_item_supporting_color(fw.it_state, !strcmp(st, "failed") ? M.error : M.on_surface_variant);
+    double done = jnum(o, "done"), total = jnum(o, "total");
+    bool busy = fw_busy(st);
+    if (busy && total > 0) { lv_obj_remove_flag(fw.bar, LV_OBJ_FLAG_HIDDEN); lv_bar_set_value(fw.bar, (int32_t)(1000 * done / total), LV_ANIM_OFF); }
+    else lv_obj_add_flag(fw.bar, LV_OBJ_FLAG_HIDDEN);
+    if (busy) lv_obj_add_state(fw.btn_check, LV_STATE_DISABLED); else lv_obj_remove_state(fw.btn_check, LV_STATE_DISABLED);
+    if (busy || !cJSON_IsObject(av)) lv_obj_add_state(fw.btn_install, LV_STATE_DISABLED); else lv_obj_remove_state(fw.btn_install, LV_STATE_DISABLED);
+}
+
+static void fw_fetch(void)
+{
+    if (fw.inflight) return;
+    fw.inflight = true;
+    ui_req("GET", "/api/ota", NULL, fw_loaded, NULL);
+}
+
+static void fw_posted(int status, const cJSON *json, void *ud)
+{
+    if (status != 200) ui_snackbar("%s", ui_resp_error(status, json));
+    else if (ud) ui_snackbar("%s", (const char *)ud);
+    fw_fetch();
+}
+
+static void fw_check_cb(lv_event_t *e) { (void)e; ui_req("POST", "/api/ota/check", "{}", fw_posted, "Checking for updates…"); }
+static void fw_install_ok(void *ud) { (void)ud; ui_req("POST", "/api/ota/install", "{}", fw_posted, "Installing; the dock restarts into it"); }
+static void fw_install_cb(lv_event_t *e)
+{
+    (void)e;
+    ui_dialog("Install this firmware?", "The dock downloads it, checks it and restarts into it. If it does not start cleanly, the current firmware comes back by itself.",
+              "Install", false, fw_install_ok, NULL);
+}
+
+static void fw_build(lv_obj_t *c)
+{
+    memset(&fw, 0, sizeof fw);
+    lv_obj_t *l = ui_section(c, "This dock");
+    fw.it_run = ui_list_item(l, ICON_RELEASE, "Running", "—");
+    fw.it_state = ui_list_item(l, ICON_INFO, "Update", "—");
+    fw.bar = ui_progress(lv_obj_get_child(fw.it_state, 1));
+    lv_obj_add_flag(fw.bar, LV_OBJ_FLAG_HIDDEN);
+    l = ui_section(c, "Updates");
+    fw.it_avail = ui_list_item(l, ICON_SYSTEM_UPDATE, "Latest", "—");
+    ui_setting(l, &s_devch);
+    lv_obj_t *row = ui_row(c, 8);
+    lv_obj_set_style_pad_top(row, 8, 0);
+    fw.btn_check = ui_button(row, BTN_TONAL, ICON_REFRESH, "Check", fw_check_cb, NULL);
+    fw.btn_install = ui_button(row, BTN_FILLED, ICON_SYSTEM_UPDATE, "Install", fw_install_cb, NULL);
+    lv_obj_add_state(fw.btn_install, LV_STATE_DISABLED);
+    lv_obj_t *hint = ui_label(c, UI_FONT_SMALL, M.on_surface_variant,
+                              "To install a file or an image from a URL, use the dock's web page or the RapidRAW app.");
+    lv_obj_set_width(hint, LV_PCT(100));
+    lv_label_set_long_mode(hint, LV_LABEL_LONG_MODE_WRAP);
+    lv_obj_set_style_pad_hor(hint, 8, 0);
+    fw_fetch();
+}
+
+static void fw_tick(void) { fw_fetch(); }
+static void fw_destroy(void) { memset(&fw, 0, sizeof fw); }
+
+const ui_page_t page_firmware = {.title = "Firmware", .build = fw_build, .tick = fw_tick, .destroy = fw_destroy, .locked = true};

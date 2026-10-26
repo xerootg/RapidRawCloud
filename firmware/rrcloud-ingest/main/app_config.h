@@ -43,6 +43,7 @@ typedef struct {
     uint16_t display_timeout_s;       /* screen off after this much inactivity, 0 = never */
     bool display_dark;                /* Material 3 dark scheme */
     uint16_t display_rotation;        /* 0, 90, 180 or 270 degrees from the panel's native orientation */
+    bool ota_dev_channel;             /* firmware updates from the rolling firmware-dev prerelease (test builds) */
 } app_config_t;
 
 esp_err_t app_config_init(void);                     /* nvs_flash_init + load (defaults when empty) */

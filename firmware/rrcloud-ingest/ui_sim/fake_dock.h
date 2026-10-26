@@ -13,6 +13,7 @@ typedef struct {
     int rssi;
     const char *pair_state;     /* idle | discovering | waiting_user | done | failed */
     int backlight;              /* last value set through the host hook */
+    bool ota_checked;           /* /api/ota/check was called: an update is "available" */
 } fake_state_t;
 
 extern fake_state_t fake;

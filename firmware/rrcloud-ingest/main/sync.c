@@ -1,4 +1,5 @@
 #include "sync.h"
+#include "ota.h"
 #include "util.h"
 #include <stdarg.h>
 #include <string.h>
@@ -640,6 +641,9 @@ static void sync_run(cam_source_t *src)
 
 static void sync_run_impl(cam_source_t *src)
 {
+    /* A firmware update restarts the dock when it is done: no run starts under it
+     * (the tick retries once the update failed or was cancelled). */
+    if (ota_busy()) { run_deferred = true; set_error("firmware update in progress; the sync starts when it is done"); return; }
     if (!s3_ready) { run_deferred = true; set_error("cloud not configured — pair or enter S3 settings first; the sync starts once it is"); return; }
     if (!net_has_ip()) { run_deferred = true; set_phase(SYNC_WAITING_NETWORK); set_error("waiting for the network"); return; }
     if (!strcmp(src->kind, "ptp") && !cam_identified) {

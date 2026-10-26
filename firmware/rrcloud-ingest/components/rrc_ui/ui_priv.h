@@ -107,7 +107,7 @@ typedef struct ui_page {
 } ui_page_t;
 
 extern const ui_page_t page_home, page_sync, page_wifi, page_device;
-extern const ui_page_t page_cloud, page_pairing, page_log, page_about;
+extern const ui_page_t page_cloud, page_pairing, page_log, page_about, page_firmware;
 
 /* Top-level destinations swap the content; sub-pages stack on top with a back arrow. */
 void ui_nav_tab(int index);                    /* 0 home, 1 sync, 2 wifi, 3 device */
