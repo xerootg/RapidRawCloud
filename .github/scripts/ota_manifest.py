@@ -6,7 +6,9 @@
 <builds-dir> holds one directory per board as the build artifacts unpack
 (<builds-dir>/<board>/rrcloud-ingest.bin, board = the firmware-build.yml input:
 poe-eth, poe-eth-dsi5, touch-lcd-43, touch-lcd-43-rev3). For each, the app image is
-copied to <out-dir>/rrcloud-ingest-<version>-<board>.bin, and
+copied to <out-dir>/rrcloud-ingest-<version>-<board>.bin, its ELF (when the build
+left one) to rrcloud-ingest-<version>-<board>.elf.gz — the symbols a crash report
+from that exact image is decoded with (main/crashlog.c, GET /api/coredump) — and
 <out-dir>/rrcloud-ingest-ota.json lists them:
 
     {"version": "...", "tag": "...", "commit": "...",
@@ -18,6 +20,7 @@ holds its chip revision. The variant is what the image says about itself (the ta
 after esp_app_desc_t, main/ota.c), and the chip range comes from the ESP image
 header, so the manifest cannot disagree with the images it lists.
 """
+import gzip
 import hashlib
 import json
 import os
@@ -59,6 +62,10 @@ def main():
             sys.exit(f"{src}: built as {built_version}, publishing as {version}")
         name = f"rrcloud-ingest-{version}-{board}.bin"
         shutil.copyfile(src, os.path.join(out, name))
+        elf = os.path.join(builds, board, "rrcloud-ingest.elf")
+        if os.path.isfile(elf):
+            with open(elf, "rb") as fi, gzip.open(os.path.join(out, name[:-4] + ".elf.gz"), "wb", compresslevel=9) as fo:
+                shutil.copyfileobj(fi, fo)
         images.append({
             "variant": variant, "hardware": hardware, "board": board, "file": name, "size": len(data),
             "sha256": hashlib.sha256(data).hexdigest(), "chip_rev_min": rev_min,

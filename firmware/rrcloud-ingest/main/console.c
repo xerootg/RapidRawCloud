@@ -29,6 +29,7 @@
 #include "board.h"
 #include "display.h"
 #include "ota.h"
+#include "crashlog.h"
 #ifdef BOARD_I2C_SDA_GPIO
 #include "driver/i2c_master.h"
 #endif
@@ -215,6 +216,14 @@ static int cmd_ota(int argc, char **argv)
     if (e != ESP_OK) { printf("ota: %s\n", esp_err_to_name(e)); return 1; }
     char buf[1024];
     if (ota_status_json(buf, sizeof buf) >= 0) printf("%s\n", buf);
+    return 0;
+}
+
+static int cmd_crash(int argc, char **argv)
+{
+    if (argc >= 2 && !strcmp(argv[1], "erase")) { printf("erase: %s\n", esp_err_to_name(crashlog_erase())); return 0; }
+    char buf[400];
+    if (crashlog_status_json(buf, sizeof buf) >= 0) printf("%s\n", buf);
     return 0;
 }
 
@@ -502,6 +511,7 @@ esp_err_t console_start(void)
         {.command = "dsi-timing", .help = "dsi-timing [lane_mbps dpi_mhz hsw hbp hfp vsw vbp vfp burst|nonburst lp|nolp]: show or change the Pi DSI panel's link timing live (bring-up tool)", .func = cmd_dsi_timing},
 #endif
         {.command = "ota", .help = "ota [check | install [url [sha256]] | cancel]: firmware update state; check the release (or test-build) manifest; install what it found, or any image by URL", .func = cmd_ota},
+        {.command = "crash", .help = "crash [erase]: the stored crash report (download the core dump at GET /api/coredump)", .func = cmd_crash},
         {.command = "eth-rx-stall-test", .help = "Drop every received ethernet frame to test the receive watchdog (the dock restarts itself)", .func = cmd_eth_rx_stall_test},
     };
     for (size_t i = 0; i < sizeof cmds / sizeof cmds[0]; i++) esp_console_cmd_register(&cmds[i]);

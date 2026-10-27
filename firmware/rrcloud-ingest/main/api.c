@@ -24,6 +24,7 @@
 #include "store.h"
 #include "coproc.h"
 #include "ota.h"
+#include "crashlog.h"
 #include "ble.h"
 #include "power.h"
 #include "board.h"
@@ -86,11 +87,12 @@ static void r_status(api_resp_t *out)
 {
     char *buf = malloc(6144);
     char *sync_json = malloc(1800);
-    char coproc_json[640], ble_json[400], power_json[96];
+    char coproc_json[640], ble_json[400], power_json[96], crash_json[320];
     if (!buf || !sync_json) { free(buf); free(sync_json); set(out, 500, NULL, 0); return; }
     sync_status_json(sync_json, 1800);
     if (coproc_status_json(coproc_json, sizeof coproc_json) < 0) strcpy(coproc_json, "{}");
     if (ble_status_json(ble_json, sizeof ble_json) < 0) strcpy(ble_json, "{}");
+    if (crashlog_status_json(crash_json, sizeof crash_json) < 0) strcpy(crash_json, "{}");
     int pn = power_status_json(power_json, sizeof power_json);
     if (pn < 0 || pn >= (int)sizeof power_json) strcpy(power_json, "{}");
     char netd[64];
@@ -110,12 +112,12 @@ static void r_status(api_resp_t *out)
     int n = snprintf(buf, 6144,
         "{\"sync\":%s,\"network\":%s,\"eth_link\":%s,\"wifi\":%s,\"time_synced\":%s,\"time\":%s,\"version\":%s,\"hostname\":%s,\"device_id\":%s,"
         "\"storage_total\":%u,\"storage_used\":%u,\"heap_free\":%u,\"psram_free\":%u,\"uptime_s\":%lld,\"usb_devices\":%d,\"usb_faults\":%u,\"usb_chan_irqs\":%u,\"eth_rx_frames\":%u,\"eth_rx_restarts\":%u,\"coproc\":%s,\"ble\":%s,"
-        "\"board\":\"%s\",\"has_ethernet\":%s,\"wifi_enabled\":%s,\"wifi_ssid\":%s,\"wifi_rssi\":%d,\"power\":%s}",
+        "\"board\":\"%s\",\"has_ethernet\":%s,\"wifi_enabled\":%s,\"wifi_ssid\":%s,\"wifi_rssi\":%d,\"power\":%s,\"crash\":%s}",
         sync_json, q_net, net_eth_link() ? "true" : "false", net_wifi_connected() ? "true" : "false", net_time_synced() ? "true" : "false", q_time, q_ver, q_host, q_dev,
         (unsigned)total, (unsigned)used, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
         (long long)(esp_timer_get_time() / 1000000), usb_diag_device_count(), (unsigned)usb_fault_count(), (unsigned)usb_fault_decode_calls(),
         (unsigned)net_eth_rx_frames(), (unsigned)net_eth_rx_restarts(), coproc_json, ble_json,
-        BOARD_NAME, net_has_ethernet() ? "true" : "false", app_config_get()->wifi_enabled ? "true" : "false", q_ssid, net_wifi_rssi(), power_json);
+        BOARD_NAME, net_has_ethernet() ? "true" : "false", app_config_get()->wifi_enabled ? "true" : "false", q_ssid, net_wifi_rssi(), power_json, crash_json);
     free(sync_json);
     if (n < 0 || n >= 6144) { free(buf); err(out, 500, "status too large"); return; }
     set(out, 200, buf, n);
@@ -351,6 +353,7 @@ void api_dispatch(const char *method, const char *path, const char *body, size_t
     else if (post && !strcmp(path, "/api/ota/upload/begin")) r_ota_begin(body, body_len, out);
     else if (post && !strcmp(path, "/api/ota/upload/chunk")) r_ota_chunk(body, body_len, out);
     else if (post && !strcmp(path, "/api/ota/upload/finish")) r_ota_finish(out);
+    else if (post && !strcmp(path, "/api/coredump/erase")) { if (crashlog_erase() == ESP_OK) ok(out); else err(out, 500, "could not erase the crash report"); }
     else if (post && !strcmp(path, "/api/ota/cancel")) { if (ota_cancel() == ESP_OK) ok(out); else err(out, 409, "the image is being written; it cannot be stopped now"); }
     else err(out, 404, "unknown endpoint");
     if (!out->json) set(out, 500, NULL, 0);

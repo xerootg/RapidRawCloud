@@ -20,6 +20,8 @@
  *   POST /api/ota/install       {} installs what the check found; {"url":…,"sha256":…} any image
  *   POST /api/ota/upload/begin  {"size":n,"sha256":"…"}; then /chunk {"off":n,"data":base64} and /finish
  *   POST /api/ota/cancel
+ *   GET  /api/coredump          the stored crash's ELF core dump (application/octet-stream)
+ *   POST /api/coredump/erase
  *
  * Optional HTTP Basic auth (user "admin") when admin_auth is enabled and a
  * password is set. The UI is meant for the LAN; put it behind your own TLS
@@ -48,6 +50,8 @@
 #include "usb_diag.h"
 #include "coproc.h"
 #include "api.h"
+#include "crashlog.h"
+#include "esp_flash.h"
 #include "util.h"
 #include "lwip/sockets.h"
 #include "lwip/stats.h"
@@ -164,6 +168,32 @@ static esp_err_t h_api(httpd_req_t *req)
     return e;
 }
 
+/* The core dump as stored (an ELF image after the espcoredump header), for
+ * `esp-coredump info_corefile -c dump.bin rrcloud-ingest.elf` with the build's ELF. */
+static esp_err_t h_coredump(httpd_req_t *req)
+{
+    AUTH();
+    size_t addr = 0, size = 0;
+    if (crashlog_dump_location(&addr, &size) != ESP_OK) {
+        httpd_resp_set_status(req, status_line(404));
+        return send_json(req, "{\"ok\":false,\"error\":\"no crash report stored\"}", -1);
+    }
+    uint8_t *buf = malloc(4096);
+    if (!buf) { httpd_resp_set_status(req, status_line(500)); return send_json(req, "{\"ok\":false,\"error\":\"oom\"}", -1); }
+    httpd_resp_set_type(req, "application/octet-stream");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"rrcloud-ingest-coredump.bin\"");
+    esp_err_t e = ESP_OK;
+    for (size_t off = 0; off < size && e == ESP_OK;) {
+        size_t n = size - off < 4096 ? size - off : 4096;
+        e = esp_flash_read(NULL, buf, addr + off, n);
+        if (e == ESP_OK) e = httpd_resp_send_chunk(req, (const char *)buf, n);
+        off += n;
+    }
+    free(buf);
+    if (e == ESP_OK) e = httpd_resp_send_chunk(req, NULL, 0);
+    return e;
+}
+
 static volatile unsigned external_connections;
 
 static esp_err_t on_open(httpd_handle_t hd, int sockfd)
@@ -261,6 +291,8 @@ esp_err_t web_start(void)
         {.uri = "/api/ota/upload/chunk", .method = HTTP_POST, .handler = h_api},
         {.uri = "/api/ota/upload/finish", .method = HTTP_POST, .handler = h_api},
         {.uri = "/api/ota/cancel", .method = HTTP_POST, .handler = h_api},
+        {.uri = "/api/coredump", .method = HTTP_GET, .handler = h_coredump},
+        {.uri = "/api/coredump/erase", .method = HTTP_POST, .handler = h_api},
     };
     for (size_t i = 0; i < sizeof routes / sizeof routes[0]; i++) httpd_register_uri_handler(s, &routes[i]);
     log_ring_printf("web ui listening on port 80");

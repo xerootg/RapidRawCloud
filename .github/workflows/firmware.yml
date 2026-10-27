@@ -123,7 +123,7 @@ jobs:
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           mkdir -p builds
-          for d in artifacts/rrcloud-ingest-esp32p4-*; do mkdir -p "builds/${d#artifacts/rrcloud-ingest-esp32p4-}"; cp "$d/rrcloud-ingest.bin" "builds/${d#artifacts/rrcloud-ingest-esp32p4-}/"; done
+          for d in artifacts/rrcloud-ingest-esp32p4-*; do mkdir -p "builds/${d#artifacts/rrcloud-ingest-esp32p4-}"; cp "$d/rrcloud-ingest.bin" "$d/rrcloud-ingest.elf" "builds/${d#artifacts/rrcloud-ingest-esp32p4-}/"; done
           python3 .github/scripts/ota_manifest.py builds dist "$VERSION" firmware-dev "${SHA:0:7}"
       - name: Replace the firmware-dev prerelease
         env:
