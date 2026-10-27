@@ -46,7 +46,21 @@ static char applied_ssid[33], applied_pw[65];
  * cable is out. Both links sit in the same subnet, and lwIP routes on-link
  * destinations to whichever netif it finds first, so an associated Wi-Fi
  * station would silently take uploads off the wire. On a board without
- * Ethernet Wi-Fi is the only path and comes up at boot. */
+ * Ethernet Wi-Fi is the only path and comes up at boot.
+ *
+ * "Ethernet carries traffic" means it has an address, not merely a link: a port
+ * that links up and passes nothing (a dead switch port, a VLAN that is not this
+ * network) left the dock with a working Wi-Fi it never used. After a link comes up,
+ * Ethernet gets ETH_ADDRESS_GRACE_US to obtain an address; without one, Wi-Fi takes
+ * over, and hands back the moment Ethernet gets one. */
+#define ETH_ADDRESS_GRACE_US (30 * 1000000LL)
+static int64_t eth_link_up_us;
+static esp_timer_handle_t eth_grace_timer;
+/* Ethernet carries traffic, or is still within its grace period to get an address. */
+static bool eth_holds_traffic(void)
+{
+    return eth_link && (eth_ip || esp_timer_get_time() - eth_link_up_us < ETH_ADDRESS_GRACE_US);
+}
 typedef enum { WIFI_POLICY_UP, WIFI_POLICY_DOWN, WIFI_POLICY_REAPPLY, WIFI_POLICY_CONNECT, WIFI_POLICY_SCAN } wifi_policy_t;
 static QueueHandle_t policy_q;
 static bool policy_post(wifi_policy_t p) { return policy_q && xQueueSend(policy_q, &p, 0) == pdTRUE; }
@@ -171,7 +185,14 @@ static void eth_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base; (void)data;
     switch (id) {
-    case ETHERNET_EVENT_CONNECTED: eth_link = true; log_ring_printf("ethernet link up"); policy_post(WIFI_POLICY_DOWN); break;
+    case ETHERNET_EVENT_CONNECTED:
+        eth_link = true;
+        eth_link_up_us = esp_timer_get_time();
+        log_ring_printf("ethernet link up");
+        /* Wi-Fi keeps any traffic it carries until Ethernet has an address (IP_EVENT_ETH_GOT_IP);
+         * if none comes within the grace period, the re-check keeps or brings Wi-Fi up. */
+        if (eth_grace_timer) { esp_timer_stop(eth_grace_timer); esp_timer_start_once(eth_grace_timer, ETH_ADDRESS_GRACE_US + 1000000); }
+        break;
     case ETHERNET_EVENT_DISCONNECTED: eth_link = false; eth_ip = false; eth_ip_str[0] = 0; log_ring_printf("ethernet link down"); policy_post(WIFI_POLICY_UP); break;
     default: break;
     }
@@ -192,6 +213,7 @@ static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         snprintf(eth_ip_str, sizeof eth_ip_str, IPSTR, IP2STR(&e->ip_info.ip));
         eth_ip = true;
         log_ring_printf("ethernet ip %s — web ui: http://%s/ (http://%s.local/)", eth_ip_str, eth_ip_str, app_config_get()->hostname);
+        policy_post(WIFI_POLICY_DOWN);   /* Ethernet carries traffic again */
     } else if (id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = data;
         snprintf(wifi_ip_str, sizeof wifi_ip_str, IPSTR, IP2STR(&e->ip_info.ip));
@@ -199,6 +221,7 @@ static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
         log_ring_printf("wifi ip %s — web ui: http://%s/ (http://%s.local/)", wifi_ip_str, wifi_ip_str, app_config_get()->hostname);
     } else if (id == IP_EVENT_ETH_LOST_IP) {
         eth_ip = false;
+        policy_post(WIFI_POLICY_UP);   /* link up, no address: Wi-Fi takes over */
     } else if (id == IP_EVENT_STA_LOST_IP) {
         wifi_ip = false;
     }
@@ -437,15 +460,18 @@ static void policy_task(void *arg)
     for (;;) {
         if (xQueueReceive(policy_q, &p, portMAX_DELAY) != pdTRUE) continue;
         const app_config_t *c = app_config_get();
-        bool want = c->wifi_enabled && c->wifi_ssid[0] && !eth_link;
+        bool want = c->wifi_enabled && c->wifi_ssid[0] && !eth_holds_traffic();
         switch (p) {
-        case WIFI_POLICY_DOWN: wifi_stop("ethernet carries traffic"); break;
+        case WIFI_POLICY_DOWN: if (eth_link && eth_ip) wifi_stop("ethernet carries traffic"); break;
         case WIFI_POLICY_UP: if (want) wifi_start(); break;
         case WIFI_POLICY_REAPPLY:
             if (!c->wifi_enabled) wifi_stop("disabled in settings");
             else if (!c->wifi_ssid[0]) wifi_stop("no network configured");
-            else if (eth_link) wifi_stop("ethernet carries traffic");
-            else wifi_start();
+            else if (eth_link && eth_ip) wifi_stop("ethernet carries traffic");
+            else if (!eth_holds_traffic()) {
+                if (eth_link && !wifi_started) log_ring_printf("ethernet has a link but no address after %lld s; Wi-Fi takes over", ETH_ADDRESS_GRACE_US / 1000000);
+                wifi_start();
+            }
             break;
         case WIFI_POLICY_CONNECT:
             if (wifi_started && applied_ssid[0] && !wifi_up && !scanning) esp_wifi_connect();
@@ -456,6 +482,9 @@ static void policy_task(void *arg)
 }
 
 static void boot_policy_cb(void *arg) { (void)arg; policy_post(WIFI_POLICY_UP); }
+#if CONFIG_RRC_HAS_ETHERNET
+static void eth_grace_cb(void *arg) { (void)arg; policy_post(WIFI_POLICY_REAPPLY); }
+#endif
 
 esp_err_t net_wifi_reconfigure(void)
 {
@@ -576,7 +605,7 @@ int net_wifi_json(char *out, size_t cap)
     rrc_jsonw_raw(&w, "{");
     rrc_jsonw_key(&w, "enabled", true); rrc_jsonw_raw(&w, c->wifi_enabled ? "true" : "false");
     rrc_jsonw_key(&w, "ssid", false); rrc_jsonw_str(&w, c->wifi_ssid);
-    rrc_jsonw_key(&w, "standby", false); rrc_jsonw_raw(&w, eth_link && c->wifi_enabled && c->wifi_ssid[0] ? "true" : "false");
+    rrc_jsonw_key(&w, "standby", false); rrc_jsonw_raw(&w, eth_holds_traffic() && c->wifi_enabled && c->wifi_ssid[0] ? "true" : "false");
     rrc_jsonw_key(&w, "started", false); rrc_jsonw_raw(&w, wifi_started ? "true" : "false");
     rrc_jsonw_key(&w, "associated", false); rrc_jsonw_raw(&w, wifi_up ? "true" : "false");
     rrc_jsonw_key(&w, "has_ip", false); rrc_jsonw_raw(&w, wifi_ip ? "true" : "false");
@@ -634,6 +663,8 @@ esp_err_t net_init(void)
     const esp_timer_create_args_t rta = {.callback = retry_cb, .name = "wifi_retry"};
     esp_timer_create(&rta, &retry_timer);
 #if CONFIG_RRC_HAS_ETHERNET
+    const esp_timer_create_args_t gta = {.callback = eth_grace_cb, .name = "eth_grace"};
+    esp_timer_create(&gta, &eth_grace_timer);   /* before eth_init: the link event arms it */
     esp_err_t e = eth_init();
     if (e != ESP_OK) log_ring_printf("ethernet init failed: %s", esp_err_to_name(e));
 #endif
