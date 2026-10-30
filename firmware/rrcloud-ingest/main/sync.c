@@ -606,6 +606,10 @@ static RTC_NOINIT_ATTR uint32_t rtc_run_magic;
 static RTC_NOINIT_ATTR uint32_t rtc_resume_tries;
 static RTC_NOINIT_ATTR uint32_t rtc_recovery_restart;
 static bool resume_pending;
+/* RESUME_MAX_TRIES crashes in a row during runs: no run starts by itself (neither a
+ * resume nor auto_sync on the still-attached camera, which turned a crash that recurs
+ * mid-run into a boot loop) until the operator asks for one or a run completes. */
+static bool crash_hold;
 
 void sync_mark_recovery_restart(void) { rtc_recovery_restart = RECOVERY_MAGIC; }
 
@@ -622,7 +626,8 @@ static void resume_check_at_boot(void)
     if (rtc_run_magic != RUN_MAGIC) return;
     rtc_run_magic = 0;
     if (rtc_resume_tries >= RESUME_MAX_TRIES) {
-        log_ring_printf("sync: not resuming the interrupted run (%u restarts in a row)", (unsigned)rtc_resume_tries);
+        crash_hold = true;
+        log_ring_printf("sync: %u restarts in a row during runs; automatic syncs are paused until one is started by hand (Sync now)", (unsigned)rtc_resume_tries);
         return;
     }
     rtc_resume_tries++;
@@ -631,6 +636,8 @@ static void resume_check_at_boot(void)
 }
 
 static void sync_run_impl(cam_source_t *src);
+static bool run_began;   /* sync_run_impl got past its preconditions (not merely deferred) */
+
 static void sync_run(cam_source_t *src)
 {
     /* A firmware update restarts the dock when it is done: no run starts under it
@@ -638,11 +645,20 @@ static void sync_run(cam_source_t *src)
      * one while this run holds the reservation, from identifying the camera on. */
     if (!ota_net_begin()) { run_deferred = true; set_error("firmware update in progress; the sync starts when it is done"); return; }
     rtc_run_magic = RUN_MAGIC;
+    run_began = false;
     sync_run_impl(src);
     rtc_run_magic = 0;
-    rtc_resume_tries = 0;
+    if (run_began) {
+        /* a run that ran to its end, however it ended, clears the crash count and the pause;
+         * one that was only deferred (no network yet, camera asleep) does not */
+        rtc_resume_tries = 0;
+        crash_hold = false;
+    }
     ota_net_end();
 }
+
+/* Whether a run may start without the operator asking. */
+static bool auto_start_allowed(void) { return (app_config_get()->auto_sync && !crash_hold) || resume_pending; }
 
 static void sync_run_impl(cam_source_t *src)
 {
@@ -656,6 +672,7 @@ static void sync_run_impl(cam_source_t *src)
     run_deferred = false;
     resume_pending = false;
     cancel_flag = false;
+    run_began = true;
     ST_LOCK(); st.phase = SYNC_ENUMERATING; st.run_total = st.run_done = st.run_skipped = st.run_failed = 0; st.run_bytes = 0; st.run_total_bytes = st.run_read_bytes = 0; st.run_inflight = 0; st.run_elapsed_ms = 0; st.current_file[0] = 0; st.current_done = 0; st.last_error[0] = 0; ST_UNLOCK();
     memset(ue_stats(), 0, sizeof *ue_stats());
     run_t0_us = esp_timer_get_time(); run_end_us = 0;
@@ -724,7 +741,7 @@ static void on_tick(void)
 {
     /* A run that could not start (no network yet, cloud unconfigured, camera asleep)
      * is retried here instead of waiting for a replug. */
-    if (run_deferred && cam && cam->connected(cam) && (app_config_get()->auto_sync || resume_pending)) sync_run(cam);
+    if (run_deferred && cam && cam->connected(cam) && auto_start_allowed()) sync_run(cam);
     if (!s3_ready || !net_has_ip()) return;
     /* bucket traffic: not beside a firmware download or flash write (ota.h) */
     if (!ota_net_begin()) return;
@@ -1162,7 +1179,8 @@ static void sync_task(void *arg)
             scpy(st.camera_serial, sizeof st.camera_serial, cam->serial);
             ST_UNLOCK();
             log_ring_printf("camera attached: %s [%s]", cam->model, cam->source_id);
-            if (app_config_get()->auto_sync || resume_pending) sync_run(cam);
+            if (auto_start_allowed()) sync_run(cam);
+            else if (crash_hold) set_error("automatic syncs are paused after repeated crashes; press Sync now to start one");
             break;
         case CMD_DETACH:
             if (cam) { cam->release(cam); }
@@ -1174,6 +1192,7 @@ static void sync_task(void *arg)
             log_ring_printf("camera detached");
             break;
         case CMD_SYNC_NOW:
+            crash_hold = false;   /* the operator asked */
             if (cam && cam->connected(cam)) sync_run(cam);
             else { set_error("no camera attached"); }
             break;
