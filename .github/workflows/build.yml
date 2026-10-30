@@ -148,8 +148,11 @@ jobs:
         if: inputs.mobile == 'android'
         uses: nttld/setup-ndk@v1
         id: setup-ndk
+        # r27 = 27.0.12077973, the NDK Android Gradle Plugin 8.11 looks for by default
+        # (ndk/<version> in the SDK, which link-to-sdk creates). With any other version
+        # Gradle cannot find it and packages native libraries unstripped.
         with:
-          ndk-version: r26d
+          ndk-version: r27
           link-to-sdk: true
 
       - name: Install frontend dependencies
