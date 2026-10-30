@@ -633,17 +633,19 @@ static void resume_check_at_boot(void)
 static void sync_run_impl(cam_source_t *src);
 static void sync_run(cam_source_t *src)
 {
+    /* A firmware update restarts the dock when it is done: no run starts under it
+     * (the tick retries once the update failed or was cancelled), and none can start
+     * one while this run holds the reservation, from identifying the camera on. */
+    if (!ota_sync_begin()) { run_deferred = true; set_error("firmware update in progress; the sync starts when it is done"); return; }
     rtc_run_magic = RUN_MAGIC;
     sync_run_impl(src);
     rtc_run_magic = 0;
     rtc_resume_tries = 0;
+    ota_sync_end();
 }
 
 static void sync_run_impl(cam_source_t *src)
 {
-    /* A firmware update restarts the dock when it is done: no run starts under it
-     * (the tick retries once the update failed or was cancelled). */
-    if (ota_busy()) { run_deferred = true; set_error("firmware update in progress; the sync starts when it is done"); return; }
     if (!s3_ready) { run_deferred = true; set_error("cloud not configured — pair or enter S3 settings first; the sync starts once it is"); return; }
     if (!net_has_ip()) { run_deferred = true; set_phase(SYNC_WAITING_NETWORK); set_error("waiting for the network"); return; }
     if (!strcmp(src->kind, "ptp") && !cam_identified) {
@@ -717,12 +719,21 @@ static void sync_run_impl(cam_source_t *src)
 }
 
 /* ---- periodic tick ---------------------------------------------------------- */
+static void tick_maintenance(void);
 static void on_tick(void)
 {
     /* A run that could not start (no network yet, cloud unconfigured, camera asleep)
      * is retried here instead of waiting for a replug. */
     if (run_deferred && cam && cam->connected(cam) && (app_config_get()->auto_sync || resume_pending)) sync_run(cam);
     if (!s3_ready || !net_has_ip()) return;
+    /* bucket traffic: not beside a firmware download or flash write (ota.h) */
+    if (!ota_sync_begin()) return;
+    tick_maintenance();
+    ota_sync_end();
+}
+
+static void tick_maintenance(void)
+{
     int64_t now = (int64_t)time(NULL);
     int64_t hb;
     bool attached;

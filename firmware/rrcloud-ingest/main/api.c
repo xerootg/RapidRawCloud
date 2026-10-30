@@ -232,7 +232,7 @@ static void r_coproc_update(const char *body, size_t len, api_resp_t *out)
 static void ota_err(api_resp_t *out, esp_err_t e)
 {
     switch (e) {
-    case ESP_ERR_INVALID_STATE: err(out, 409, "a firmware update is already in progress"); break;
+    case ESP_ERR_INVALID_STATE: err(out, 409, "a firmware update is in progress, or a cancelled one is still stopping; try again shortly"); break;
     case ESP_ERR_NOT_ALLOWED: err(out, 409, "a sync is running; update when it is done"); break;
     case ESP_ERR_NOT_FOUND: err(out, 409, "no update known for this channel yet: check for one first"); break;
     case ESP_ERR_NOT_FINISHED: err(out, 409, "the running firmware is still on trial; install again once it is kept (about a minute after it started)"); break;

@@ -100,7 +100,11 @@ export default function DockFirmware({
 }) {
   const [ota, setOta] = useState<DockOta | null>(null);
   const [sending, setSending] = useState<Sending | null>(null);
+  const [preparing, setPreparing] = useState(false);
   const cancelRef = useRef(false);
+  // set before the first await, so a second click cannot start a second transfer
+  const inFlightRef = useRef(false);
+  const transferring = sending !== null;
 
   const refresh = useCallback(async () => {
     try {
@@ -113,9 +117,10 @@ export default function DockFirmware({
   useEffect(() => {
     if (!connected) return;
     void refresh();
-    const id = setInterval(() => void refresh(), sending ? 10000 : 3000);
+    // keyed on whether a transfer runs, not on its progress (replaced after every chunk)
+    const id = setInterval(() => void refresh(), transferring ? 10000 : 3000);
     return () => clearInterval(id);
-  }, [connected, refresh, sending]);
+  }, [connected, refresh, transferring]);
 
   const setChannel = async (dev: boolean) => {
     try {
@@ -148,7 +153,9 @@ export default function DockFirmware({
 
   // The phone does the download: for a dock without internet of its own.
   const sendFromPhone = async () => {
-    if (!ota) return;
+    if (!ota || inFlightRef.current) return;
+    inFlightRef.current = true;
+    setPreparing(true);
     cancelRef.current = false;
     try {
       const tag = ota.channel === 'dev' ? 'firmware-dev' : 'firmware-latest';
@@ -214,6 +221,7 @@ export default function DockFirmware({
           const r = await rpc<{ expected: number }>('POST', '/api/ota/upload/chunk', body).catch(() =>
             rpc<{ expected: number }>('POST', '/api/ota/upload/chunk', body),
           );
+          if (r.expected > off) stalled = 0; // only reconnects in a row without progress count
           off = r.expected;
         } catch (e) {
           // The Bluetooth link to the dock drops every few minutes under sustained traffic
@@ -234,6 +242,8 @@ export default function DockFirmware({
         }
         setSending({ done: off, from, total: bytes.length, started, version: m.version, reconnects });
       }
+      // a cancel pressed while the last chunk was in flight still discards the upload
+      if (cancelRef.current) throw new Error('cancelled');
       await rpc('POST', '/api/ota/upload/finish', {});
       onMessage(`Sent ${m.version}; the dock checks it and restarts into it`);
     } catch (e) {
@@ -242,15 +252,18 @@ export default function DockFirmware({
       if (cancelRef.current) await rpc('POST', '/api/ota/cancel', {}).catch(() => undefined);
     } finally {
       setSending(null);
+      setPreparing(false);
+      inFlightRef.current = false;
       onSending(false);
       void refresh();
     }
   };
 
   if (!ota) return null;
-  const busy = BUSY.includes(ota.state) || sending !== null;
+  const busy = BUSY.includes(ota.state) || sending !== null || preparing;
   // an upload the dock is still holding (the link dropped) can be resumed from this phone
-  const canSend = connected && sending === null && (!BUSY.includes(ota.state) || ota.state === 'receiving');
+  const canSend =
+    connected && sending === null && !preparing && (!BUSY.includes(ota.state) || ota.state === 'receiving');
   const sent = sending ? sending.done - sending.from : 0;
   const eta =
     sending && sent > 0

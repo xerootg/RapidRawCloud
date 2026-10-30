@@ -38,8 +38,12 @@
  * whether the previous update was rolled back, and starts the health check. */
 void ota_init(void);
 
-/* True from the start of a download/upload until it fails or the dock restarts. */
-bool ota_busy(void);
+/* The reservation sync work holds around anything that uses the network or the
+ * camera (a run, the periodic tick). Refused (false) from the start of a
+ * download/upload until it fails, is cancelled or the dock restarts; while held, no
+ * update starts or begins writing. Called only from the sync task. */
+bool ota_sync_begin(void);
+void ota_sync_end(void);
 
 /* /api/ota document. */
 int ota_status_json(char *out, size_t cap);

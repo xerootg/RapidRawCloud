@@ -6,6 +6,14 @@
  * shared state, and only reaches the flash, while its generation is still the current
  * one, so a cancelled download that is still reading cannot overwrite the next job's
  * state or flash its image. Once writing has begun the job can no longer be cancelled.
+ *
+ * A cancelled job's task can still be inside an HTTP connect or read for up to the
+ * client timeout. No new job starts until it has exited (st.workers), so nothing
+ * reaches the flash while a superseded download is still receiving.
+ *
+ * Sync work holds a reservation (ota_sync_begin/end) taken under the same lock as an
+ * update's admission and its switch to writing: an update never starts beside a sync,
+ * and a sync never starts beside a download or a flash write.
  */
 #include "ota.h"
 #include <stdio.h>
@@ -34,7 +42,6 @@
 #include "board.h"
 #include "net.h"
 #include "ble.h"
-#include "sync.h"
 #include "log_ring.h"
 #include "rrc_proto.h"
 #include "util.h"
@@ -73,6 +80,8 @@ static const char *const state_names[] = {"idle", "checking", "downloading", "re
 static struct {
     ota_state_t state;
     uint32_t gen;        /* the current job; see the file comment */
+    int workers;         /* check/install tasks still running, current or cancelled */
+    bool sync_active;    /* a sync run or the sync tick holds the reservation */
     char msg[160];
     uint32_t done, total;
     /* the last check */
@@ -137,38 +146,43 @@ static void expire_upload_locked(void)
 static bool busy_locked(void)
 {
     expire_upload_locked();
-    return (st.state >= ST_CHECKING && st.state <= ST_RESTARTING) || st.buf;
+    return (st.state >= ST_CHECKING && st.state <= ST_RESTARTING) || st.buf || st.workers > 0;
 }
 
-bool ota_busy(void)
+bool ota_sync_begin(void)
 {
-    if (!mtx) return false;
+    ensure_mutex();
     LOCK();
     expire_upload_locked();
-    bool b = st.state >= ST_DOWNLOADING && st.state <= ST_RESTARTING;
+    bool ok = !(st.state >= ST_DOWNLOADING && st.state <= ST_RESTARTING);
+    if (ok) st.sync_active = true;
     UNLOCK();
-    return b;
+    return ok;
 }
 
-static bool sync_running(void)
+void ota_sync_end(void)
 {
-    sync_status_t s;
-    sync_get_status(&s);
-    return s.phase == SYNC_ENUMERATING || s.phase == SYNC_UPLOADING || s.phase == SYNC_PUBLISHING;
+    ensure_mutex();
+    LOCK(); st.sync_active = false; UNLOCK();
 }
 
-/* Starts job `s` when nothing else runs; returns its generation in *gen. */
+static void worker_exit(void)
+{
+    LOCK(); st.workers--; UNLOCK();
+}
+
+/* Starts job `s` (with a task to run it) when nothing else runs; returns its generation in *gen. */
 static esp_err_t claim(ota_state_t s, uint32_t *gen)
 {
     ensure_mutex();
-    if (sync_running()) return ESP_ERR_NOT_ALLOWED;
     LOCK();
     esp_err_t e = ESP_OK;
     /* Until the running image is kept, the other slot holds the one to roll back to:
      * installing over it would leave nothing to go back to. */
     if (st.trial) e = ESP_ERR_NOT_FINISHED;
+    else if (st.sync_active) e = ESP_ERR_NOT_ALLOWED;
     else if (busy_locked()) e = ESP_ERR_INVALID_STATE;
-    else { st.gen++; st.state = s; st.msg[0] = 0; st.done = st.total = 0; *gen = st.gen; }
+    else { st.gen++; st.workers++; st.state = s; st.msg[0] = 0; st.done = st.total = 0; *gen = st.gen; }
     UNLOCK();
     return e;
 }
@@ -442,14 +456,15 @@ static void install_task(void *arg)
     }
     if (!set_state(j->gen, ST_VERIFYING, "checking %u bytes", (unsigned)j->len)) goto out;
     if (!image_acceptable(j->img, j->len, j->sha, why, sizeof why)) { set_state(j->gen, ST_FAILED, "%s", why); goto out; }
-    if (sync_running()) { set_state(j->gen, ST_FAILED, "a sync started; install again when it is done"); goto out; }
     char version[33];
     snprintf(version, sizeof version, "%.32s", ((const esp_app_desc_t *)(j->img + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t)))->version);
-    /* The point of no return: once WRITING, a cancel is refused (ota_cancel). */
+    /* The point of no return: once WRITING, a cancel is refused (ota_cancel). Checked
+     * under the lock ota_sync_begin takes, so no sync can be starting meanwhile. */
     LOCK();
-    bool current = j->gen == st.gen;
-    if (current) { st.state = ST_WRITING; st.done = 0; st.total = (uint32_t)j->len; snprintf(st.msg, sizeof st.msg, "writing %u bytes", (unsigned)j->len); }
+    bool current = j->gen == st.gen, sync = st.sync_active;
+    if (current && !sync) { st.state = ST_WRITING; st.done = 0; st.total = (uint32_t)j->len; snprintf(st.msg, sizeof st.msg, "writing %u bytes", (unsigned)j->len); }
     UNLOCK();
+    if (current && sync) { set_state(j->gen, ST_FAILED, "a sync started; install again when it is done"); goto out; }
     if (!current) goto out;
     log_ring_printf("firmware update: writing %s (%u bytes)", version, (unsigned)j->len);
     if (flash_image(j->gen, j->img, j->len) != ESP_OK) goto out;
@@ -464,6 +479,7 @@ static void install_task(void *arg)
 out:
     free(j->img);
     free(j);
+    worker_exit();
     vTaskDelete(NULL);
 }
 
@@ -476,6 +492,7 @@ static esp_err_t start_job(job_t *j)
     if (xTaskCreate(install_task, "ota", 8192, j, 4, NULL) != pdPASS) {
         free(j->img);
         free(j);
+        worker_exit();
         set_state(gen, ST_FAILED, "could not start the update task");
         return ESP_ERR_NO_MEM;
     }
@@ -583,6 +600,7 @@ static void check_task(void *arg)
     else set_state(gen, ST_FAILED, "the %s manifest has no image for %s on chip v%u.%u", dev ? "test-build" : "release", rrc_fw_tag.variant, (unsigned)(rev / 100), (unsigned)(rev % 100));
     cJSON_Delete(m);
 done:
+    worker_exit();
     vTaskDelete(NULL);
 }
 
@@ -593,10 +611,11 @@ esp_err_t ota_check(void)
     esp_err_t e = ESP_OK;
     uint32_t gen = 0;
     if (busy_locked()) e = ESP_ERR_INVALID_STATE;   /* a check is allowed on trial: it changes nothing */
-    else { st.gen++; st.state = ST_CHECKING; st.msg[0] = 0; gen = st.gen; }
+    else { st.gen++; st.workers++; st.state = ST_CHECKING; st.msg[0] = 0; gen = st.gen; }
     UNLOCK();
     if (e != ESP_OK) return e;
     if (xTaskCreate(check_task, "ota_check", 8192, (void *)(uintptr_t)gen, 3, NULL) != pdPASS) {
+        worker_exit();
         set_state(gen, ST_FAILED, "could not start the check");
         return ESP_ERR_NO_MEM;
     }
@@ -609,13 +628,13 @@ esp_err_t ota_upload_begin(size_t size, const char *sha256_hex)
     ensure_mutex();
     const esp_partition_t *target = esp_ota_get_next_update_partition(NULL);
     if (!target || size < FW_TAG_OFFSET + sizeof(fw_tag_t) || size > target->size || !hex64_ok(sha256_hex)) return ESP_ERR_INVALID_ARG;
-    if (sync_running()) return ESP_ERR_NOT_ALLOWED;
     /* allocated before the lock (it can take a while), given back if another begin won */
     uint8_t *buf = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!buf) return ESP_ERR_NO_MEM;
     LOCK();
     esp_err_t e = ESP_OK;
     if (st.trial) e = ESP_ERR_NOT_FINISHED;
+    else if (st.sync_active) e = ESP_ERR_NOT_ALLOWED;
     else if (busy_locked()) e = ESP_ERR_INVALID_STATE;
     else {
         st.gen++;
@@ -666,6 +685,7 @@ esp_err_t ota_upload_finish(void)
     else if (st.got != st.size) e = ESP_ERR_INVALID_SIZE;
     else {
         j->gen = st.gen;
+        st.workers++;
         j->img = st.buf;
         j->len = st.size;
         scpy(j->sha, sizeof j->sha, st.sha);
