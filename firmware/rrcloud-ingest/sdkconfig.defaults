@@ -96,6 +96,11 @@ CONFIG_ESP_HOSTED_HOST_SDIO_PIN_D3=17
 CONFIG_ESP_HOSTED_HOST_RESET_GPIO=54
 # The co-processor is brought up from app_main (after Ethernet), not before it.
 CONFIG_ESP_HOSTED_AUTO_CALL_INIT_BEFORE_APP_MAIN=n
+# SDIO transfer buffers in PSRAM first (the P4's SDMMC DMA reaches it), internal RAM
+# only as a fallback. In internal RAM, a TLS download beside the display left no
+# block for the receive buffer to grow into; esp_hosted then skips the read and
+# the Wi-Fi link never receives again.
+CONFIG_EH_HOST_PORT_DMA_PREFER_SPIRAM=y
 
 # ---- Diagnostics: DWARF unwinding so a panic prints a real backtrace on RISC-V
 # (the raw stack dump is useless for a hardware-reported stack overflow).
