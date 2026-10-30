@@ -259,6 +259,7 @@ export default function DockSection() {
   }, [rpc, appSettings?.sync?.endpoint]);
 
   const connect = async (address: string) => {
+    if (otaSending) return;
     setConnecting(address);
     setError('');
     try {
@@ -399,7 +400,7 @@ export default function DockSection() {
         <div className="flex flex-col gap-2">
           <button
             className="self-start px-3 py-1.5 rounded-md bg-accent text-button-text disabled:opacity-50"
-            disabled={scanning}
+            disabled={scanning || otaSending}
             onClick={() => void startScan()}
           >
             {scanning ? 'Scanning…' : 'Find docks'}
@@ -411,7 +412,8 @@ export default function DockSection() {
               </span>
               <button
                 className="px-2 py-1 rounded-md bg-accent text-button-text text-sm disabled:opacity-50"
-                disabled={connecting !== null}
+                // a firmware transfer stays bound to the dock it was confirmed for
+                disabled={connecting !== null || otaSending}
                 onClick={() => void connect(d.address)}
               >
                 {connecting === d.address ? 'Connecting…' : 'Connect'}
@@ -427,7 +429,11 @@ export default function DockSection() {
             <span className="text-text-primary text-sm">
               {info.hostname} · firmware {info.version}
             </span>
-            <button className="px-2 py-1 rounded-md bg-bg-primary border border-border-color/40 text-text-primary text-sm" onClick={() => void disconnect()}>
+            <button
+              className="px-2 py-1 rounded-md bg-bg-primary border border-border-color/40 text-text-primary text-sm disabled:opacity-50"
+              disabled={otaSending}
+              onClick={() => void disconnect()}
+            >
               Disconnect
             </button>
           </div>

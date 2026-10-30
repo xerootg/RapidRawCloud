@@ -65,6 +65,9 @@ jobs:
 
   # Builds of a pull request (or of any branch, run by hand) carry their commit in the
   # version, because they also become the dock's test-build channel (publish-dev below).
+  # The images are built from that commit (the pull request's head, not the merge with
+  # the base the other checks run on), so the version, the manifest and the firmware-dev
+  # tag all name the source the image came from.
   meta:
     name: Resolve the build's version
     runs-on: ubuntu-latest
@@ -90,6 +93,7 @@ jobs:
     with:
       board: ${{ matrix.board }}
       version: ${{ needs.meta.outputs.version }}
+      ref: ${{ github.event.pull_request.head.sha || github.sha }}
       artifact-name: rrcloud-ingest-esp32p4-${{ matrix.board }}
 
   # The dock's test-build channel: every green build of a pull request from this

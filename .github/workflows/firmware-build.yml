@@ -20,6 +20,10 @@ on:
         description: Version string to build in instead of version.txt (test builds; empty = version.txt)
         type: string
         default: ''
+      ref:
+        description: Commit to build (empty = the triggering one; for a pull request that is its merge with the base)
+        type: string
+        default: ''
       board:
         description: "poe-eth (ESP32-P4-WIFI6-POE-ETH), poe-eth-dsi5 (the same board with a 5-inch Raspberry Pi DSI touch display), touch-lcd-43 (ESP32-P4-WIFI6-Touch-LCD-4.3, chip rev < 3) or touch-lcd-43-rev3 (same board, chip rev >= 3)"
         type: string
@@ -39,6 +43,8 @@ jobs:
       version: ${{ steps.build.outputs.version }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - name: idf.py build
         id: build
         shell: bash

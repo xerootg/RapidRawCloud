@@ -266,6 +266,7 @@ async function refresh(){
 }
 /* ---- firmware update -------------------------------------------------------------------- */
 const otaClass = { idle:'ok', failed:'err', restarting:'warn' };
+let otaUploading = false;
 async function refreshOta(){
   try {
     const o = await api('/api/ota');
@@ -278,7 +279,7 @@ async function refreshOta(){
     $('otaprog').style.display = o.total && busy ? 'block' : 'none';
     if (o.total) $('otaprog').value = 100 * o.done / o.total;
     $('otainstall').disabled = busy || !a;
-    $('otacheck').disabled = busy; $('otaupload').disabled = busy; $('otaurlgo').disabled = busy;
+    $('otacheck').disabled = busy; $('otaupload').disabled = busy || otaUploading; $('otaurlgo').disabled = busy;
     $('otacancel').disabled = !['checking','downloading','receiving'].includes(o.state);
     return o;
   } catch (e) { return null; }
@@ -289,15 +290,20 @@ $('otainstall').onclick = () => { if (confirm('Install this firmware? The dock r
 $('otacancel').onclick = () => api('/api/ota/cancel', {}).then(refreshOta).catch(e=>toast(e.message));
 $('otaurlgo').onclick = () => { const url = $('otaurl').value.trim(); if (!url) return toast('Enter a URL'); api('/api/ota/install', {url, sha256: $('otasha').value.trim()}).then(refreshOta).catch(e=>toast(e.message)); };
 $('otaupload').onclick = async () => {
+  if (otaUploading) return;
   const f = $('otafile').files[0];
   if (!f) return toast('Choose a file first');
   if (!confirm(`Install ${f.name} (${fmtBytes(f.size)})? The dock restarts into it (on trial).`)) return;
+  otaUploading = true; $('otaupload').disabled = true;
+  /* only an upload this click began is ours to cancel: a refused begin means another one runs */
+  let began = false;
   try {
     const bytes = new Uint8Array(await f.arrayBuffer());
     /* crypto.subtle only exists on https pages; the dock verifies the image's own hashes either way */
     let sha256 = '';
     if (window.crypto && crypto.subtle) sha256 = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(b => b.toString(16).padStart(2, '0')).join('');
     const b = await api('/api/ota/upload/begin', {size: bytes.length, sha256});
+    began = true;
     const chunk = b.chunk || 4096;
     for (let off = 0; off < bytes.length;) {
       const part = bytes.subarray(off, Math.min(off + chunk, bytes.length));
@@ -312,7 +318,8 @@ $('otaupload').onclick = async () => {
     }
     await api('/api/ota/upload/finish', {});
     toast('Uploaded; the dock checks and installs it');
-  } catch (e) { toast('Upload failed: ' + e.message); api('/api/ota/cancel', {}).catch(()=>{}); }
+  } catch (e) { toast('Upload failed: ' + e.message); if (began) await api('/api/ota/cancel', {}).catch(()=>{}); }
+  otaUploading = false;
   refreshOta();
 };
 

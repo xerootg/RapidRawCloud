@@ -12,8 +12,10 @@
  * reaches the flash while a superseded download is still receiving.
  *
  * Sync work holds a reservation (ota_sync_begin/end) taken under the same lock as an
- * update's admission and its switch to writing: an update never starts beside a sync,
- * and a sync never starts beside a download or a flash write.
+ * update's admission and its switch to writing: no check, download, upload or flash
+ * write starts beside a sync, and no sync starts beside any of them (nor before a
+ * cancelled one's task has exited). The radio co-processor's updater (coproc.c) takes
+ * the same slot through ota_external_begin/end.
  */
 #include "ota.h"
 #include <stdio.h>
@@ -82,6 +84,7 @@ static struct {
     uint32_t gen;        /* the current job; see the file comment */
     int workers;         /* check/install tasks still running, current or cancelled */
     bool sync_active;    /* a sync run or the sync tick holds the reservation */
+    bool external;       /* the co-processor updater holds the slot */
     char msg[160];
     uint32_t done, total;
     /* the last check */
@@ -146,18 +149,35 @@ static void expire_upload_locked(void)
 static bool busy_locked(void)
 {
     expire_upload_locked();
-    return (st.state >= ST_CHECKING && st.state <= ST_RESTARTING) || st.buf || st.workers > 0;
+    return (st.state >= ST_CHECKING && st.state <= ST_RESTARTING) || st.buf || st.workers > 0 || st.external;
 }
 
 bool ota_sync_begin(void)
 {
     ensure_mutex();
     LOCK();
-    expire_upload_locked();
-    bool ok = !(st.state >= ST_DOWNLOADING && st.state <= ST_RESTARTING);
+    bool ok = !busy_locked();
     if (ok) st.sync_active = true;
     UNLOCK();
     return ok;
+}
+
+esp_err_t ota_external_begin(void)
+{
+    ensure_mutex();
+    LOCK();
+    esp_err_t e = ESP_OK;
+    if (st.sync_active) e = ESP_ERR_NOT_ALLOWED;
+    else if (busy_locked()) e = ESP_ERR_INVALID_STATE;
+    else st.external = true;
+    UNLOCK();
+    return e;
+}
+
+void ota_external_end(void)
+{
+    ensure_mutex();
+    LOCK(); st.external = false; UNLOCK();
 }
 
 void ota_sync_end(void)
@@ -269,6 +289,8 @@ int ota_status_json(char *out, size_t cap)
     rrc_jsonw_key(&w, "variant", false); rrc_jsonw_str(&w, rrc_fw_tag.variant);
     rrc_jsonw_key(&w, "chip_rev", false); rrc_jsonw_u64(&w, efuse_hal_chip_revision());
     rrc_jsonw_key(&w, "channel", false); rrc_jsonw_str(&w, app_config_get()->ota_dev_channel ? "dev" : "release");
+    /* where this build takes its updates from, so a phone downloading for it uses the same */
+    rrc_jsonw_key(&w, "repo", false); rrc_jsonw_str(&w, CONFIG_RRC_OTA_GITHUB_REPO);
     rrc_jsonw_key(&w, "state", false); rrc_jsonw_str(&w, state_names[st.state]);
     rrc_jsonw_key(&w, "message", false); rrc_jsonw_str(&w, st.msg);
     rrc_jsonw_key(&w, "done", false); rrc_jsonw_u64(&w, st.done);
@@ -610,7 +632,9 @@ esp_err_t ota_check(void)
     LOCK();
     esp_err_t e = ESP_OK;
     uint32_t gen = 0;
-    if (busy_locked()) e = ESP_ERR_INVALID_STATE;   /* a check is allowed on trial: it changes nothing */
+    /* a check is allowed on trial (it changes nothing), not beside a sync (it downloads) */
+    if (st.sync_active) e = ESP_ERR_NOT_ALLOWED;
+    else if (busy_locked()) e = ESP_ERR_INVALID_STATE;
     else { st.gen++; st.workers++; st.state = ST_CHECKING; st.msg[0] = 0; gen = st.gen; }
     UNLOCK();
     if (e != ESP_OK) return e;

@@ -222,7 +222,8 @@ static void r_coproc_update(const char *body, size_t len, api_resp_t *out)
     json_string_field(body, len, "url", url, sizeof url);
     json_string_field(body, len, "sha256", sha, sizeof sha);
     esp_err_t e = coproc_update_start(url, sha);
-    if (e == ESP_ERR_INVALID_STATE) { err(out, 409, "a co-processor update is already running"); return; }
+    if (e == ESP_ERR_INVALID_STATE) { err(out, 409, "a co-processor or firmware update is already running"); return; }
+    if (e == ESP_ERR_NOT_ALLOWED) { err(out, 409, "a sync is running; update when it is done"); return; }
     if (e != ESP_OK) { err(out, 400, "need an http(s) url and an optional 64-hex sha256"); return; }
     log_ring_printf("co-processor update requested");
     ok(out);

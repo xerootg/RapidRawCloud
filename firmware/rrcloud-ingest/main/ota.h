@@ -39,11 +39,18 @@
 void ota_init(void);
 
 /* The reservation sync work holds around anything that uses the network or the
- * camera (a run, the periodic tick). Refused (false) from the start of a
- * download/upload until it fails, is cancelled or the dock restarts; while held, no
- * update starts or begins writing. Called only from the sync task. */
+ * camera (a run, the periodic tick). Refused (false) while a check, download,
+ * upload, flash write or co-processor update runs, and until a cancelled one's task
+ * has exited; while held, none of them starts or begins writing. Called only from
+ * the sync task. */
 bool ota_sync_begin(void);
 void ota_sync_end(void);
+
+/* The same slot for the radio co-processor's updater (coproc.c), held from its
+ * download until it fails or restarts the dock: ESP_ERR_NOT_ALLOWED during a sync,
+ * ESP_ERR_INVALID_STATE while a firmware update (or a cancelled one) runs. */
+esp_err_t ota_external_begin(void);
+void ota_external_end(void);
 
 /* /api/ota document. */
 int ota_status_json(char *out, size_t cap);

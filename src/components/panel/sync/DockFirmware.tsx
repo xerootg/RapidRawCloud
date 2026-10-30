@@ -13,7 +13,7 @@ import { fetch } from '@tauri-apps/plugin-http';
  * firmware starts on trial: it rolls back by itself if it does not come up cleanly.
  */
 
-const REPO = 'xerootg/RapidRawCloud';
+const REPO = 'xerootg/RapidRawCloud'; // for a dock whose firmware predates `repo` in /api/ota
 const CHUNK = 4096; // the dock's OTA_UPLOAD_CHUNK; base64 keeps a request under its 8 KiB limit
 
 export interface DockOta {
@@ -23,6 +23,7 @@ export interface DockOta {
   variant: string;
   chip_rev: number;
   channel: 'release' | 'dev';
+  repo?: string; // the GitHub repository the dock's build takes updates from
   state: string;
   message: string;
   done: number;
@@ -159,7 +160,8 @@ export default function DockFirmware({
     cancelRef.current = false;
     try {
       const tag = ota.channel === 'dev' ? 'firmware-dev' : 'firmware-latest';
-      const base = `https://github.com/${REPO}/releases/download`;
+      const repo = ota.repo && /^[\w.-]+\/[\w.-]+$/.test(ota.repo) ? ota.repo : REPO;
+      const base = `https://github.com/${repo}/releases/download`;
       const mr = await fetch(`${base}/${tag}/rrcloud-ingest-ota.json`);
       if (!mr.ok)
         throw new Error(`no ${ota.channel === 'dev' ? 'test build' : 'release'} manifest (HTTP ${mr.status})`);
@@ -203,10 +205,29 @@ export default function DockFirmware({
         // only this image: another one of the same size would fail the dock's SHA-256 check at the end
         return now.state === 'receiving' && now.total === bytes.length && now.upload_sha256 === sha ? now.done : null;
       };
-      let off = (await resumeAt()) ?? -1;
-      if (off < 0) {
+      // The Bluetooth link to the dock drops every few minutes under sustained traffic
+      // (its radio sits behind the ESP32-C6's hosted HCI): reconnect to the same dock.
+      const reconnectLoop = async (): Promise<boolean> => {
+        for (let i = 0; i < 6 && !cancelRef.current; i++) {
+          await sleep(3000);
+          if (await reconnect()) return true;
+        }
+        return false;
+      };
+      // Resume an upload of this image the dock already holds, or begin one. Run again
+      // after a reconnect, it also picks up a begin whose reply was lost.
+      const setup = async (): Promise<number> => {
+        const at = await resumeAt();
+        if (at !== null) return at;
         await rpc('POST', '/api/ota/upload/begin', { size: bytes.length, sha256: sha });
-        off = 0;
+        return 0;
+      };
+      let off: number;
+      try {
+        off = await setup();
+      } catch (e) {
+        if (cancelRef.current || !(await reconnectLoop())) throw e;
+        off = await setup();
       }
       let started = Date.now();
       let from = off;
@@ -224,13 +245,8 @@ export default function DockFirmware({
           if (r.expected > off) stalled = 0; // only reconnects in a row without progress count
           off = r.expected;
         } catch (e) {
-          // The Bluetooth link to the dock drops every few minutes under sustained traffic
-          // (its radio sits behind the ESP32-C6's hosted HCI): reconnect and resume.
-          let back = false;
-          for (let i = 0; i < 6 && !back && !cancelRef.current; i++) {
-            await sleep(3000);
-            back = await reconnect();
-          }
+          // reconnect and resume where the dock is
+          const back = await reconnectLoop();
           const at = back ? await resumeAt().catch(() => null) : null;
           if (at === null) throw e;
           stalled = at > off ? 0 : stalled + 1;
