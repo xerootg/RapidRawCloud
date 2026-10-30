@@ -101,6 +101,12 @@ CONFIG_ESP_HOSTED_AUTO_CALL_INIT_BEFORE_APP_MAIN=n
 # block for the receive buffer to grow into; esp_hosted then skips the read and
 # the Wi-Fi link never receives again.
 CONFIG_EH_HOST_PORT_DMA_PREFER_SPIRAM=y
+# Each frame Wi-Fi receives arrives in a ~1.6 KB internal DMA buffer that lwIP would hold
+# until the application reads it: a full 128 KiB TCP window of a download is about 80 of
+# them, which exhausted internal RAM (the hardware AES then failed to allocate and TLS
+# broke). Copy into lwIP pbufs instead (PSRAM, SPIRAM_TRY_ALLOCATE_WIFI_LWIP) and give
+# the driver buffer back at once.
+CONFIG_LWIP_L2_TO_L3_COPY=y
 
 # ---- Diagnostics: DWARF unwinding so a panic prints a real backtrace on RISC-V
 # (the raw stack dump is useless for a hardware-reported stack overflow).
