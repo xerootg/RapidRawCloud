@@ -38,16 +38,17 @@
  * whether the previous update was rolled back, and starts the health check. */
 void ota_init(void);
 
-/* The reservation sync work holds around anything that uses the network or the
- * camera (a run, the periodic tick). Refused (false) while a check, download,
- * upload, flash write or co-processor update runs, and until a cancelled one's task
- * has exited; while held, none of them starts or begins writing. Called only from
- * the sync task. */
-bool ota_sync_begin(void);
-void ota_sync_end(void);
+/* The reservation network work holds while it runs: sync runs and the sync tick,
+ * pairing, console diagnostics. Refused (false) while a check, download, upload,
+ * flash write or co-processor update runs, and until a cancelled one's task has
+ * exited; while anyone holds it, none of those starts or begins writing. Counted:
+ * each successful begin needs one end. */
+bool ota_net_begin(void);
+void ota_net_end(void);
 
 /* The same slot for the radio co-processor's updater (coproc.c), held from its
- * download until it fails or restarts the dock: ESP_ERR_NOT_ALLOWED during a sync,
+ * download until it fails or restarts the dock: ESP_ERR_NOT_ALLOWED during a sync (or other
+ * ota_net_begin holder),
  * ESP_ERR_INVALID_STATE while a firmware update (or a cancelled one) runs. */
 esp_err_t ota_external_begin(void);
 void ota_external_end(void);
@@ -56,7 +57,7 @@ void ota_external_end(void);
 int ota_status_json(char *out, size_t cap);
 
 /* Asynchronous; progress and result in the status document. ESP_ERR_INVALID_STATE:
- * another job runs; ESP_ERR_NOT_ALLOWED: a sync runs; ESP_ERR_NOT_FINISHED: the
+ * another job runs; ESP_ERR_NOT_ALLOWED: a sync (or other network work) runs; ESP_ERR_NOT_FINISHED: the
  * running image is still on trial; ESP_ERR_NOT_FOUND (install_available): no check
  * result for the current channel. */
 esp_err_t ota_check(void);

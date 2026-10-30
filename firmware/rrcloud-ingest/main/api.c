@@ -165,6 +165,7 @@ static void r_pair_begin(const char *body, size_t len, api_resp_t *out)
     if (!url[0]) { err(out, 400, "url required"); return; }
     esp_err_t e = pairing_begin(url);
     if (e == ESP_ERR_INVALID_STATE) { err(out, 409, "pairing already in progress"); return; }
+    if (e == ESP_ERR_NOT_ALLOWED) { err(out, 409, "a firmware update is in progress; pair when it is done"); return; }
     if (e != ESP_OK) { err(out, 500, esp_err_to_name(e)); return; }
     ok(out);
 }

@@ -11,11 +11,12 @@
  * client timeout. No new job starts until it has exited (st.workers), so nothing
  * reaches the flash while a superseded download is still receiving.
  *
- * Sync work holds a reservation (ota_sync_begin/end) taken under the same lock as an
- * update's admission and its switch to writing: no check, download, upload or flash
- * write starts beside a sync, and no sync starts beside any of them (nor before a
- * cancelled one's task has exited). The radio co-processor's updater (coproc.c) takes
- * the same slot through ota_external_begin/end.
+ * Other network work (sync runs and the sync tick, pairing, console diagnostics) holds
+ * a reservation (ota_net_begin/end) taken under the same lock as an update's admission
+ * and its switch to writing: no check, download, upload or flash write starts beside
+ * it, and none of it starts beside any of them (nor before a cancelled one's task has
+ * exited). The radio co-processor's updater (coproc.c) takes the update slot itself
+ * through ota_external_begin/end.
  */
 #include "ota.h"
 #include <stdio.h>
@@ -32,6 +33,7 @@
 #include "esp_app_format.h"
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
+#include "nvs.h"
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "hal/efuse_hal.h"
@@ -83,7 +85,7 @@ static struct {
     ota_state_t state;
     uint32_t gen;        /* the current job; see the file comment */
     int workers;         /* check/install tasks still running, current or cancelled */
-    bool sync_active;    /* a sync run or the sync tick holds the reservation */
+    int net_users;       /* holders of the ota_net_begin reservation */
     bool external;       /* the co-processor updater holds the slot */
     char msg[160];
     uint32_t done, total;
@@ -152,12 +154,12 @@ static bool busy_locked(void)
     return (st.state >= ST_CHECKING && st.state <= ST_RESTARTING) || st.buf || st.workers > 0 || st.external;
 }
 
-bool ota_sync_begin(void)
+bool ota_net_begin(void)
 {
     ensure_mutex();
     LOCK();
     bool ok = !busy_locked();
-    if (ok) st.sync_active = true;
+    if (ok) st.net_users++;
     UNLOCK();
     return ok;
 }
@@ -167,7 +169,7 @@ esp_err_t ota_external_begin(void)
     ensure_mutex();
     LOCK();
     esp_err_t e = ESP_OK;
-    if (st.sync_active) e = ESP_ERR_NOT_ALLOWED;
+    if (st.net_users > 0) e = ESP_ERR_NOT_ALLOWED;
     else if (busy_locked()) e = ESP_ERR_INVALID_STATE;
     else st.external = true;
     UNLOCK();
@@ -180,10 +182,10 @@ void ota_external_end(void)
     LOCK(); st.external = false; UNLOCK();
 }
 
-void ota_sync_end(void)
+void ota_net_end(void)
 {
     ensure_mutex();
-    LOCK(); st.sync_active = false; UNLOCK();
+    LOCK(); if (st.net_users > 0) st.net_users--; UNLOCK();
 }
 
 static void worker_exit(void)
@@ -200,7 +202,7 @@ static esp_err_t claim(ota_state_t s, uint32_t *gen)
     /* Until the running image is kept, the other slot holds the one to roll back to:
      * installing over it would leave nothing to go back to. */
     if (st.trial) e = ESP_ERR_NOT_FINISHED;
-    else if (st.sync_active) e = ESP_ERR_NOT_ALLOWED;
+    else if (st.net_users > 0) e = ESP_ERR_NOT_ALLOWED;
     else if (busy_locked()) e = ESP_ERR_INVALID_STATE;
     else { st.gen++; st.workers++; st.state = s; st.msg[0] = 0; st.done = st.total = 0; *gen = st.gen; }
     UNLOCK();
@@ -220,12 +222,18 @@ static void health_tick(void *arg)
     int64_t up = esp_timer_get_time();
     bool ip = net_has_ip(), bt = ble_reachable();
     if (up >= HEALTH_MIN_UP_US && (ip || bt)) {
-        esp_ota_mark_app_valid_cancel_rollback();
-        LOCK(); st.trial = false; UNLOCK();
-        log_ring_printf("firmware update: %s kept (up %lld s, reachable over %s)", esp_app_get_description()->version,
-                        (long long)(up / 1000000), ip && bt ? "the network and Bluetooth" : ip ? "the network" : "Bluetooth");
-        esp_timer_stop(self);
-        return;
+        esp_err_t e = esp_ota_mark_app_valid_cancel_rollback();
+        if (e == ESP_OK) {
+            LOCK(); st.trial = false; UNLOCK();
+            log_ring_printf("firmware update: %s kept (up %lld s, reachable over %s)", esp_app_get_description()->version,
+                            (long long)(up / 1000000), ip && bt ? "the network and Bluetooth" : ip ? "the network" : "Bluetooth");
+            esp_timer_stop(self);
+            return;
+        }
+        /* still pending verification for the bootloader: stay on trial and retry on the
+         * next tick, up to the give-up time below */
+        static bool logged;
+        if (!logged) { logged = true; log_ring_printf("firmware update: could not mark %s as kept (%s); retrying", esp_app_get_description()->version, esp_err_to_name(e)); }
     }
     if (up >= HEALTH_GIVE_UP_US) {
         log_ring_printf("firmware update: %s is not reachable %lld s after starting (no network, no Bluetooth); going back to the previous firmware",
@@ -233,6 +241,28 @@ static void health_tick(void *arg)
         vTaskDelay(pdMS_TO_TICKS(500));   /* let the line reach the console */
         esp_ota_mark_app_invalid_rollback_and_reboot();
     }
+}
+
+/* Whether an update has shown this dock's bootloader cannot roll back, kept in NVS
+ * until a trial boot shows that it can (flashing the bootloader over USB does). */
+static void no_rollback_store(bool v)
+{
+    nvs_handle_t h;
+    if (nvs_open("ota", NVS_READWRITE, &h) != ESP_OK) return;
+    if (v) nvs_set_u8(h, "no_rollback", 1);
+    else nvs_erase_key(h, "no_rollback");
+    nvs_commit(h);
+    nvs_close(h);
+}
+
+static bool no_rollback_load(void)
+{
+    nvs_handle_t h;
+    uint8_t v = 0;
+    if (nvs_open("ota", NVS_READONLY, &h) != ESP_OK) return false;
+    nvs_get_u8(h, "no_rollback", &v);
+    nvs_close(h);
+    return v != 0;
 }
 
 void ota_init(void)
@@ -248,19 +278,25 @@ void ota_init(void)
         static esp_timer_handle_t t;
         const esp_timer_create_args_t ta = {.callback = health_tick, .arg = &t, .name = "ota_health"};
         if (esp_timer_create(&ta, &t) != ESP_OK || esp_timer_start_periodic(t, 5 * 1000000) != ESP_OK) {
-            /* Without the check the trial can never succeed; keep the image rather than
-             * strand the dock on a timer failure. */
-            esp_ota_mark_app_valid_cancel_rollback();
-            st.trial = false;
+            /* Without the check the image cannot prove itself: fail closed, back to the
+             * previous firmware, rather than keep an image nobody has checked. */
+            log_ring_printf("firmware update: the health check could not start; going back to the previous firmware");
+            vTaskDelay(pdMS_TO_TICKS(500));
+            esp_ota_mark_app_invalid_rollback_and_reboot();
         }
+        /* a trial boot proves the bootloader rolls back */
+        no_rollback_store(false);
     } else if (se == ESP_OK && s == ESP_OTA_IMG_NEW) {
         /* Installed over the air, yet started without a trial: the bootloader predates
          * rollback (CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE lives there, and updates do not
-         * replace it). Say so: the safety net the UI describes is not there. */
-        st.no_rollback = true;
+         * replace it). Say so, and remember it: after this boot the image is VALID and
+         * the next boot could not tell. */
+        no_rollback_store(true);
         esp_ota_mark_app_valid_cancel_rollback();
-        log_ring_printf("firmware update: this dock's bootloader cannot roll back a bad update; flash the bootloader over USB once (README, \"Firmware updates\")");
     }
+    st.no_rollback = no_rollback_load();
+    if (st.no_rollback)
+        log_ring_printf("firmware update: this dock's bootloader cannot roll back a bad update; flash the bootloader over USB once (README, \"Firmware updates\")");
     const esp_partition_t *bad = esp_ota_get_last_invalid_partition();
     esp_app_desc_t d;
     if (bad && esp_ota_get_partition_description(bad, &d) == ESP_OK) {
@@ -481,12 +517,12 @@ static void install_task(void *arg)
     char version[33];
     snprintf(version, sizeof version, "%.32s", ((const esp_app_desc_t *)(j->img + sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t)))->version);
     /* The point of no return: once WRITING, a cancel is refused (ota_cancel). Checked
-     * under the lock ota_sync_begin takes, so no sync can be starting meanwhile. */
+     * under the lock ota_net_begin takes, so no sync can be starting meanwhile. */
     LOCK();
-    bool current = j->gen == st.gen, sync = st.sync_active;
+    bool current = j->gen == st.gen, sync = st.net_users > 0;
     if (current && !sync) { st.state = ST_WRITING; st.done = 0; st.total = (uint32_t)j->len; snprintf(st.msg, sizeof st.msg, "writing %u bytes", (unsigned)j->len); }
     UNLOCK();
-    if (current && sync) { set_state(j->gen, ST_FAILED, "a sync started; install again when it is done"); goto out; }
+    if (current && sync) { set_state(j->gen, ST_FAILED, "a sync or other network work started; install again when it is done"); goto out; }
     if (!current) goto out;
     log_ring_printf("firmware update: writing %s (%u bytes)", version, (unsigned)j->len);
     if (flash_image(j->gen, j->img, j->len) != ESP_OK) goto out;
@@ -632,8 +668,8 @@ esp_err_t ota_check(void)
     LOCK();
     esp_err_t e = ESP_OK;
     uint32_t gen = 0;
-    /* a check is allowed on trial (it changes nothing), not beside a sync (it downloads) */
-    if (st.sync_active) e = ESP_ERR_NOT_ALLOWED;
+    /* a check is allowed on trial (it changes nothing), not beside a sync or other network work (it downloads) */
+    if (st.net_users > 0) e = ESP_ERR_NOT_ALLOWED;
     else if (busy_locked()) e = ESP_ERR_INVALID_STATE;
     else { st.gen++; st.workers++; st.state = ST_CHECKING; st.msg[0] = 0; gen = st.gen; }
     UNLOCK();
@@ -658,7 +694,7 @@ esp_err_t ota_upload_begin(size_t size, const char *sha256_hex)
     LOCK();
     esp_err_t e = ESP_OK;
     if (st.trial) e = ESP_ERR_NOT_FINISHED;
-    else if (st.sync_active) e = ESP_ERR_NOT_ALLOWED;
+    else if (st.net_users > 0) e = ESP_ERR_NOT_ALLOWED;
     else if (busy_locked()) e = ESP_ERR_INVALID_STATE;
     else {
         st.gen++;

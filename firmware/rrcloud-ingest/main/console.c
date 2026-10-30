@@ -63,7 +63,7 @@ static int cmd_config(int argc, char **argv)
 /* Keys whose value is a JSON bool / number; everything else is a string.
  * Secrets (s3_secret_key, wifi_password, admin_password) go through the same
  * JSON patch the web UI sends, so one code path validates and persists. */
-static const char *const BOOL_KEYS[] = {"s3_tls_insecure", "auto_sync", "upload_videos", "admin_auth", "usb_debug", "ble_enabled"};
+static const char *const BOOL_KEYS[] = {"s3_tls_insecure", "auto_sync", "upload_videos", "admin_auth", "usb_debug", "ble_enabled", "ota_dev_channel"};
 static const char *const NUM_KEYS[] = {"min_size_kb"};
 
 static bool in_list(const char *k, const char *const *list, size_t n)

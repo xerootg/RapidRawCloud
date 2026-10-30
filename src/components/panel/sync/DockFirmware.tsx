@@ -13,7 +13,8 @@ import { fetch } from '@tauri-apps/plugin-http';
  * firmware starts on trial: it rolls back by itself if it does not come up cleanly.
  */
 
-const REPO = 'xerootg/RapidRawCloud'; // for a dock whose firmware predates `repo` in /api/ota
+// The only repository the app downloads from (the http scope in src-tauri/capabilities/sync/sync.json).
+const REPO = 'xerootg/RapidRawCloud';
 const CHUNK = 4096; // the dock's OTA_UPLOAD_CHUNK; base64 keeps a request under its 8 KiB limit
 
 export interface DockOta {
@@ -107,6 +108,16 @@ export default function DockFirmware({
   const inFlightRef = useRef(false);
   const transferring = sending !== null;
 
+  // Leaving the settings page unmounts this panel (DockSection only keeps it across a
+  // dropped link): stop a transfer it started instead of leaving it running unowned on
+  // the shared Bluetooth client.
+  useEffect(
+    () => () => {
+      cancelRef.current = true;
+    },
+    [],
+  );
+
   const refresh = useCallback(async () => {
     try {
       setOta(await rpc<DockOta>('GET', '/api/ota'));
@@ -158,10 +169,17 @@ export default function DockFirmware({
     inFlightRef.current = true;
     setPreparing(true);
     cancelRef.current = false;
+    // From here on the panel stays mounted (a dropped link must not orphan the transfer)
+    // and connecting to another dock is disabled: the transfer belongs to this one.
+    onSending(true);
+    let owned = false; // this operation began or resumed the upload the dock holds
     try {
+      if (ota.repo && ota.repo !== REPO)
+        throw new Error(
+          `this dock takes updates from ${ota.repo}; the app downloads only ${REPO} builds (use "Dock: install" or the dock's web page)`,
+        );
       const tag = ota.channel === 'dev' ? 'firmware-dev' : 'firmware-latest';
-      const repo = ota.repo && /^[\w.-]+\/[\w.-]+$/.test(ota.repo) ? ota.repo : REPO;
-      const base = `https://github.com/${repo}/releases/download`;
+      const base = `https://github.com/${REPO}/releases/download`;
       const mr = await fetch(`${base}/${tag}/rrcloud-ingest-ota.json`);
       if (!mr.ok)
         throw new Error(`no ${ota.channel === 'dev' ? 'test build' : 'release'} manifest (HTTP ${mr.status})`);
@@ -185,9 +203,6 @@ export default function DockFirmware({
         return;
       // the versioned release, not the rolling one: it cannot change under the download
       const release = ota.channel === 'dev' || !m.tag ? tag : m.tag;
-      // from here on the panel stays mounted (a dropped link must not orphan the transfer)
-      // and the buttons stay disabled
-      onSending(true);
       setSending({ done: 0, from: 0, total: img.size, started: Date.now(), version: m.version, reconnects: 0 });
       onMessage(`Downloading ${m.version}…`);
       const ir = await fetch(`${base}/${release}/${img.file}`);
@@ -222,6 +237,7 @@ export default function DockFirmware({
         await rpc('POST', '/api/ota/upload/begin', { size: bytes.length, sha256: sha });
         return 0;
       };
+      if (cancelRef.current) throw new Error('cancelled');
       let off: number;
       try {
         off = await setup();
@@ -229,6 +245,7 @@ export default function DockFirmware({
         if (cancelRef.current || !(await reconnectLoop())) throw e;
         off = await setup();
       }
+      owned = true;
       let started = Date.now();
       let from = off;
       let reconnects = 0;
@@ -260,12 +277,22 @@ export default function DockFirmware({
       }
       // a cancel pressed while the last chunk was in flight still discards the upload
       if (cancelRef.current) throw new Error('cancelled');
-      await rpc('POST', '/api/ota/upload/finish', {});
+      try {
+        await rpc('POST', '/api/ota/upload/finish', {});
+      } catch (e) {
+        // the link dropped around the finish: see what the dock made of it
+        if (!(await reconnectLoop())) throw e;
+        const now = await rpc<DockOta>('GET', '/api/ota');
+        const received = now.state === 'receiving' && now.upload_sha256 === sha && now.done === bytes.length;
+        if (received) await rpc('POST', '/api/ota/upload/finish', {});
+        else if (!['verifying', 'writing', 'restarting'].includes(now.state)) throw e; // else only the reply was lost
+      }
       onMessage(`Sent ${m.version}; the dock checks it and restarts into it`);
     } catch (e) {
       onError(e);
-      // a cancel throws away what the dock received; a lost link keeps it for a resume
-      if (cancelRef.current) await rpc('POST', '/api/ota/cancel', {}).catch(() => undefined);
+      // a cancel throws away what the dock received for this transfer (never another
+      // client's upload); a lost link keeps it for a resume
+      if (cancelRef.current && owned) await rpc('POST', '/api/ota/cancel', {}).catch(() => undefined);
     } finally {
       setSending(null);
       setPreparing(false);

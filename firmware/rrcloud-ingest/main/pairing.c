@@ -15,6 +15,7 @@
 #include "app_config.h"
 #include "sync.h"
 #include "log_ring.h"
+#include "ota.h"
 
 static const char *TAG = "pair";
 static pair_status_t st;
@@ -216,6 +217,7 @@ static void pairing_task(void *arg)
 done:
     free(body); free(issuer); free(client_id); free(config_endpoint); free(device_ep); free(token_ep); free(device_code);
     running = false;
+    ota_net_end();
     vTaskDelete(NULL);
 }
 
@@ -230,10 +232,12 @@ esp_err_t pairing_begin(const char *service_url)
     else snprintf(service_base, sizeof service_base, "https://%s", u);
     size_t n = strlen(service_base);
     while (n && (service_base[n - 1] == '/' || service_base[n - 1] == ' ')) service_base[--n] = 0;
+    /* its requests are network work: not beside a firmware download or flash write (ota.h) */
+    if (!ota_net_begin()) return ESP_ERR_NOT_ALLOWED;
     LOCK(); memset(&st, 0, sizeof st); UNLOCK();
     cancel = false;
     running = true;
-    if (xTaskCreate(pairing_task, "pairing", 12288, NULL, 3, NULL) != pdPASS) { running = false; return ESP_ERR_NO_MEM; }
+    if (xTaskCreate(pairing_task, "pairing", 12288, NULL, 3, NULL) != pdPASS) { running = false; ota_net_end(); return ESP_ERR_NO_MEM; }
     ESP_LOGI(TAG, "pairing with %s", service_base);
     return ESP_OK;
 }
