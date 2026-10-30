@@ -1,4 +1,5 @@
 #include "net.h"
+#include "driver/gpio.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -198,11 +199,42 @@ static void eth_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     }
 }
 #endif
+#if CONFIG_RRC_HAS_ETHERNET
+esp_err_t net_eth_phy_regs(uint16_t regs[32])
+{
+    if (!eth_handle) return ESP_ERR_INVALID_STATE;
+    for (uint32_t r = 0; r < 32; r++) {
+        uint32_t v = 0;
+        esp_eth_phy_reg_rw_data_t rw = {.reg_addr = r, .reg_value_p = &v};
+        esp_err_t e = esp_eth_ioctl(eth_handle, ETH_CMD_READ_PHY_REG, &rw);
+        if (e != ESP_OK) return e;
+        regs[r] = (uint16_t)v;
+    }
+    return ESP_OK;
+}
+
+esp_err_t net_eth_restart_phy(void)
+{
+    if (!eth_handle) return ESP_ERR_INVALID_STATE;
+    log_ring_printf("ethernet: restarting with a PHY hardware reset");
+    esp_err_t e = esp_eth_stop(eth_handle);
+    if (e != ESP_OK && e != ESP_ERR_INVALID_STATE) return e;
+    gpio_set_direction(BOARD_ETH_PHY_RST_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(BOARD_ETH_PHY_RST_GPIO, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));   /* IP101GRI: reset low >= 10 ms */
+    gpio_set_level(BOARD_ETH_PHY_RST_GPIO, 1);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    return esp_eth_start(eth_handle);
+}
+#endif
+
 #if !CONFIG_RRC_HAS_ETHERNET
 /* No Ethernet on this board: nothing to count, nothing to watch. */
 uint32_t net_eth_rx_frames(void) { return 0; }
 uint32_t net_eth_rx_restarts(void) { return 0; }
 void net_eth_rx_drop_test(bool on) { (void)on; }
+esp_err_t net_eth_phy_regs(uint16_t regs[32]) { (void)regs; return ESP_ERR_INVALID_STATE; }
+esp_err_t net_eth_restart_phy(void) { return ESP_ERR_INVALID_STATE; }
 #endif
 
 static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)

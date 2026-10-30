@@ -250,6 +250,27 @@ static int cmd_crash(int argc, char **argv)
     return 0;
 }
 
+static int cmd_eth_phy(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    uint16_t r[32];
+    esp_err_t e = net_eth_phy_regs(r);
+    if (e != ESP_OK) { printf("eth-phy: %s\n", esp_err_to_name(e)); return 1; }
+    for (int i = 0; i < 32; i += 8)
+        printf("phy %02d: %04x %04x %04x %04x %04x %04x %04x %04x\n", i, r[i], r[i + 1], r[i + 2], r[i + 3], r[i + 4], r[i + 5], r[i + 6], r[i + 7]);
+    printf("bmcr %04x bmsr %04x (link %s, autoneg %s) id %04x:%04x anar %04x anlpar %04x; rx frames so far %u\n", r[0], r[1],
+           (r[1] & 0x4) ? "up" : "down", (r[1] & 0x20) ? "done" : "pending", r[2], r[3], r[4], r[5], (unsigned)net_eth_rx_frames());
+    return 0;
+}
+
+static int cmd_eth_reset(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    esp_err_t e = net_eth_restart_phy();
+    printf("eth-reset: %s\n", esp_err_to_name(e));
+    return e == ESP_OK ? 0 : 1;
+}
+
 static int cmd_eth_rx_stall_test(int argc, char **argv)
 {
     (void)argc; (void)argv;
@@ -535,6 +556,8 @@ esp_err_t console_start(void)
 #endif
         {.command = "ota", .help = "ota [check | install [url [sha256]] | cancel]: firmware update state; check the release (or test-build) manifest; install what it found, or any image by URL", .func = cmd_ota},
         {.command = "crash", .help = "crash [erase]: the stored crash report (download the core dump at GET /api/coredump)", .func = cmd_crash},
+        {.command = "eth-phy", .help = "Dump the Ethernet PHY's registers (IP101GRI) and the receive counter", .func = cmd_eth_phy},
+        {.command = "eth-reset", .help = "Restart Ethernet with a PHY hardware reset (no dock restart)", .func = cmd_eth_reset},
         {.command = "eth-rx-stall-test", .help = "Drop every received ethernet frame to test the receive watchdog (the dock restarts itself)", .func = cmd_eth_rx_stall_test},
     };
     for (size_t i = 0; i < sizeof cmds / sizeof cmds[0]; i++) esp_console_cmd_register(&cmds[i]);
