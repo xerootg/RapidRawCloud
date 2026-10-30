@@ -65,6 +65,7 @@ static bool eth_holds_traffic(void)
 typedef enum { WIFI_POLICY_UP, WIFI_POLICY_DOWN, WIFI_POLICY_REAPPLY, WIFI_POLICY_CONNECT, WIFI_POLICY_SCAN } wifi_policy_t;
 static QueueHandle_t policy_q;
 static bool policy_post(wifi_policy_t p) { return policy_q && xQueueSend(policy_q, &p, 0) == pdTRUE; }
+static void update_default_route(void);
 static char eth_ip_str[16], wifi_ip_str[16];
 
 /* Association bookkeeping for the UI (/api/wifi). */
@@ -194,7 +195,7 @@ static void eth_event(void *arg, esp_event_base_t base, int32_t id, void *data)
          * if none comes within the grace period, the re-check keeps or brings Wi-Fi up. */
         if (eth_grace_timer) { esp_timer_stop(eth_grace_timer); esp_timer_start_once(eth_grace_timer, ETH_ADDRESS_GRACE_US + 1000000); }
         break;
-    case ETHERNET_EVENT_DISCONNECTED: eth_link = false; eth_ip = false; eth_ip_str[0] = 0; log_ring_printf("ethernet link down"); policy_post(WIFI_POLICY_UP); break;
+    case ETHERNET_EVENT_DISCONNECTED: eth_link = false; eth_ip = false; eth_ip_str[0] = 0; log_ring_printf("ethernet link down"); update_default_route(); policy_post(WIFI_POLICY_UP); break;
     default: break;
     }
 }
@@ -237,6 +238,21 @@ esp_err_t net_eth_phy_regs(uint16_t regs[32]) { (void)regs; return ESP_ERR_INVAL
 esp_err_t net_eth_restart_phy(void) { return ESP_ERR_INVALID_STATE; }
 #endif
 
+/* The default route follows the addresses. IDF ranks netifs by route_prio among those
+ * that are up, and a netif with link but no address counts as up: Ethernet (ranked
+ * first, see eth_start) with a dead port kept the default route while Wi-Fi carried
+ * the traffic, so everything beyond the subnet was unreachable. Setting the default
+ * here also stops IDF re-ranking on its own. */
+static void update_default_route(void)
+{
+    esp_netif_t *d = NULL;
+#if CONFIG_RRC_HAS_ETHERNET
+    if (eth_ip && eth_netif) d = eth_netif;
+#endif
+    if (!d && wifi_ip && wifi_netif) d = wifi_netif;
+    if (d) esp_netif_set_default_netif(d);
+}
+
 static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
 {
     (void)arg; (void)base;
@@ -257,6 +273,7 @@ static void ip_event(void *arg, esp_event_base_t base, int32_t id, void *data)
     } else if (id == IP_EVENT_STA_LOST_IP) {
         wifi_ip = false;
     }
+    update_default_route();
 }
 
 static void retry_cb(void *arg) { (void)arg; policy_post(WIFI_POLICY_CONNECT); }
