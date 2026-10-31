@@ -271,11 +271,11 @@ The authoritative build recipe is `.github/workflows/build.yml`; the
 essentials:
 
 ```sh
-# One-time: Android SDK + NDK r26d, and the Rust target on the PINNED toolchain
+# One-time: Android SDK + NDK r27 (the version AGP 8.11 expects), and the Rust target on the PINNED toolchain
 rustup target add aarch64-linux-android --toolchain 1.98-x86_64-unknown-linux-gnu
 
 export ANDROID_HOME=/path/to/android-sdk
-export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/26.3.11579264   # r26d
+export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.0.12077973   # r27
 export NDK_HOME=$ANDROID_NDK_HOME
 
 # ort-sys must link the Android ONNX Runtime that build.rs fetches into

@@ -1,0 +1,8 @@
+# Fork addition (not upstream). A GNU build-id in the Android library, so a tombstone's
+# frames can be matched to the unstripped copy published as the release's
+# *_native-debug-symbols.zip (.github/workflows/build.yml). The NDK's clang/LLD do not
+# add one by default. Cargo joins cfg-matched rustflags with the per-triple ones the
+# Tauri CLI sets through CARGO_TARGET_<TRIPLE>_RUSTFLAGS (as long as RUSTFLAGS itself
+# is unset, which CI keeps it).
+[target.'cfg(target_os = "android")']
+rustflags = ["-C", "link-arg=-Wl,--build-id=sha1"]

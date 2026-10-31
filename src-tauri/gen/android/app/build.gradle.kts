@@ -76,6 +76,9 @@ rust {
     rootDirRel = "../../../"
 }
 
+// RapidRawCloud (docs/UPSTREAM_TOUCHES.md): the packaging{} inside the debug build type configures android-wide packaging, so release kept debug symbols too; release strips them.
+androidComponents.onVariants(androidComponents.selector().withBuildType("release")) { it.packaging.jniLibs.keepDebugSymbols.set(emptySet()) }
+
 dependencies {
     implementation("androidx.webkit:webkit:1.14.0")
     implementation("androidx.appcompat:appcompat:1.7.1")
