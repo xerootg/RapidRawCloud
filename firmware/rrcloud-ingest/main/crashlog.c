@@ -63,9 +63,12 @@ void crashlog_init(void)
     static esp_core_dump_summary_t s;   /* ~1.2 KB with the stack dump: off the stack */
     size_t size = 0;
     if (!get(&s, &size)) return;
-    log_ring_printf("crash report (kept from an earlier crash until erased): task \"%.16s\", pc 0x%08lx, %s (mcause %lu, mtval 0x%08lx), ra 0x%08lx, sp 0x%08lx; firmware ELF %.16s…; %u-byte core dump at GET /api/coredump",
-                    s.exc_task, (unsigned long)s.exc_pc, cause_text(s.ex_info.mcause), (unsigned long)s.ex_info.mcause,
-                    (unsigned long)s.ex_info.mtval, (unsigned long)s.ex_info.ra, (unsigned long)s.ex_info.sp,
+    /* three short lines: the log ring keeps at most ~136 characters of a message */
+    log_ring_printf("crash report (kept until erased): task \"%.16s\", %s (mcause %lu)",
+                    s.exc_task, cause_text(s.ex_info.mcause), (unsigned long)s.ex_info.mcause);
+    log_ring_printf("crash report: pc 0x%08lx ra 0x%08lx sp 0x%08lx mtval 0x%08lx", (unsigned long)s.exc_pc,
+                    (unsigned long)s.ex_info.ra, (unsigned long)s.ex_info.sp, (unsigned long)s.ex_info.mtval);
+    log_ring_printf("crash report: firmware ELF %.16s..., %u-byte core dump at GET /api/coredump",
                     (const char *)s.app_elf_sha256, (unsigned)size);
 }
 
