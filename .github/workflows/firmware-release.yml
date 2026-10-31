@@ -172,7 +172,7 @@ jobs:
           path: artifacts
       - run: |
           mkdir -p builds
-          for d in artifacts/rrcloud-ingest-build-${{ needs.meta.outputs.version }}-*; do b="${d#artifacts/rrcloud-ingest-build-${{ needs.meta.outputs.version }}-}"; mkdir -p "builds/$b"; cp "$d/rrcloud-ingest.bin" "builds/$b/"; done
+          for d in artifacts/rrcloud-ingest-build-${{ needs.meta.outputs.version }}-*; do b="${d#artifacts/rrcloud-ingest-build-${{ needs.meta.outputs.version }}-}"; mkdir -p "builds/$b"; cp "$d/rrcloud-ingest.bin" "$d/rrcloud-ingest.elf" "builds/$b/"; done
           python3 .github/scripts/ota_manifest.py builds dist "${{ needs.meta.outputs.version }}" "firmware-v${{ needs.meta.outputs.version }}" "${GITHUB_SHA:0:7}"
       - uses: actions/upload-artifact@v4
         with:

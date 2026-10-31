@@ -30,6 +30,7 @@
 #endif
 #include "usb_fault.h"
 #include "ota.h"
+#include "crashlog.h"
 #include "esp_timer.h"
 
 static const char *TAG = "main";
@@ -41,28 +42,6 @@ static void usb_lib_task(void *arg)
         uint32_t flags;
         usb_host_lib_handle_events(portMAX_DELAY, &flags);
         if (flags & USB_HOST_LIB_EVENT_FLAGS_ALL_FREE) ESP_LOGD(TAG, "usb: all devices freed");
-    }
-}
-
-static const char *reset_reason_str(esp_reset_reason_t r)
-{
-    switch (r) {
-    case ESP_RST_POWERON: return "power-on";
-    case ESP_RST_EXT: return "external pin";
-    case ESP_RST_SW: return "software";
-    case ESP_RST_PANIC: return "panic";
-    case ESP_RST_INT_WDT: return "interrupt watchdog";
-    case ESP_RST_TASK_WDT: return "task watchdog";
-    case ESP_RST_WDT: return "watchdog";
-    case ESP_RST_DEEPSLEEP: return "deep sleep";
-    case ESP_RST_BROWNOUT: return "brownout";
-    case ESP_RST_SDIO: return "sdio";
-    case ESP_RST_USB: return "usb";
-    case ESP_RST_JTAG: return "jtag";
-    case ESP_RST_EFUSE: return "efuse";
-    case ESP_RST_PWR_GLITCH: return "power glitch";
-    case ESP_RST_CPU_LOCKUP: return "cpu lockup";
-    default: return "unknown";
     }
 }
 
@@ -83,11 +62,12 @@ static void health_tick(void *arg)
 void app_main(void)
 {
     log_ring_init();
+    crashlog_init();   /* a crash before this boot: its summary goes into the log first */
     ESP_ERROR_CHECK(app_config_init());
     ESP_ERROR_CHECK(store_init());
     store_ledger_load();
     esp_reset_reason_t rr = esp_reset_reason();
-    log_ring_printf("rrcloud-ingest starting after %s reset (%d); device %s; psram free %u KiB", reset_reason_str(rr), (int)rr, app_device_id(), (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
+    log_ring_printf("rrcloud-ingest starting after %s reset (%d); device %s; psram free %u KiB", crashlog_reset_reason_str(), (int)rr, app_device_id(), (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024));
     usb_fault_init();
     ota_init();   /* a trial boot of a new image starts its health check here */
     esp_log_level_set("health", ESP_LOG_DEBUG);

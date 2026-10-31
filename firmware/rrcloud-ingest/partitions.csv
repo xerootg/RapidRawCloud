@@ -7,3 +7,7 @@ phy_init,   data, phy,      0x1b000,   0x1000
 ota_0,      app,  ota_0,    0x20000,   0x400000
 ota_1,      app,  ota_1,    0x420000,  0x400000
 storage,    data, littlefs, 0x820000,  0x800000
+# Crash reports (main/crashlog.c): an ELF core dump written by the panic handler, read
+# back over the web API. Added after the rest, in flash that was unused, so the
+# partitions above keep their places (a USB flash of the table adds it; nothing moves).
+coredump,   data, coredump, 0x1020000, 0x100000

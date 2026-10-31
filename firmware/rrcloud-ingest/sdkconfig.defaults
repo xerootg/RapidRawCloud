@@ -14,6 +14,14 @@ CONFIG_PARTITION_TABLE_OFFSET=0x8000
 # app marks it valid; a reset before that brings the previous image back. This lives in
 # the bootloader, which over-the-air updates do not replace: flash it over USB once.
 CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+# Crash reports (main/crashlog.c): an ELF core dump to the coredump partition on a panic.
+# The first one is kept until erased (a boot loop must not overwrite the crash that
+# started it); its summary is logged at the next boot.
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_CRC32=y
+CONFIG_ESP_COREDUMP_FLASH_NO_OVERWRITE=y
+CONFIG_ESP_COREDUMP_CHECK_BOOT=y
 
 # ---- PSRAM: transfer buffers (8 MiB upload parts) live here.
 # 200 MHz hex PSRAM was gated behind IDF_EXPERIMENTAL_FEATURES on IDF 5.5.0; without

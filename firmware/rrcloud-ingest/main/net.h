@@ -56,3 +56,9 @@ uint32_t net_eth_rx_restarts(void);
 /* Test hook: drop every received frame before the stack sees it, which is what
  * the EMAC lockup looks like from above. The watchdog then restarts the dock. */
 void net_eth_rx_drop_test(bool on);
+/* Diagnostics for a receive path that passes nothing: the IP101 PHY's registers
+ * (page 0, 0..31) into regs[32]; ESP_ERR_INVALID_STATE without Ethernet. */
+esp_err_t net_eth_phy_regs(uint16_t regs[32]);
+/* Stops Ethernet, pulses the PHY's hardware reset, and starts it again (link,
+ * DHCP and all), without restarting the dock. */
+esp_err_t net_eth_restart_phy(void);

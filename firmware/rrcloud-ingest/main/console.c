@@ -27,8 +27,11 @@
 #include "mbedtls/aes.h"
 #include "rrc_hash.h"
 #include "board.h"
+#include "cJSON.h"
+#include "api.h"
 #include "display.h"
 #include "ota.h"
+#include "crashlog.h"
 #ifdef BOARD_I2C_SDA_GPIO
 #include "driver/i2c_master.h"
 #endif
@@ -60,18 +63,25 @@ static int cmd_config(int argc, char **argv)
     return n > 0 ? 0 : 1;
 }
 
-/* Keys whose value is a JSON bool / number; everything else is a string.
- * Secrets (s3_secret_key, wifi_password, admin_password) go through the same
- * JSON patch the web UI sends, so one code path validates and persists. */
-static const char *const BOOL_KEYS[] = {"s3_tls_insecure", "auto_sync", "upload_videos", "admin_auth", "usb_debug", "ble_enabled", "ota_dev_channel"};
-static const char *const NUM_KEYS[] = {"min_size_kb"};
+/* Secrets never appear in the config document (it carries has_* flags instead), so
+ * they are the only keys `set` accepts without a current value to take a type from. */
+static const char *const SECRET_KEYS[] = {"s3_secret_key", "wifi_password", "admin_password"};
+/* These config-document fields are informational; app_config_apply_json does
+ * not read them, so accepting them here would report success without a change. */
+static const char *const READ_ONLY_KEYS[] = {"device_id", "has_s3_secret", "has_wifi_password", "has_admin_password"};
 
-static bool in_list(const char *k, const char *const *list, size_t n)
+static bool parse_bool(const char *v, bool *out)
 {
-    for (size_t i = 0; i < n; i++) if (!strcmp(k, list[i])) return true;
+    if (!strcmp(v, "1") || !strcasecmp(v, "true") || !strcasecmp(v, "on") || !strcasecmp(v, "yes")) { *out = true; return true; }
+    if (!strcmp(v, "0") || !strcasecmp(v, "false") || !strcasecmp(v, "off") || !strcasecmp(v, "no")) { *out = false; return true; }
     return false;
 }
 
+/* set <key> <value>: one setting through POST /api/config, the path the web page and
+ * the app use (same validation, persistence and side effects). The value's JSON type
+ * comes from the key's current value in the configuration, so a new setting needs no
+ * list here, and a key the configuration does not have is refused instead of being
+ * sent as a string the dock silently ignores. */
 static int cmd_set(int argc, char **argv)
 {
     if (argc < 3) {
@@ -79,46 +89,76 @@ static int cmd_set(int argc, char **argv)
         return 1;
     }
     const char *key = argv[1];
+    for (size_t i = 0; i < sizeof READ_ONLY_KEYS / sizeof READ_ONLY_KEYS[0]; i++) if (!strcmp(key, READ_ONLY_KEYS[i])) {
+        printf("unknown setting \"%s\" (see `config` for the keys)\n", key);
+        return 1;
+    }
     /* Values may contain spaces (globs, device name): rejoin the remaining args.
-     * Both buffers live on the heap: the REPL task stack is small and the JSON
-     * patch below goes through cJSON and NVS on top of them. */
-    enum { VALUE_CAP = 1024, DOC_CAP = 1400 };
-    char *value = calloc(1, VALUE_CAP + DOC_CAP);
+     * Everything lives on the heap: the REPL task stack is small. */
+    enum { VALUE_CAP = 1024, DOC_CAP = 1400, CFG_CAP = 4096 };
+    char *value = calloc(1, VALUE_CAP + DOC_CAP + CFG_CAP);
     if (!value) { printf("out of memory\n"); return 1; }
-    char *doc = value + VALUE_CAP;
+    char *doc = value + VALUE_CAP, *cfg = doc + DOC_CAP;
+    int rc = 1;
+    cJSON *cur = NULL;
     size_t o = 0;
     for (int i = 2; i < argc; i++) {
         int w = snprintf(value + o, VALUE_CAP - o, "%s%s", i > 2 ? " " : "", argv[i]);
-        if (w < 0 || (size_t)w >= VALUE_CAP - o) { printf("value too long\n"); free(value); return 1; }
+        if (w < 0 || (size_t)w >= VALUE_CAP - o) { printf("value too long\n"); goto out; }
         o += (size_t)w;
     }
+    int cn = app_config_to_json(cfg, CFG_CAP);
+    cur = cn > 0 ? cJSON_ParseWithLength(cfg, (size_t)cn) : NULL;
+    const cJSON *now = cJSON_GetObjectItemCaseSensitive(cur, key);
+    bool secret = false;
+    for (size_t i = 0; i < sizeof SECRET_KEYS / sizeof SECRET_KEYS[0]; i++) if (!strcmp(key, SECRET_KEYS[i])) secret = true;
     rrc_jsonw w;
     rrc_jsonw_init(&w, doc, DOC_CAP);
     rrc_jsonw_raw(&w, "{");
     rrc_jsonw_key(&w, key, true); /* first key: no leading comma */
-    if (in_list(key, BOOL_KEYS, sizeof BOOL_KEYS / sizeof BOOL_KEYS[0])) {
-        bool b = !strcmp(value, "1") || !strcasecmp(value, "true") || !strcasecmp(value, "on") || !strcasecmp(value, "yes");
+    if (cJSON_IsBool(now)) {
+        bool b;
+        if (!parse_bool(value, &b)) { printf("%s is on/off: true|false (also 1|0, on|off, yes|no)\n", key); goto out; }
         rrc_jsonw_raw(&w, b ? "true" : "false");
-    } else if (in_list(key, NUM_KEYS, sizeof NUM_KEYS / sizeof NUM_KEYS[0])) {
-        rrc_jsonw_u64(&w, strtoull(value, NULL, 10));
-    } else {
+    } else if (cJSON_IsNumber(now)) {
+        char *end;
+        double d = strtod(value, &end);
+        if (end == value || *end) { printf("%s is a number\n", key); goto out; }
+        double min = 0, max = UINT32_MAX;
+        if (!strcmp(key, "display_brightness")) { min = 5; max = 100; }
+        if (!strcmp(key, "display_timeout_s")) max = 3600;
+        if (!(d >= min && d <= max) || d != (uint32_t)d) {
+            printf("%s must be an integer in %.0f..%.0f\n", key, min, max); goto out;
+        }
+        if (!strcmp(key, "display_rotation") && d != 0 && d != 90 && d != 180 && d != 270) {
+            printf("display_rotation: 0, 90, 180 or 270\n"); goto out;
+        }
+        char num[32];
+        snprintf(num, sizeof num, "%.17g", d);
+        rrc_jsonw_raw(&w, num);
+    } else if (cJSON_IsString(now) || secret) {
         rrc_jsonw_str(&w, value);
+    } else {
+        printf("unknown setting \"%s\" (see `config` for the keys)\n", key);
+        goto out;
     }
     rrc_jsonw_raw(&w, "}");
     int n = rrc_jsonw_finish(&w);
-    if (n < 0) { printf("could not encode\n"); free(value); return 1; }
-    char err[96] = "";
-    esp_err_t e = app_config_apply_json(doc, (size_t)n, err, sizeof err);
+    if (n < 0) { printf("could not encode\n"); goto out; }
+    api_resp_t r;
+    api_dispatch("POST", "/api/config", doc, (size_t)n, &r);
+    if (r.status == 200) {
+        log_ring_printf("configuration changed from the console (%s)", key);
+        printf("ok\n");
+        rc = 0;
+    } else {
+        printf("rejected: %.*s\n", (int)r.len, r.json ? r.json : "");
+    }
+    api_resp_free(&r);
+out:
+    cJSON_Delete(cur);
     free(value);
-    if (e != ESP_OK) { printf("rejected: %s\n", err[0] ? err : esp_err_to_name(e)); return 1; }
-    e = app_config_save(app_config_get());
-    if (e != ESP_OK) { printf("could not persist: %s\n", esp_err_to_name(e)); return 1; }
-    sync_config_changed();
-    net_wifi_reconfigure();
-    usb_diag_set_verbose(app_config_get()->usb_debug);
-    log_ring_printf("configuration changed from the console (%s)", key);
-    printf("ok\n");
-    return 0;
+    return rc;
 }
 
 static int cmd_sync(int argc, char **argv) { (void)argc; (void)argv; sync_request_now(); printf("sync requested\n"); return 0; }
@@ -216,6 +256,37 @@ static int cmd_ota(int argc, char **argv)
     char buf[1024];
     if (ota_status_json(buf, sizeof buf) >= 0) printf("%s\n", buf);
     return 0;
+}
+
+static int cmd_crash(int argc, char **argv)
+{
+    if (argc >= 2 && !strcmp(argv[1], "erase")) { esp_err_t e = crashlog_erase(); printf("erase: %s\n", e == ESP_ERR_NOT_ALLOWED || e == ESP_ERR_INVALID_STATE ? "busy: network work or firmware update in progress" : esp_err_to_name(e)); return 0; }
+    char buf[400];
+    if (crashlog_status_json(buf, sizeof buf) >= 0) printf("%s\n", buf);
+    return 0;
+}
+
+static int cmd_eth_phy(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    uint16_t r[32];
+    esp_err_t e = net_eth_phy_regs(r);
+    if (e != ESP_OK) { printf("eth-phy: %s\n", esp_err_to_name(e)); return 1; }
+    for (int i = 0; i < 32; i += 8)
+        printf("phy %02d: %04x %04x %04x %04x %04x %04x %04x %04x\n", i, r[i], r[i + 1], r[i + 2], r[i + 3], r[i + 4], r[i + 5], r[i + 6], r[i + 7]);
+    printf("bmcr %04x bmsr %04x (link %s, autoneg %s) id %04x:%04x anar %04x anlpar %04x; rx frames so far %u\n", r[0], r[1],
+           (r[1] & 0x4) ? "up" : "down", (r[1] & 0x20) ? "done" : "pending", r[2], r[3], r[4], r[5], (unsigned)net_eth_rx_frames());
+    return 0;
+}
+
+static int cmd_eth_reset(int argc, char **argv)
+{
+    (void)argc; (void)argv;
+    if (!ota_net_begin()) { printf("eth-reset: firmware update in progress\n"); return 1; }
+    esp_err_t e = net_eth_restart_phy();
+    ota_net_end();
+    printf("eth-reset: %s\n", esp_err_to_name(e));
+    return e == ESP_OK ? 0 : 1;
 }
 
 static int cmd_eth_rx_stall_test(int argc, char **argv)
@@ -502,6 +573,9 @@ esp_err_t console_start(void)
         {.command = "dsi-timing", .help = "dsi-timing [lane_mbps dpi_mhz hsw hbp hfp vsw vbp vfp burst|nonburst lp|nolp]: show or change the Pi DSI panel's link timing live (bring-up tool)", .func = cmd_dsi_timing},
 #endif
         {.command = "ota", .help = "ota [check | install [url [sha256]] | cancel]: firmware update state; check the release (or test-build) manifest; install what it found, or any image by URL", .func = cmd_ota},
+        {.command = "crash", .help = "crash [erase]: the stored crash report (download the core dump at GET /api/coredump)", .func = cmd_crash},
+        {.command = "eth-phy", .help = "Dump the Ethernet PHY's registers (IP101GRI) and the receive counter", .func = cmd_eth_phy},
+        {.command = "eth-reset", .help = "Restart Ethernet with a PHY hardware reset (no dock restart)", .func = cmd_eth_reset},
         {.command = "eth-rx-stall-test", .help = "Drop every received ethernet frame to test the receive watchdog (the dock restarts itself)", .func = cmd_eth_rx_stall_test},
     };
     for (size_t i = 0; i < sizeof cmds / sizeof cmds[0]; i++) esp_console_cmd_register(&cmds[i]);

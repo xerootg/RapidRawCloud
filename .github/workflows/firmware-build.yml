@@ -73,6 +73,7 @@ jobs:
           # Paths are kept relative to build/ so flash_args stays valid for merge_bin.
           path: |
             firmware/rrcloud-ingest/build/rrcloud-ingest.bin
+            firmware/rrcloud-ingest/build/rrcloud-ingest.elf
             firmware/rrcloud-ingest/build/bootloader/bootloader.bin
             firmware/rrcloud-ingest/build/partition_table/partition-table.bin
             firmware/rrcloud-ingest/build/ota_data_initial.bin
