@@ -55,12 +55,18 @@ static char applied_ssid[33], applied_pw[65];
  * Ethernet gets ETH_ADDRESS_GRACE_US to obtain an address; without one, Wi-Fi takes
  * over, and hands back the moment Ethernet gets one. */
 #define ETH_ADDRESS_GRACE_US (30 * 1000000LL)
+#if CONFIG_RRC_HAS_ETHERNET
 static int64_t eth_link_up_us;
 static esp_timer_handle_t eth_grace_timer;
+#endif
 /* Ethernet carries traffic, or is still within its grace period to get an address. */
 static bool eth_holds_traffic(void)
 {
+#if CONFIG_RRC_HAS_ETHERNET
     return eth_link && (eth_ip || esp_timer_get_time() - eth_link_up_us < ETH_ADDRESS_GRACE_US);
+#else
+    return false;
+#endif
 }
 typedef enum { WIFI_POLICY_UP, WIFI_POLICY_DOWN, WIFI_POLICY_REAPPLY, WIFI_POLICY_CONNECT, WIFI_POLICY_SCAN } wifi_policy_t;
 static QueueHandle_t policy_q;

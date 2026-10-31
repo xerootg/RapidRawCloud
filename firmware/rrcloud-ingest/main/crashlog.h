@@ -17,11 +17,19 @@
 /* After log_ring_init(): logs the stored crash, if any. */
 void crashlog_init(void);
 
-/* {"present":bool,"task":"…","pc":"0x…","cause":n,"cause_text":"…","ra":"0x…","sp":"0x…","elf_sha256":"…","size":n} */
+/* {"present":bool,"valid":bool,"task":"…","pc":"0x…","cause":n,"cause_text":"…","ra":"0x…","sp":"0x…","elf_sha256":"…","size":n} */
 int crashlog_status_json(char *out, size_t cap);
 
-/* Partition address and size of the stored dump; ESP_ERR_NOT_FOUND when none. */
-esp_err_t crashlog_dump_location(size_t *addr, size_t *size);
+/* Begin a download (even if corrupt), holding the crashlog mutex on ESP_OK.
+ * Returns ESP_ERR_NOT_FOUND when absent; errors release the lock. Before init,
+ * returns ESP_ERR_INVALID_STATE. The same task must call end after success. */
+esp_err_t crashlog_download_begin(size_t *size);
+
+/* Read within the stored image; only between a successful begin and end. */
+esp_err_t crashlog_read(size_t off, void *buf, size_t len);
+
+/* Release the download lock, including on read/send failure or disconnect. */
+void crashlog_download_end(void);
 
 esp_err_t crashlog_erase(void);
 

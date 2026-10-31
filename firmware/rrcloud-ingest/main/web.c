@@ -51,7 +51,6 @@
 #include "coproc.h"
 #include "api.h"
 #include "crashlog.h"
-#include "esp_flash.h"
 #include "util.h"
 #include "lwip/sockets.h"
 #include "lwip/stats.h"
@@ -173,24 +172,25 @@ static esp_err_t h_api(httpd_req_t *req)
 static esp_err_t h_coredump(httpd_req_t *req)
 {
     AUTH();
-    size_t addr = 0, size = 0;
-    if (crashlog_dump_location(&addr, &size) != ESP_OK) {
-        httpd_resp_set_status(req, status_line(404));
+    size_t size = 0;
+    esp_err_t e = crashlog_download_begin(&size);
+    if (e != ESP_OK) {
+        httpd_resp_set_status(req, status_line(e == ESP_ERR_NOT_FOUND ? 404 : 500));
         return send_json(req, "{\"ok\":false,\"error\":\"no crash report stored\"}", -1);
     }
     uint8_t *buf = malloc(4096);
-    if (!buf) { httpd_resp_set_status(req, status_line(500)); return send_json(req, "{\"ok\":false,\"error\":\"oom\"}", -1); }
-    httpd_resp_set_type(req, "application/octet-stream");
-    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"rrcloud-ingest-coredump.bin\"");
-    esp_err_t e = ESP_OK;
+    if (!buf) { crashlog_download_end(); httpd_resp_set_status(req, status_line(500)); return send_json(req, "{\"ok\":false,\"error\":\"oom\"}", -1); }
+    e = httpd_resp_set_type(req, "application/octet-stream");
+    if (e == ESP_OK) e = httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"rrcloud-ingest-coredump.bin\"");
     for (size_t off = 0; off < size && e == ESP_OK;) {
         size_t n = size - off < 4096 ? size - off : 4096;
-        e = esp_flash_read(NULL, buf, addr + off, n);
+        e = crashlog_read(off, buf, n);
         if (e == ESP_OK) e = httpd_resp_send_chunk(req, (const char *)buf, n);
         off += n;
     }
     free(buf);
     if (e == ESP_OK) e = httpd_resp_send_chunk(req, NULL, 0);
+    crashlog_download_end();
     return e;
 }
 

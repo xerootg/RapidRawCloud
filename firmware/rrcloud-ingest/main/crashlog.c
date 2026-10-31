@@ -7,8 +7,14 @@
 #include <stdlib.h>
 #include "esp_core_dump.h"
 #include "esp_system.h"
+#include "esp_flash.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "log_ring.h"
 #include "rrc_proto.h"
+
+static SemaphoreHandle_t mtx;
+static size_t download_addr, download_size;
 
 static const char *reason_str(esp_reset_reason_t r)
 {
@@ -53,16 +59,26 @@ static const char *cause_text(uint32_t mcause)
 
 static bool get(esp_core_dump_summary_t *s, size_t *size)
 {
-    size_t addr = 0;
-    if (esp_core_dump_image_get(&addr, size) != ESP_OK || !*size) return false;
-    return esp_core_dump_get_summary(s) == ESP_OK;
+    *size = 0;
+    if (crashlog_download_begin(size) != ESP_OK) return false;
+    /* A reset during writing can leave a length but incomplete ELF headers.
+     * Check the checksum before the summary parser follows those headers. */
+    bool valid = esp_core_dump_image_check() == ESP_OK;
+    if (valid) valid = s && esp_core_dump_get_summary(s) == ESP_OK;
+    crashlog_download_end();
+    return valid;
 }
 
 void crashlog_init(void)
 {
+    if (!mtx) mtx = xSemaphoreCreateMutex();
+    if (!mtx) { log_ring_printf("crash report: could not create mutex"); return; }
     static esp_core_dump_summary_t s;   /* ~1.2 KB with the stack dump: off the stack */
     size_t size = 0;
-    if (!get(&s, &size)) return;
+    if (!get(&s, &size)) {
+        if (size) log_ring_printf("crash report: incomplete/corrupt dump is stored");
+        return;
+    }
     /* three short lines: the log ring keeps at most ~136 characters of a message */
     log_ring_printf("crash report (kept until erased): task \"%.16s\", %s (mcause %lu)",
                     s.exc_task, cause_text(s.ex_info.mcause), (unsigned long)s.ex_info.mcause);
@@ -77,13 +93,14 @@ int crashlog_status_json(char *out, size_t cap)
     /* the summary carries a ~1 KB stack dump: on the heap, not the caller's stack */
     esp_core_dump_summary_t *sm = malloc(sizeof *sm);
     size_t size = 0;
-    bool have = sm && get(sm, &size);
+    bool valid = get(sm, &size);
     rrc_jsonw w;
     rrc_jsonw_init(&w, out, cap);
     rrc_jsonw_raw(&w, "{");
-    rrc_jsonw_key(&w, "present", true); rrc_jsonw_raw(&w, have ? "true" : "false");
+    rrc_jsonw_key(&w, "present", true); rrc_jsonw_raw(&w, size ? "true" : "false");
     rrc_jsonw_key(&w, "reset_reason", false); rrc_jsonw_str(&w, crashlog_reset_reason_str());
-    if (have) {
+    rrc_jsonw_key(&w, "valid", false); rrc_jsonw_raw(&w, valid ? "true" : "false");
+    if (valid) {
         char hex[12], task[17], sha[APP_ELF_SHA256_SZ + 1];
         snprintf(task, sizeof task, "%.16s", sm->exc_task);
         rrc_jsonw_key(&w, "task", false); rrc_jsonw_str(&w, task);
@@ -104,15 +121,43 @@ int crashlog_status_json(char *out, size_t cap)
     return rrc_jsonw_finish(&w);
 }
 
-esp_err_t crashlog_dump_location(size_t *addr, size_t *size)
+/* A successful begin keeps erase and other readers out until end. Invalid
+ * images remain downloadable: only the summary parser requires a checksum. */
+esp_err_t crashlog_download_begin(size_t *size)
 {
-    if (esp_core_dump_image_get(addr, size) != ESP_OK || !*size) return ESP_ERR_NOT_FOUND;
+    if (!size) return ESP_ERR_INVALID_ARG;
+    *size = 0;
+    if (!mtx) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(mtx, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
+    esp_err_t e = esp_core_dump_image_get(&download_addr, &download_size);
+    if (e != ESP_OK || !download_size) {
+        crashlog_download_end();
+        return ESP_ERR_NOT_FOUND;
+    }
+    *size = download_size;
     return ESP_OK;
+}
+
+esp_err_t crashlog_read(size_t off, void *buf, size_t len)
+{
+    if (!mtx || !download_size) return ESP_ERR_INVALID_STATE;
+    if (!buf || off > download_size || len > download_size - off) return ESP_ERR_INVALID_ARG;
+    return esp_flash_read(NULL, buf, download_addr + off, len);
+}
+
+void crashlog_download_end(void)
+{
+    if (!mtx) return;
+    download_size = 0;
+    xSemaphoreGive(mtx);
 }
 
 esp_err_t crashlog_erase(void)
 {
+    if (!mtx) return ESP_ERR_INVALID_STATE;
+    if (xSemaphoreTake(mtx, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
     esp_err_t e = esp_core_dump_image_erase();
+    xSemaphoreGive(mtx);
     if (e == ESP_OK) log_ring_printf("crash report erased");
     return e;
 }
