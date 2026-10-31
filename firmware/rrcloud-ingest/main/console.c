@@ -66,6 +66,9 @@ static int cmd_config(int argc, char **argv)
 /* Secrets never appear in the config document (it carries has_* flags instead), so
  * they are the only keys `set` accepts without a current value to take a type from. */
 static const char *const SECRET_KEYS[] = {"s3_secret_key", "wifi_password", "admin_password"};
+/* These config-document fields are informational; app_config_apply_json does
+ * not read them, so accepting them here would report success without a change. */
+static const char *const READ_ONLY_KEYS[] = {"device_id", "has_s3_secret", "has_wifi_password", "has_admin_password"};
 
 static bool parse_bool(const char *v, bool *out)
 {
@@ -86,6 +89,10 @@ static int cmd_set(int argc, char **argv)
         return 1;
     }
     const char *key = argv[1];
+    for (size_t i = 0; i < sizeof READ_ONLY_KEYS / sizeof READ_ONLY_KEYS[0]; i++) if (!strcmp(key, READ_ONLY_KEYS[i])) {
+        printf("unknown setting \"%s\" (see `config` for the keys)\n", key);
+        return 1;
+    }
     /* Values may contain spaces (globs, device name): rejoin the remaining args.
      * Everything lives on the heap: the REPL task stack is small. */
     enum { VALUE_CAP = 1024, DOC_CAP = 1400, CFG_CAP = 4096 };

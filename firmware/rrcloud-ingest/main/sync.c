@@ -602,9 +602,11 @@ static bool run_submit(run_t *rc, const enum_ctx_t *ec, size_t item, bool may_de
 #define RUN_MAGIC 0x52554e31u   /* "RUN1" */
 #define RESUME_MAX_TRIES 3
 #define RECOVERY_MAGIC 0x52435652u   /* "RCVR" */
+#define HOLD_MAGIC 0x484f4c44u   /* "HOLD" */
 static RTC_NOINIT_ATTR uint32_t rtc_run_magic;
 static RTC_NOINIT_ATTR uint32_t rtc_resume_tries;
 static RTC_NOINIT_ATTR uint32_t rtc_recovery_restart;
+static RTC_NOINIT_ATTR uint32_t rtc_hold_magic;
 static bool resume_pending;
 /* RESUME_MAX_TRIES crashes in a row during runs: no run starts by itself (neither a
  * resume nor auto_sync on the still-attached camera, which turned a crash that recurs
@@ -615,7 +617,11 @@ void sync_mark_recovery_restart(void) { rtc_recovery_restart = RECOVERY_MAGIC; }
 
 static void resume_check_at_boot(void)
 {
+    /* The pause outlives the interrupted-run marker: a further crash while idle
+     * or an ordinary reboot must not silently re-enable automatic syncs. */
     esp_reset_reason_t r = esp_reset_reason();
+    if (r == ESP_RST_POWERON || r == ESP_RST_BROWNOUT) rtc_hold_magic = 0;   /* no-init RAM holds garbage after power loss */
+    crash_hold = rtc_hold_magic == HOLD_MAGIC;
     /* A software restart counts like a crash only when the firmware itself
      * restarted to recover (sync_mark_recovery_restart, e.g. the Ethernet
      * receive watchdog); a console or web-UI reboot never resumes. */
@@ -625,12 +631,13 @@ static void resume_check_at_boot(void)
     if (!crash) { rtc_run_magic = 0; rtc_resume_tries = 0; return; }
     if (rtc_run_magic != RUN_MAGIC) return;
     rtc_run_magic = 0;
-    if (rtc_resume_tries >= RESUME_MAX_TRIES) {
+    if (rtc_resume_tries < RESUME_MAX_TRIES) rtc_resume_tries++;
+    if (crash_hold || rtc_resume_tries >= RESUME_MAX_TRIES) {
+        rtc_hold_magic = HOLD_MAGIC;
         crash_hold = true;
         log_ring_printf("sync: %u restarts in a row during runs; automatic syncs are paused until one is started by hand (Sync now)", (unsigned)rtc_resume_tries);
         return;
     }
-    rtc_resume_tries++;
     resume_pending = true;
     log_ring_printf("sync: restarted %s during a run; it resumes when the camera is back", recovery ? "to recover the network" : "after a crash");
 }
@@ -653,6 +660,7 @@ static void sync_run(cam_source_t *src)
          * one that was only deferred (no network yet, camera asleep) does not */
         rtc_resume_tries = 0;
         crash_hold = false;
+        rtc_hold_magic = 0;
     }
     ota_net_end();
 }
@@ -1193,6 +1201,7 @@ static void sync_task(void *arg)
             break;
         case CMD_SYNC_NOW:
             crash_hold = false;   /* the operator asked */
+            rtc_hold_magic = 0;
             if (cam && cam->connected(cam)) sync_run(cam);
             else { set_error("no camera attached"); }
             break;
