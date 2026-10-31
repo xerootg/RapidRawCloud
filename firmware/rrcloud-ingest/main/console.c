@@ -124,6 +124,15 @@ static int cmd_set(int argc, char **argv)
         char *end;
         double d = strtod(value, &end);
         if (end == value || *end) { printf("%s is a number\n", key); goto out; }
+        double min = 0, max = UINT32_MAX;
+        if (!strcmp(key, "display_brightness")) { min = 5; max = 100; }
+        if (!strcmp(key, "display_timeout_s")) max = 3600;
+        if (!(d >= min && d <= max) || d != (uint32_t)d) {
+            printf("%s must be an integer in %.0f..%.0f\n", key, min, max); goto out;
+        }
+        if (!strcmp(key, "display_rotation") && d != 0 && d != 90 && d != 180 && d != 270) {
+            printf("display_rotation: 0, 90, 180 or 270\n"); goto out;
+        }
         char num[32];
         snprintf(num, sizeof num, "%.17g", d);
         rrc_jsonw_raw(&w, num);
@@ -273,7 +282,9 @@ static int cmd_eth_phy(int argc, char **argv)
 static int cmd_eth_reset(int argc, char **argv)
 {
     (void)argc; (void)argv;
+    if (!ota_net_begin()) { printf("eth-reset: firmware update in progress\n"); return 1; }
     esp_err_t e = net_eth_restart_phy();
+    ota_net_end();
     printf("eth-reset: %s\n", esp_err_to_name(e));
     return e == ESP_OK ? 0 : 1;
 }
