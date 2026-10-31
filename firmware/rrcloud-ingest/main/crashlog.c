@@ -11,10 +11,14 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "log_ring.h"
+#include "ota.h"
 #include "rrc_proto.h"
 
 static SemaphoreHandle_t mtx;
 static size_t download_addr, download_size;
+static esp_core_dump_summary_t s;   /* ~1.2 KB with the stack dump: off the stack */
+static size_t size;
+static bool valid;
 
 static const char *reason_str(esp_reset_reason_t r)
 {
@@ -73,9 +77,8 @@ void crashlog_init(void)
 {
     if (!mtx) mtx = xSemaphoreCreateMutex();
     if (!mtx) { log_ring_printf("crash report: could not create mutex"); return; }
-    static esp_core_dump_summary_t s;   /* ~1.2 KB with the stack dump: off the stack */
-    size_t size = 0;
-    if (!get(&s, &size)) {
+    valid = get(&s, &size);
+    if (!valid) {
         if (size) log_ring_printf("crash report: incomplete/corrupt dump is stored");
         return;
     }
@@ -90,10 +93,8 @@ void crashlog_init(void)
 
 int crashlog_status_json(char *out, size_t cap)
 {
-    /* the summary carries a ~1 KB stack dump: on the heap, not the caller's stack */
-    esp_core_dump_summary_t *sm = malloc(sizeof *sm);
-    size_t size = 0;
-    bool valid = get(sm, &size);
+    if (mtx) xSemaphoreTake(mtx, portMAX_DELAY);
+    const esp_core_dump_summary_t *sm = &s;
     rrc_jsonw w;
     rrc_jsonw_init(&w, out, cap);
     rrc_jsonw_raw(&w, "{");
@@ -117,7 +118,7 @@ int crashlog_status_json(char *out, size_t cap)
         rrc_jsonw_key(&w, "size", false); rrc_jsonw_u64(&w, size);
     }
     rrc_jsonw_raw(&w, "}");
-    free(sm);
+    if (mtx) xSemaphoreGive(mtx);
     return rrc_jsonw_finish(&w);
 }
 
@@ -156,7 +157,12 @@ esp_err_t crashlog_erase(void)
 {
     if (!mtx) return ESP_ERR_INVALID_STATE;
     if (xSemaphoreTake(mtx, portMAX_DELAY) != pdTRUE) return ESP_ERR_TIMEOUT;
-    esp_err_t e = esp_core_dump_image_erase();
+    esp_err_t e = ota_external_begin();
+    if (e == ESP_OK) {
+        e = esp_core_dump_image_erase();
+        if (e == ESP_OK) { valid = false; size = 0; memset(&s, 0, sizeof s); }
+        ota_external_end();
+    }
     xSemaphoreGive(mtx);
     if (e == ESP_OK) log_ring_printf("crash report erased");
     return e;

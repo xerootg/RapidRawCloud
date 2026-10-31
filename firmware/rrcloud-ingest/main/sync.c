@@ -627,7 +627,7 @@ static void resume_check_at_boot(void)
      * receive watchdog); a console or web-UI reboot never resumes. */
     bool recovery = r == ESP_RST_SW && rtc_recovery_restart == RECOVERY_MAGIC;
     rtc_recovery_restart = 0;
-    bool crash = recovery || r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT;
+    bool crash = recovery || r == ESP_RST_PANIC || r == ESP_RST_INT_WDT || r == ESP_RST_TASK_WDT || r == ESP_RST_WDT || r == ESP_RST_CPU_LOCKUP;
     if (!crash) { rtc_run_magic = 0; rtc_resume_tries = 0; return; }
     if (rtc_run_magic != RUN_MAGIC) return;
     rtc_run_magic = 0;

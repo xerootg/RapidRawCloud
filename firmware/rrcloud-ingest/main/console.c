@@ -260,7 +260,7 @@ static int cmd_ota(int argc, char **argv)
 
 static int cmd_crash(int argc, char **argv)
 {
-    if (argc >= 2 && !strcmp(argv[1], "erase")) { printf("erase: %s\n", esp_err_to_name(crashlog_erase())); return 0; }
+    if (argc >= 2 && !strcmp(argv[1], "erase")) { esp_err_t e = crashlog_erase(); printf("erase: %s\n", e == ESP_ERR_NOT_ALLOWED || e == ESP_ERR_INVALID_STATE ? "busy: network work or firmware update in progress" : esp_err_to_name(e)); return 0; }
     char buf[400];
     if (crashlog_status_json(buf, sizeof buf) >= 0) printf("%s\n", buf);
     return 0;

@@ -353,7 +353,7 @@ void api_dispatch(const char *method, const char *path, const char *body, size_t
     else if (post && !strcmp(path, "/api/ota/upload/begin")) r_ota_begin(body, body_len, out);
     else if (post && !strcmp(path, "/api/ota/upload/chunk")) r_ota_chunk(body, body_len, out);
     else if (post && !strcmp(path, "/api/ota/upload/finish")) r_ota_finish(out);
-    else if (post && !strcmp(path, "/api/coredump/erase")) { if (crashlog_erase() == ESP_OK) ok(out); else err(out, 500, "could not erase the crash report"); }
+    else if (post && !strcmp(path, "/api/coredump/erase")) { esp_err_t e = crashlog_erase(); if (e == ESP_OK) ok(out); else if (e == ESP_ERR_NOT_ALLOWED || e == ESP_ERR_INVALID_STATE) err(out, 409, "busy: network work or firmware update in progress"); else err(out, 500, "could not erase the crash report"); }
     else if (post && !strcmp(path, "/api/ota/cancel")) { if (ota_cancel() == ESP_OK) ok(out); else err(out, 409, "the image is being written; it cannot be stopped now"); }
     else err(out, 404, "unknown endpoint");
     if (!out->json) set(out, 500, NULL, 0);
