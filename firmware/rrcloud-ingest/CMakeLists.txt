@@ -6,6 +6,11 @@ set(EXTRA_COMPONENT_DIRS ${CMAKE_CURRENT_LIST_DIR}/components)
 
 # Firmware version (also drives the GitHub release tag firmware-v<version>; see .github/workflows/firmware-release.yml).
 file(STRINGS ${CMAKE_CURRENT_LIST_DIR}/version.txt PROJECT_VER LIMIT_COUNT 1)
+# Test builds (the rolling firmware-dev prerelease) carry the commit in their version, so
+# the dock's update check can tell two builds of one version.txt apart.
+if(DEFINED ENV{RRC_FW_VERSION} AND NOT "$ENV{RRC_FW_VERSION}" STREQUAL "")
+    set(PROJECT_VER "$ENV{RRC_FW_VERSION}")
+endif()
 
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 project(rrcloud-ingest)

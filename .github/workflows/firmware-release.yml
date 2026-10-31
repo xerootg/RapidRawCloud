@@ -139,9 +139,16 @@ jobs:
               pip install esptool
               esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 921600 write_flash 0x0 rrcloud-ingest-merged.bin
 
-          Updating the app only (keeps NVS config and the LittleFS ledger):
+          The merged image fills the gaps between the parts with 0xFF, which **erases the NVS
+          configuration (cloud, pairing, Wi-Fi)**: use it for a first install only. To update a
+          configured dock over USB, write the parts (this also installs the bootloader that rolls
+          back a bad over-the-air update, and resets the boot slot, which an over-the-air update
+          may have moved to ota_1):
 
-              esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 921600 write_flash 0x20000 rrcloud-ingest.bin
+              esptool.py --chip esp32p4 -p /dev/ttyACM0 -b 921600 write_flash 0x2000 bootloader.bin 0x8000 partition-table.bin 0x19000 ota_data_initial.bin 0x20000 rrcloud-ingest.bin
+
+          After that, the dock updates itself: Device › Firmware on the screen, the Firmware card on
+          its web page, or the RapidRAW app.
 
           ${{ matrix.then }}
           MD
@@ -151,10 +158,34 @@ jobs:
           name: rrcloud-ingest-${{ needs.meta.outputs.version }}-${{ matrix.suffix }}
           path: dist/*.zip
 
+  # Over-the-air images: each board's app image plus rrcloud-ingest-ota.json, which a dock
+  # reads to find its own (main/ota.c, .github/scripts/ota_manifest.py).
+  ota:
+    name: Over-the-air images and manifest
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rrcloud-ingest-build-${{ needs.meta.outputs.version }}-*
+          path: artifacts
+      - run: |
+          mkdir -p builds
+          for d in artifacts/rrcloud-ingest-build-${{ needs.meta.outputs.version }}-*; do b="${d#artifacts/rrcloud-ingest-build-${{ needs.meta.outputs.version }}-}"; mkdir -p "builds/$b"; cp "$d/rrcloud-ingest.bin" "builds/$b/"; done
+          python3 .github/scripts/ota_manifest.py builds dist "${{ needs.meta.outputs.version }}" "firmware-v${{ needs.meta.outputs.version }}" "${GITHUB_SHA:0:7}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rrcloud-ingest-${{ needs.meta.outputs.version }}-ota
+          path: dist/*
+
   release:
     name: Publish GitHub release
-    if: needs.meta.outputs.release == 'true'
-    needs: [meta, tests, package]
+    if: success() && needs.meta.outputs.release == 'true'
+    needs: [meta, tests, package, ota]
+    concurrency:
+      group: firmware-release   # firmware-latest is deleted and re-created below
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -165,6 +196,10 @@ jobs:
           pattern: rrcloud-ingest-${{ needs.meta.outputs.version }}-esp32p4*
           merge-multiple: true
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: rrcloud-ingest-${{ needs.meta.outputs.version }}-ota
+          path: ota
       - name: Checksums
         run: cd dist && sha256sum *.zip > SHA256SUMS
       - name: Release notes
@@ -192,3 +227,14 @@ jobs:
           files: |
             dist/*.zip
             dist/SHA256SUMS
+            ota/*
+      # The dock's release channel: firmware releases are prereleases and the repository's
+      # "latest" release is the app's, so docks read a rolling firmware-latest release instead.
+      - name: Point firmware-latest at this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete firmware-latest --cleanup-tag --yes -R "${GITHUB_REPOSITORY}" || true
+          echo "Rolling pointer for the dock's update check: the images and manifest of [firmware-v${{ needs.meta.outputs.version }}](https://github.com/${GITHUB_REPOSITORY}/releases/tag/firmware-v${{ needs.meta.outputs.version }})." > latest.md
+          gh release create firmware-latest -R "${GITHUB_REPOSITORY}" --target "${GITHUB_SHA}" --prerelease --latest=false \
+            --title "rrcloud-ingest latest (${{ needs.meta.outputs.version }})" --notes-file latest.md ota/*

@@ -14,5 +14,7 @@ esp_err_t ble_start(void);
 void ble_reconfigure(void);
 /* {"enabled":…,"up":…,"advertising":…,"connected":…,"encrypted":…,"name":…,"address":…,"mtu":…,"error":…} */
 int ble_status_json(char *out, size_t cap);
+/* True while the admin service is up (advertising or connected): the app can reach the dock. */
+bool ble_reachable(void);
 /* Drops every stored bond (and the current connection): the next phone pairs afresh. */
 void ble_forget_bonds(void);

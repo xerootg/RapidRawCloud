@@ -1,4 +1,5 @@
 #include "sync.h"
+#include "ota.h"
 #include "util.h"
 #include <stdarg.h>
 #include <string.h>
@@ -632,10 +633,15 @@ static void resume_check_at_boot(void)
 static void sync_run_impl(cam_source_t *src);
 static void sync_run(cam_source_t *src)
 {
+    /* A firmware update restarts the dock when it is done: no run starts under it
+     * (the tick retries once the update failed or was cancelled), and none can start
+     * one while this run holds the reservation, from identifying the camera on. */
+    if (!ota_net_begin()) { run_deferred = true; set_error("firmware update in progress; the sync starts when it is done"); return; }
     rtc_run_magic = RUN_MAGIC;
     sync_run_impl(src);
     rtc_run_magic = 0;
     rtc_resume_tries = 0;
+    ota_net_end();
 }
 
 static void sync_run_impl(cam_source_t *src)
@@ -713,12 +719,21 @@ static void sync_run_impl(cam_source_t *src)
 }
 
 /* ---- periodic tick ---------------------------------------------------------- */
+static void tick_maintenance(void);
 static void on_tick(void)
 {
     /* A run that could not start (no network yet, cloud unconfigured, camera asleep)
      * is retried here instead of waiting for a replug. */
     if (run_deferred && cam && cam->connected(cam) && (app_config_get()->auto_sync || resume_pending)) sync_run(cam);
     if (!s3_ready || !net_has_ip()) return;
+    /* bucket traffic: not beside a firmware download or flash write (ota.h) */
+    if (!ota_net_begin()) return;
+    tick_maintenance();
+    ota_net_end();
+}
+
+static void tick_maintenance(void)
+{
     int64_t now = (int64_t)time(NULL);
     int64_t hb;
     bool attached;
@@ -1132,6 +1147,9 @@ static void sync_task(void *arg)
     msg_t m;
     for (;;) {
         if (xQueueReceive(q, &m, portMAX_DELAY) != pdTRUE) continue;
+        /* console diagnostics move data over the network and USB: not beside an update (ota.h) */
+        bool diag = m.cmd >= CMD_DEBUG_LS;
+        if (diag && !ota_net_begin()) { printf("a firmware update is in progress; try again when it is done\n"); free(m.arg); continue; }
         switch (m.cmd) {
         case CMD_ATTACH:
             cam = m.src;
@@ -1172,6 +1190,7 @@ static void sync_task(void *arg)
         case CMD_DEBUG_READ: debug_read(m.arg ? m.arg : "", m.repeat, m.port); free(m.arg); break;
         case CMD_DEBUG_TCP: { char *colon = m.arg ? strrchr(m.arg, ':') : NULL; if (colon) { *colon = 0; debug_tcp(m.arg, atoi(colon + 1), m.repeat); } free(m.arg); break; }
         }
+        if (diag) ota_net_end();
     }
 }
 

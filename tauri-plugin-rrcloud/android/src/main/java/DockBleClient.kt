@@ -179,7 +179,11 @@ class DockBleClient(private val context: Context, private val emit: (String, JSO
         assembly.reset(); assemblyTotal = -1
         // ATT allows MTU-3 bytes per write, but Android refuses attribute values over
         // 512 bytes (GATT_MAX_ATTR_LEN) and NimBLE's attribute limit is the same.
-        val maxPayload = (mtu - 3).coerceAtLeast(20).coerceAtMost(512)
+        // At most one LE packet (251-byte LL payload minus L2CAP and ATT headers) per
+        // fragment: writes the link layer has to split arrive garbled through the dock's
+        // ESP32-C6 hosted HCI and end in a link timeout under sustained traffic (a firmware
+        // upload); the dock caps its notifications the same way (firmware ble.c).
+        val maxPayload = (mtu - 3).coerceAtLeast(20).coerceAtMost(244)
         var off = 0; var first = true
         val tag = (r.id and 0xF) shl 4
         while (first || off < r.payload.size) {
@@ -258,6 +262,10 @@ class DockBleClient(private val context: Context, private val emit: (String, JSO
                 if (g !== gatt) return@post
                 if (newState == BluetoothProfile.STATE_CONNECTED && status == BluetoothGatt.GATT_SUCCESS) {
                     state("connected")
+                    // Short connection interval: each request fragment is a write with response
+                    // (one round trip per connection event), and a dock firmware update is ~700
+                    // requests. The dock asks for the same once the link is encrypted.
+                    g.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
                     if (!g.requestMtu(517)) g.discoverServices()
                 } else {
                     val why = if (status == BluetoothGatt.GATT_SUCCESS) "disconnected" else "connection lost ($status)"

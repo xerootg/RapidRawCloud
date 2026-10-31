@@ -25,6 +25,7 @@
 #include "eh_host_sys.h"
 #include "eh_host_cp_ota.h"
 #include "log_ring.h"
+#include "ota.h"
 #include "rrc_proto.h"
 #include "util.h"
 
@@ -259,6 +260,7 @@ out:
     if (c) { esp_http_client_close(c); esp_http_client_cleanup(c); }
     free(buf);
     free(r);
+    ota_external_end();
     vTaskDelete(NULL);
 }
 
@@ -268,16 +270,19 @@ esp_err_t coproc_update_start(const char *url, const char *sha256_hex)
     if (!url || !*url) { url = COPROC_IMAGE_URL_DEFAULT; sha256_hex = COPROC_IMAGE_SHA256_DEFAULT; }
     if (strncmp(url, "http://", 7) && strncmp(url, "https://", 8)) return ESP_ERR_INVALID_ARG;
     if (sha256_hex && *sha256_hex && strlen(sha256_hex) != 64) return ESP_ERR_INVALID_ARG;
+    /* One updater at a time, never beside a sync: the slot is the dock firmware's
+     * (ota.h), held until this update fails or restarts the dock. It also stands for
+     * "already running" here: a running co-processor update holds it. */
+    esp_err_t e = ota_external_begin();
+    if (e != ESP_OK) return e;
     LOCK();
-    bool running = st.upd == UPD_RUNNING;
-    if (!running) { st.upd = UPD_RUNNING; st.upd_done = st.upd_total = 0; st.upd_msg[0] = 0; }
+    st.upd = UPD_RUNNING; st.upd_done = st.upd_total = 0; st.upd_msg[0] = 0;
     UNLOCK();
-    if (running) return ESP_ERR_INVALID_STATE;
     upd_req_t *r = calloc(1, sizeof *r);
-    if (!r) { LOCK(); st.upd = UPD_FAILED; UNLOCK(); return ESP_ERR_NO_MEM; }
+    if (!r) { LOCK(); st.upd = UPD_FAILED; UNLOCK(); ota_external_end(); return ESP_ERR_NO_MEM; }
     scpy(r->url, sizeof r->url, url);
     if (sha256_hex) scpy(r->sha, sizeof r->sha, sha256_hex);
     /* 12 KiB: TLS session for the download + RPC frames; the data buffer is on the heap. */
-    if (xTaskCreate(update_task, "coproc_upd", 12288, r, 3, NULL) != pdPASS) { free(r); LOCK(); st.upd = UPD_FAILED; UNLOCK(); return ESP_ERR_NO_MEM; }
+    if (xTaskCreate(update_task, "coproc_upd", 12288, r, 3, NULL) != pdPASS) { free(r); LOCK(); st.upd = UPD_FAILED; UNLOCK(); ota_external_end(); return ESP_ERR_NO_MEM; }
     return ESP_OK;
 }

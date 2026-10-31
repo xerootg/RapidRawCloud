@@ -132,6 +132,32 @@
   </form>
 
   <section class="card" style="margin-top:14px">
+    <h2>Firmware <span id="otastate" class="pill">…</span></h2>
+    <div class="kv">
+      <div>Running</div><div id="otarun">—</div>
+      <div>Latest</div><div id="otaavail">not checked</div>
+    </div>
+    <div class="note" id="otamsg"></div>
+    <progress id="otaprog" max="100" value="0" style="display:none"></progress>
+    <label class="check"><input type="checkbox" id="ota_dev_channel"> Test builds (the rolling <code>firmware-dev</code> prerelease instead of releases)</label>
+    <div>
+      <button id="otacheck" class="secondary" type="button">Check for updates</button>
+      <button id="otainstall" type="button" disabled>Install</button>
+      <button id="otacancel" class="secondary" type="button">Cancel</button>
+    </div>
+    <label for="otafile">Install a file (<code>rrcloud-ingest*.bin</code> for this board)</label>
+    <input id="otafile" type="file" accept=".bin,application/octet-stream">
+    <button id="otaupload" class="secondary" type="button">Upload and install</button>
+    <label for="otaurl">Or install from a URL</label>
+    <div class="row">
+      <div><input id="otaurl" type="url" placeholder="https://…/rrcloud-ingest.bin"></div>
+      <div><input id="otasha" type="text" placeholder="SHA-256 (optional)"></div>
+    </div>
+    <button id="otaurlgo" class="secondary" type="button">Install from URL</button>
+    <div class="note">A new firmware starts on trial: it is kept once it has run for a minute and can be reached (network or Bluetooth); if it crashes or cannot be reached, the dock goes back to the current one by itself. The dock refuses images for another board, and installs nothing while a sync runs.</div>
+  </section>
+
+  <section class="card" style="margin-top:14px">
     <h2>Log</h2>
     <pre id="log">…</pre>
   </section>
@@ -145,7 +171,7 @@ let toastT; function toast(m){ const t=$('toast'); t.textContent=m; t.style.disp
 async function api(path, body){ const r = await fetch(path, body!==undefined ? {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)} : {}); const j = await r.json().catch(()=>({})); if(!r.ok) throw new Error(j.error||('HTTP '+r.status)); return j; }
 
 const strFields = ['include_globs','exclude_globs','msc_root','key_template','s3_endpoint','s3_bucket','s3_region','s3_access_key','device_name','hostname','wifi_ssid'];
-const boolFields = ['auto_sync','upload_videos','s3_tls_insecure','wifi_enabled','admin_auth','usb_debug','ble_enabled'];
+const boolFields = ['auto_sync','upload_videos','s3_tls_insecure','wifi_enabled','admin_auth','usb_debug','ble_enabled','ota_dev_channel'];
 async function loadConfig(){
   const c = await api('/api/config');
   strFields.forEach(f => $(f).value = c[f] ?? '');
@@ -238,7 +264,66 @@ async function refresh(){
     const log = await api('/api/log'); $('log').textContent = log.join('\n'); 
   } catch (e) { $('sub').textContent = 'connection lost… ' + e.message; }
 }
-loadConfig().then(pollPair); refresh(); setInterval(refresh, 2000);
+/* ---- firmware update -------------------------------------------------------------------- */
+const otaClass = { idle:'ok', failed:'err', restarting:'warn' };
+let otaUploading = false;
+async function refreshOta(){
+  try {
+    const o = await api('/api/ota');
+    const st = $('otastate'); st.textContent = o.trial ? 'on trial' : o.state; st.className = 'pill ' + (o.trial ? 'warn' : (otaClass[o.state] || 'warn'));
+    $('otarun').textContent = `${o.running} (${o.variant}, built ${o.built}, chip v${Math.floor(o.chip_rev/100)}.${o.chip_rev%100})` + (o.rolled_back ? ` — ${o.rolled_back} did not start cleanly and was rolled back` : '') + (o.rollback ? '' : " — this dock's bootloader cannot roll back a bad update: flash it over USB once (README)");
+    const a = o.available;
+    $('otaavail').textContent = a ? `${a.channel === 'dev' ? 'test build' : 'release'} ${a.version}${a.commit ? ' ('+a.commit+')' : ''} · ${fmtBytes(a.size)}${a.newer ? '' : ' · already running'}` : (o.checked ? 'nothing for this board' : 'not checked');
+    $('otamsg').textContent = o.message || '';
+    const busy = ['checking','downloading','receiving','verifying','writing','restarting'].includes(o.state);
+    $('otaprog').style.display = o.total && busy ? 'block' : 'none';
+    if (o.total) $('otaprog').value = 100 * o.done / o.total;
+    $('otainstall').disabled = busy || !a;
+    $('otacheck').disabled = busy; $('otaupload').disabled = busy || otaUploading; $('otaurlgo').disabled = busy;
+    $('otacancel').disabled = !['checking','downloading','receiving'].includes(o.state);
+    return o;
+  } catch (e) { return null; }
+}
+$('ota_dev_channel').onchange = async e => { try { await api('/api/config', {ota_dev_channel: e.target.checked}); toast(e.target.checked ? 'Test builds on' : 'Releases only'); } catch (x) { toast(x.message); e.target.checked = !e.target.checked; } };
+$('otacheck').onclick = () => api('/api/ota/check', {}).then(refreshOta).catch(e=>toast(e.message));
+$('otainstall').onclick = () => { if (confirm('Install this firmware? The dock restarts into it (on trial).')) api('/api/ota/install', {}).then(refreshOta).catch(e=>toast(e.message)); };
+$('otacancel').onclick = () => api('/api/ota/cancel', {}).then(refreshOta).catch(e=>toast(e.message));
+$('otaurlgo').onclick = () => { const url = $('otaurl').value.trim(); if (!url) return toast('Enter a URL'); api('/api/ota/install', {url, sha256: $('otasha').value.trim()}).then(refreshOta).catch(e=>toast(e.message)); };
+$('otaupload').onclick = async () => {
+  if (otaUploading) return;
+  const f = $('otafile').files[0];
+  if (!f) return toast('Choose a file first');
+  if (!confirm(`Install ${f.name} (${fmtBytes(f.size)})? The dock restarts into it (on trial).`)) return;
+  otaUploading = true; $('otaupload').disabled = true;
+  /* only an upload this click began is ours to cancel: a refused begin means another one runs */
+  let began = false;
+  try {
+    const bytes = new Uint8Array(await f.arrayBuffer());
+    /* crypto.subtle only exists on https pages; the dock verifies the image's own hashes either way */
+    let sha256 = '';
+    if (window.crypto && crypto.subtle) sha256 = [...new Uint8Array(await crypto.subtle.digest('SHA-256', bytes))].map(b => b.toString(16).padStart(2, '0')).join('');
+    const b = await api('/api/ota/upload/begin', {size: bytes.length, sha256});
+    began = true;
+    const chunk = b.chunk || 4096;
+    for (let off = 0; off < bytes.length;) {
+      const part = bytes.subarray(off, Math.min(off + chunk, bytes.length));
+      let s = ''; for (let i = 0; i < part.length; i++) s += String.fromCharCode(part[i]);
+      const r = await fetch('/api/ota/upload/chunk', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({off, data: btoa(s)})});
+      const j = await r.json().catch(()=>({}));
+      if (r.status === 409 && typeof j.expected === 'number') { off = j.expected; continue; }
+      if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
+      off = j.expected;
+      $('otaprog').style.display = 'block'; $('otaprog').value = 100 * off / bytes.length;
+      $('otamsg').textContent = `uploading ${fmtBytes(off)} of ${fmtBytes(bytes.length)}`;
+    }
+    await api('/api/ota/upload/finish', {});
+    toast('Uploaded; the dock checks and installs it');
+  } catch (e) { toast('Upload failed: ' + e.message); if (began) await api('/api/ota/cancel', {}).catch(()=>{}); }
+  otaUploading = false;
+  refreshOta();
+};
+
+loadConfig().then(pollPair); refresh(); refreshOta(); setInterval(refresh, 2000); setInterval(refreshOta, 2000);
 </script>
 </body>
 </html>
