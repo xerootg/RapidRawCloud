@@ -1,13 +1,14 @@
 use crate::Cursor;
 use crate::app_settings::{AppSettings, load_settings};
-use crate::app_state::{AppState, LoadedImage};
+use crate::app_state::{AppState, LoadedImage, PreviewTarget};
 use crate::baseline_exposure::BaselineOptions;
+use crate::cache_utils::{DecodeFingerprint, FlightRole, clear_preview_slot};
 use crate::exif_processing;
 use crate::file_management::{parse_virtual_path, read_file_mapped};
 use crate::formats::is_raw_file;
 use crate::image_processing::ImageMetadata;
 use crate::image_processing::{
-    apply_orientation, apply_srgb_to_linear, effective_baseline_exposure,
+    apply_orientation, apply_srgb_to_linear, effective_baseline_exposure, linear_channel_to_srgb,
     remove_raw_artifacts_and_enhance,
 };
 use crate::mask_generation::{MaskDefinition, SubMask, generate_mask_bitmap};
@@ -15,11 +16,16 @@ use crate::white_balance::WhiteBalance;
 use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use exif::{Reader as ExifReader, Tag};
-use image::{DynamicImage, GenericImageView, ImageReader, imageops};
+use glam::{DMat3, Mat3, Vec3};
+use image::{DynamicImage, GenericImageView, ImageDecoder, ImageReader, Rgb32FImage, imageops};
+use moxcms::{
+    ColorProfile, DataColorSpace, Layout, RenderingIntent, ToneReprCurve, TransformOptions,
+};
 use rawler::Orientation;
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs;
 use std::panic;
@@ -30,6 +36,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::Instant;
+use tauri::Manager;
 
 #[derive(serde::Serialize)]
 pub struct LoadImageResult {
@@ -78,9 +85,41 @@ pub fn load_and_composite(
 ) -> Result<DynamicImage> {
     let base_image =
         load_base_image_from_bytes(base_image, path, use_fast_raw_dev, settings, cancel_token)?;
-    // Base is a full decode of the original bytes, so patch geometry is already
-    // in this image's pixel space: proxy_scale = 1.0 (§4.4, no-op).
-    composite_patches_on_image(&base_image, adjustments, 1.0)
+    let prepared = match prepare_base_image_cow(&base_image, path, adjustments)? {
+        Cow::Owned(img) => Some(img),
+        Cow::Borrowed(_) => None,
+    };
+    Ok(prepared.unwrap_or(base_image))
+}
+
+pub fn prepare_base_image_cow<'a>(
+    base_image: &'a DynamicImage,
+    path: &str,
+    adjustments: &Value,
+) -> Result<Cow<'a, DynamicImage>> {
+    prepare_base_image_cow_scaled(base_image, path, adjustments, 1.0)
+}
+
+/// [`prepare_base_image_cow`] over a base that may be a smart-preview proxy
+/// (§4.4): `proxy_scale` (`proxy_long_edge / orig_long_edge`, `1.0` for a
+/// full-resolution base) scales cropped AI patches' original-space geometry
+/// into the base's pixel space. RapidRawCloud addition (UPSTREAM_TOUCHES.md).
+pub fn prepare_base_image_cow_scaled<'a>(
+    base_image: &'a DynamicImage,
+    path: &str,
+    adjustments: &Value,
+    proxy_scale: f32,
+) -> Result<Cow<'a, DynamicImage>> {
+    let has_patches = adjustments
+        .get("aiPatches")
+        .and_then(|v| v.as_array())
+        .is_some_and(|a| !a.is_empty());
+
+    let denoised = crate::ai_denoise::apply_ai_denoise(base_image, path, adjustments);
+    match crate::negative_conversion::apply_negative_conversion(denoised, adjustments) {
+        Cow::Owned(prepared) if !has_patches => Ok(Cow::Owned(prepared)),
+        prepared => composite_patches_cow(prepared, path, adjustments, proxy_scale),
+    }
 }
 
 pub fn load_base_image_from_bytes(
@@ -92,13 +131,10 @@ pub fn load_base_image_from_bytes(
 ) -> Result<DynamicImage> {
     let highlight_compression = settings.raw_highlight_compression.unwrap_or(2.5);
     let linear_mode = settings.linear_raw_mode.clone();
-    let color_nr_setting = settings.raw_preprocessing_color_nr.unwrap_or(0.5);
-    let color_nr_amount = if color_nr_setting <= 0.0 {
-        0.0
-    } else {
-        let x = color_nr_setting.clamp(0.01, 1.0);
-        (12.0 / x - 10.0).max(0.1)
-    };
+    let color_nr_amount = settings
+        .raw_preprocessing_color_nr
+        .unwrap_or(0.5)
+        .clamp(0.0, 1.0);
     let sharpening_amount = settings.raw_preprocessing_sharpening.unwrap_or(0.35);
     let apply_to_non_raws = settings.apply_preprocessing_to_non_raws.unwrap_or(false);
 
@@ -118,11 +154,7 @@ pub fn load_base_image_from_bytes(
             return Err(anyhow!("Load cancelled"));
         }
 
-        match crate::apple_raw::develop_raw9(
-            bytes,
-            path_for_ext_check,
-            &crate::apple_raw::Raw9Options::for_loading(),
-        ) {
+        match crate::apple_raw::develop_raw9(bytes, path_for_ext_check) {
             Ok(image) => return Ok(image),
             Err(e) => log::warn!(
                 "Apple RAW 9 unavailable for '{}', falling back to rawler: {}",
@@ -481,24 +513,23 @@ fn largest_tiff_jpeg_preview(buf: &[u8]) -> Option<DynamicImage> {
     None
 }
 
-fn embedded_preview_fallback(bytes: &[u8]) -> Option<DynamicImage> {
-    let Some(img) = largest_tiff_jpeg_preview(bytes) else {
-        return crate::raw_processing::extract_embedded_preview(bytes);
-    };
+pub fn tiff_embedded_preview(bytes: &[u8]) -> Option<DynamicImage> {
+    let img = largest_tiff_jpeg_preview(bytes)?;
 
-    let orientation = ExifReader::new()
-        .read_from_container(&mut Cursor::new(bytes))
-        .ok()
-        .and_then(|exif| {
-            exif.get_field(Tag::Orientation, exif::In::PRIMARY)?
-                .value
-                .get_uint(0)
-        });
+    let orientation = exif_processing::read_exif(bytes).and_then(|exif| {
+        exif.get_field(Tag::Orientation, exif::In::PRIMARY)?
+            .value
+            .get_uint(0)
+    });
 
     Some(match orientation {
         Some(o) if o > 1 => apply_orientation(img, Orientation::from_u16(o as u16)),
         _ => img,
     })
+}
+
+fn embedded_preview_fallback(bytes: &[u8]) -> Option<DynamicImage> {
+    tiff_embedded_preview(bytes).or_else(|| crate::raw_processing::extract_embedded_preview(bytes))
 }
 
 pub fn safe_embedded_preview_fallback(bytes: &[u8], path: &str) -> Option<DynamicImage> {
@@ -550,11 +581,19 @@ pub fn load_image_with_orientation(
     limits.max_image_width = Some(65_536);
     limits.max_image_height = Some(65_536);
     limits.max_alloc = Some(4 * 1024 * 1024 * 1024);
-    reader.limits(limits);
+    reader.limits(limits.clone());
 
     check_cancel()?;
 
-    let image = reader.decode().map_err(|e| match e {
+    let mut decoder = reader.into_decoder().context("Failed to decode image")?;
+    // `into_decoder` applies only the dimension limits; `decode()` used to
+    // reserve the output buffer against `max_alloc` too, so do that here
+    // before `from_decoder` allocates it.
+    limits
+        .reserve(decoder.total_bytes())
+        .map_err(|e| anyhow!("Image dimensions or decoded size exceed supported limits: {e}"))?;
+    let icc_profile = decoder.icc_profile().ok().flatten();
+    let image = DynamicImage::from_decoder(decoder).map_err(|e| match e {
         image::ImageError::Limits(limit_err) => {
             anyhow!("Image dimensions or decoded size exceed supported limits: {limit_err}")
         }
@@ -562,24 +601,142 @@ pub fn load_image_with_orientation(
     })?;
     check_cancel()?;
 
-    let oriented_image = {
-        let exif_reader = ExifReader::new();
-        if let Ok(exif) = exif_reader.read_from_container(&mut cursor.clone()) {
-            if let Some(orientation) = exif
-                .get_field(Tag::Orientation, exif::In::PRIMARY)
-                .and_then(|f| f.value.get_uint(0))
-            {
-                check_cancel()?;
-                apply_orientation(image, Orientation::from_u16(orientation as u16))
-            } else {
-                image
-            }
-        } else {
-            image
-        }
+    let exif = ExifReader::new()
+        .read_from_container(&mut cursor.clone())
+        .ok();
+    let orientation = exif.as_ref().and_then(|exif| {
+        exif.get_field(Tag::Orientation, exif::In::PRIMARY)?
+            .value
+            .get_uint(0)
+    });
+    let oriented_image = match orientation {
+        Some(orientation) => apply_orientation(image, Orientation::from_u16(orientation as u16)),
+        None => image,
     };
 
-    Ok(DynamicImage::ImageRgb32F(oriented_image.to_rgb32f()))
+    let mut rgb = oriented_image.to_rgb32f();
+    let source_profile = match icc_profile {
+        Some(icc) => ColorProfile::new_from_slice(&icc).ok(),
+        None => exif
+            .as_ref()
+            .is_some_and(is_exif_adobe_rgb)
+            .then(ColorProfile::new_adobe_rgb),
+    };
+    if let Some(profile) = source_profile {
+        check_cancel()?;
+        convert_profile_to_srgb(&mut rgb, &profile);
+    }
+
+    Ok(DynamicImage::ImageRgb32F(rgb))
+}
+
+fn is_exif_adobe_rgb(exif: &exif::Exif) -> bool {
+    let uncalibrated = exif
+        .get_field(Tag::ColorSpace, exif::In::PRIMARY)
+        .and_then(|f| f.value.get_uint(0))
+        == Some(0xFFFF);
+    let interop_r03 = exif
+        .get_field(Tag::InteroperabilityIndex, exif::In::PRIMARY)
+        .is_some_and(|f| f.display_value().to_string().contains("R03"));
+    uncalibrated && interop_r03
+}
+
+fn with_linear_trc(mut profile: ColorProfile) -> ColorProfile {
+    let identity = ToneReprCurve::Lut(Vec::new());
+    profile.red_trc = Some(identity.clone());
+    profile.green_trc = Some(identity.clone());
+    profile.blue_trc = Some(identity);
+    profile.cicp = None;
+    profile
+}
+
+fn colorants(profile: &ColorProfile) -> DMat3 {
+    DMat3::from_cols_array_2d(&profile.colorant_matrix().v).transpose()
+}
+
+fn convert_profile_to_srgb(image: &mut Rgb32FImage, source: &ColorProfile) {
+    if source.color_space != DataColorSpace::Rgb || image.width() == 0 {
+        return;
+    }
+    let srgb = ColorProfile::new_srgb();
+    let (target, to_srgb) = if source.is_matrix_shaper() {
+        let matrix = (colorants(&srgb).inverse() * colorants(source)).as_mat3();
+        (with_linear_trc(source.clone()), matrix)
+    } else {
+        (with_linear_trc(srgb), Mat3::IDENTITY)
+    };
+
+    let options = TransformOptions {
+        rendering_intent: RenderingIntent::RelativeColorimetric,
+        ..TransformOptions::default()
+    };
+    let Ok(transform) = source.create_transform_f32(Layout::Rgb, &target, Layout::Rgb, options)
+    else {
+        log::warn!("Unsupported embedded color profile, assuming sRGB");
+        return;
+    };
+    let to_linear_srgb = |src: &[f32], dst: &mut [f32]| {
+        transform.transform(src, dst)?;
+        for rgb in dst.as_chunks_mut::<3>().0 {
+            *rgb = (to_srgb * Vec3::from_array(*rgb)).to_array();
+        }
+        Ok::<_, moxcms::CmsError>(())
+    };
+
+    const STEPS: usize = 16;
+    let probe: Vec<f32> = (0..(STEPS + 1).pow(3))
+        .flat_map(|i| {
+            [
+                i % (STEPS + 1),
+                i / (STEPS + 1) % (STEPS + 1),
+                i / (STEPS + 1).pow(2),
+            ]
+            .map(|c| c as f32 / STEPS as f32)
+        })
+        .collect();
+    let mut probe_out = vec![0.0f32; probe.len()];
+    if to_linear_srgb(&probe, &mut probe_out).is_err() {
+        return;
+    }
+    let is_srgb = probe.iter().zip(&probe_out).all(|(input, linear)| {
+        (linear_channel_to_srgb(*linear).min(1.0) - input).abs() < 2.0 / 255.0
+    });
+    if is_srgb {
+        return;
+    }
+
+    let row_len = image.width() as usize * 3;
+    let mut linear = vec![0.0f32; image.as_raw().len()];
+    let converted = linear
+        .par_chunks_mut(row_len)
+        .zip(image.as_raw().par_chunks(row_len))
+        .try_for_each(|(dst, src)| to_linear_srgb(src, dst));
+    if converted.is_err() {
+        log::warn!("Failed to apply embedded color profile, assuming sRGB");
+        return;
+    }
+
+    image
+        .as_mut()
+        .par_chunks_exact_mut(3)
+        .zip(linear.par_chunks_exact(3))
+        .for_each(|(out, rgb)| {
+            let peak = rgb[0].max(rgb[1]).max(rgb[2]);
+            if peak <= 0.0 {
+                out.fill(0.0);
+                return;
+            }
+            let floor = rgb[0].min(rgb[1]).min(rgb[2]);
+            let saturation = if floor < 0.0 {
+                peak / (peak - floor)
+            } else {
+                1.0
+            };
+            let scale = peak.max(1.0);
+            for (o, c) in out.iter_mut().zip(rgb) {
+                *o = linear_channel_to_srgb((peak - (peak - c) * saturation) / scale);
+            }
+        });
 }
 
 /// Composite AI patches onto `base_image`.
@@ -594,19 +751,20 @@ pub fn load_image_with_orientation(
 /// and so are already correct at any resolution. Callers whose base IS the
 /// original (export / hydrate / load-from-original) pass `proxy_scale = 1.0`,
 /// which makes every scaling step below an exact no-op.
-pub fn composite_patches_on_image(
-    base_image: &DynamicImage,
+fn composite_patches_cow<'a>(
+    base_image: Cow<'a, DynamicImage>,
+    path: &str,
     current_adjustments: &Value,
     proxy_scale: f32,
-) -> Result<DynamicImage> {
+) -> Result<Cow<'a, DynamicImage>> {
     let patches_val = match current_adjustments.get("aiPatches") {
         Some(val) => val,
-        None => return Ok(base_image.clone()),
+        None => return Ok(base_image),
     };
 
     let patches_arr = match patches_val.as_array() {
         Some(arr) if !arr.is_empty() => arr,
-        _ => return Ok(base_image.clone()),
+        _ => return Ok(base_image),
     };
 
     let visible_patches: Vec<&Value> = patches_arr
@@ -628,7 +786,7 @@ pub fn composite_patches_on_image(
         .collect();
 
     if visible_patches.is_empty() {
-        return Ok(base_image.clone());
+        return Ok(base_image);
     }
 
     let (base_w, base_h) = base_image.dimensions();
@@ -678,7 +836,7 @@ pub fn composite_patches_on_image(
                 .filter(|s| !s.is_empty())
             {
                 let mask_bytes = general_purpose::STANDARD.decode(mask_b64)?;
-                let mask_img = image::load_from_memory(&mask_bytes)?.to_luma8();
+                let mask_img = image::load_from_memory(&mask_bytes)?.into_luma8();
                 if !is_cropped && (mask_img.width() != base_w || mask_img.height() != base_h) {
                     imageops::resize(&mask_img, base_w, base_h, imageops::FilterType::Lanczos3)
                 } else if scale_patch {
@@ -693,7 +851,7 @@ pub fn composite_patches_on_image(
                     mask_img
                 }
             } else {
-                let patch_info: PatchMaskInfo = serde_json::from_value((*patch_obj).clone())
+                let patch_info = PatchMaskInfo::deserialize(*patch_obj)
                     .context("Failed to deserialize patch info for mask generation")?;
 
                 let mask_def = MaskDefinition {
@@ -720,8 +878,11 @@ pub fn composite_patches_on_image(
                     generate_mask_bitmap(&mask_def, trans_w, trans_h, 1.0, (0.0, 0.0), None)
                         .context("Failed to generate mask from sub_masks for compositing")?;
 
-                gen_mask =
-                    crate::image_processing::inverse_transform_mask(gen_mask, current_adjustments);
+                gen_mask = crate::image_processing::inverse_transform_mask(
+                    gen_mask,
+                    path,
+                    current_adjustments,
+                );
 
                 if let (Some(ox), Some(oy)) = (offset_x, offset_y) {
                     // `gen_mask` is generated at base (= proxy) dims, so the crop
@@ -753,7 +914,7 @@ pub fn composite_patches_on_image(
                 .and_then(|v| v.as_str())
                 .context("Missing color data")?;
             let color_bytes = general_purpose::STANDARD.decode(color_b64)?;
-            let color_image_u8 = image::load_from_memory(&color_bytes)?.to_rgb8();
+            let color_image_u8 = image::load_from_memory(&color_bytes)?.into_rgb8();
 
             let (patch_w, patch_h) = color_image_u8.dimensions();
             // The compositing loop indexes `color` by the mask's linear index, so
@@ -791,7 +952,7 @@ pub fn composite_patches_on_image(
 
     let decoded_patches = decoded_patches?;
 
-    let mut composited_image = base_image.clone();
+    let mut composited_image = base_image.into_owned();
     let lut = srgb_to_linear_lut();
 
     let get_color = |patch: &DecodedPatch, r: u8, g: u8, b: u8| -> (f32, f32, f32) {
@@ -1056,19 +1217,123 @@ pub fn composite_patches_on_image(
         }
     }
 
-    Ok(composited_image)
+    Ok(Cow::Owned(composited_image))
+}
+
+fn is_cancelled(cancel_token: &Option<(Arc<AtomicUsize>, usize)>) -> bool {
+    cancel_token
+        .as_ref()
+        .is_some_and(|(tracker, generation)| tracker.load(Ordering::SeqCst) != *generation)
+}
+
+pub fn decode_pristine(
+    source_path: &Path,
+    path_str: &str,
+    settings: &AppSettings,
+    cancel_token: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<(DynamicImage, HashMap<String, String>), String> {
+    if crate::file_management::is_cloud_placeholder(source_path) {
+        return Err(format!(
+            "'{}' is stored in iCloud and hasn't been downloaded yet. Download it in Finder, then try again.",
+            path_str
+        ));
+    }
+    let decode = |bytes: &[u8]| -> Result<(DynamicImage, HashMap<String, String>), String> {
+        if is_cancelled(&cancel_token) {
+            return Err("Load cancelled".to_string());
+        }
+        let image =
+            load_base_image_from_bytes(bytes, path_str, false, settings, cancel_token.clone())
+                .map_err(|e| e.to_string())?;
+        crate::as_shot::as_shot_from_bytes(path_str, bytes);
+        Ok((image, exif_processing::read_exif_data(path_str, bytes)))
+    };
+    match read_file_mapped(source_path) {
+        Ok(mmap) => decode(&mmap),
+        Err(e) => {
+            log::warn!(
+                "Failed to memory-map file '{}': {}. Falling back to standard read.",
+                path_str,
+                e
+            );
+            let bytes = fs::read(source_path)
+                .map_err(|io_err| format!("Fallback read failed for {}: {}", path_str, io_err))?;
+            decode(&bytes)
+        }
+    }
+}
+
+pub fn cache_pristine(
+    state: &AppState,
+    path_str: String,
+    fingerprint: Option<DecodeFingerprint>,
+    image: DynamicImage,
+    exif: HashMap<String, String>,
+) -> (Arc<DynamicImage>, HashMap<String, String>) {
+    let image = Arc::new(image);
+    if let Some(fp) = fingerprint {
+        state.decoded_image_cache.lock().unwrap().insert(
+            path_str,
+            fp,
+            Arc::clone(&image),
+            exif.clone(),
+        );
+    }
+    (image, exif)
+}
+
+pub fn get_or_decode_pristine(
+    state: &AppState,
+    source_path: &Path,
+    settings: &AppSettings,
+    cancel_token: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<(Arc<DynamicImage>, HashMap<String, String>), String> {
+    let path_str = source_path.to_string_lossy().to_string();
+    let fingerprint = DecodeFingerprint::for_file(source_path, settings);
+    let cached = || {
+        fingerprint
+            .as_ref()
+            .and_then(|fp| state.decoded_image_cache.lock().unwrap().get(&path_str, fp))
+    };
+    loop {
+        if let Some(hit) = cached() {
+            return Ok(hit);
+        }
+        if is_cancelled(&cancel_token) {
+            return Err("Load cancelled".to_string());
+        }
+        let _flight = match state.decode_flights.begin(&path_str) {
+            FlightRole::Follower(flight) => {
+                flight.wait();
+                continue;
+            }
+            FlightRole::Leader(guard) => guard,
+        };
+        if let Some(hit) = cached() {
+            return Ok(hit);
+        }
+
+        let (image, exif) = decode_pristine(source_path, &path_str, settings, cancel_token)?;
+        return Ok(cache_pristine(state, path_str, fingerprint, image, exif));
+    }
 }
 
 #[tauri::command]
-pub fn is_image_cached(path: String, state: tauri::State<'_, AppState>) -> bool {
+pub fn is_image_cached(
+    path: String,
+    state: tauri::State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> bool {
     let (source_path, _) = parse_virtual_path(&path);
-    let source_path_str = source_path.to_string_lossy().to_string();
+    let settings = load_settings(app_handle).unwrap_or_default();
+    let Some(fingerprint) = DecodeFingerprint::for_file(&source_path, &settings) else {
+        return false;
+    };
     state
         .decoded_image_cache
         .lock()
         .unwrap()
-        .get(&source_path_str)
-        .is_some()
+        .contains(&source_path.to_string_lossy(), &fingerprint)
 }
 
 #[tauri::command]
@@ -1077,9 +1342,12 @@ pub async fn load_image(
     state: tauri::State<'_, AppState>,
     app_handle: tauri::AppHandle,
 ) -> Result<LoadImageResult, String> {
+    let (source_path, sidecar_path) = parse_virtual_path(&path);
+    let source_path_str = source_path.to_string_lossy().to_string();
+    let _preload_guard = state.image_preloader.begin_load(&source_path_str);
+
     let my_generation = state.load_image_generation.fetch_add(1, Ordering::SeqCst) + 1;
-    let generation_tracker = state.load_image_generation.clone();
-    let cancel_token = Some((generation_tracker.clone(), my_generation));
+    let cancel_token = Some((state.load_image_generation.clone(), my_generation));
 
     {
         *state
@@ -1088,14 +1356,9 @@ pub async fn load_image(
             .unwrap_or_else(|e| e.into_inner()) = None;
         // §4.4: clear any prior proxy scale; set again only on the proxy path.
         *state.proxy_scale.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        *state
-            .cached_preview
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        *state
-            .gpu_image_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        for target in PreviewTarget::ALL {
+            clear_preview_slot(&state, target);
+        }
         *state
             .full_warped_cache
             .lock()
@@ -1113,15 +1376,11 @@ pub async fn load_image(
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         state
-            .geometry_cache
+            .uncropped_source_cache
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
 
-        *state
-            .denoise_result
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
         *state.hdr_result.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *state
             .panorama_result
@@ -1129,126 +1388,57 @@ pub async fn load_image(
             .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
-    let (source_path, sidecar_path) = parse_virtual_path(&path);
-    let source_path_str = source_path.to_string_lossy().to_string();
+    crate::immich::ensure_local(&app_handle, &source_path).await?;
 
     let metadata: ImageMetadata = crate::exif_processing::load_sidecar(&sidecar_path);
 
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
     let baseline_options = BaselineOptions::from_settings(&settings);
 
-    let path_clone = source_path_str.clone();
-
-    let cached_data = state
+    state
         .decoded_image_cache
         .lock()
         .unwrap()
-        .get(&source_path_str);
+        .promote(&source_path_str);
 
-    let (pristine_arc, exif_data) = if let Some((cached_img, cached_exif)) = cached_data {
-        (cached_img, cached_exif)
-    } else {
-        // A 0-byte file under a configured sync is a placeholder whatever the
-        // stub mirror says: the mirror can lag the durable state (issue #37),
-        // and the alternative is handing an empty file to the RAW decoder,
-        // which surfaces as "No decoder found".
-        let empty_placeholder = crate::sync::hooks::is_empty_placeholder(&source_path);
-        if crate::file_management::is_cloud_placeholder(&source_path) || empty_placeholder {
-            // §3.5 guard: a RapidRawCloud sync stub is hydrated in place and
-            // the load proceeds on the real bytes. A non-stub placeholder (a
-            // macOS iCloud dataless file, or any placeholder with sync off,
-            // where `is_stub` is a const `false`) keeps the upstream error.
-            if crate::sync::hooks::is_stub(&source_path) || empty_placeholder {
-                // P3 proxy edit mode (§4.4): if a smart preview is present
-                // locally, decode the PROXY instead of hydrating, but report
-                // the ORIGINAL (journal) dimensions. `proxy_handle` is `None`
-                // when sync is off or no proxy is present, so this is inert on
-                // the upstream/hydrate path.
-                #[cfg(feature = "sync")]
-                if let Some(handle) = crate::sync::hooks::proxy_handle(&source_path) {
-                    return load_image_from_proxy(
-                        path,
-                        handle,
-                        metadata,
-                        settings.clone(),
-                        state,
-                        my_generation,
-                    )
-                    .await;
-                }
-                crate::sync::hooks::ensure_local(&source_path, "load_image")
-                    .map_err(|e| e.to_string())?;
-            } else {
-                return Err(format!(
-                    "'{}' is stored in iCloud and hasn't been downloaded yet. Download it in Finder, then try again.",
-                    source_path_str
-                ));
-            }
+    // A 0-byte file under a configured sync is a placeholder whatever the
+    // stub mirror says: the mirror can lag the durable state (issue #37), and
+    // the alternative is handing an empty file to the RAW decoder, which
+    // surfaces as "No decoder found". §3.5 guard: a RapidRawCloud sync stub is
+    // hydrated in place and the load proceeds on the real bytes; a non-stub
+    // placeholder (macOS iCloud) keeps upstream's error in `decode_pristine`.
+    if crate::sync::hooks::is_stub(&source_path)
+        || crate::sync::hooks::is_empty_placeholder(&source_path)
+    {
+        // P3 proxy edit mode (§4.4): if a smart preview is present locally,
+        // decode the PROXY instead of hydrating, but report the ORIGINAL
+        // (journal) dimensions. `proxy_handle` is `None` when sync is off or no
+        // proxy is present, so this is inert on the upstream/hydrate path.
+        #[cfg(feature = "sync")]
+        if let Some(handle) = crate::sync::hooks::proxy_handle(&source_path) {
+            drop(_preload_guard);
+            return load_image_from_proxy(
+                path,
+                handle,
+                metadata,
+                settings.clone(),
+                state,
+                my_generation,
+            )
+            .await;
         }
+        crate::sync::hooks::ensure_local(&source_path, "load_image").map_err(|e| e.to_string())?;
+    }
 
-        let (pristine_img, exif_data_loaded) = tokio::task::spawn_blocking(move || {
-            if generation_tracker.load(Ordering::SeqCst) != my_generation {
-                return Err("Load cancelled".to_string());
-            }
-
-            let result: Result<(DynamicImage, HashMap<String, String>), String> =
-                (|| match read_file_mapped(Path::new(&path_clone)) {
-                    Ok(mmap) => {
-                        if generation_tracker.load(Ordering::SeqCst) != my_generation {
-                            return Err("Load cancelled".to_string());
-                        }
-
-                        let img = load_base_image_from_bytes(
-                            &mmap,
-                            &path_clone,
-                            false,
-                            &settings,
-                            cancel_token.clone(),
-                        )
-                        .map_err(|e| e.to_string())?;
-                        let exif = exif_processing::read_exif_data(&path_clone, &mmap);
-                        Ok((img, exif))
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to memory-map file '{}': {}. Falling back to standard read.",
-                            path_clone,
-                            e
-                        );
-                        let bytes = fs::read(&path_clone).map_err(|io_err| {
-                            format!("Fallback read failed for {}: {}", path_clone, io_err)
-                        })?;
-
-                        if generation_tracker.load(Ordering::SeqCst) != my_generation {
-                            return Err("Load cancelled".to_string());
-                        }
-
-                        let img = load_base_image_from_bytes(
-                            &bytes,
-                            &path_clone,
-                            false,
-                            &settings,
-                            cancel_token.clone(),
-                        )
-                        .map_err(|e| e.to_string())?;
-                        let exif = exif_processing::read_exif_data(&path_clone, &bytes);
-                        Ok((img, exif))
-                    }
-                })();
-            result
+    let (pristine_arc, exif_data) = {
+        let app_handle = app_handle.clone();
+        let source_path = source_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let state = app_handle.state::<AppState>();
+            get_or_decode_pristine(&state, &source_path, &settings, cancel_token)
         })
         .await
-        .map_err(|e| e.to_string())??;
-
-        let arc_img = Arc::new(pristine_img);
-
-        state.decoded_image_cache.lock().unwrap().insert(
-            source_path_str.clone(),
-            arc_img.clone(),
-            exif_data_loaded.clone(),
-        );
-
-        (arc_img, exif_data_loaded)
+        .map_err(|e| e.to_string())??
     };
 
     if state.load_image_generation.load(Ordering::SeqCst) != my_generation {
@@ -1274,11 +1464,13 @@ pub async fn load_image(
     }
 
     *state.original_image.lock().unwrap() = Some(LoadedImage {
-        path,
+        path: path.clone(),
         image: pristine_arc,
         is_raw,
         as_shot,
     });
+
+    crate::ai_jobs::prioritize(&app_handle, &path);
 
     Ok(LoadImageResult {
         width: orig_width,
@@ -1294,7 +1486,7 @@ pub async fn load_image(
 mod proxy_patch_tests {
     //! §4.4 regression: an offset-cropped AI patch stores its offset/size and
     //! its mask/color bitmaps in ORIGINAL pixel space. When `composite_patches_
-    //! on_image` runs over a smart-preview PROXY base it must scale that geometry
+    //! cow` runs over a smart-preview PROXY base it must scale that geometry
     //! and those bitmaps by `proxy_scale`; before the fix the offset was applied
     //! verbatim, so on a 2x-downscaled proxy an original-space offset of 600 px
     //! fell past the 500 px proxy edge and the patch was dropped entirely
@@ -1359,7 +1551,9 @@ mod proxy_patch_tests {
         // [300,400)x[300,400).
         let proxy = black_base(500, 500);
         let adj = cropped_red_patch(600, 600, 200, 200);
-        let out = composite_patches_on_image(&proxy, &adj, 0.5).unwrap();
+        let out = composite_patches_cow(Cow::Borrowed(&proxy), "", &adj, 0.5)
+            .unwrap()
+            .into_owned();
         let rgb = out.to_rgb32f();
 
         // Center of the scaled patch must be red (before the fix the verbatim
@@ -1388,7 +1582,9 @@ mod proxy_patch_tests {
         // used verbatim (export / hydrate / load-from-original parity).
         let base = black_base(1000, 1000);
         let adj = cropped_red_patch(600, 600, 200, 200);
-        let out = composite_patches_on_image(&base, &adj, 1.0).unwrap();
+        let out = composite_patches_cow(Cow::Borrowed(&base), "", &adj, 1.0)
+            .unwrap()
+            .into_owned();
         let rgb = out.to_rgb32f();
         assert!(
             is_red(rgb.get_pixel(700, 700)),

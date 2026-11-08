@@ -33,6 +33,9 @@ import Text from '../../ui/Text';
 import { TextColors, TextVariants, TextWeights } from '../../../types/typography';
 import { useEditorStore } from '../../../store/useEditorStore';
 import { useUIStore } from '../../../store/useUIStore';
+import ImmichExportOptions, { useImmichExportAvailable, useImmichExportChoice } from '../../immich/ImmichExportOptions';
+import { prepareImmichExport } from '../../immich/immichApi';
+import { formatBytes } from '../../../utils/formatBytes';
 
 interface ExportPanelProps {
   exportState: ExportState;
@@ -83,6 +86,9 @@ function ValidatedNumberInput({ ariaLabel, disabled, field, max }: ValidatedNumb
       max={max}
       min="0"
       onChange={(e) => field.handleChange(e.target.value)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') e.currentTarget.blur();
+      }}
       step="any"
       type="number"
       value={field.text}
@@ -206,21 +212,6 @@ function WatermarkPreview({
   );
 }
 
-const formatBytes = (bytes: number, t: any, decimals = 2) => {
-  if (!+bytes) return `0 ${t('export.bytes.bytes')}`;
-  const k = 1024;
-  const dm = decimals < 0 ? 0 : decimals;
-  const sizes = [
-    t('export.bytes.bytes'),
-    t('export.bytes.kb'),
-    t('export.bytes.mb'),
-    t('export.bytes.gb'),
-    t('export.bytes.tb'),
-  ];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return `${parseFloat((bytes / Math.pow(k, i)).toFixed(dm))} ${sizes[i]}`;
-};
-
 export default function ExportPanel({
   exportState,
   multiSelectedPaths,
@@ -304,6 +295,12 @@ export default function ExportPanel({
     setStripGps,
     exportMasks,
     setExportMasks,
+    exportOriginal,
+    setExportOriginal,
+    originalCrop,
+    setOriginalCrop,
+    originalKeepExposure,
+    setOriginalKeepExposure,
     filenameTemplate,
     setFilenameTemplate,
     enableWatermark,
@@ -393,11 +390,15 @@ export default function ExportPanel({
 
   const [estimatedSize, setEstimatedSize] = useState<number | null>(null);
   const [isEstimating, setIsEstimating] = useState<boolean>(false);
+  const estimateRequestIdRef = useRef(0);
   const [watermarkImageAspectRatio, setWatermarkImageAspectRatio] = useState(1);
   const [imageAspectRatio, setImageAspectRatio] = useState(16 / 9);
   const filenameInputRef = useRef<HTMLInputElement>(null);
   const osPlatform = useOsPlatform();
   const isAndroid = osPlatform === 'android';
+  const canExportToImmich = useImmichExportAvailable() && !isAndroid;
+  const destination = destinationType === 'immich' && !canExportToImmich ? 'customFolder' : destinationType;
+  const immichExport = useImmichExportChoice();
   const activePanels = useUIStore((state) => state.activePanels);
   const isPanelReallyActive = Object.values(activePanels).includes(Panel.Export);
 
@@ -470,24 +471,27 @@ export default function ExportPanel({
 
   const debouncedEstimateSize = useMemo(
     () =>
-      debounce(async (paths, currentAdj, currentPath, exportSettings, format) => {
+      debounce(async (requestId, paths, currentAdj, currentPath, exportSettings, format) => {
         if (paths.length === 0 || !isVisible) {
           setEstimatedSize(null);
+          setIsEstimating(false);
           return;
         }
         setIsEstimating(true);
         try {
-          const size: number = await invoke(Invokes.EstimateExportSizes, {
+          const size: number | null = await invoke(Invokes.EstimateExportSizes, {
             paths,
             exportSettings,
             outputFormat: format,
             currentEditPath: currentPath || null,
             currentEditAdjustments: currentAdj || null,
           });
+          if (requestId !== estimateRequestIdRef.current || size === null) return;
           setEstimatedSize(size);
-        } catch (err) {
+          setIsEstimating(false);
+        } catch {
+          if (requestId !== estimateRequestIdRef.current) return;
           setEstimatedSize(null);
-        } finally {
           setIsEstimating(false);
         }
       }, 500),
@@ -504,7 +508,7 @@ export default function ExportPanel({
       keepMetadata,
       preserveTimestamps,
       preserveFolders,
-      destinationType,
+      destinationType: destination,
       subfolder,
       resize: enableResize ? { mode: resizeMode, value: resizeValue, dontEnlarge } : null,
       border: borderSettings,
@@ -524,17 +528,24 @@ export default function ExportPanel({
     };
     const format = FILE_FORMATS.find((f: FileFormat) => f.id === fileFormat)?.extensions[0] || 'jpeg';
     const runEstimate = () =>
-      debouncedEstimateSize(pathsToExport, adjustmentsRef.current, selectedImage?.path, exportSettings, format);
+      debouncedEstimateSize(
+        ++estimateRequestIdRef.current,
+        pathsToExport,
+        adjustmentsRef.current,
+        selectedImage?.path,
+        exportSettings,
+        format,
+      );
 
     runEstimate();
 
-    let prevAdjustments = useEditorStore.getState().adjustments;
+    let { adjustments: prevAdjustments, originalSize: prevOriginalSize } = useEditorStore.getState();
     const unsubscribe = useEditorStore.subscribe((state) => {
-      if (state.adjustments !== prevAdjustments) {
-        prevAdjustments = state.adjustments;
-        adjustmentsRef.current = state.adjustments;
-        runEstimate();
-      }
+      if (state.adjustments === prevAdjustments && state.originalSize === prevOriginalSize) return;
+      prevAdjustments = state.adjustments;
+      prevOriginalSize = state.originalSize;
+      adjustmentsRef.current = state.adjustments;
+      runEstimate();
     });
 
     return () => {
@@ -601,13 +612,14 @@ export default function ExportPanel({
       keepMetadata,
       preserveTimestamps,
       preserveFolders,
-      destinationType,
+      destinationType: destination,
       subfolder,
       resize: enableResize ? { mode: resizeMode, value: resizeValue, dontEnlarge } : null,
       border: borderSettings,
       pad: padSettings,
       stripGps,
       exportMasks: exportMasks,
+      exportOriginal: exportOriginal ? { crop: originalCrop, keepExposure: originalKeepExposure } : null,
       watermark:
         enableWatermark && watermarkPath
           ? {
@@ -627,10 +639,15 @@ export default function ExportPanel({
       const selectedFormat: any = FILE_FORMATS.find((f) => f.id === fileFormat);
 
       let outputFolderOrFile = '';
-      const isOriginalFolder = destinationType === 'originalFolder';
-      const shouldChooseOutputFile = numImages === 1 && !preserveFolders && !isOriginalFolder;
+      const isOriginalFolder = destination === 'originalFolder';
+      const isImmich = destination === 'immich';
+      const shouldChooseOutputFile = numImages === 1 && !preserveFolders && !isOriginalFolder && !isImmich;
 
-      if (isOriginalFolder) {
+      if (isImmich) {
+        exportSettings.preserveFolders = false;
+        exportSettings.exportOriginal = null;
+        outputFolderOrFile = await prepareImmichExport(immichExport.album, immichExport.withOriginal);
+      } else if (isOriginalFolder) {
         outputFolderOrFile = 'originalFolderDummy';
       } else if (shouldChooseOutputFile) {
         const originalFilename = pathsToExport[0].split(/[\\/]/).pop() || '';
@@ -663,7 +680,7 @@ export default function ExportPanel({
 
       if (isAndroid || outputFolderOrFile) {
         if (!isAndroid) {
-          if (isOriginalFolder) {
+          if (isOriginalFolder || isImmich) {
             saveLastUsedPreset(lastExportPath || '');
           } else {
             const dir = shouldChooseOutputFile
@@ -676,7 +693,12 @@ export default function ExportPanel({
           }
         }
 
-        setExportState({ status: Status.Exporting, progress: { current: 0, total: numImages }, errorMessage: '' });
+        setExportState({
+          destination: isOriginalFolder || isImmich || isAndroid ? null : outputFolderOrFile,
+          errorMessage: '',
+          progress: { current: 0, total: numImages },
+          status: Status.Exporting,
+        });
         await invoke(Invokes.ExportImages, {
           paths: pathsToExport,
           outputFolderOrFile: outputFolderOrFile,
@@ -722,7 +744,7 @@ export default function ExportPanel({
         <Text variant={TextVariants.title}>{t('export.title')}</Text>
       </div>
       <div className="grow overflow-y-auto p-3 space-y-8">
-        {canExport ? (
+        {numImages > 0 ? (
           <>
             <div className={isExporting ? 'opacity-50 pointer-events-none' : ''}>
               <ExportPresetsList
@@ -788,14 +810,17 @@ export default function ExportPanel({
                   options={[
                     { label: t('export.destination.customFolder'), value: 'customFolder' },
                     { label: t('export.destination.originalFolder'), value: 'originalFolder' },
+                    ...(canExportToImmich ? [{ label: t('immich.export.destination'), value: 'immich' }] : []),
                   ]}
-                  value={destinationType || 'customFolder'}
+                  value={destination || 'customFolder'}
                   onChange={(val) => setDestinationType(val as string)}
                   disabled={isExporting}
                   className="w-full"
                 />
 
-                {destinationType === 'originalFolder' && (
+                {destination === 'immich' && <ImmichExportOptions disabled={isExporting} />}
+
+                {destination === 'originalFolder' && (
                   <div className="flex items-center gap-3 pl-2 border-l-2 border-surface">
                     <Text variant={TextVariants.label} className="whitespace-nowrap min-w-[70px]">
                       {t('export.destination.subfolder')}
@@ -1128,6 +1153,32 @@ export default function ExportPanel({
                               onChange={setExportMasks}
                               disabled={isExporting}
                             />
+                            {destination !== 'immich' && (
+                              <>
+                                <Switch
+                                  label={t('export.advanced.exportOriginal')}
+                                  checked={exportOriginal}
+                                  onChange={setExportOriginal}
+                                  disabled={isExporting}
+                                />
+                                {exportOriginal && (
+                                  <div className="pl-2 border-l-2 border-card-active flex flex-col gap-4">
+                                    <Switch
+                                      label={t('export.advanced.originalCrop')}
+                                      checked={originalCrop}
+                                      onChange={setOriginalCrop}
+                                      disabled={isExporting}
+                                    />
+                                    <Switch
+                                      label={t('export.advanced.originalKeepExposure')}
+                                      checked={originalKeepExposure}
+                                      onChange={setOriginalKeepExposure}
+                                      disabled={isExporting}
+                                    />
+                                  </div>
+                                )}
+                              </>
+                            )}
                           </>
                         )}
                         {[FileFormats.Jpeg, FileFormats.Png, FileFormats.Tiff].includes(fileFormat as FileFormats) && (

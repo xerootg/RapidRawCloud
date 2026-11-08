@@ -203,7 +203,9 @@ pub fn generate_tags_with_clip(
     let mask_val = Tensor::from_array(mask_layout.into_owned())?;
 
     let mut clip_session = clip_session_mutex.lock().unwrap();
-    let outputs = clip_session.run(ort::inputs![ids_val, image_val, mask_val])?;
+    let outputs = crate::ai_processing::gpu_inference(
+        clip_session.run(ort::inputs![ids_val, image_val, mask_val]),
+    )?;
 
     let logits_dyn = outputs[0].try_extract_array::<f32>()?.to_owned();
     let logits = logits_dyn.into_dimensionality::<ndarray::Dim<[usize; 2]>>()?;
@@ -259,6 +261,16 @@ fn limit_tags(
     final_tags
 }
 
+fn needs_ai_tags(path: &Path) -> bool {
+    let (_, sidecar_path) = parse_virtual_path(&path.to_string_lossy());
+    match crate::exif_processing::load_sidecar(&sidecar_path).tags {
+        None => true,
+        Some(tags) => !tags
+            .iter()
+            .any(|tag| !tag.starts_with(COLOR_TAG_PREFIX) && !tag.starts_with(USER_TAG_PREFIX)),
+    }
+}
+
 #[tauri::command]
 pub async fn start_background_indexing(
     folder_path: String,
@@ -268,6 +280,7 @@ pub async fn start_background_indexing(
     if let Some(handle) = state.indexing_task_handle.lock().unwrap().take() {
         println!("Cancelling previous indexing task.");
         handle.abort();
+        let _ = app_handle.emit("indexing-cancelled", ());
     }
 
     let settings = crate::load_settings(app_handle.clone())?;
@@ -290,23 +303,14 @@ pub async fn start_background_indexing(
     let app_handle_clone = app_handle.clone();
 
     let task: JoinHandle<()> = tokio::spawn(async move {
-        let _ = app_handle_clone.emit("indexing-started", ());
-        println!("Starting background indexing for: {}", folder_path);
-        println!(
-            "Using {} concurrent threads for AI tagging.",
-            max_concurrent_tasks
-        );
-
-        let state_clone = app_handle_clone.state::<AppState>();
-        let gpu_context =
-            crate::gpu_processing::get_or_init_gpu_context(&state_clone, &app_handle).ok();
-
         let image_paths: Vec<PathBuf> = match fs::read_dir(&folder_path) {
             Ok(entries) => entries
                 .filter_map(Result::ok)
                 .map(|entry| entry.path())
                 .filter(|path| {
-                    path.is_file() && is_supported_image_file(path.to_string_lossy().as_ref())
+                    path.is_file()
+                        && is_supported_image_file(path.to_string_lossy().as_ref())
+                        && needs_ai_tags(path)
                 })
                 .collect(),
             Err(e) => {
@@ -322,12 +326,33 @@ pub async fn start_background_indexing(
             }
         };
 
-        println!(
-            "Found {} images to process in {}",
-            image_paths.len(),
-            folder_path
-        );
         let total_images = image_paths.len();
+        if total_images == 0 {
+            *app_handle_clone
+                .state::<AppState>()
+                .indexing_task_handle
+                .lock()
+                .unwrap() = None;
+            return;
+        }
+
+        let _ = app_handle_clone.emit(
+            "indexing-started",
+            serde_json::json!({ "current": 0, "total": total_images }),
+        );
+        println!(
+            "Starting background indexing of {} images in: {}",
+            total_images, folder_path
+        );
+        println!(
+            "Using {} concurrent threads for AI tagging.",
+            max_concurrent_tasks
+        );
+
+        let state_clone = app_handle_clone.state::<AppState>();
+        let gpu_context =
+            crate::gpu_processing::get_or_init_gpu_context(&state_clone, &app_handle).ok();
+
         let processed_count = Arc::new(Mutex::new(0));
         let custom_ai_tags_shared = Arc::new(custom_ai_tags);
 
@@ -341,70 +366,50 @@ pub async fn start_background_indexing(
 
                 async move {
                     let path_str = path.to_string_lossy().to_string();
-                    let (_, sidecar_path) = parse_virtual_path(&path_str);
+                    let (source_path, sidecar_path) = parse_virtual_path(&path_str);
 
-                    let metadata = crate::exif_processing::load_sidecar(&sidecar_path);
+                    match file_management::get_cached_or_generate_thumbnail_image(
+                        &path_str,
+                        &app_handle_inner,
+                        gpu_context_inner.as_ref(),
+                    ) {
+                        Ok(image) => {
+                            if let Ok(ai_tags) = generate_tags_with_clip(
+                                &image,
+                                &clip_models_inner.model,
+                                &clip_models_inner.tokenizer,
+                                (*tags_inner).clone(),
+                                ai_tag_count,
+                            ) {
+                                println!("Found AI tags for {}: {:?}", path_str, ai_tags);
 
-                    let should_generate_tags = match &metadata.tags {
-                        None => true,
-                        Some(tags) => !tags.iter().any(|tag| {
-                            !tag.starts_with(COLOR_TAG_PREFIX) && !tag.starts_with(USER_TAG_PREFIX)
-                        }),
-                    };
+                                let _ = crate::exif_processing::update_sidecar(
+                                    &sidecar_path,
+                                    &source_path,
+                                    |metadata| {
+                                        let mut existing_tags: HashSet<String> = metadata
+                                            .tags
+                                            .take()
+                                            .unwrap_or_default()
+                                            .into_iter()
+                                            .collect();
 
-                    if should_generate_tags {
-                        match file_management::get_cached_or_generate_thumbnail_image(
-                            &path_str,
-                            &app_handle_inner,
-                            gpu_context_inner.as_ref(),
-                        ) {
-                            Ok(image) => {
-                                if let Ok(ai_tags) = generate_tags_with_clip(
-                                    &image,
-                                    &clip_models_inner.model,
-                                    &clip_models_inner.tokenizer,
-                                    (*tags_inner).clone(),
-                                    ai_tag_count,
-                                ) {
-                                    println!("Found AI tags for {}: {:?}", path_str, ai_tags);
+                                        existing_tags.extend(ai_tags);
 
-                                    // Merge the generated tags under the
-                                    // per-path lock (§3.4 step 1): the slow
-                                    // CLIP inference ran *outside* the lock,
-                                    // but the final union re-loads the sidecar
-                                    // fresh inside the lock so a concurrent
-                                    // user rating/label/tag/adjustment edit on
-                                    // the same image is not clobbered (the
-                                    // AI-tagging-vs-user-edit race).
-                                    let _ = crate::exif_processing::update_sidecar(
-                                        None,
-                                        &sidecar_path,
-                                        crate::sync::WriteOrigin::AiTagging,
-                                        |metadata| {
-                                            let mut existing_tags: HashSet<String> = metadata
-                                                .tags
-                                                .take()
-                                                .unwrap_or_default()
-                                                .into_iter()
-                                                .collect();
-                                            for tag in ai_tags {
-                                                existing_tags.insert(tag);
-                                            }
-                                            let mut final_tags: Vec<String> =
-                                                existing_tags.into_iter().collect();
-                                            final_tags.sort_unstable();
-                                            metadata.tags = Some(final_tags);
-                                            true
-                                        },
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "Could not get or generate image for tagging {}: {}",
-                                    path_str, e
+                                        let mut final_tags: Vec<String> =
+                                            existing_tags.into_iter().collect();
+                                        final_tags.sort_unstable();
+
+                                        metadata.tags = Some(final_tags);
+                                    },
                                 );
                             }
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Could not get or generate image for tagging {}: {}",
+                                path_str, e
+                            );
                         }
                     }
 
@@ -443,28 +448,30 @@ fn modify_tags_for_path(
 ) -> Result<(), String> {
     let (source_path, sidecar_path) = parse_virtual_path(path_str);
 
-    // Read-modify-write under the per-path lock so a concurrent background
-    // AI-tagging pass on the same image cannot lose this tag edit (and vice
-    // versa) — the §3.4 step 1 AI-tagging-vs-user-edit race.
-    let metadata = crate::exif_processing::update_sidecar(
-        None,
-        &sidecar_path,
-        crate::sync::WriteOrigin::UserTag,
-        |metadata| {
+    let metadata =
+        crate::exif_processing::update_sidecar(&sidecar_path, &source_path, |metadata| {
             let mut tags = metadata.tags.take().unwrap_or_default();
             modify_fn(&mut tags);
+
             tags.sort_unstable();
             tags.dedup();
-            metadata.tags = if tags.is_empty() { None } else { Some(tags) };
-            true
-        },
-    )?;
+
+            if !tags.is_empty() {
+                metadata.tags = Some(tags);
+            }
+        })
+        .map_err(|e| e.to_string())?;
 
     if let Ok(settings) = crate::load_settings(app_handle.clone())
         && settings.enable_xmp_sync.unwrap_or(false)
     {
         let create_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
-        file_management::sync_metadata_to_xmp(&source_path, &metadata, create_if_missing);
+        file_management::sync_metadata_to_xmp(
+            &source_path,
+            &sidecar_path,
+            &metadata,
+            create_if_missing,
+        );
     }
 
     Ok(())
@@ -508,18 +515,7 @@ pub fn remove_tag_for_paths(
 
 fn rrdata_source_path(rrdata: &Path) -> Option<PathBuf> {
     let name = rrdata.file_name()?.to_str()?;
-    let base = name.strip_suffix(".rrdata")?;
-
-    let source_filename = if base.len() >= 7 && base.as_bytes()[base.len() - 7] == b'.' {
-        let id = &base[base.len() - 6..];
-        if id.chars().all(|c| c.is_ascii_hexdigit()) {
-            &base[..base.len() - 7]
-        } else {
-            base
-        }
-    } else {
-        base
-    };
+    let (source_filename, _) = crate::file_management::parse_sidecar_name(name)?;
 
     Some(rrdata.with_file_name(source_filename))
 }
@@ -534,256 +530,75 @@ fn sync_xmp_for_rrdata(
         return;
     }
     if let Some(source_path) = rrdata_source_path(rrdata_path) {
-        file_management::sync_metadata_to_xmp(&source_path, metadata, create_xmp_if_missing);
+        file_management::sync_metadata_to_xmp(
+            &source_path,
+            rrdata_path,
+            metadata,
+            create_xmp_if_missing,
+        );
     }
 }
 
-/// Removes tags from a single `.rrdata` sidecar **under the per-path lock**,
-/// retaining exactly the tags for which `retain` returns `true`
-/// (ARCHITECTURE.md §3.4 step 1). The whole load+mutate+write runs inside
-/// [`crate::exif_processing::update_sidecar`], so a field a concurrent writer
-/// (an editor rating/label edit, the background AI-tagging pass, sync's apply)
-/// committed between this clear's read and its write can never be clobbered —
-/// the AI-tagging-vs-user-edit lost-update race. The earlier
-/// `fs::read_to_string` + `serde_json::from_str` (outside any lock) +
-/// `save_sidecar` pattern loaded the document outside the lock and so lost
-/// such a concurrent field; these two tag-clearing commands are themselves
-/// AI-tag read-modify-write writers and must go through `update_sidecar` for
-/// the same reason as `modify_tags_for_path`.
-///
-/// Returns the written metadata when a tag was actually removed, or `None`
-/// when the sidecar had no tags or none matched for removal — the write (and
-/// the engine churn notification) is skipped, so an item whose tags are
-/// unchanged is left exactly as it was.
-fn clear_tags_in_sidecar(
-    path: &Path,
-    retain: impl Fn(&str) -> bool,
-) -> Result<Option<ImageMetadata>, String> {
-    let mut removed = false;
-    let metadata = crate::exif_processing::update_sidecar(
-        None,
-        path,
-        crate::sync::WriteOrigin::AiTagging,
-        |metadata| {
-            let Some(tags) = metadata.tags.as_mut() else {
-                return false;
-            };
-            let original_len = tags.len();
-            tags.retain(|tag| retain(tag));
-            if tags.len() == original_len {
-                // Nothing matched for removal — skip the write (no churn,
-                // and nothing to clobber).
-                return false;
+fn retain_tags_under(
+    root_path: &str,
+    app_handle: &AppHandle,
+    keep: impl Fn(&str) -> bool,
+) -> Result<usize, String> {
+    if !Path::new(root_path).exists() {
+        return Err(format!("Root path does not exist: {}", root_path));
+    }
+
+    let settings = crate::load_settings(app_handle.clone()).unwrap_or_default();
+    let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
+    let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
+
+    let mut updated_count = 0;
+    let walker = WalkDir::new(root_path).into_iter();
+
+    for entry in walker.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("rrdata") {
+            continue;
+        }
+        let Some(source_path) = rrdata_source_path(path) else {
+            continue;
+        };
+
+        let has_removable_tags = crate::exif_processing::load_sidecar(path)
+            .tags
+            .is_some_and(|tags| tags.iter().any(|tag| !keep(tag)));
+        if !has_removable_tags {
+            continue;
+        }
+
+        let updated = crate::exif_processing::update_sidecar(path, &source_path, |metadata| {
+            if let Some(tags) = &mut metadata.tags {
+                tags.retain(|tag| keep(tag));
+                if tags.is_empty() {
+                    metadata.tags = None;
+                }
             }
-            if tags.is_empty() {
-                metadata.tags = None;
-            }
-            removed = true;
-            true
-        },
-    )?;
-    Ok(removed.then_some(metadata))
+        });
+        if let Ok(metadata) = updated {
+            updated_count += 1;
+            sync_xmp_for_rrdata(path, &metadata, enable_xmp_sync, create_xmp_if_missing);
+        }
+    }
+    Ok(updated_count)
 }
 
 #[tauri::command]
 pub fn clear_ai_tags(root_path: String, app_handle: AppHandle) -> Result<usize, String> {
-    if !Path::new(&root_path).exists() {
-        return Err(format!("Root path does not exist: {}", root_path));
-    }
-
-    let settings = crate::load_settings(app_handle.clone()).unwrap_or_default();
-    let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
-    let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
-
-    let mut updated_count = 0;
-    let walker = WalkDir::new(root_path).into_iter();
-
-    for entry in walker.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rrdata") {
-            // Keep color tags and user tags, remove others (AI tags).
-            match clear_tags_in_sidecar(path, |tag| {
-                tag.starts_with(COLOR_TAG_PREFIX) || tag.starts_with(USER_TAG_PREFIX)
-            }) {
-                Ok(Some(metadata)) => {
-                    updated_count += 1;
-                    sync_xmp_for_rrdata(path, &metadata, enable_xmp_sync, create_xmp_if_missing);
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("Failed to clear AI tags for {}: {}", path.display(), e),
-            }
-        }
-    }
-    Ok(updated_count)
+    // Keep color tags and user tags, remove others (AI tags)
+    retain_tags_under(&root_path, &app_handle, |tag| {
+        tag.starts_with(COLOR_TAG_PREFIX) || tag.starts_with(USER_TAG_PREFIX)
+    })
 }
 
 #[tauri::command]
 pub fn clear_all_tags(root_path: String, app_handle: AppHandle) -> Result<usize, String> {
-    if !Path::new(&root_path).exists() {
-        return Err(format!("Root path does not exist: {}", root_path));
-    }
-
-    let settings = crate::load_settings(app_handle.clone()).unwrap_or_default();
-    let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
-    let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
-
-    let mut updated_count = 0;
-    let walker = WalkDir::new(root_path).into_iter();
-
-    for entry in walker.filter_map(|e| e.ok()) {
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rrdata") {
-            // Keep only color tags, remove AI and user tags.
-            match clear_tags_in_sidecar(path, |tag| tag.starts_with(COLOR_TAG_PREFIX)) {
-                Ok(Some(metadata)) => {
-                    updated_count += 1;
-                    sync_xmp_for_rrdata(path, &metadata, enable_xmp_sync, create_xmp_if_missing);
-                }
-                Ok(None) => {}
-                Err(e) => eprintln!("Failed to clear tags for {}: {}", path.display(), e),
-            }
-        }
-    }
-    Ok(updated_count)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::image_processing::ImageMetadata;
-
-    fn seed(path: &Path, meta: &ImageMetadata) {
-        std::fs::write(path, serde_json::to_vec_pretty(meta).unwrap()).unwrap();
-    }
-
-    fn read(path: &Path) -> ImageMetadata {
-        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
-    }
-
-    fn keep_non_ai(tag: &str) -> bool {
-        tag.starts_with(COLOR_TAG_PREFIX) || tag.starts_with(USER_TAG_PREFIX)
-    }
-
-    /// Regression for the P1-U7 round-2 review (major): `clear_ai_tags` /
-    /// `clear_all_tags` must read-modify-write their sidecar **under the
-    /// per-path lock** (via `update_sidecar`), not load the document outside
-    /// the lock and then `save_sidecar`. The old pattern clobbered any field a
-    /// concurrent writer committed between the clear's read and its write — the
-    /// §3.4 step 1 AI-tagging-vs-user-edit lost-update race.
-    ///
-    /// Deterministic (no sleep-race for the pass/fail signal): we hold the
-    /// path's lock, start the clear (which must block before it reads), commit
-    /// a concurrent `rating = 5` edit to disk, then release the lock. With the
-    /// RMW under the lock the clear re-reads `rating = 5` and preserves it;
-    /// with the load outside the lock it had already read the stale `rating =
-    /// 0` and writes it back, losing the committed edit.
-    #[test]
-    fn clear_tags_does_not_clobber_a_concurrently_committed_edit() {
-        let dir = tempfile::tempdir().unwrap();
-        let sidecar = dir.path().join("img.NEF.rrdata");
-        seed(
-            &sidecar,
-            &ImageMetadata {
-                rating: 0,
-                tags: Some(vec!["ai:cat".to_string(), "user:keep".to_string()]),
-                ..ImageMetadata::default()
-            },
-        );
-
-        // Hold the per-path lock: the clear's RMW cannot start until we have
-        // committed the concurrent edit to disk and released it.
-        let lock = crate::sync::sidecar_lock_for(&sidecar);
-        let guard = lock.lock().unwrap_or_else(|p| p.into_inner());
-
-        let clear_path = sidecar.clone();
-        let handle = std::thread::spawn(move || clear_tags_in_sidecar(&clear_path, keep_non_ai));
-
-        // Let the clear thread reach its lock-wait (and, for the old
-        // load-outside-the-lock pattern, perform its external read of the
-        // stale rating=0 document). This sleep only sequences the race it is
-        // meant to expose; the assertion itself is deterministic once the
-        // committed edit lands below.
-        std::thread::sleep(std::time::Duration::from_millis(300));
-
-        // A concurrent writer commits rating=5 while the clear is blocked.
-        seed(
-            &sidecar,
-            &ImageMetadata {
-                rating: 5,
-                tags: Some(vec!["ai:cat".to_string(), "user:keep".to_string()]),
-                ..ImageMetadata::default()
-            },
-        );
-
-        drop(guard);
-        let written = handle.join().unwrap().expect("clear must not error");
-        assert!(
-            written.is_some(),
-            "the ai: tag should have been removed, producing a write"
-        );
-
-        let final_meta = read(&sidecar);
-        assert_eq!(
-            final_meta.rating, 5,
-            "clear clobbered a concurrently-committed rating edit — its read-modify-write \
-             did not run under the per-path lock"
-        );
-        let tags = final_meta.tags.unwrap_or_default();
-        assert!(
-            tags.contains(&"user:keep".to_string()),
-            "the retained user tag must survive, got {tags:?}"
-        );
-        assert!(
-            !tags.iter().any(|t| t.starts_with("ai:")),
-            "the ai: tag must be removed, got {tags:?}"
-        );
-    }
-
-    /// `clear_tags_in_sidecar` must not write (no churn, nothing to clobber)
-    /// when no tag matches for removal: a sidecar with only retained tags, and
-    /// one with no tags at all, both return `None` and leave the bytes
-    /// untouched. This is the "skip the item when the loaded tags are
-    /// unchanged" guarantee the review asked for.
-    #[test]
-    fn clear_tags_skips_write_when_nothing_is_removed() {
-        let dir = tempfile::tempdir().unwrap();
-
-        let retained = dir.path().join("retained.NEF.rrdata");
-        seed(
-            &retained,
-            &ImageMetadata {
-                rating: 2,
-                tags: Some(vec!["user:keep".to_string()]),
-                ..ImageMetadata::default()
-            },
-        );
-        let before = std::fs::read(&retained).unwrap();
-        assert!(
-            clear_tags_in_sidecar(&retained, keep_non_ai)
-                .unwrap()
-                .is_none(),
-            "a sidecar whose tags all survive must report no change"
-        );
-        assert_eq!(
-            std::fs::read(&retained).unwrap(),
-            before,
-            "the untouched sidecar's bytes must be left exactly as they were"
-        );
-
-        let untagged = dir.path().join("untagged.NEF.rrdata");
-        seed(
-            &untagged,
-            &ImageMetadata {
-                rating: 1,
-                tags: None,
-                ..ImageMetadata::default()
-            },
-        );
-        assert!(
-            clear_tags_in_sidecar(&untagged, keep_non_ai)
-                .unwrap()
-                .is_none(),
-            "a sidecar with no tags must report no change"
-        );
-    }
+    // Keep only color tags, remove AI and user tags
+    retain_tags_under(&root_path, &app_handle, |tag| {
+        tag.starts_with(COLOR_TAG_PREFIX)
+    })
 }

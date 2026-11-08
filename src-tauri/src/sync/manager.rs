@@ -260,6 +260,14 @@ impl SyncManager {
         self.configured.load(Ordering::SeqCst)
     }
 
+    /// Emits `sync-error {path?, message}` through the app handle stored in
+    /// [`start_in_setup`]; a silent no-op in tests / headless (no handle).
+    pub fn emit_error(&self, path: Option<&str>, message: &str) {
+        if let Some(app) = self.app.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            crate::sync::events::emit_error(app, path, message);
+        }
+    }
+
     /// Points the engine at a bucket and local roots: opens the redb state
     /// store under `state_dir`, builds the S3 client from `settings` +
     /// `creds`, and arms the supervisor. Inert (no network) — a bad
@@ -3321,9 +3329,19 @@ mod imp {
         ) -> Result<PathBuf, SyncError> {
             let path_str = image_path.to_string_lossy();
             let adjustments = crate::file_management::thumbnail_adjustments_key_bytes(&path_str);
-            let hash =
-                crate::file_management::compute_thumbnail_cache_hash(&path_str, &adjustments)
-                    .ok_or_else(|| se("seed_thumbnail: cannot compute thumbnail cache key"))?;
+            // The key also folds in the render settings (upstream's thumbnail
+            // cache keys on them), so read the app's current settings; headless
+            // / tests (no app handle) key on the defaults.
+            let settings = crate::sync::global_manager()
+                .and_then(|m| m.app.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .and_then(|app| crate::app_settings::load_settings(app).ok())
+                .unwrap_or_default();
+            let hash = crate::file_management::compute_thumbnail_cache_hash(
+                &path_str,
+                &adjustments,
+                &settings,
+            )
+            .ok_or_else(|| se("seed_thumbnail: cannot compute thumbnail cache key"))?;
             std::fs::create_dir_all(cache_thumbnails_dir).map_err(se)?;
             let linked = cache_thumbnails_dir.join(format!("{hash}_{suffix}.jpg"));
             // Replace any stale link/file at the key first.

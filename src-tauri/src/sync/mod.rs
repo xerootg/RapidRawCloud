@@ -21,10 +21,8 @@
 //! no-ops, `SyncManager` is an empty shell, and the build is functionally
 //! identical to upstream (§7).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use once_cell::sync::Lazy;
 
 #[cfg(feature = "sync")]
@@ -95,11 +93,12 @@ pub mod proxy_support {
 /// command is avoided — `#[tauri::command]` also defines a same-named macro,
 /// which a re-export would pull into this module. No behavior change.
 #[doc(hidden)]
-pub fn copy_files_guarded(
+pub async fn copy_files_guarded(
     source_paths: Vec<String>,
     destination_folder: String,
+    app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    crate::file_management::copy_files(source_paths, destination_folder)
+    crate::file_management::copy_files(source_paths, destination_folder, app_handle).await
 }
 
 /// Where a sidecar write came from, threaded through the [`save_sidecar`]
@@ -124,43 +123,6 @@ pub enum WriteOrigin {
     VirtualCopy,
     /// `load_sidecar`'s auto-heal rewrite (bloated-exif truncation).
     AutoHeal,
-}
-
-/// The per-path sidecar lock map (ARCHITECTURE.md §3.4 step 1): serializes
-/// the three writers to one sidecar (user edit, AI tagging, sync's inbound
-/// apply). A process-global map, held by `AppState` as a shared handle, so
-/// the chokepoint serializes correctly whether or not an `AppHandle` is in
-/// scope at the call site.
-pub type SidecarLockMap = Arc<DashMap<PathBuf, Arc<std::sync::Mutex<()>>>>;
-
-static SIDECAR_LOCKS: Lazy<SidecarLockMap> = Lazy::new(|| Arc::new(DashMap::new()));
-
-/// A shared handle to the process-global sidecar lock map.
-pub fn sidecar_locks() -> SidecarLockMap {
-    SIDECAR_LOCKS.clone()
-}
-
-/// Acquires (creating if needed) the lock guarding `path`.
-pub fn sidecar_lock_for(path: &std::path::Path) -> Arc<std::sync::Mutex<()>> {
-    SIDECAR_LOCKS
-        .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
-        .clone()
-}
-
-/// Removes `path`'s lock entry iff no writer currently holds it (its only
-/// remaining strong ref is the map's own, `strong_count == 1`). Keeps the
-/// map from growing one permanent entry per distinct sidecar path for the
-/// process lifetime (P1-U7 review).
-///
-/// Safe w.r.t. the per-path serialization guarantee: `remove_if` and
-/// `sidecar_lock_for`'s `entry` both take the same DashMap shard write lock,
-/// so a concurrent `sidecar_lock_for(path)` cannot clone the `Arc` between
-/// the count check and the removal. Removal therefore happens only when no
-/// live writer holds the lock; a subsequent writer re-creates a fresh lock,
-/// and two live writers for one path can never hold different mutexes.
-pub fn prune_sidecar_lock(path: &std::path::Path) {
-    SIDECAR_LOCKS.remove_if(path, |_, lock| Arc::strong_count(lock) == 1);
 }
 
 // The process-global manager handle. The chokepoint's hook bodies route

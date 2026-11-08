@@ -28,6 +28,64 @@ pub fn notify_sidecar_saved(sidecar_path: &Path, meta: &ImageMetadata, origin: W
     }
 }
 
+/// Wraps upstream's one low-level sidecar write (`exif_processing::
+/// write_sidecar_json`, which every `update_sidecar` / auto-heal / EXIF-cache
+/// write funnels through) with the §2.5 churn gate: `write` performs
+/// upstream's atomic temp+rename of `bytes`; when the semantic hash of the
+/// document moved, the engine is notified (§3.4 step 5). An EXIF-cache or
+/// auto-heal rewrite with an unchanged semantic hash never enqueues an upload.
+/// With sync off this is exactly `write(bytes)`.
+pub fn write_sidecar_bytes(
+    sidecar_path: &Path,
+    bytes: &[u8],
+    write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    #[cfg(feature = "sync")]
+    {
+        imp::write_sidecar_bytes(sidecar_path, bytes, write)
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = sidecar_path;
+        write(bytes)
+    }
+}
+
+/// Upstream's sidecar reader just quarantined an unparseable (or 0-byte)
+/// sidecar and is about to continue from defaults (§3.4 step 2). When sync
+/// is configured that defaults-based document would out-version the real edit
+/// on every device (the A4 trap), so this returns an error that aborts the
+/// read-modify-write and surfaces `sync-error`; the next cycle's drift repair
+/// pulls the real head back down. With sync off/unconfigured it returns
+/// `Ok(())` and upstream's proceed-from-defaults behavior stands.
+pub fn corrupt_sidecar_quarantined(sidecar_path: &Path) -> std::io::Result<()> {
+    #[cfg(feature = "sync")]
+    {
+        imp::corrupt_sidecar_quarantined(sidecar_path)
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = sidecar_path;
+        Ok(())
+    }
+}
+
+/// Whether upstream's "a primary sidecar back at defaults is deleted" tidy-up
+/// must be skipped. Under a configured sync a reset is an edit like any other:
+/// deleting the file would leave the engine nothing to hash and upload, so
+/// other devices would keep the stale edit. The default document is written
+/// instead. `false` (upstream behavior) when sync is off or unconfigured.
+pub fn keep_default_sidecar() -> bool {
+    #[cfg(feature = "sync")]
+    {
+        imp::sync_configured()
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        false
+    }
+}
+
 /// A new original (import / derived output / duplicate / copy) landed and
 /// should be enqueued for upload (§3.4 "new-original hooks").
 pub fn notify_new_original(path: &Path) {
@@ -294,6 +352,48 @@ mod imp {
         if let Some(mgr) = global_manager() {
             mgr.note_local_sidecar(sidecar_path, origin);
         }
+    }
+
+    pub fn sync_configured() -> bool {
+        global_manager().is_some_and(|m| m.is_configured())
+    }
+
+    pub fn write_sidecar_bytes(
+        sidecar_path: &Path,
+        bytes: &[u8],
+        write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let changed = match std::fs::read(sidecar_path) {
+            Ok(prior) if !prior.is_empty() => match (
+                rrcloud_core::semhash::sem_hash(&prior),
+                rrcloud_core::semhash::sem_hash(bytes),
+            ) {
+                (Ok(prior_sem), Ok(new_sem)) => prior_sem != new_sem,
+                _ => true,
+            },
+            _ => true,
+        };
+        write(bytes)?;
+        if changed && let Some(mgr) = global_manager() {
+            // `origin` is reserved for §2.6 per-field provenance; the intake
+            // keys purely on the semantic hash of the bytes now on disk.
+            mgr.note_local_sidecar(sidecar_path, WriteOrigin::User);
+        }
+        Ok(())
+    }
+
+    pub fn corrupt_sidecar_quarantined(sidecar_path: &Path) -> std::io::Result<()> {
+        let Some(mgr) = global_manager().filter(|m| m.is_configured()) else {
+            return Ok(());
+        };
+        mgr.emit_error(
+            Some(sidecar_path.to_string_lossy().as_ref()),
+            "sidecar restored — please retry",
+        );
+        Err(std::io::Error::other(format!(
+            "corrupt sidecar quarantined, write aborted: {}",
+            sidecar_path.display()
+        )))
     }
 
     pub fn notify_new_original(path: &Path) {

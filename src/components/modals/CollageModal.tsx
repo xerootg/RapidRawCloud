@@ -23,13 +23,14 @@ import clsx from 'clsx';
 import { LAYOUTS, type Layout, type LayoutDefinition } from '../../utils/CollageVariants';
 import Text from '../ui/Text';
 import { TextVariants } from '../../types/typography';
+import { getDevicePixelRatio } from '../../utils/displayScale';
 
 interface CollageModalProps {
   isOpen: boolean;
   onClose(): void;
   onSave(base64Data: string, firstPath: string): Promise<string>;
   sourceImages: Array<Pick<ImageFile, 'path'>>;
-  thumbnails: Record<string, string>;
+  thumbnails?: Record<string, string>;
 }
 
 interface LoadedImage {
@@ -249,7 +250,7 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
       let canvasWidth,
         canvasHeight,
         exportScale = 1;
-      const dpr = isExport ? 1 : window.devicePixelRatio || 1;
+      const dpr = isExport ? 1 : getDevicePixelRatio();
 
       if (isExport) {
         canvasWidth = exportWidth;

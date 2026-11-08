@@ -10,7 +10,7 @@
 //! directly-callable `copy_files` guard end to end (hydrate-then-copy, never
 //! a 0-byte copy).
 
-#![cfg(feature = "sync")]
+#![cfg(all(feature = "sync", any(windows, target_os = "linux")))]
 
 mod common;
 
@@ -24,6 +24,31 @@ use tokio::sync::{Mutex, MutexGuard};
 async fn global_guard() -> MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(())).lock().await
+}
+
+/// A headless Wry app handle (upstream's `copy_files` now takes one for its
+/// Immich hydration step), built once per test binary and leaked — the same
+/// harness as `rename_separators.rs`. Needs a display: run under `xvfb-run`.
+fn app_handle() -> tauri::AppHandle {
+    static HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+    HANDLE
+        .get_or_init(|| {
+            static APP_DATA: OnceLock<tempfile::TempDir> = OnceLock::new();
+            let data_root = APP_DATA.get_or_init(|| tempfile::tempdir().expect("app data tempdir"));
+            let mut ctx = tauri::generate_context!();
+            ctx.config_mut().app.app_directories_override = Some(
+                tauri::utils::config::AppDirectoriesOverride::Root(data_root.path().to_path_buf()),
+            );
+            ctx.config_mut().app.windows.clear();
+            let app = tauri::Builder::default()
+                .any_thread()
+                .build(ctx)
+                .expect("build headless tauri app (needs a display: run under xvfb-run)");
+            let handle = app.handle().clone();
+            std::mem::forget(app);
+            handle
+        })
+        .clone()
 }
 
 fn settings_for(garage: &garage::Garage, bucket: &str) -> SyncSettings {
@@ -231,7 +256,9 @@ async fn copy_files_hydrates_then_copies_real_bytes_not_the_stub() {
     sync::copy_files_guarded(
         vec![stub_path.to_string_lossy().into_owned()],
         dest_dir.path().to_string_lossy().into_owned(),
+        app_handle(),
     )
+    .await
     .expect("copy_files");
 
     // The copied file must carry the real (hydrated) bytes, never 0 bytes.
