@@ -40,7 +40,8 @@ use std::path::{Path, PathBuf};
 
 use rapidraw_lib::rrcloud_core::proxy;
 use rapidraw_lib::sync::proxy_support::{
-    develop_raw_image, gpu_adapter_probe, proxy_decode_settings, proxy_reported_dimensions,
+    develop_raw_image, gpu_adapter_probe, proxy_as_shot, proxy_decode_settings,
+    proxy_reported_dimensions, read_as_shot,
 };
 
 const HL: f32 = 2.5;
@@ -494,6 +495,46 @@ fn wh_provenance_matches_develop() {
             reported,
             (ow, oh),
             "{fmt}: proxy-mode reported dims drifted"
+        );
+    }
+}
+
+/// §4.4: a stub edited through its proxy renders with its original's as-shot
+/// inputs. The exposure — including the maker-note highlight preservation no
+/// DNG tag of the proxy can carry — must be exactly upstream's `read_as_shot`
+/// of the original (it travels in the proxy's as-shot record); the white
+/// balance comes from the original's `AsShotNeutral` + matrices the proxy
+/// carries, equal up to the DNG rational encoding.
+#[test]
+fn proxy_as_shot_matches_the_original() {
+    let dir = skip_without_corpus!("proxy_as_shot_matches_the_original");
+    for (fmt, path) in format_samples(&dir) {
+        let bytes = read(&path);
+        let original = read_as_shot(&bytes).expect("upstream as-shot of the original");
+        let out = proxy::generate_proxy(&bytes).expect("generate proxy");
+        let stub = proxy_as_shot(&out.dng).expect("sync build reads the proxy");
+
+        let (o, p) = (original.exposure, stub.exposure);
+        assert_eq!(
+            (o.scene_referred, o.dng_baseline, o.highlight_preservation),
+            (p.scene_referred, p.dng_baseline, p.highlight_preservation),
+            "{fmt}: proxy-mode exposure must be the original's"
+        );
+
+        let (ow, pw) = (original.white_balance, stub.white_balance);
+        assert!(
+            (ow.temperature - pw.temperature).abs() <= 1.0 && (ow.tint - pw.tint).abs() <= 0.1,
+            "{fmt}: proxy-mode as-shot WB drifted: original {ow:?}, proxy {pw:?}"
+        );
+        eprintln!(
+            "{fmt}: highlight preservation {:+.2} EV, DNG baseline {:+.2} EV, \
+             WB {:.1} K / {:+.2} (proxy {:.1} K / {:+.2})",
+            o.highlight_preservation,
+            o.dng_baseline,
+            ow.temperature,
+            ow.tint,
+            pw.temperature,
+            pw.tint
         );
     }
 }

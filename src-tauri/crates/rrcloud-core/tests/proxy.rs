@@ -11,7 +11,8 @@
 //!     dimensions (never EXIF); the proxy DNG is `<= 2560 px` long edge with
 //!     the original aspect ratio.
 //!   * **Proxy structure (§4.2 step 7)** — `LinearRaw` photometric,
-//!     `BlackLevel 0`, `WhiteLevel 32767`, `Software = RapidRawCloud/pxy1`.
+//!     `BlackLevel 0`, `WhiteLevel 32767`, `Software = RapidRawCloud/pxy1`,
+//!     and the original's as-shot exposure record (§4.4).
 //!   * **Thumbs (§4.2 step 8)** — `_small` 480 / `_medium` 1280 long edge.
 //!
 //! Corpus-gated: point `RRCLOUD_RAW_CORPUS` at a directory of CC0 RAWs
@@ -181,6 +182,13 @@ fn proxy_is_linear_dng_with_documented_levels() {
             software.as_deref(),
             Some(PROXY_SOFTWARE_TAG),
             "{fmt}: proxy Software tag must be {PROXY_SOFTWARE_TAG}"
+        );
+
+        // §4.4: the original's as-shot exposure rides in the proxy's record.
+        assert_eq!(
+            proxy::read_as_shot_exposure(&out.dng),
+            Some(out.as_shot_exposure),
+            "{fmt}: proxy must carry its original's as-shot exposure record"
         );
     }
 }

@@ -283,14 +283,14 @@ pub fn render_adjustments_headless(
 
     // Raw-mode adjustments (the proxy and original develop bases are both raw
     // develop output); no masks, no LUT, full frame. The base is already a
-    // developed linear frame with no camera metadata here, so the as-shot white
-    // balance is the reference neutral; the user's WB adjustments in
-    // `adjustments` apply on top of it.
+    // developed linear frame with no camera metadata here, so the as-shot
+    // white balance and exposure are the reference (neutral, 0 EV baseline
+    // compensation); the user's WB adjustments in `adjustments` apply on top.
     let all_adjustments = crate::image_processing::get_all_adjustments_from_json(
         adjustments,
         true,
-        crate::white_balance::WhiteBalance::reference(),
-        None,
+        crate::as_shot::AsShot::reference(),
+        crate::image_processing::RenderOptions::default(),
     );
     let request = RenderRequest {
         adjustments: all_adjustments,

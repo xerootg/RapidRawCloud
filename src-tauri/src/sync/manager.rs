@@ -2595,6 +2595,24 @@ mod imp {
         /// touching the store or the record. The P4 worker reuses the same
         /// `proxy` module for backfill + the S3/journal upload of previews.
         pub fn generate_and_store_proxy(&self, image_path: &Path) -> Result<(), SyncError> {
+            self.store_proxy(image_path, false)
+        }
+
+        /// §4.4: regenerate the original's existing smart preview if it
+        /// predates the as-shot exposure record (`rrcloud_core::as_shot`), so
+        /// the stub an eviction leaves behind renders with the original's
+        /// maker-note highlight preservation. Called only at eviction — the
+        /// last moment the original is local — so the record check reads one
+        /// proxy per evicted original instead of the whole store every cycle.
+        /// No proxy: nothing to refresh (editing the stub hydrates it).
+        fn refresh_stale_proxy(&self, image_path: &Path) -> Result<(), SyncError> {
+            self.store_proxy(image_path, true)
+        }
+
+        /// [`Self::generate_and_store_proxy`]'s body. `refresh_stale` turns it
+        /// into [`Self::refresh_stale_proxy`]: act only on an existing proxy
+        /// without the as-shot record, and replace it in place.
+        fn store_proxy(&self, image_path: &Path, refresh_stale: bool) -> Result<(), SyncError> {
             let rk = relkey(image_path, &self.sync_root).map_err(se)?;
             let Some(record) = self.db.get_item(&rk).map_err(se)? else {
                 return Ok(());
@@ -2616,8 +2634,16 @@ mod imp {
                 content_id.as_str(),
                 rrcloud_core::proxy::PROXY_FILE_SUFFIX
             ));
-            // Already generated — nothing to do.
             if dng_path.is_file() {
+                // Already generated — nothing to do, unless this is a refresh
+                // and the proxy predates the as-shot record.
+                let stale = refresh_stale
+                    && std::fs::read(&dng_path)
+                        .is_ok_and(|b| rrcloud_core::proxy::read_as_shot_exposure(&b).is_none());
+                if !stale {
+                    return Ok(());
+                }
+            } else if refresh_stale {
                 return Ok(());
             }
             let bytes = match std::fs::read(image_path) {
@@ -3180,6 +3206,15 @@ mod imp {
             path: &Path,
             on_evicted: &mut dyn FnMut(&Path),
         ) -> Result<(), SyncError> {
+            // §4.4: the stub keeps editing through its smart preview; bring an
+            // older one up to the as-shot record while the original is still
+            // here to compute it from. Best-effort: never blocks the eviction.
+            if let Err(e) = self.refresh_stale_proxy(path) {
+                log::warn!(
+                    "smart preview refresh before evicting {}: {e}",
+                    path.display()
+                );
+            }
             self.db
                 .transition(rk, record.state, ItemState::Stub, |_| {})
                 .map_err(se)?;

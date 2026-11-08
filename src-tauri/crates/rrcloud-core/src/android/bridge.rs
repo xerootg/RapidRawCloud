@@ -22,7 +22,7 @@
 //! the DCIM dedupe decision — is delegated to [`super::bounded_cycle`] /
 //! [`super::result_code`] / [`super::dcim_dedupe`], which are host-testable
 //! on their own; this module's bodies are glue (JNI unwrapping,
-//! `ndk_context`/`rustls_platform_verifier` init, opening redb + reading
+//! `rustls_platform_verifier` init, opening redb + reading
 //! settings/credentials via a JNI callback into Kotlin, running the bounded
 //! cycle over the same engine primitives `sync::manager::Configured` uses
 //! on desktop) that cannot be exercised without a JVM and is therefore
@@ -524,7 +524,7 @@ mod imp {
     /// - `ctx`: the Android `Context` (`ApplicationContext` from the
     ///   caller — `SyncCycleWorker`/`DcimScanWorker`'s `applicationContext`,
     ///   or the foreground service's own context), used to initialize
-    ///   `ndk_context`/`rustls_platform_verifier` and to reach the
+    ///   `rustls_platform_verifier` and to reach the
     ///   settings/`CredentialStore` callbacks.
     /// - `budget_ms`: milliseconds remaining in the caller's execution
     ///   window (the WorkManager ~10-minute expedited budget minus
@@ -554,7 +554,10 @@ mod imp {
             return BridgeResult::RetryLockHeld.to_code();
         };
 
-        super::init_ndk_context(&mut env, &ctx);
+        // No `ndk_context` init here: tao 0.37+ initializes it in the
+        // activity's `onCreate`, and does so unguarded, so a worker that
+        // initialized it first would make the next app launch in this
+        // process abort (see `platform_init`'s module doc).
         super::init_rustls_platform_verifier(&mut env, &ctx);
 
         let Some((settings, creds)) = load_config(&mut env, &ctx) else {
@@ -976,71 +979,20 @@ mod imp {
 #[cfg(target_os = "android")]
 pub use imp::*;
 
-/// Android platform init shared by every entry point above: `ndk_context`
-/// (so this process's `rrcloud-core` code — none of which calls it today,
-/// but keeping the context initialized is cheap and matches
-/// `android_integration::initialize_android`'s own pattern exactly) and
-/// `rustls_platform_verifier` (so the `S3Client`'s `reqwest`/`rustls`
-/// stack trusts the Android platform's certificate store in this
-/// process). Both calls here go through [`super::platform_init`]'s
-/// process-wide shared guards, NOT a `Once` local to this module — this
-/// process is the SAME process as the app (ARCHITECTURE.md §5.1; no
-/// `android:process` override exists on any manifest entry), so a local
-/// guard here would have no idea `android_integration.rs`'s own call site
-/// already ran, or is about to. See `platform_init`'s module doc for the
-/// on-device crash that shape caused.
-#[cfg(target_os = "android")]
-fn init_ndk_context(env: &mut jni::JNIEnv, ctx: &jni::objects::JObject) {
-    if let Ok(vm) = env.get_java_vm() {
-        let vm_ptr = vm.get_java_vm_pointer() as *mut std::ffi::c_void;
-        // `ctx` here is a plain native-method argument -- the JNI spec
-        // guarantees that is a fresh LOCAL reference, valid only for this
-        // one call. It must NOT be handed to the shared guard as-is: if
-        // this call wins the process-wide `Once` race (plausible -- a
-        // `WorkManager` worker can run before the app ever opens a
-        // webview in a cold-started process), `ndk_context` would keep
-        // this local's raw pointer forever, and every later
-        // `android_integration.rs` read of
-        // `ndk_context::android_context().context()` would dereference a
-        // handle freed when this JNI call returns -- see
-        // `platform_init`'s module doc for the full "local vs. global
-        // reference" rationale.
-        //
-        // `ensure_ndk_context_initialized` only calls this closure at
-        // all if this call actually wins that race (at most once per
-        // process, see that function's doc), so only the single winning
-        // call ever promotes-and-leaks a global ref here -- a losing
-        // call (the common case: this runs on every `SyncCycleWorker`/
-        // `DcimScanWorker` invocation) never does.
-        super::platform_init::ensure_ndk_context_initialized(vm_ptr, || {
-            match env.new_global_ref(ctx) {
-                Ok(global_ctx) => {
-                    let context_ptr = global_ctx.as_obj().as_raw() as *mut std::ffi::c_void;
-                    // Intentionally leaked: this global reference must
-                    // outlive this native call -- outlive this whole
-                    // process, in fact, exactly like `ndk_context` itself
-                    // assumes of whatever pointer it is given. Dropping
-                    // `global_ctx` would `DeleteGlobalRef` it and
-                    // reintroduce the exact dangling-pointer bug this
-                    // promotion exists to prevent.
-                    std::mem::forget(global_ctx);
-                    context_ptr
-                }
-                Err(e) => {
-                    eprintln!(
-                        "rrcloud bridge: failed to promote ctx to a global ref for ndk_context init: {e}"
-                    );
-                    std::ptr::null_mut()
-                }
-            }
-        });
-    } else {
-        eprintln!("rrcloud bridge: could not obtain JavaVM for ndk_context init");
-    }
-}
-
-/// See [`init_ndk_context`] — same shared-guard rationale, routed through
-/// [`super::platform_init::ensure_rustls_platform_verifier_initialized`].
+/// Android platform init shared by every entry point above:
+/// `rustls_platform_verifier`, so the `S3Client`'s `reqwest`/`rustls` stack
+/// trusts the Android platform's certificate store in this process. Routed
+/// through [`super::platform_init`]'s process-wide shared guard, NOT a
+/// `Once` local to this module — this process is the SAME process as the
+/// app (ARCHITECTURE.md §5.1; no `android:process` override exists on any
+/// manifest entry), so a local guard here would have no idea
+/// `android_integration.rs`'s own call site already ran, or is about to.
+///
+/// `ndk_context` is deliberately NOT initialized here (it used to be):
+/// nothing in this crate reads it, and tao 0.37+ (tauri 2.12+) initializes
+/// it itself in the activity's `onCreate` with no "already set" check, so a
+/// worker that got there first would make the next app launch in this
+/// process abort. See `platform_init`'s module doc.
 #[cfg(target_os = "android")]
 fn init_rustls_platform_verifier(env: &mut jni::JNIEnv, ctx: &jni::objects::JObject) {
     let raw_env = env.get_raw() as *mut jni22::sys::JNIEnv;

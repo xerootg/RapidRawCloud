@@ -498,12 +498,17 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
       };
 
       const handleApplyAutoAdjustmentsToSelection = () => {
-        if (finalSelection.length === 0) return;
-        finalSelection.forEach((p) => globalImageCache.delete(p));
+        const editingPath = activeView === 'editor' ? selectedImage?.path : undefined;
+        const batchPaths = finalSelection.filter((p) => p !== editingPath);
+        if (batchPaths.length < finalSelection.length) {
+          handleAutoAdjustments();
+        }
+        if (batchPaths.length === 0) return;
+        batchPaths.forEach((p) => globalImageCache.delete(p));
 
-        invoke(Invokes.ApplyAutoAdjustmentsToPaths, { paths: finalSelection })
+        invoke(Invokes.ApplyAutoAdjustmentsToPaths, { paths: batchPaths })
           .then(async () => {
-            if (selectedImage && finalSelection.includes(selectedImage.path)) {
+            if (selectedImage && batchPaths.includes(selectedImage.path)) {
               const metadata: any = await invoke(Invokes.LoadMetadata, { path: selectedImage.path });
               if (metadata.adjustments && !metadata.adjustments.is_null) {
                 const normalized = normalizeLoadedAdjustments(metadata.adjustments);
@@ -511,7 +516,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
                 useEditorStore.getState().resetHistory(normalized);
               }
             }
-            if (libraryActivePath && finalSelection.includes(libraryActivePath)) {
+            if (libraryActivePath && batchPaths.includes(libraryActivePath)) {
               const metadata: any = await invoke(Invokes.LoadMetadata, { path: libraryActivePath });
               if (metadata.adjustments && !metadata.adjustments.is_null) {
                 const normalized = normalizeLoadedAdjustments(metadata.adjustments);
@@ -864,6 +869,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
       buildSyncItemMenu,
       handleCopyAdjustments,
       handlePasteAdjustments,
+      handleAutoAdjustments,
       handleRate,
       buildFlagMenu,
       handleSetColorLabel,
