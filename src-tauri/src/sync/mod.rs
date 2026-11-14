@@ -21,16 +21,15 @@
 //! no-ops, `SyncManager` is an empty shell, and the build is functionally
 //! identical to upstream (§7).
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use dashmap::DashMap;
 use once_cell::sync::Lazy;
 
 #[cfg(feature = "sync")]
 pub mod commands;
 pub mod credentials;
 pub mod events;
+pub mod headless_gpu;
 pub mod hooks;
 pub mod manager;
 #[cfg(feature = "sync")]
@@ -52,16 +51,18 @@ pub use manager::{
 
 // Re-exports so the integration tests (and future command layer) reach the
 // chokepoint and settings types through one module path.
-pub use crate::app_settings::{AppSettings, SyncSettings};
-pub use crate::exif_processing::{save_sidecar, update_sidecar};
-pub use crate::image_processing::ImageMetadata;
+pub use crate::app::settings::{AppSettings, SyncSettings};
+pub use crate::metadata::sidecar::ImageMetadata;
+pub use crate::metadata::sidecar::{save_sidecar, update_sidecar};
 
 // §3.5 guard-site test seams. The upstream placeholder check and the stub
 // thumbnail-cache key live in the private `file_management` module; re-export
 // them through `sync` (pure visibility, no behavior change) so the P2
 // integration suite can assert placeholder/hash behavior. Both are plain
 // functions (not `#[tauri::command]`s), so a `pub use` is safe.
-pub use crate::file_management::{compute_thumbnail_cache_hash, is_cloud_placeholder};
+pub use crate::library::{
+    file_ops::is_cloud_placeholder, thumbnails::compute_thumbnail_cache_hash,
+};
 
 /// P3 smart-preview fidelity test seams (ARCHITECTURE.md §8-P3).
 ///
@@ -69,19 +70,25 @@ pub use crate::file_management::{compute_thumbnail_cache_hash, is_cloud_placehol
 /// GPU entry points, plus the proxy-mode dimension-reporting helpers, so the
 /// `tests/proxy_fidelity.rs` integration suite can drive the real code paths
 /// (RawDevelop LinearRaw branch, the clamp fix, linear-space Lanczos3, the
-/// wgpu adapter probe) without widening those modules' own visibility. No
-/// behavior: re-exports and the `ProxyHandle` type only.
+/// wgpu adapter probe, the original-vs-proxy as-shot readers) without
+/// widening those modules' own visibility. No behavior: re-exports and the
+/// `ProxyHandle` type only.
 #[doc(hidden)]
 pub mod proxy_support {
-    pub use crate::gpu_processing::{
-        gpu_adapter_probe, init_gpu_context_headless, render_adjustments_headless,
-    };
-    pub use crate::image_loader::{
+    pub use crate::decode::image_loader::{
         load_image_with_orientation, proxy_decode_settings, proxy_reported_dimensions,
     };
-    pub use crate::image_processing::{GpuContext, apply_srgb_to_linear, downscale_f32_image};
-    pub use crate::raw_processing::develop_raw_image;
-    pub use crate::sync::hooks::ProxyHandle;
+    pub use crate::decode::raw_processing::{develop_raw_image, read_as_shot};
+    pub use crate::render::gpu::context::GpuContext;
+    pub use crate::render::image_processing::{apply_srgb_to_linear, downscale_f32_image};
+    pub use crate::sync::headless_gpu::{
+        gpu_adapter_probe, init_gpu_context_headless, render_adjustments_headless,
+    };
+    pub use crate::sync::hooks::{ProxyHandle, proxy_as_shot};
+    // The as-shot types the two readers above return (§4.4 parity test).
+    pub use crate::decode::as_shot::AsShot;
+    pub use crate::decode::baseline_exposure::RawExposure;
+    pub use crate::decode::white_balance::WhiteBalance;
 }
 
 /// Test seam for the §3.5 `copy_files` guard: a plain-function wrapper over
@@ -90,11 +97,43 @@ pub mod proxy_support {
 /// command is avoided — `#[tauri::command]` also defines a same-named macro,
 /// which a re-export would pull into this module. No behavior change.
 #[doc(hidden)]
-pub fn copy_files_guarded(
+pub async fn copy_files_guarded(
     source_paths: Vec<String>,
     destination_folder: String,
+    app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    crate::file_management::copy_files(source_paths, destination_folder)
+    crate::library::file_ops::copy_files(source_paths, destination_folder, app_handle).await
+}
+
+/// Test seams for integration tests that need private upstream commands:
+/// plain-function wrappers over the `library` commands (`rename_separators`,
+/// `show_in_finder_injection`) and the app settings type (`proxy_fidelity`).
+/// A direct `pub use` of a `#[tauri::command]` is avoided because the attribute
+/// also defines a same-named macro which a re-export would pull along. No
+/// behavior change.
+#[doc(hidden)]
+pub mod test_seams {
+    pub use crate::app::settings::AppSettings;
+
+    pub fn rename_folder(
+        path: String,
+        new_name: String,
+        app_handle: tauri::AppHandle,
+    ) -> Result<(), String> {
+        crate::library::folders::rename_folder(path, new_name, app_handle)
+    }
+
+    pub fn rename_files(
+        paths: Vec<String>,
+        name_template: String,
+        app_handle: tauri::AppHandle,
+    ) -> Result<Vec<String>, String> {
+        crate::library::file_ops::rename_files(paths, name_template, app_handle)
+    }
+
+    pub fn show_in_finder(path: String) -> Result<(), String> {
+        crate::library::file_ops::show_in_finder(path)
+    }
 }
 
 /// Where a sidecar write came from, threaded through the [`save_sidecar`]
@@ -119,43 +158,6 @@ pub enum WriteOrigin {
     VirtualCopy,
     /// `load_sidecar`'s auto-heal rewrite (bloated-exif truncation).
     AutoHeal,
-}
-
-/// The per-path sidecar lock map (ARCHITECTURE.md §3.4 step 1): serializes
-/// the three writers to one sidecar (user edit, AI tagging, sync's inbound
-/// apply). A process-global map, held by `AppState` as a shared handle, so
-/// the chokepoint serializes correctly whether or not an `AppHandle` is in
-/// scope at the call site.
-pub type SidecarLockMap = Arc<DashMap<PathBuf, Arc<std::sync::Mutex<()>>>>;
-
-static SIDECAR_LOCKS: Lazy<SidecarLockMap> = Lazy::new(|| Arc::new(DashMap::new()));
-
-/// A shared handle to the process-global sidecar lock map.
-pub fn sidecar_locks() -> SidecarLockMap {
-    SIDECAR_LOCKS.clone()
-}
-
-/// Acquires (creating if needed) the lock guarding `path`.
-pub fn sidecar_lock_for(path: &std::path::Path) -> Arc<std::sync::Mutex<()>> {
-    SIDECAR_LOCKS
-        .entry(path.to_path_buf())
-        .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
-        .clone()
-}
-
-/// Removes `path`'s lock entry iff no writer currently holds it (its only
-/// remaining strong ref is the map's own, `strong_count == 1`). Keeps the
-/// map from growing one permanent entry per distinct sidecar path for the
-/// process lifetime (P1-U7 review).
-///
-/// Safe w.r.t. the per-path serialization guarantee: `remove_if` and
-/// `sidecar_lock_for`'s `entry` both take the same DashMap shard write lock,
-/// so a concurrent `sidecar_lock_for(path)` cannot clone the `Arc` between
-/// the count check and the removal. Removal therefore happens only when no
-/// live writer holds the lock; a subsequent writer re-creates a fresh lock,
-/// and two live writers for one path can never hold different mutexes.
-pub fn prune_sidecar_lock(path: &std::path::Path) {
-    SIDECAR_LOCKS.remove_if(path, |_, lock| Arc::strong_count(lock) == 1);
 }
 
 // The process-global manager handle. The chokepoint's hook bodies route

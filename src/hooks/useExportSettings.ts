@@ -1,10 +1,11 @@
 import { useState, useMemo, useCallback } from 'react';
-import { BorderBasis, ExportPreset, TiffBitDepth, WatermarkAnchor } from '../components/ui/ExportImportProperties';
+import { BorderBasis, DEFAULT_EXPORT_DPI, ExportPreset, TiffBitDepth, WatermarkAnchor } from '../types/export';
 
 export function useExportSettings() {
   const [fileFormat, setFileFormat] = useState('jpeg');
   const [jpegQuality, setJpegQuality] = useState(90);
   const [tiffBitDepth, setTiffBitDepth] = useState<TiffBitDepth>(16);
+  const [dpi, setDpi] = useState(DEFAULT_EXPORT_DPI);
   const [enableResize, setEnableResize] = useState(false);
   const [resizeMode, setResizeMode] = useState('longEdge');
   const [resizeValue, setResizeValue] = useState(2048);
@@ -22,6 +23,9 @@ export function useExportSettings() {
   const [preserveTimestamps, setPreserveTimestamps] = useState(false);
   const [stripGps, setStripGps] = useState(true);
   const [exportMasks, setExportMasks] = useState(false);
+  const [exportOriginal, setExportOriginal] = useState(false);
+  const [originalCrop, setOriginalCrop] = useState(true);
+  const [originalKeepExposure, setOriginalKeepExposure] = useState(false);
   const [preserveFolders, setPreserveFolders] = useState(false);
   const [filenameTemplate, setFilenameTemplate] = useState('{original_filename}_edited');
   const [enableWatermark, setEnableWatermark] = useState(false);
@@ -37,6 +41,7 @@ export function useExportSettings() {
     setFileFormat(preset.fileFormat);
     setJpegQuality(preset.jpegQuality);
     setTiffBitDepth(preset.tiffBitDepth ?? 16);
+    setDpi(preset.dpi ?? DEFAULT_EXPORT_DPI);
     setEnableResize(preset.enableResize);
     setResizeMode(preset.resizeMode);
     setResizeValue(preset.resizeValue);
@@ -54,6 +59,9 @@ export function useExportSettings() {
     setPreserveTimestamps(preset.preserveTimestamps ?? false);
     setStripGps(preset.stripGps);
     setExportMasks(preset.exportMasks ?? false);
+    setExportOriginal(preset.exportOriginal ?? false);
+    setOriginalCrop(preset.originalCrop ?? true);
+    setOriginalKeepExposure(preset.originalKeepExposure ?? false);
     setPreserveFolders(preset.preserveFolders ?? false);
     setFilenameTemplate(preset.filenameTemplate);
     setEnableWatermark(preset.enableWatermark);
@@ -71,6 +79,7 @@ export function useExportSettings() {
       fileFormat,
       jpegQuality,
       tiffBitDepth,
+      dpi,
       enableResize,
       resizeMode,
       resizeValue,
@@ -88,6 +97,9 @@ export function useExportSettings() {
       preserveTimestamps,
       stripGps,
       exportMasks,
+      exportOriginal,
+      originalCrop,
+      originalKeepExposure,
       preserveFolders,
       filenameTemplate,
       enableWatermark,
@@ -103,6 +115,7 @@ export function useExportSettings() {
       fileFormat,
       jpegQuality,
       tiffBitDepth,
+      dpi,
       enableResize,
       resizeMode,
       resizeValue,
@@ -120,6 +133,9 @@ export function useExportSettings() {
       preserveTimestamps,
       stripGps,
       exportMasks,
+      exportOriginal,
+      originalCrop,
+      originalKeepExposure,
       preserveFolders,
       filenameTemplate,
       enableWatermark,
@@ -140,6 +156,8 @@ export function useExportSettings() {
     setJpegQuality,
     tiffBitDepth,
     setTiffBitDepth,
+    dpi,
+    setDpi,
     enableResize,
     setEnableResize,
     resizeMode,
@@ -174,6 +192,12 @@ export function useExportSettings() {
     setStripGps,
     exportMasks,
     setExportMasks,
+    exportOriginal,
+    setExportOriginal,
+    originalCrop,
+    setOriginalCrop,
+    originalKeepExposure,
+    setOriginalKeepExposure,
     preserveFolders,
     setPreserveFolders,
     filenameTemplate,

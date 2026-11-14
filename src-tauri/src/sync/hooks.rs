@@ -9,13 +9,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::image_processing::ImageMetadata;
+use crate::metadata::sidecar::ImageMetadata;
 use crate::sync::WriteOrigin;
 
 /// A sidecar was atomically written and its semantic hash changed
 /// (ARCHITECTURE.md §3.4 step 5). Enqueues the §3.7 debounced upload.
 /// No-op when the semantic hash is unchanged (the churn gate lives in the
-/// [`crate::exif_processing::save_sidecar`] chokepoint, which only calls
+/// [`crate::metadata::sidecar::save_sidecar`] chokepoint, which only calls
 /// this when the hash actually moved).
 pub fn notify_sidecar_saved(sidecar_path: &Path, meta: &ImageMetadata, origin: WriteOrigin) {
     #[cfg(feature = "sync")]
@@ -25,6 +25,64 @@ pub fn notify_sidecar_saved(sidecar_path: &Path, meta: &ImageMetadata, origin: W
     #[cfg(not(feature = "sync"))]
     {
         let _ = (sidecar_path, meta, origin);
+    }
+}
+
+/// Wraps upstream's one low-level sidecar write (`exif_processing::
+/// write_sidecar_json`, which every `update_sidecar` / auto-heal / EXIF-cache
+/// write funnels through) with the §2.5 churn gate: `write` performs
+/// upstream's atomic temp+rename of `bytes`; when the semantic hash of the
+/// document moved, the engine is notified (§3.4 step 5). An EXIF-cache or
+/// auto-heal rewrite with an unchanged semantic hash never enqueues an upload.
+/// With sync off this is exactly `write(bytes)`.
+pub fn write_sidecar_bytes(
+    sidecar_path: &Path,
+    bytes: &[u8],
+    write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    #[cfg(feature = "sync")]
+    {
+        imp::write_sidecar_bytes(sidecar_path, bytes, write)
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = sidecar_path;
+        write(bytes)
+    }
+}
+
+/// Upstream's sidecar reader just quarantined an unparseable (or 0-byte)
+/// sidecar and is about to continue from defaults (§3.4 step 2). When sync
+/// is configured that defaults-based document would out-version the real edit
+/// on every device (the A4 trap), so this returns an error that aborts the
+/// read-modify-write and surfaces `sync-error`; the next cycle's drift repair
+/// pulls the real head back down. With sync off/unconfigured it returns
+/// `Ok(())` and upstream's proceed-from-defaults behavior stands.
+pub fn corrupt_sidecar_quarantined(sidecar_path: &Path) -> std::io::Result<()> {
+    #[cfg(feature = "sync")]
+    {
+        imp::corrupt_sidecar_quarantined(sidecar_path)
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = sidecar_path;
+        Ok(())
+    }
+}
+
+/// Whether upstream's "a primary sidecar back at defaults is deleted" tidy-up
+/// must be skipped. Under a configured sync a reset is an edit like any other:
+/// deleting the file would leave the engine nothing to hash and upload, so
+/// other devices would keep the stale edit. The default document is written
+/// instead. `false` (upstream behavior) when sync is off or unconfigured.
+pub fn keep_default_sidecar() -> bool {
+    #[cfg(feature = "sync")]
+    {
+        imp::sync_configured()
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        false
     }
 }
 
@@ -167,6 +225,45 @@ pub fn proxy_handle(path: &Path) -> Option<ProxyHandle> {
     }
 }
 
+/// The as-shot white balance and exposure for the cloud stub at `path`
+/// (§4.4): `Some` for a stub — its local smart preview's values (see
+/// [`proxy_as_shot`]), or the reference when it has no proxy — and `None`
+/// when `path` is not a stub or sync is off, so upstream's `as_shot` reads
+/// the original as usual. Backs the stub branch of `as_shot::as_shot`; the
+/// result is never put in upstream's per-path cache, so the real values are
+/// read once the original is hydrated.
+pub fn stub_as_shot(path: &Path) -> Option<crate::decode::as_shot::AsShot> {
+    #[cfg(feature = "sync")]
+    {
+        imp::stub_as_shot(path)
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// The as-shot inputs a smart preview stands in for (§4.4): upstream's own
+/// reader on the proxy bytes (white balance from the original's
+/// `AsShotNeutral` and color matrices, which the proxy carries), with the
+/// exposure replaced by the original's from the proxy's as-shot record
+/// (`rrcloud_core::as_shot`) — the maker-note highlight preservation the
+/// proxy's own tags cannot carry. A proxy generated before the record
+/// existed keeps what it yields itself (no highlight preservation). `None`
+/// when sync is off.
+pub fn proxy_as_shot(proxy_bytes: &[u8]) -> Option<crate::decode::as_shot::AsShot> {
+    #[cfg(feature = "sync")]
+    {
+        Some(imp::proxy_as_shot(proxy_bytes))
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = proxy_bytes;
+        None
+    }
+}
+
 /// The grid thumbnails for the cloud stub at `image_path`, surfaced into the
 /// webview thumbnail cache under the exact key the generator looks up
 /// (§3.5 thumb seeding): `Some((small, medium))` cache paths when the
@@ -239,7 +336,7 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use crate::image_processing::ImageMetadata;
+    use crate::metadata::sidecar::ImageMetadata;
     use crate::sync::{WriteOrigin, global_manager};
 
     /// The §3.3 exit-flush budget: bounded so the process never stalls on
@@ -255,6 +352,48 @@ mod imp {
         if let Some(mgr) = global_manager() {
             mgr.note_local_sidecar(sidecar_path, origin);
         }
+    }
+
+    pub fn sync_configured() -> bool {
+        global_manager().is_some_and(|m| m.is_configured())
+    }
+
+    pub fn write_sidecar_bytes(
+        sidecar_path: &Path,
+        bytes: &[u8],
+        write: impl FnOnce(&[u8]) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let changed = match std::fs::read(sidecar_path) {
+            Ok(prior) if !prior.is_empty() => match (
+                rrcloud_core::semhash::sem_hash(&prior),
+                rrcloud_core::semhash::sem_hash(bytes),
+            ) {
+                (Ok(prior_sem), Ok(new_sem)) => prior_sem != new_sem,
+                _ => true,
+            },
+            _ => true,
+        };
+        write(bytes)?;
+        if changed && let Some(mgr) = global_manager() {
+            // `origin` is reserved for §2.6 per-field provenance; the intake
+            // keys purely on the semantic hash of the bytes now on disk.
+            mgr.note_local_sidecar(sidecar_path, WriteOrigin::User);
+        }
+        Ok(())
+    }
+
+    pub fn corrupt_sidecar_quarantined(sidecar_path: &Path) -> std::io::Result<()> {
+        let Some(mgr) = global_manager().filter(|m| m.is_configured()) else {
+            return Ok(());
+        };
+        mgr.emit_error(
+            Some(sidecar_path.to_string_lossy().as_ref()),
+            "sidecar restored — please retry",
+        );
+        Err(std::io::Error::other(format!(
+            "corrupt sidecar quarantined, write aborted: {}",
+            sidecar_path.display()
+        )))
     }
 
     pub fn notify_new_original(path: &Path) {
@@ -320,6 +459,33 @@ mod imp {
         global_manager().and_then(|mgr| mgr.proxy_handle(path))
     }
 
+    pub fn stub_as_shot(path: &Path) -> Option<crate::decode::as_shot::AsShot> {
+        // §4.4: a stub has no readable original, so its as-shot inputs come
+        // from its smart preview. No proxy (editing it hydrates first): the
+        // reference, which is what upstream yields for an unreadable raw.
+        if !is_stub(path) {
+            return None;
+        }
+        let proxy_bytes = proxy_handle(path).and_then(|h| std::fs::read(&h.dng_path).ok());
+        Some(match proxy_bytes {
+            Some(bytes) => proxy_as_shot(&bytes),
+            None => crate::decode::as_shot::AsShot::reference(),
+        })
+    }
+
+    pub fn proxy_as_shot(proxy_bytes: &[u8]) -> crate::decode::as_shot::AsShot {
+        let mut as_shot = crate::decode::raw_processing::read_as_shot(proxy_bytes)
+            .unwrap_or_else(crate::decode::as_shot::AsShot::reference);
+        if let Some(e) = rrcloud_core::proxy::read_as_shot_exposure(proxy_bytes) {
+            as_shot.exposure = crate::decode::baseline_exposure::RawExposure {
+                scene_referred: e.scene_referred,
+                dng_baseline: e.dng_baseline,
+                highlight_preservation: e.highlight_preservation,
+            };
+        }
+        as_shot
+    }
+
     pub fn stub_thumbnails(
         image_path: &Path,
         cache_thumbnails_dir: &Path,
@@ -372,7 +538,7 @@ mod imp {
         {
             if let Some(mgr) = global_manager()
                 && mgr.dirty_count() > 0
-                && let Err(e) = crate::android_integration::android_enqueue_expedited_sync()
+                && let Err(e) = crate::platform::android::android_enqueue_expedited_sync()
             {
                 log::warn!("exit flush: could not enqueue expedited Android sync: {e}");
             }

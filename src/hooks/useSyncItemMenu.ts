@@ -1,6 +1,6 @@
 import { useCallback } from 'react';
 import { CloudDownload, HardDriveDownload, Pin, PinOff } from 'lucide-react';
-import { Option } from '../components/ui/AppProperties';
+import { Option } from '../types/ui';
 import { useSyncStore } from '../store/useSyncStore';
 import { useSyncActions } from './useSyncActions';
 

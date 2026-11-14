@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
 
 use crate::AppState;
-use crate::app_settings::SyncSettings;
+use crate::app::settings::SyncSettings;
 
 use super::commands::{configure_core, credential_store, set_credentials_core};
 
@@ -381,11 +381,11 @@ pub async fn sync_pair_complete(
         doc.credentials.secret_access_key,
     )?;
 
-    let mut app_settings = crate::app_settings::load_settings(app.clone())?;
+    let mut app_settings = crate::app::settings::load_settings(app.clone())?;
     // Device-local fields survive pairing (see merge_cloud_sync's doc).
     let applied_sync = merge_cloud_sync(&app_settings.sync, &doc.sync);
     app_settings.sync = applied_sync.clone();
-    crate::app_settings::save_settings(app_settings.clone(), app.clone())?;
+    crate::app::settings::save_settings(app_settings.clone(), app.clone())?;
 
     // Reconfigure now if a library is open; otherwise the saved settings +
     // credentials engage on the next library open (expected on first run).

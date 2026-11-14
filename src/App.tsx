@@ -29,6 +29,7 @@ import { PANEL_ICONS } from './components/panel/PanelSwitcher';
 import Controls from './components/panel/right/ControlsPanel';
 import MetadataPanel from './components/panel/right/MetadataPanel';
 import CropPanel from './components/panel/right/CropPanel';
+import AdjustmentSliderResetProvider from './components/adjustments/AdjustmentSliderResetProvider';
 import MasksPanel from './components/panel/right/MasksPanel';
 import AIPanel from './components/panel/right/AIPanel';
 import PresetsPanel from './components/panel/right/PresetsPanel';
@@ -39,10 +40,15 @@ import LibraryView from './components/views/LibraryView';
 
 import { ContextMenuProvider } from './context/ContextMenuContext';
 import { useSettingsStore } from './store/useSettingsStore';
-import { DEFAULT_BOTTOM_PANEL_HEIGHT, DEFAULT_PANEL_WIDTH, useUIStore } from './store/useUIStore';
+import {
+  DEFAULT_BOTTOM_PANEL_HEIGHT,
+  DEFAULT_PANEL_WIDTH,
+  getReopenedPanelWidth,
+  useUIStore,
+} from './store/useUIStore';
 import { useLibraryStore } from './store/useLibraryStore';
-import { useEditorStore } from './store/useEditorStore';
-import { useProcessStore } from './store/useProcessStore';
+import { canvasToolState, useEditorStore } from './store/useEditorStore';
+import { JobKind, useProcessStore } from './store/useProcessStore';
 import { useShallow } from 'zustand/react/shallow';
 
 import { useThumbnails } from './hooks/useThumbnails';
@@ -50,13 +56,15 @@ import { ImageDimensions } from './hooks/useImageRenderSize';
 import { useKeyboardShortcuts } from './hooks/useKeyboardShortcuts';
 import { useTauriListeners } from './hooks/useTauriListeners';
 import { useSyncDriver } from './hooks/useSyncDriver';
-import { useFileOperations } from './hooks/useFileOperations';
+
+import { transferFiles, useFileOperations } from './hooks/useFileOperations';
 import { useAppContextMenus } from './hooks/useAppContextMenus';
 import { useSortedLibrary } from './hooks/useSortedLibrary';
+import { useImagePreloader } from './hooks/useImagePreloader';
 import { useAppNavigation } from './hooks/useAppNavigation';
 import { useExternalEditSession } from './hooks/useExternalEditSession';
-import ExternalEditBar from './components/ui/ExternalEditBar';
-import { Status } from './components/ui/ExportImportProperties';
+import ExternalEditBar from './components/panel/ExternalEditBar';
+import { Status } from './types/export';
 
 import { useEditorActions } from './hooks/useEditorActions';
 import { useLibraryActions } from './hooks/useLibraryActions';
@@ -66,19 +74,17 @@ import { useAppInitialization } from './hooks/useAppInitialization';
 import { useAndroidBackHandler } from './hooks/useAndroidBackHandler';
 import './i18n';
 
-import {
-  Invokes,
-  ImageFile,
-  LibraryViewMode,
-  Panel,
-  PanelRegion,
-  Theme,
-  ThumbnailSize,
-  ThumbnailAspectRatio,
-} from './components/ui/AppProperties';
+import { Invokes } from './types/invokes';
+import { ImageFile } from './types/library';
+import { LibraryViewMode, Theme, ThumbnailSize, ThumbnailAspectRatio } from './types/settings';
+import { Panel, PanelRegion } from './types/ui';
 
 import ImageProcessingManager from './components/managers/ImageProcessingManager';
 import ImageLoaderManager from './components/managers/ImageLoaderManager';
+import { isImmichAlbumId } from './utils/immichApi';
+import { useImmichEvents } from './hooks/useImmichEvents';
+
+const DND_MEASURING = { droppable: { strategy: MeasuringStrategy.Always } };
 
 const insertChildrenIntoTree = (node: any, targetPath: string, newChildren: any[]): any => {
   if (!node) return null;
@@ -201,16 +207,15 @@ function App() {
     })),
   );
 
-  const { selectedImage, activeMaskContainerId, activeAiPatchContainerId, hasRenderedFirstFrame, setEditor } =
-    useEditorStore(
-      useShallow((state) => ({
-        selectedImage: state.selectedImage,
-        activeMaskContainerId: state.activeMaskContainerId,
-        activeAiPatchContainerId: state.activeAiPatchContainerId,
-        hasRenderedFirstFrame: state.hasRenderedFirstFrame,
-        setEditor: state.setEditor,
-      })),
-    );
+  const { selectedImage, activeMaskContainerId, activeAiPatchContainerId, wgpuPhase, setEditor } = useEditorStore(
+    useShallow((state) => ({
+      selectedImage: state.selectedImage,
+      activeMaskContainerId: state.activeMaskContainerId,
+      activeAiPatchContainerId: state.activeAiPatchContainerId,
+      wgpuPhase: state.wgpuPhase,
+      setEditor: state.setEditor,
+    })),
+  );
 
   const { exportState, setExportState } = useProcessStore(
     useShallow((state) => ({
@@ -351,6 +356,7 @@ function App() {
     handleSelectSubfolder,
     handleSelectAlbum,
     handleOpenFolder,
+    handleOpenContainingFolder,
     handleNavBack,
     handleNavForward,
     handleContinueSession,
@@ -363,7 +369,7 @@ function App() {
     externalEditSession,
     isFinishing: isExternalEditFinishing,
     finishExternalEdit,
-  } = useExternalEditSession(handleImageSelect);
+  } = useExternalEditSession(handleImageSelect, handleOpenContainingFolder);
 
   const {
     handleRate,
@@ -384,6 +390,7 @@ function App() {
   }, [handleImageSelect]);
 
   const { displayList: sortedImageList, badges: groupBadgeInfo } = useSortedLibrary();
+  useImagePreloader(sortedImageList);
 
   const handleLibraryRefresh = useCallback(async () => {
     if (currentFolderPath) {
@@ -402,6 +409,8 @@ function App() {
           };
           const album = findObj(albumTree);
           if (album) await handleSelectAlbum(album.id, album.name, album.images, true);
+          else if (isImmichAlbumId(activeAlbumId))
+            await handleSelectAlbum(activeAlbumId, currentFolderPath.slice('Album: '.length), [], true);
         }
       } else {
         await handleSelectSubfolder(currentFolderPath, false, undefined, false, true);
@@ -433,9 +442,6 @@ function App() {
     handleSavePanorama,
     handleStartHdr,
     handleSaveHdr,
-    handleApplyDenoise,
-    handleBatchDenoise,
-    handleSaveDenoisedImage,
     handleSaveCollage,
     handleStartFocusStack,
     handleSaveFocusStack,
@@ -460,11 +466,14 @@ function App() {
     handleTogglePinFolder,
   });
 
+  useImmichEvents(handleLibraryRefresh);
+
   useTauriListeners({
     refreshAllFolderTrees,
     handleSelectSubfolder,
     refreshImageList: handleLibraryRefresh,
     markGenerated,
+    prevAdjustmentsRef,
   });
 
   useAndroidBackHandler();
@@ -528,8 +537,7 @@ function App() {
 
   useEffect(() => {
     setEditor({
-      isWbPickerActive: false,
-      isRelightPickerActive: false,
+      ...canvasToolState(),
       isStraightenActive: false,
       isGuidedPerspectiveActive: false,
       activeMaskId: null,
@@ -747,11 +755,19 @@ function App() {
             />
           );
         case Panel.Adjustments:
-          return <Controls />;
+          return (
+            <AdjustmentSliderResetProvider>
+              <Controls />
+            </AdjustmentSliderResetProvider>
+          );
         case Panel.Metadata:
           return <MetadataPanel />;
         case Panel.Crop:
-          return <CropPanel />;
+          return (
+            <AdjustmentSliderResetProvider>
+              <CropPanel />
+            </AdjustmentSliderResetProvider>
+          );
         case Panel.Masks:
           return <MasksPanel />;
         case Panel.Ai:
@@ -791,10 +807,7 @@ function App() {
 
   const shouldHideFolderTree = useCompactPanels || useWidePanels;
   const isWgpuActive =
-    activeView === 'editor' &&
-    appSettings?.useWgpuRenderer !== false &&
-    selectedImage?.isReady &&
-    hasRenderedFirstFrame;
+    activeView === 'editor' && appSettings?.useWgpuRenderer !== false && !!selectedImage && wgpuPhase === 'live';
   const useMacWindowShell = osPlatform === 'macos' && !appSettings?.decorations && !isWindowFullScreen && !isFullScreen;
 
   const layoutSensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
@@ -809,6 +822,20 @@ function App() {
     }
   };
 
+  const openHiddenSide = (region: PanelRegion) => {
+    if (region.startsWith('left') && !uiVisibility.leftPanel) {
+      setUI((state) => ({
+        uiVisibility: { ...state.uiVisibility, leftPanel: true },
+        leftPanelWidth: getReopenedPanelWidth(state.leftPanelWidth),
+      }));
+    } else if (region.startsWith('right') && !uiVisibility.rightPanel) {
+      setUI((state) => ({
+        uiVisibility: { ...state.uiVisibility, rightPanel: true },
+        rightPanelWidth: getReopenedPanelWidth(state.rightPanelWidth),
+      }));
+    }
+  };
+
   const handleDragEnd = (e: any) => {
     setLayoutDragItem(null);
     setActiveImageDragItem(null);
@@ -818,11 +845,15 @@ function App() {
       movePanel(active.data.current.panel as Panel, over.data.current.region as PanelRegion);
     }
 
+    if (appSettings?.hideCollapsedPanels && active.data.current?.type === 'layout-tab' && over?.data.current?.region) {
+      openHiddenSide(over.data.current.region as PanelRegion);
+    }
+
     if (active.data.current?.type === 'library-image' && over?.data.current?.type === 'folder') {
       const targetFolder = over.data.current.path;
       const sourcePaths = activeImageDragItem?.paths || [active.data.current.path];
 
-      invoke(Invokes.MoveFiles, { sourcePaths, destinationFolder: targetFolder })
+      transferFiles(JobKind.Move, sourcePaths, targetFolder)
         .then(() => {
           refreshAllFolderTrees();
           handleLibraryRefresh();
@@ -850,8 +881,11 @@ function App() {
   };
 
   const ActiveOverlayIcon = activeLayoutDragItem ? PANEL_ICONS[activeLayoutDragItem] : null;
-  const effectiveLeftWidth = uiVisibility.leftPanel ? leftPanelWidth : 48;
-  const effectiveRightWidth = uiVisibility.rightPanel ? rightPanelWidth : useWidePanels ? 58 : 48;
+  const shouldHideCollapsedPanels = appSettings?.hideCollapsedPanels && !activeLayoutDragItem;
+  const collapsedLeftWidth = shouldHideCollapsedPanels ? 0 : 48;
+  const collapsedRightWidth = shouldHideCollapsedPanels ? 0 : useWidePanels ? 58 : 48;
+  const effectiveLeftWidth = uiVisibility.leftPanel ? leftPanelWidth : collapsedLeftWidth;
+  const effectiveRightWidth = uiVisibility.rightPanel ? rightPanelWidth : collapsedRightWidth;
 
   return (
     <>
@@ -893,11 +927,7 @@ function App() {
             onDragStart={handleDragStart}
             onDragEnd={handleDragEnd}
             collisionDetection={pointerWithin}
-            measuring={{
-              droppable: {
-                strategy: MeasuringStrategy.Always,
-              },
-            }}
+            measuring={DND_MEASURING}
           >
             <div className="flex flex-row grow h-full min-h-0">
               {!shouldHideFolderTree && hasMainContent && (
@@ -981,6 +1011,7 @@ function App() {
                     handleContinueSession={handleContinueSession}
                     handleGoHome={handleGoHome}
                     handleOpenFolder={handleOpenFolder}
+                    handleNavigateToFolder={(path) => handleSelectSubfolder(path, false, undefined, true)}
                     handleImportClick={handleImportClick}
                     handleLibraryRefresh={handleLibraryRefresh}
                     handleCopyAdjustments={handleCopyAdjustments}
@@ -1035,10 +1066,6 @@ function App() {
           handleSaveFocusStack={handleSaveFocusStack}
           handleSaveHdr={handleSaveHdr}
           handleStartHdr={handleStartHdr}
-          refreshImageList={handleLibraryRefresh}
-          handleApplyDenoise={handleApplyDenoise}
-          handleBatchDenoise={handleBatchDenoise}
-          handleSaveDenoisedImage={handleSaveDenoisedImage}
           handleCreateFolder={handleCreateFolder}
           handleRenameFolder={handleRenameFolder}
           handleSaveRename={handleSaveRename}

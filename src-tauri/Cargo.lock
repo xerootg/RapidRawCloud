@@ -6,13 +6,15 @@ version = 4
 name = "RapidRAW"
 version = "0.0.0"
 dependencies = [
+ "android-native-keyring-store",
  "anyhow",
+ "apple-native-keyring-store",
  "base64 0.23.1",
  "blake3",
  "bytemuck",
  "bytes",
  "chrono",
- "dashmap",
+ "crc32fast",
  "fern",
  "filetime",
  "futures",
@@ -33,11 +35,14 @@ dependencies = [
  "jxl-encoder",
  "jxl-oxide",
  "kamadak-exif",
+ "keyring-core",
  "libc",
  "little_exif",
  "log",
+ "lsdetect",
  "memmap2",
  "mimalloc",
+ "moxcms",
  "mozjpeg-rs",
  "nalgebra",
  "ndarray",
@@ -50,10 +55,11 @@ dependencies = [
  "objc2-foundation",
  "once_cell",
  "ort",
+ "png 0.18.1",
  "pollster",
  "quick-xml 0.41.0",
  "rand 0.10.2",
- "rawler 0.7.1 (git+https://github.com/CyberTimon/RapidRAW-DngLab.git?rev=a32bc1ff1f4f3c56d4d3226082f6eb17414f9159)",
+ "rawler",
  "rayon",
  "regex",
  "reqwest 0.13.4",
@@ -79,14 +85,21 @@ dependencies = [
  "tauri-plugin-store",
  "tauri-plugin-wayland-nvidia-quirk",
  "tempfile",
+ "tiff",
  "tokenizers",
  "tokio",
  "trash",
  "uuid",
  "walkdir",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-protocols",
  "webkit2gtk",
  "webp",
  "wgpu",
+ "windows 0.62.2",
+ "windows-native-keyring-store",
+ "zbus-secret-service-keyring-store",
 ]
 
 [[package]]
@@ -125,6 +138,17 @@ name = "adler32"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aae1277d39aeec15cb388266ecc24b11c80469deae6067e17a1a7aa9e5c1f234"
+
+[[package]]
+name = "aes"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35f0f96ce78e38c3dc6d8948aa8163d06385be74000f3c7a95bf1eef35d3ea32"
+dependencies = [
+ "cipher",
+ "cpubits",
+ "cpufeatures 0.3.0",
+]
 
 [[package]]
 name = "ahash"
@@ -204,6 +228,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "android-native-keyring-store"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48c6349ddff23194f8fdce2ea8849380f5a4868c1648965b70e801e104cba9b3"
+dependencies = [
+ "base64 0.22.1",
+ "jni 0.21.1",
+ "keyring-core",
+ "log",
+ "ndk-context",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -217,6 +259,17 @@ name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
+name = "apple-native-keyring-store"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b350bfd03649e07aa05c0a81b3e15934374e585c98204a57e20b9d49f49bb9a"
+dependencies = [
+ "keyring-core",
+ "log",
+ "security-framework",
+]
 
 [[package]]
 name = "approx"
@@ -679,6 +732,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "block-padding"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "710f1dd022ef4e93f8a438b4ba958de7f64308434fa6a87104481645cc30068b"
+dependencies = [
+ "hybrid-array",
+]
+
+[[package]]
 name = "block2"
 version = "0.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -895,6 +957,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cbc"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce2dc9ee5f88d11e0beb842c88b33c8a5cf0d1329c4b19494af42b07dbfe8896"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "cc"
 version = "1.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -980,6 +1051,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cipher"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e8cf2a2c93cd704877c0858356ed03480ff301ee950b43f1cbe4573b088bfa6c"
+dependencies = [
+ "crypto-common 0.2.2",
+ "inout",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1020,6 +1101,12 @@ checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
 dependencies = [
  "cc",
 ]
+
+[[package]]
+name = "cmov"
+version = "0.5.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 
 [[package]]
 name = "codespan-reporting"
@@ -1184,6 +1271,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpubits"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15b85f9c39137c3a891689859392b1bd49812121d0d61c9caf00d46ed5ce06ae"
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1314,6 +1407,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "914a755b7c2d4af2bdcff7ce1739e2db9a1b81a9b07123d8015786ae03c0980d"
 
 [[package]]
+name = "ctutils"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d5515a3834141de9eafb9717ad39eea8247b5674e6066c404e8c4b365d2a29e"
+dependencies = [
+ "cmov",
+]
+
+[[package]]
 name = "daachorse"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1395,20 +1497,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b1e3a325bc115f096c8b77bbf027a7c2592230e70be2d985be950d3d5e60ebe"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "dashmap"
-version = "6.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
-dependencies = [
- "cfg-if",
- "crossbeam-utils",
- "hashbrown 0.14.5",
- "lock_api",
- "once_cell",
- "parking_lot_core",
 ]
 
 [[package]]
@@ -1550,6 +1638,7 @@ dependencies = [
  "block-buffer 0.12.1",
  "const-oid",
  "crypto-common 0.2.2",
+ "ctutils",
 ]
 
 [[package]]
@@ -1660,6 +1749,12 @@ dependencies = [
  "selectors",
  "tendril",
 ]
+
+[[package]]
+name = "downcast-rs"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "dpi"
@@ -2649,12 +2744,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "hkdf"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
+dependencies = [
+ "hmac 0.13.0",
+]
+
+[[package]]
 name = "hmac"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6c49c37c09c17a53d937dfbb742eb3a961d65a994e6bcdcf37e7399d0cc8ab5e"
 dependencies = [
  "digest 0.10.7",
+]
+
+[[package]]
+name = "hmac"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6303bc9732ae41b04cb554b844a762b4115a61bfaa81e3e83050991eeb56863f"
+dependencies = [
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -3077,6 +3190,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f4200d433cbd5178df7797c9c2e75b348b728e39631cf14520d1e2fc424201f4"
 dependencies = [
  "cfb",
+]
+
+[[package]]
+name = "inout"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
+dependencies = [
+ "block-padding",
+ "hybrid-array",
 ]
 
 [[package]]
@@ -3561,6 +3684,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "keyring-core"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fb1e621458ca9c51aa110bd0339d4751a056b9576bf1253aee1aa560dda0fc9d"
+dependencies = [
+ "log",
+]
+
+[[package]]
 name = "khronos-egl"
 version = "6.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3789,6 +3921,15 @@ name = "lru-slab"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "112b39cec0b298b6c1999fee3e31427f74f676e4cb9879ed1a121b43661a4154"
+
+[[package]]
+name = "lsdetect"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "042f46bce4d9622bb7243bb1d18cac317d1df7891d5f648b96590aed3d773e6f"
+dependencies = [
+ "rayon",
+]
 
 [[package]]
 name = "macro_rules_attribute"
@@ -4333,7 +4474,7 @@ version = "0.7.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "680998035259dcfcafe653688bf2aa6d3e2dc05e98be6ab46afb089dc84f1df8"
 dependencies = [
- "proc-macro-crate 3.5.0",
+ "proc-macro-crate 2.0.2",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
@@ -5482,40 +5623,7 @@ dependencies = [
 [[package]]
 name = "rawler"
 version = "0.7.1"
-source = "git+https://github.com/CyberTimon/RapidRAW-DngLab.git?rev=934af4b213a12b95f77d69529627067056066294#934af4b213a12b95f77d69529627067056066294"
-dependencies = [
- "backtrace",
- "bitstream-io",
- "byteorder",
- "chrono",
- "enumn",
- "glob",
- "hex",
- "image",
- "itertools 0.14.0",
- "jxl-oxide",
- "lazy_static",
- "libflate",
- "log",
- "md5",
- "memmap2",
- "multiversion",
- "num",
- "num_enum",
- "rayon",
- "rustc_version",
- "serde",
- "thiserror 2.0.20",
- "toml 0.8.2",
- "uuid",
- "weezl",
- "zerocopy",
-]
-
-[[package]]
-name = "rawler"
-version = "0.7.1"
-source = "git+https://github.com/CyberTimon/RapidRAW-DngLab.git?rev=a32bc1ff1f4f3c56d4d3226082f6eb17414f9159#a32bc1ff1f4f3c56d4d3226082f6eb17414f9159"
+source = "git+https://github.com/CyberTimon/RapidRAW-DngLab.git?rev=b1d102af3e5543c9582e99718c7ae57d564ec176#b1d102af3e5543c9582e99718c7ae57d564ec176"
 dependencies = [
  "backtrace",
  "bitstream-io",
@@ -5826,7 +5934,7 @@ dependencies = [
  "flate2",
  "futures",
  "hex",
- "hmac",
+ "hmac 0.12.1",
  "image",
  "jni 0.21.1",
  "jni 0.22.4",
@@ -5835,7 +5943,7 @@ dependencies = [
  "ndk-context",
  "percent-encoding",
  "quick-xml 0.41.0",
- "rawler 0.7.1 (git+https://github.com/CyberTimon/RapidRAW-DngLab.git?rev=934af4b213a12b95f77d69529627067056066294)",
+ "rawler",
  "rayon",
  "redb",
  "reqwest 0.13.4",
@@ -5976,9 +6084,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-platform-verifier"
-version = "0.7.0"
+version = "0.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26d1e2536ce4f35f4846aa13bff16bd0ff40157cdb14cc056c7b14ba41233ba0"
+checksum = "1167586491e2b18b8bfbb293e8180ec17c201c4f076d7cb3070ca964e7598f98"
 dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
@@ -5997,9 +6105,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-platform-verifier-android"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
+checksum = "eec689c0bc40ff2458a5977b6619cb718087084a18e02a131c599b62d05e1a5f"
 
 [[package]]
 name = "rustls-webpki"
@@ -6110,10 +6218,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "secret-service"
+version = "5.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5107b24b91445dd2aa449a258a1807b63240942157292354dc5bfdbeb8bc6db8"
+dependencies = [
+ "aes",
+ "cbc",
+ "futures-util",
+ "getrandom 0.4.3",
+ "hkdf",
+ "hybrid-array",
+ "num",
+ "once_cell",
+ "serde",
+ "sha2 0.11.0",
+ "zbus",
+]
 
 [[package]]
 name = "security-framework"
@@ -7475,6 +7608,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -8134,6 +8268,55 @@ dependencies = [
 ]
 
 [[package]]
+name = "wayland-backend"
+version = "0.3.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38a91b4eaddff87b1cd1074985e3713da4af2c49742d1b356b2c01670a67a078"
+dependencies = [
+ "cc",
+ "downcast-rs",
+ "rustix",
+ "scoped-tls",
+ "smallvec 1.15.2",
+ "wayland-sys",
+]
+
+[[package]]
+name = "wayland-client"
+version = "0.31.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e3c36a0f861ad76d0901f2800b46321410d9f73f2ea88aac0650d86c32688073"
+dependencies = [
+ "bitflags 2.13.1",
+ "rustix",
+ "wayland-backend",
+ "wayland-scanner",
+]
+
+[[package]]
+name = "wayland-protocols"
+version = "0.32.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23d0c813de3daa2ed6520af85a3bd49b0e722a3078506899aa9686fea58dc4b6"
+dependencies = [
+ "bitflags 2.13.1",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-scanner",
+]
+
+[[package]]
+name = "wayland-scanner"
+version = "0.31.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "338e30461b3a2b67d70eb30a6d89f8e0c93a833e07d2ae89085cd070c4a00ac0"
+dependencies = [
+ "proc-macro2",
+ "quick-xml 0.41.0",
+ "quote",
+]
+
+[[package]]
 name = "wayland-sys"
 version = "0.31.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8644,6 +8827,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 
 [[package]]
+name = "windows-native-keyring-store"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "063426e76fdec7438d56bb777f67e318a84a25c707b07e575cb8b78e10c028f8"
+dependencies = [
+ "byteorder",
+ "keyring-core",
+ "regex",
+ "windows-sys 0.61.2",
+ "zeroize",
+]
+
+[[package]]
 name = "windows-numerics"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9115,6 +9311,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_repr",
+ "tokio",
  "tracing",
  "uds_windows",
  "uuid",
@@ -9123,6 +9320,17 @@ dependencies = [
  "zbus_macros",
  "zbus_names",
  "zvariant",
+]
+
+[[package]]
+name = "zbus-secret-service-keyring-store"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "74801d001b9e7729adb4f1825b67b398185fed424749aa3d8bacf70417137d9a"
+dependencies = [
+ "keyring-core",
+ "secret-service",
+ "zbus",
 ]
 
 [[package]]

@@ -2,25 +2,37 @@ import { useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import debounce from 'lodash.debounce';
 import { toast } from 'react-toastify';
-import { useEditorStore } from '../store/useEditorStore';
+import { useTranslation } from 'react-i18next';
+import { TFunction } from 'i18next';
+import { SignalHigh, SignalLow, SignalMedium } from 'lucide-react';
+import { useEditorStore, debouncedSetHistory } from '../store/useEditorStore';
 import { useLibraryStore } from '../store/useLibraryStore';
 import { useSettingsStore } from '../store/useSettingsStore';
+import { adjustmentsFromMetadata, getDefaultAdjustmentsFor } from '../utils/developDefaults';
 import { useProcessStore } from '../store/useProcessStore';
+import { useUIStore } from '../store/useUIStore';
 import {
   Adjustments,
+  AutoAdjustMode,
+  CROP_GEOMETRY_KEYS,
   INITIAL_ADJUSTMENTS,
   COPYABLE_ADJUSTMENT_KEYS,
   PasteMode,
-  LensAdjustment,
+  getActiveTools,
+  mergeActiveTools,
   normalizeLoadedAdjustments,
+  setToolActive,
 } from '../utils/adjustments';
-import { calculateCenteredCrop } from '../utils/cropUtils';
-import { Invokes } from '../components/ui/AppProperties';
+import { calculateAutoCropForRotation, calculateCenteredCrop } from '../utils/cropUtils';
+import originalAdjustmentKeys from '../utils/originalAdjustmentKeys.json';
+import { CompareMode } from '../types/settings';
+import { Invokes } from '../types/invokes';
+import { Option, Panel } from '../types/ui';
+import { SelectedImage } from '../types/editor';
 import { globalImageCache } from '../utils/ImageLRUCache';
+import { getDevicePixelRatio } from '../utils/displayScale';
 
-export const debouncedSetHistory = debounce((newAdj: Adjustments) => {
-  useEditorStore.getState().pushHistory(newAdj);
-}, 500);
+export { debouncedSetHistory };
 
 export const debouncedSave = debounce((path: string, adjustmentsToSave: Adjustments) => {
   invoke(Invokes.SaveMetadataAndUpdateThumbnail, { path, adjustments: adjustmentsToSave }).catch((err) => {
@@ -29,20 +41,130 @@ export const debouncedSave = debounce((path: string, adjustmentsToSave: Adjustme
   });
 }, 300);
 
-export function useEditorActions() {
-  const setEditor = useEditorStore((s) => s.setEditor);
+const AUTO_ADJUST_MODE_ICONS: Record<AutoAdjustMode, any> = {
+  [AutoAdjustMode.Subtle]: SignalLow,
+  [AutoAdjustMode.Normal]: SignalMedium,
+  [AutoAdjustMode.Strong]: SignalHigh,
+};
 
-  const setAdjustments = useCallback(
-    (value: Partial<Adjustments> | ((prev: Adjustments) => Adjustments)) => {
+export const buildAutoAdjustModeOptions = (t: TFunction, onSelect: (mode: AutoAdjustMode) => void): Option[] =>
+  Object.values(AutoAdjustMode).map((mode) => ({
+    label: t(`contextMenus.autoAdjustModes.${mode}`),
+    icon: AUTO_ADJUST_MODE_ICONS[mode],
+    onClick: () => onSelect(mode),
+  }));
+
+const waitForImageReady = (path: string) =>
+  new Promise<boolean>((resolve) => {
+    const unsubscribe = useEditorStore.subscribe((state) => {
+      if (state.selectedImage?.path !== path) {
+        unsubscribe();
+        resolve(false);
+      } else if (state.selectedImage.isReady) {
+        unsubscribe();
+        resolve(true);
+      }
+    });
+  });
+
+export const withRotation = (adjustments: Adjustments, image: SelectedImage | null, rotation: number): Adjustments => ({
+  ...adjustments,
+  rotation,
+  crop:
+    image?.width && image?.height
+      ? calculateAutoCropForRotation(
+          image.width,
+          image.height,
+          adjustments.orientationSteps || 0,
+          adjustments.aspectRatio,
+          rotation,
+          adjustments.crop,
+          rotation - (adjustments.rotation || 0),
+        )
+      : adjustments.crop,
+});
+
+const ORIGINAL_PRESERVED_KEYS = [...originalAdjustmentKeys.preserved, ...originalAdjustmentKeys.crop] as Array<
+  keyof Adjustments
+>;
+
+export const getOriginalAdjustments = (adjustments: Adjustments): Adjustments => {
+  const original = { ...INITIAL_ADJUSTMENTS };
+  ORIGINAL_PRESERVED_KEYS.forEach((key) => {
+    (original as any)[key] = adjustments[key];
+  });
+  return original;
+};
+
+const getCompareState = (mode: CompareMode, adjustments: Adjustments) =>
+  mode === 'toggle'
+    ? { showOriginal: true, previewOverride: getOriginalAdjustments(adjustments), compareView: 'off' as const }
+    : { showOriginal: false, previewOverride: null, compareView: mode };
+
+export const reloadAdjustmentsForPaths = async (paths: string[]) => {
+  const { selectedImage, setEditor, resetHistory } = useEditorStore.getState();
+  const { libraryActivePath, setLibrary } = useLibraryStore.getState();
+  if (selectedImage && paths.includes(selectedImage.path)) {
+    const meta: any = await invoke(Invokes.LoadMetadata, { path: selectedImage.path });
+    if (meta.adjustments && !meta.adjustments.is_null) {
+      const normalized = normalizeLoadedAdjustments(meta.adjustments);
+      setEditor({ adjustments: normalized });
+      resetHistory(normalized);
+    }
+  }
+  if (libraryActivePath && paths.includes(libraryActivePath)) {
+    const meta: any = await invoke(Invokes.LoadMetadata, { path: libraryActivePath });
+    if (meta.adjustments && !meta.adjustments.is_null) {
+      setLibrary({ libraryActiveAdjustments: normalizeLoadedAdjustments(meta.adjustments) });
+    }
+  }
+};
+
+export const applyCrop = () => {
+  useEditorStore.getState().setEditor({ isStraightenActive: false, liveRotation: null });
+  useUIStore.getState().setPanel(Panel.Adjustments);
+};
+
+export const cancelCrop = () => {
+  const { cropSessionSnapshot, selectedImage, adjustments, setEditor } = useEditorStore.getState();
+  applyCrop();
+  if (cropSessionSnapshot && cropSessionSnapshot.path === (selectedImage?.path ?? null)) {
+    const { geometry } = cropSessionSnapshot;
+    const hasChanged = CROP_GEOMETRY_KEYS.some(
+      (key) => JSON.stringify(adjustments[key]) !== JSON.stringify(geometry[key]),
+    );
+    if (hasChanged) {
       setEditor((state) => {
-        const prev = state.adjustments;
-        const newAdjustments = typeof value === 'function' ? value(prev) : { ...prev, ...value };
+        const newAdjustments = { ...state.adjustments, ...geometry };
         debouncedSetHistory(newAdjustments);
         return {
           adjustments: newAdjustments,
           ...(state.showOriginal ? { showOriginal: false, previewOverride: null } : {}),
         };
       });
+    }
+  }
+};
+
+export function useEditorActions() {
+  const { t } = useTranslation();
+  const setEditor = useEditorStore((s) => s.setEditor);
+
+  const setAdjustments = useCallback(
+    (value: Partial<Adjustments> | ((prev: Adjustments) => Adjustments), label?: string) => {
+      // A labelled action gets its own history step instead of merging with pending slider edits.
+      if (label) debouncedSetHistory.flush();
+      setEditor((state) => {
+        const prev = state.adjustments;
+        const newAdjustments = typeof value === 'function' ? value(prev) : { ...prev, ...value };
+        if (newAdjustments === prev) return state;
+        debouncedSetHistory(newAdjustments, label);
+        return {
+          adjustments: newAdjustments,
+          ...(state.showOriginal ? { showOriginal: false, previewOverride: null } : {}),
+        };
+      });
+      if (label) debouncedSetHistory.flush();
     },
     [setEditor],
   );
@@ -51,8 +173,7 @@ export function useEditorActions() {
     (degrees: number) => {
       const { selectedImage, adjustments } = useEditorStore.getState();
       const increment = degrees > 0 ? 1 : 3;
-      const newAspectRatio =
-        adjustments.aspectRatio && adjustments.aspectRatio !== 0 ? 1 / adjustments.aspectRatio : null;
+      const newAspectRatio = adjustments.aspectRatio ? 1 / adjustments.aspectRatio : adjustments.aspectRatio;
       const newOrientationSteps = ((adjustments.orientationSteps || 0) + increment) % 4;
       const newCrop =
         selectedImage?.width && selectedImage?.height
@@ -70,63 +191,71 @@ export function useEditorActions() {
     [setAdjustments],
   );
 
-  const handleAutoAdjustments = useCallback(async () => {
-    const selectedImage = useEditorStore.getState().selectedImage;
-    if (!selectedImage?.isReady) return;
-    try {
-      const autoAdjustments: Adjustments = await invoke(Invokes.CalculateAutoAdjustments);
-      setAdjustments((prev: Adjustments) => ({
-        ...prev,
-        ...autoAdjustments,
-        sectionVisibility: { ...prev.sectionVisibility, ...autoAdjustments.sectionVisibility },
-      }));
-    } catch (err) {
-      toast.error(`Failed to apply auto adjustments: ${err}`);
-    }
-  }, [setAdjustments]);
-
-  const toggleShowOriginal = useCallback(() => {
-    setEditor((state) => {
-      const isShowing = !state.showOriginal;
-
-      if (isShowing) {
-        const override = { ...INITIAL_ADJUSTMENTS };
-        const geometryKeys: Array<keyof Adjustments> = [
-          'crop',
-          'rotation',
-          'flipHorizontal',
-          'flipVertical',
-          'orientationSteps',
-          'aspectRatio',
-          'transformDistortion',
-          'transformVertical',
-          'transformHorizontal',
-          'transformRotate',
-          'transformAspect',
-          'transformScale',
-          'transformXOffset',
-          'transformYOffset',
-          'lensDistortionAmount',
-          'lensVignetteAmount',
-          'lensTcaAmount',
-          'lensDistortionParams',
-          'lensMaker',
-          'lensModel',
-          'lensDistortionEnabled',
-          'lensTcaEnabled',
-          'lensVignetteEnabled',
-        ];
-
-        geometryKeys.forEach((key) => {
-          (override as any)[key] = state.adjustments[key];
+  const handleAutoAdjustments = useCallback(
+    async (mode: AutoAdjustMode = AutoAdjustMode.Normal) => {
+      const selectedImage = useEditorStore.getState().selectedImage;
+      if (!selectedImage?.isReady) return;
+      try {
+        const autoAdjustments: Adjustments = await invoke(Invokes.CalculateAutoAdjustments, {
+          jsAdjustments: useEditorStore.getState().adjustments,
+          mode,
         });
-
-        return { showOriginal: true, previewOverride: override };
-      } else {
-        return { showOriginal: false, previewOverride: null };
+        setAdjustments(
+          (prev: Adjustments) => ({
+            ...prev,
+            ...autoAdjustments,
+            activeTools: mergeActiveTools(prev, autoAdjustments),
+          }),
+          t('contextMenus.editor.autoAdjust'),
+        );
+      } catch (err) {
+        toast.error(`Failed to apply auto adjustments: ${err}`);
       }
-    });
+    },
+    [setAdjustments, t],
+  );
+
+  const handleAutoStraighten = useCallback(async () => {
+    const { selectedImage, isAutoStraightening } = useEditorStore.getState();
+    if (!selectedImage || isAutoStraightening) return;
+    setEditor({ isAutoStraightening: true });
+    try {
+      if (!selectedImage.isReady && !(await waitForImageReady(selectedImage.path))) return;
+      const rotation: number | null = await invoke(Invokes.CalculateAutoStraighten, {
+        jsAdjustments: useEditorStore.getState().adjustments,
+      });
+      const loadedImage = useEditorStore.getState().selectedImage;
+      if (loadedImage?.path !== selectedImage.path) return;
+      if (rotation === null) {
+        toast.info(t('editor.crop.autoStraightenNoLines'));
+        return;
+      }
+      setEditor({ liveRotation: null, isStraightenActive: false });
+      setAdjustments((prev: Adjustments) => withRotation(prev, loadedImage, rotation));
+    } catch (err) {
+      toast.error(t('editor.crop.autoStraightenFailed', { error: String(err) }));
+    } finally {
+      setEditor({ isAutoStraightening: false });
+    }
+  }, [setAdjustments, setEditor, t]);
+
+  const toggleCompare = useCallback(() => {
+    const mode = useSettingsStore.getState().appSettings?.compareMode ?? 'toggle';
+    setEditor((state) =>
+      state.showOriginal || state.compareView !== 'off'
+        ? { showOriginal: false, previewOverride: null, compareView: 'off' }
+        : getCompareState(mode, state.adjustments),
+    );
   }, [setEditor]);
+
+  const selectCompareMode = useCallback(
+    (mode: CompareMode) => {
+      const { appSettings, handleSettingsChange } = useSettingsStore.getState();
+      if (appSettings) handleSettingsChange({ ...appSettings, compareMode: mode });
+      setEditor((state) => getCompareState(mode, state.adjustments));
+    },
+    [setEditor],
+  );
 
   const handleLutSelect = useCallback(
     async (path: string, isBuiltIn: boolean = false) => {
@@ -144,10 +273,7 @@ export function useEditorActions() {
           lutSize: result.size,
           lutIntensity: 100,
           lutIsSceneReferred: isBuiltIn,
-          sectionVisibility: {
-            ...(prev.sectionVisibility || INITIAL_ADJUSTMENTS.sectionVisibility),
-            effects: true,
-          },
+          activeTools: setToolActive(getActiveTools(prev), 'lut', true),
         }));
       } catch (err) {
         toast.error(`Failed to load LUT: ${err}`);
@@ -176,23 +302,28 @@ export function useEditorActions() {
   );
 
   const handleResetAdjustments = useCallback(
-    (paths?: string[]) => {
-      const { multiSelectedPaths, libraryActivePath, setLibrary } = useLibraryStore.getState();
-      const { selectedImage, resetHistory } = useEditorStore.getState();
+    (paths?: string[], toNeutral = false) => {
+      const { multiSelectedPaths } = useLibraryStore.getState();
       const pathsToReset = paths || multiSelectedPaths;
       if (pathsToReset.length === 0) return;
 
       pathsToReset.forEach((p) => globalImageCache.delete(p));
       debouncedSetHistory.cancel();
 
-      invoke(Invokes.ResetAdjustmentsForPaths, { paths: pathsToReset })
-        .then(() => {
+      const resetTarget = (path: string) =>
+        toNeutral ? Promise.resolve(structuredClone(INITIAL_ADJUSTMENTS)) : getDefaultAdjustmentsFor(path);
+
+      invoke(Invokes.ResetAdjustmentsForPaths, { paths: pathsToReset, toNeutral })
+        .then(async () => {
+          const { libraryActivePath, setLibrary } = useLibraryStore.getState();
+          const { selectedImage, resetHistory } = useEditorStore.getState();
           if (libraryActivePath && pathsToReset.includes(libraryActivePath))
-            setLibrary({ libraryActiveAdjustments: { ...INITIAL_ADJUSTMENTS } });
+            resetTarget(libraryActivePath)
+              .then((adjustments) => setLibrary({ libraryActiveAdjustments: adjustments }))
+              .catch((err) => console.error('Failed to load default adjustments:', err));
           if (selectedImage && pathsToReset.includes(selectedImage.path)) {
-            const aspect =
-              selectedImage.width && selectedImage.height ? selectedImage.width / selectedImage.height : null;
-            const resetData = { ...INITIAL_ADJUSTMENTS, aspectRatio: aspect, aiPatches: [] };
+            const resetData = { ...(await resetTarget(selectedImage.path)), aiPatches: [] };
+            if (useEditorStore.getState().selectedImage?.path !== selectedImage.path) return;
             resetHistory(resetData);
             setEditor({ adjustments: resetData });
           }
@@ -202,44 +333,60 @@ export function useEditorActions() {
     [setEditor],
   );
 
-  const handleAutoLensCorrection = useCallback(
-    (paths?: string[]) => {
-      const { multiSelectedPaths, libraryActivePath, setLibrary } = useLibraryStore.getState();
-      const { selectedImage, resetHistory } = useEditorStore.getState();
+  const handleAutoLensCorrection = useCallback((paths?: string[]) => {
+    const { multiSelectedPaths } = useLibraryStore.getState();
+    const { selectedImage } = useEditorStore.getState();
 
-      const pathsToUpdate =
-        paths && paths.length > 0
-          ? paths
-          : multiSelectedPaths.length > 0
-            ? multiSelectedPaths
-            : selectedImage
-              ? [selectedImage.path]
-              : [];
+    const pathsToUpdate =
+      paths && paths.length > 0
+        ? paths
+        : multiSelectedPaths.length > 0
+          ? multiSelectedPaths
+          : selectedImage
+            ? [selectedImage.path]
+            : [];
 
-      if (pathsToUpdate.length === 0) return;
+    if (pathsToUpdate.length === 0) return;
 
-      pathsToUpdate.forEach((p) => globalImageCache.delete(p));
+    pathsToUpdate.forEach((p) => globalImageCache.delete(p));
 
-      invoke('apply_auto_lens_correction_to_paths', { paths: pathsToUpdate })
-        .then(async () => {
-          if (selectedImage && pathsToUpdate.includes(selectedImage.path)) {
-            const meta: any = await invoke(Invokes.LoadMetadata, { path: selectedImage.path });
-            if (meta.adjustments && !meta.adjustments.is_null) {
-              const normalized = normalizeLoadedAdjustments(meta.adjustments);
-              setEditor({ adjustments: normalized });
-              resetHistory(normalized);
-            }
-          }
-          if (libraryActivePath && pathsToUpdate.includes(libraryActivePath)) {
-            const meta: any = await invoke(Invokes.LoadMetadata, { path: libraryActivePath });
-            if (meta.adjustments && !meta.adjustments.is_null) {
-              setLibrary({ libraryActiveAdjustments: normalizeLoadedAdjustments(meta.adjustments) });
-            }
-          }
-        })
-        .catch((err) => toast.error(`Failed to apply auto lens correction: ${err}`));
+    invoke('apply_auto_lens_correction_to_paths', { paths: pathsToUpdate })
+      .then(() => reloadAdjustmentsForPaths(pathsToUpdate))
+      .catch((err) => toast.error(`Failed to apply auto lens correction: ${err}`));
+  }, []);
+
+  const handleAutoStraightenPaths = useCallback(
+    (paths: string[]) => {
+      const { selectedImage } = useEditorStore.getState();
+      const editingPath = useUIStore.getState().activeView === 'editor' ? selectedImage?.path : undefined;
+      const batchPaths = paths.filter((path) => path !== editingPath);
+      if (batchPaths.length < paths.length) {
+        handleAutoStraighten();
+      }
+      if (batchPaths.length === 0) return;
+      batchPaths.forEach((p) => globalImageCache.delete(p));
+      invoke(Invokes.ApplyAutoStraightenToPaths, { paths: batchPaths })
+        .then(() => reloadAdjustmentsForPaths(batchPaths))
+        .catch((err) => toast.error(t('editor.crop.autoStraightenFailed', { error: String(err) })));
     },
-    [setEditor],
+    [handleAutoStraighten, t],
+  );
+
+  const handleEnableAdjustments = useCallback(
+    (paths: string[], patch: Partial<Adjustments>) => {
+      const { selectedImage } = useEditorStore.getState();
+      const editingPath = useUIStore.getState().activeView === 'editor' ? selectedImage?.path : undefined;
+      const batchPaths = paths.filter((path) => path !== editingPath);
+      if (batchPaths.length < paths.length) {
+        setAdjustments((prev: Adjustments) => ({ ...prev, ...patch }));
+      }
+      if (batchPaths.length === 0) return;
+      batchPaths.forEach((p) => globalImageCache.delete(p));
+      invoke(Invokes.ApplyAdjustmentsToPaths, { paths: batchPaths, adjustments: patch })
+        .then(() => reloadAdjustmentsForPaths(batchPaths))
+        .catch((err) => toast.error(`Failed to apply adjustments: ${err}`));
+    },
+    [setAdjustments],
   );
 
   const handleCopyAdjustments = useCallback(async (pathOrEvent?: string | any) => {
@@ -248,19 +395,16 @@ export function useEditorActions() {
     const { libraryActivePath, multiSelectedPaths } = useLibraryStore.getState();
     let sourceAdjustments: any = null;
 
+    const editingPath = useUIStore.getState().activeView === 'editor' ? selectedImage?.path : undefined;
     const pathToCopyFrom =
-      pathOverride || (selectedImage ? selectedImage.path : libraryActivePath || multiSelectedPaths[0]);
+      pathOverride || editingPath || libraryActivePath || multiSelectedPaths[0] || selectedImage?.path;
 
     if (selectedImage && pathToCopyFrom === selectedImage.path) {
       sourceAdjustments = adjustments;
     } else if (pathToCopyFrom) {
       try {
         const meta: any = await invoke(Invokes.LoadMetadata, { path: pathToCopyFrom });
-        if (meta?.adjustments && !meta.adjustments.is_null) {
-          sourceAdjustments = normalizeLoadedAdjustments(meta.adjustments);
-        } else {
-          sourceAdjustments = INITIAL_ADJUSTMENTS;
-        }
+        sourceAdjustments = adjustmentsFromMetadata(meta?.adjustments);
       } catch (err) {
         toast.error(`Failed to load metadata for copying: ${err}`);
         return;
@@ -276,38 +420,38 @@ export function useEditorActions() {
         adjustmentsToCopy[key] = structuredClone(sourceAdjustments[key]);
       }
     }
-    useEditorStore.getState().setEditor({ copiedAdjustments: adjustmentsToCopy });
+    const copiedAdjustmentsDefaults = pathToCopyFrom
+      ? await getDefaultAdjustmentsFor(pathToCopyFrom).catch(() => null)
+      : null;
+    useEditorStore.getState().setEditor({ copiedAdjustments: adjustmentsToCopy, copiedAdjustmentsDefaults });
     useProcessStore.getState().setProcess({ isCopied: true });
   }, []);
 
   const handlePasteAdjustments = useCallback(
     (paths?: string[]) => {
-      const { copiedAdjustments, selectedImage, adjustments } = useEditorStore.getState();
+      const { copiedAdjustments, copiedAdjustmentsDefaults, selectedImage } = useEditorStore.getState();
       const { multiSelectedPaths } = useLibraryStore.getState();
       const { appSettings } = useSettingsStore.getState();
       const { setProcess } = useProcessStore.getState();
 
       if (!copiedAdjustments || !appSettings) return;
 
-      const { mode, includedAdjustments } = appSettings.copyPasteSettings;
+      const { mode, includedAdjustments } = appSettings.copyPasteSettings ?? {
+        mode: PasteMode.Merge,
+        includedAdjustments: COPYABLE_ADJUSTMENT_KEYS,
+      };
       const adjustmentsToApply: Partial<Adjustments> = {};
 
       for (const key of includedAdjustments) {
         if (Object.prototype.hasOwnProperty.call(copiedAdjustments, key)) {
           const value = copiedAdjustments[key as keyof Adjustments];
           if (mode === PasteMode.Merge) {
-            const defaultValue = INITIAL_ADJUSTMENTS[key as keyof Adjustments];
+            const defaultValue = (copiedAdjustmentsDefaults ?? INITIAL_ADJUSTMENTS)[key as keyof Adjustments];
             if (JSON.stringify(value) !== JSON.stringify(defaultValue))
               adjustmentsToApply[key as keyof Adjustments] = value;
           } else {
             adjustmentsToApply[key as keyof Adjustments] = value;
           }
-        }
-      }
-
-      if (includedAdjustments.includes(LensAdjustment.LensMaker)) {
-        if (!adjustmentsToApply.lensMaker) {
-          adjustmentsToApply.lensDistortionParams = null;
         }
       }
 
@@ -322,35 +466,30 @@ export function useEditorActions() {
 
       pathsToUpdate.forEach((p) => globalImageCache.delete(p));
 
-      if (selectedImage && pathsToUpdate.includes(selectedImage.path)) {
-        setAdjustments({ ...adjustments, ...adjustmentsToApply });
+      const openPath = selectedImage && pathsToUpdate.includes(selectedImage.path) ? selectedImage.path : null;
+      if (openPath) {
+        debouncedSave.flush();
       }
 
       invoke(Invokes.ApplyAdjustmentsToPaths, { paths: pathsToUpdate, adjustments: adjustmentsToApply })
-        .then(() => {
-          if (selectedImage && pathsToUpdate.includes(selectedImage.path)) {
-            invoke('load_metadata', { path: selectedImage.path }).then((meta: any) => {
-              if (meta.adjustments) {
-                setAdjustments((prev: any) => ({
-                  ...prev,
-                  lensMaker: meta.adjustments.lensMaker,
-                  lensModel: meta.adjustments.lensModel,
-                  lensDistortionParams: meta.adjustments.lensDistortionParams,
-                }));
-              }
-            });
-          }
+        .then(async () => {
+          if (!openPath) return;
+          const meta: any = await invoke(Invokes.LoadMetadata, { path: openPath });
+          if (!meta.adjustments || useEditorStore.getState().selectedImage?.path !== openPath) return;
+
+          const pasted = Object.fromEntries(Object.keys(adjustmentsToApply).map((key) => [key, meta.adjustments[key]]));
+          setAdjustments((prev: any) => ({ ...prev, ...pasted }), t('contextMenus.editor.pasteAdjustments'));
         })
         .catch((err) => toast.error(`Failed to paste adjustments: ${err}`));
 
       setProcess({ isPasted: true });
     },
-    [setAdjustments],
+    [setAdjustments, t],
   );
 
   const handleZoomChange = useCallback((zoomValue: number, fitToWindow: boolean = false) => {
     const { originalSize, baseRenderSize, adjustments } = useEditorStore.getState();
-    const dpr = typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1;
+    const dpr = getDevicePixelRatio();
     let targetZoomPercent: number;
 
     const orientationSteps = adjustments.orientationSteps || 0;
@@ -402,13 +541,17 @@ export function useEditorActions() {
     setAdjustments,
     handleRotate,
     handleAutoAdjustments,
+    handleAutoStraighten,
+    handleAutoStraightenPaths,
     handleLutSelect,
     setLutPreviewOverride,
     handleResetAdjustments,
     handleAutoLensCorrection,
+    handleEnableAdjustments,
     handleCopyAdjustments,
     handlePasteAdjustments,
     handleZoomChange,
-    toggleShowOriginal,
+    toggleCompare,
+    selectCompareMode,
   };
 }

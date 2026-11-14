@@ -166,7 +166,9 @@ async fn evictor_demotes_lru_verified_originals_and_keeps_pinned() {
     // the round-trip to a stub.
     let old_path_str = stub_old.to_string_lossy().to_string();
     let adjustments = br#"{"exposure":0.0}"#;
-    let old_hash_before = sync::compute_thumbnail_cache_hash(&old_path_str, adjustments).unwrap();
+    let old_hash_before =
+        sync::compute_thumbnail_cache_hash(&old_path_str, adjustments, &Default::default())
+            .unwrap();
 
     // Budget that fits exactly ONE original ⇒ the LRU victim (OLD) is
     // demoted, the recently-accessed NEW is kept.
@@ -196,7 +198,9 @@ async fn evictor_demotes_lru_verified_originals_and_keeps_pinned() {
         r_old.mtime_unix,
         "eviction restores the remote mtime"
     );
-    let old_hash_after = sync::compute_thumbnail_cache_hash(&old_path_str, adjustments).unwrap();
+    let old_hash_after =
+        sync::compute_thumbnail_cache_hash(&old_path_str, adjustments, &Default::default())
+            .unwrap();
     assert_eq!(
         old_hash_before, old_hash_after,
         "the thumbnail cache key survives eviction (mtime preserved)"

@@ -23,8 +23,8 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
 
-use crate::app_settings::SyncSettings;
-use crate::app_state::AppState;
+use crate::app::settings::SyncSettings;
+use crate::app::state::AppState;
 #[cfg(target_os = "android")]
 use crate::sync::credentials::AndroidCredentialStore;
 #[cfg(not(target_os = "android"))]
@@ -154,7 +154,7 @@ pub fn sync_ensure_configured(state: State<'_, AppState>, app: AppHandle) -> Res
     if state.sync_manager.is_configured() {
         return Ok(()); // already live this session
     }
-    let settings = crate::app_settings::load_settings(app.clone())?;
+    let settings = crate::app::settings::load_settings(app.clone())?;
     if !settings.sync.enabled {
         return Ok(());
     }
@@ -265,9 +265,9 @@ pub async fn sync_configure(
 ) -> Result<(), String> {
     // Persist the sync block through the existing settings path (credentials
     // are NOT part of `AppSettings`, so nothing secret is written — §3.6).
-    let mut app_settings = crate::app_settings::load_settings(app.clone())?;
+    let mut app_settings = crate::app::settings::load_settings(app.clone())?;
     app_settings.sync = settings.clone();
-    crate::app_settings::save_settings(app_settings.clone(), app.clone())?;
+    crate::app::settings::save_settings(app_settings.clone(), app.clone())?;
 
     // The library root the engine keys relative to: the first configured root
     // folder (falling back to the last opened one). Reconfiguring sync with no
@@ -296,7 +296,7 @@ pub async fn sync_configure(
 pub fn sync_list_media_buckets() -> Result<Vec<String>, String> {
     #[cfg(target_os = "android")]
     {
-        crate::android_integration::android_list_media_buckets()
+        crate::platform::android::android_list_media_buckets()
     }
     #[cfg(not(target_os = "android"))]
     {

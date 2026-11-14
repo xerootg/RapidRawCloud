@@ -1,7 +1,8 @@
 # Headless rrcloud-worker image. rrcloud-core-only (no tauri/gtk/webkit): the
 # worker generates linear-DNG proxies via the pinned rawler in rrcloud-core, so
-# color parity with the app needs no app code. Slim runtime: just the binary +
-# CA certs for TLS to the S3 endpoint.
+# color parity with the app needs no app code beyond one pure-rawler upstream
+# file compiled in verbatim (see the COPY below). Slim runtime: just the
+# binary + CA certs for TLS to the S3 endpoint.
 #
 # rrcloud-core takes its wire types from the generated protocol SDK
 # (protocol/gen/rust/rrcloud-proto, a path dependency), so the build context
@@ -21,6 +22,10 @@ COPY protocol/gen/rust/rrcloud-proto ./protocol/gen/rust/rrcloud-proto
 COPY src-tauri/crates/rrcloud-core/Cargo.toml src-tauri/crates/rrcloud-core/Cargo.lock ./src-tauri/crates/rrcloud-core/
 COPY src-tauri/crates/rrcloud-core/src ./src-tauri/crates/rrcloud-core/src
 COPY src-tauri/crates/rrcloud-core/tests ./src-tauri/crates/rrcloud-core/tests
+# rrcloud-core compiles upstream's maker-note exposure reader verbatim
+# (src/as_shot.rs, `#[path]`) so proxies carry the original's highlight
+# preservation exactly as the app computes it. Only that one app file.
+COPY src-tauri/src/decode/baseline_exposure.rs ./src-tauri/src/decode/baseline_exposure.rs
 WORKDIR /build/src-tauri/crates/rrcloud-core
 # Build only the worker bin in release.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

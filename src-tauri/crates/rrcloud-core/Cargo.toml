@@ -55,10 +55,10 @@ quick-xml = { version = "0.41", features = ["serialize"] }
 # Smart-preview proxy production (ARCHITECTURE.md §4.2, P3). `proxy.rs` is
 # feature-independent in this crate and built directly against the SAME
 # pinned rawler the host app resolves (`CyberTimon/RapidRAW-DngLab` @
-# 934af4b) so proxy color math is bit-for-bit the app's — no rawler fork or
+# b1d102a) so proxy color math is bit-for-bit the app's — no rawler fork or
 # port (§4.2 "NO rawler fork needed"). Pinned by `rev` because this crate is
 # standalone (its own lockfile); the host app pins the same rev via its lock.
-rawler = { git = "https://github.com/CyberTimon/RapidRAW-DngLab.git", rev = "934af4b213a12b95f77d69529627067056066294" }
+rawler = { git = "https://github.com/CyberTimon/RapidRAW-DngLab.git", rev = "b1d102af3e5543c9582e99718c7ae57d564ec176" }
 # Lanczos3 linear-space resample + q75 JPEG thumb encode (§4.2 steps 5/8),
 # matching the host app's `image` major so the proxy path and the app agree.
 image = "0.25"

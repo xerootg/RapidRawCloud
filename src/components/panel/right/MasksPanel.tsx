@@ -1,11 +1,4 @@
-import {
-  type ChangeEvent,
-  type PointerEvent as ReactPointerEvent,
-  useState,
-  useEffect,
-  useRef,
-  useCallback,
-} from 'react';
+import { type ChangeEvent, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useShallow } from 'zustand/react/shallow';
 import { v4 as uuidv4 } from 'uuid';
 import clsx from 'clsx';
@@ -39,61 +32,64 @@ import {
   Plus,
   PlusSquare,
   RotateCcw,
+  Send,
   Trash2,
   SwatchBook,
   SquaresIntersect,
+  X,
 } from 'lucide-react';
 
 import CollapsibleSection from '../../ui/CollapsibleSection';
 import Switch from '../../ui/Switch';
 import Slider from '../../ui/Slider';
-import BasicAdjustments from '../../adjustments/Basic';
-import CurveGraph from '../../adjustments/Curves';
-import ColorPanel from '../../adjustments/Color';
-import DetailsPanel from '../../adjustments/Details';
-import EffectsPanel from '../../adjustments/Effects';
-import Waveform from '../editor/Waveform';
+import Input from '../../ui/Input';
+import Button from '../../ui/Button';
+import AdjustmentSection from '../../adjustments/AdjustmentSection';
+import ConnectedWaveform from '../editor/ConnectedWaveform';
 import Resizer from '../../ui/Resizer';
-import { DepthRangePicker } from '../../ui/DepthRangePicker';
+import { DepthRangePicker } from '../../adjustments/DepthRangePicker';
+import DepthScope from '../../adjustments/depthScope/DepthScope';
 import AdjustmentSectionsSubMenu from './AdjustmentSectionsSubMenu';
+import FacePartsIllustration from './FacePartsIllustration';
 
 import {
-  Mask,
-  MaskType,
-  SubMask,
   MASK_BASIC_TYPES,
   MASK_RANGE_TYPES,
   MASK_AI_TYPES,
   ALL_MASK_TYPES,
+  FACE_PARTS,
   MASK_ICON_MAP,
-  SubMaskMode,
-  ToolType,
-  formatMaskTypeName,
-  getSubMaskName,
-  getMaskTypeName,
   NewMaskDropZone,
 } from './Masks';
+import { Mask, MaskType, SubMask, SubMaskMode, ToolType } from '../../../types/masks';
+import { formatMaskTypeName, getSubMaskName, getMaskTypeName } from '../../../utils/maskNames';
 import {
   Adjustments,
   INITIAL_MASK_ADJUSTMENTS,
   INITIAL_MASK_CONTAINER,
   MaskContainer,
   ADJUSTMENT_SECTIONS,
+  getActiveTools,
   getVisibleAdjustmentSections,
+  isToolActive,
+  mergeActiveTools,
+  setToolActive,
+  toggleToolActive,
 } from '../../../utils/adjustments';
 import { useContextMenu } from '../../../context/ContextMenuContext';
-import { OPTION_SEPARATOR, Orientation, Panel } from '../../ui/AppProperties';
+import { OPTION_SEPARATOR, Orientation, Panel } from '../../../types/ui';
 import { createSubMask } from '../../../utils/maskUtils';
 import { usePresets } from '../../../hooks/usePresets';
 import Text from '../../ui/Text';
 import { TEXT_COLOR_KEYS, TextColors, TextVariants, TextWeights } from '../../../types/typography';
 import { useEditorStore } from '../../../store/useEditorStore';
 import { useSettingsStore } from '../../../store/useSettingsStore';
-import { useProcessStore } from '../../../store/useProcessStore';
+import { selectAiModelDownloadStatus, useProcessStore } from '../../../store/useProcessStore';
 import { useAiMasking } from '../../../hooks/useAiMasking';
 import { useEditorActions } from '../../../hooks/useEditorActions';
-import { useUIStore } from '../../../store/useUIStore';
+import { isPanelVisible, useUIStore } from '../../../store/useUIStore';
 import { useWaveformControls } from '../../../hooks/useWaveformControls';
+import type { ParseKeys } from 'i18next';
 
 interface DragData {
   type: 'Container' | 'SubMask' | 'Creation';
@@ -102,12 +98,18 @@ interface DragData {
   parentId?: string;
 }
 
+const FACE_MASK_DELAY_MS = 500;
+
 const SUB_MASK_CONFIG: Record<Mask, any> = {
   [Mask.Radial]: {
     parameters: [{ key: 'feather', min: 0, max: 100, step: 1, multiplier: 100, defaultValue: 50 }],
   },
   [Mask.Brush]: { showBrushTools: true },
   [Mask.Flow]: { showBrushTools: true, showFlowControl: true },
+  [Mask.MatchBrush]: {
+    showBrushTools: true,
+    parameters: [{ key: 'tolerance', min: 1, max: 100, step: 1, defaultValue: 30 }],
+  },
   [Mask.Linear]: { parameters: [] },
   [Mask.Color]: {
     parameters: [
@@ -145,7 +147,23 @@ const SUB_MASK_CONFIG: Record<Mask, any> = {
       { key: 'feather', min: 0, max: 100, step: 1, defaultValue: 0 },
     ],
   },
+  [Mask.AiText]: {
+    parameters: [
+      { key: 'grow', min: -100, max: 100, step: 1, defaultValue: 0 },
+      { key: 'feather', min: 0, max: 100, step: 1, defaultValue: 0 },
+    ],
+  },
+  [Mask.AiFace]: {
+    parameters: [
+      { key: 'grow', min: -100, max: 100, step: 1, defaultValue: 0 },
+      { key: 'feather', min: 0, max: 100, step: 1, defaultValue: 0 },
+    ],
+  },
   [Mask.QuickEraser]: { parameters: [] },
+  [Mask.Clone]: {},
+  [Mask.Heal]: {},
+  [Mask.Liquify]: {},
+  [Mask.Retouch]: {},
 };
 
 const BrushTools = ({
@@ -257,25 +275,20 @@ export default function MasksPanel() {
   const { t } = useTranslation();
   const { setAdjustments } = useEditorActions();
   const isAiFree = useSettingsStore((s) => s.appSettings?.aiProvider === 'ai-free');
-  const { handleGenerateAiDepthMask, handleGenerateAiForegroundMask, handleGenerateAiSkyMask, handleCancelAiTask } =
-    useAiMasking();
+  const {
+    handleGenerateAiDepthMask,
+    handleGenerateAiForegroundMask,
+    handleGenerateAiSkyMask,
+    handleGenerateAiTextMask,
+    handleGenerateAiFaceMask,
+    handleCancelAiTask,
+  } = useAiMasking();
 
   const { setCustomEscapeHandler, isAdjustmentsPanelVisible } = useUIStore(
-    useShallow((state) => {
-      const leftVisible = state.uiVisibility.leftPanel;
-      const rightVisible = state.uiVisibility.rightPanel;
-
-      const isVisible =
-        (leftVisible && state.activePanels.leftTop === Panel.Adjustments) ||
-        (leftVisible && state.activePanels.leftBottom === Panel.Adjustments) ||
-        (rightVisible && state.activePanels.rightTop === Panel.Adjustments) ||
-        (rightVisible && state.activePanels.rightBottom === Panel.Adjustments);
-
-      return {
-        setCustomEscapeHandler: state.setCustomEscapeHandler,
-        isAdjustmentsPanelVisible: isVisible,
-      };
-    }),
+    useShallow((state) => ({
+      setCustomEscapeHandler: state.setCustomEscapeHandler,
+      isAdjustmentsPanelVisible: isPanelVisible(state, Panel.Adjustments),
+    })),
   );
 
   const { appSettings } = useSettingsStore(
@@ -286,7 +299,7 @@ export default function MasksPanel() {
 
   const { aiModelDownloadStatus, activeAiTasks } = useProcessStore(
     useShallow((state) => ({
-      aiModelDownloadStatus: state.aiModelDownloadStatus,
+      aiModelDownloadStatus: selectAiModelDownloadStatus(state),
       activeAiTasks: state.activeAiTasks,
     })),
   );
@@ -297,11 +310,8 @@ export default function MasksPanel() {
     adjustments,
     brushSettings,
     copiedMask,
-    histogram,
     selectedImage,
     isWaveformVisible,
-    waveform,
-    activeWaveformChannel,
     waveformHeight,
     setEditor,
   } = useEditorStore(
@@ -311,17 +321,14 @@ export default function MasksPanel() {
       adjustments: state.adjustments,
       brushSettings: state.brushSettings,
       copiedMask: state.copiedMask,
-      histogram: state.histogram,
       selectedImage: state.selectedImage,
       isWaveformVisible: state.isWaveformVisible,
-      waveform: state.waveform,
-      activeWaveformChannel: state.activeWaveformChannel,
       waveformHeight: state.waveformHeight,
       setEditor: state.setEditor,
     })),
   );
 
-  const { isResizingWaveform, onToggleWaveform, setActiveWaveformChannel, setWaveformHeight, handleWaveformResize } =
+  const { isResizingWaveform, onToggleWaveform, setActiveWaveformChannel, handleWaveformResize } =
     useWaveformControls();
 
   const setBrushSettings = useCallback(
@@ -333,7 +340,7 @@ export default function MasksPanel() {
   const selectBrushToolForNewMask = useCallback(() => {
     setEditor((state) => ({
       brushSettings: {
-        ...(state.brushSettings ?? { size: 50, feather: 50, tool: ToolType.Brush }),
+        ...(state.brushSettings ?? { size: 100, feather: 50, tool: ToolType.Brush }),
         tool: ToolType.Brush,
       },
     }));
@@ -487,6 +494,13 @@ export default function MasksPanel() {
       }
     }
 
+    if (type === Mask.MatchBrush && subMask.parameters) {
+      subMask.parameters.rotation = adjustments?.rotation || 0;
+      subMask.parameters.flipHorizontal = adjustments?.flipHorizontal || false;
+      subMask.parameters.flipVertical = adjustments?.flipVertical || false;
+      subMask.parameters.orientationSteps = steps;
+    }
+
     if (type === Mask.AiDepth) {
       if (!subMask.parameters) subMask.parameters = {};
       subMask.parameters.minDepth = 20;
@@ -511,9 +525,10 @@ export default function MasksPanel() {
     onSelectContainer(newContainer.id);
     onSelectMask(subMask.id);
     setExpandedContainers((prev) => new Set(prev).add(newContainer.id));
-    if (type === Mask.Brush || type === Mask.Flow) selectBrushToolForNewMask();
+    if (type === Mask.Brush || type === Mask.Flow || type === Mask.MatchBrush) selectBrushToolForNewMask();
     if (type === Mask.AiForeground) handleGenerateAiForegroundMask(subMask.id);
     else if (type === Mask.AiSky) handleGenerateAiSkyMask(subMask.id);
+    else if (type === Mask.AiFace) handleGenerateAiFaceMask(subMask.id, subMask.parameters?.parts ?? []);
     else if (type === Mask.AiDepth) handleGenerateAiDepthMask(subMask.id, subMask.parameters);
   };
 
@@ -542,9 +557,10 @@ export default function MasksPanel() {
     onSelectContainer(containerId);
     onSelectMask(subMask.id);
     setExpandedContainers((prev) => new Set(prev).add(containerId));
-    if (type === Mask.Brush || type === Mask.Flow) selectBrushToolForNewMask();
+    if (type === Mask.Brush || type === Mask.Flow || type === Mask.MatchBrush) selectBrushToolForNewMask();
     if (type === Mask.AiForeground) handleGenerateAiForegroundMask(subMask.id);
     else if (type === Mask.AiSky) handleGenerateAiSkyMask(subMask.id);
+    else if (type === Mask.AiFace) handleGenerateAiFaceMask(subMask.id, subMask.parameters?.parts ?? []);
     else if (type === Mask.AiDepth) handleGenerateAiDepthMask(subMask.id, subMask.parameters);
   };
 
@@ -625,10 +641,11 @@ export default function MasksPanel() {
   const updateSubMask = (id: string, data: any) =>
     setAdjustments((prev: Adjustments) => ({
       ...prev,
-      masks: prev.masks.map((m) => ({
-        ...m,
-        subMasks: m.subMasks.map((sm) => (sm.id === id ? { ...sm, ...data } : sm)),
-      })),
+      masks: prev.masks.map((m) =>
+        m.subMasks.some((sm) => sm.id === id)
+          ? { ...m, subMasks: m.subMasks.map((sm) => (sm.id === id ? { ...sm, ...data } : sm)) }
+          : m,
+      ),
     }));
 
   const handleDeleteContainer = (id: string) => {
@@ -820,8 +837,8 @@ export default function MasksPanel() {
         } else if (overData?.type === 'SubMask') {
           const container = adjustments.masks.find((m) => m.id === overData.parentId);
           if (container) {
-            const targetIndex = container.subMasks.findIndex((sm) => sm.id === over.id);
-            handleAddSubMask(overData.parentId!, dragData.maskType!, targetIndex);
+            const targetIndex = container.subMasks.findIndex((sm) => sm.id === over?.id);
+            handleAddSubMask(overData.parentId!, dragData.maskType!, SubMaskMode.Additive, targetIndex);
           }
         } else {
           handleAddMaskContainer(dragData.maskType!);
@@ -1020,19 +1037,7 @@ export default function MasksPanel() {
               className="shrink-0 flex flex-col relative border-b border-surface overflow-hidden"
             >
               <div className="grow w-full h-full p-3 pb-2 min-h-0">
-                <Waveform
-                  waveformData={waveform || null}
-                  histogram={histogram}
-                  displayMode={activeWaveformChannel || 'luma'}
-                  setDisplayMode={setActiveWaveformChannel}
-                  showClipping={adjustments.showClipping || false}
-                  onToggleClipping={() => {
-                    setAdjustments((prev: Adjustments) => ({
-                      ...prev,
-                      showClipping: !prev.showClipping,
-                    }));
-                  }}
-                />
+                <ConnectedWaveform setDisplayMode={setActiveWaveformChannel} setAdjustments={setAdjustments} />
               </div>
               <Resizer direction={Orientation.Horizontal} onMouseDown={handleWaveformResize} />
             </motion.div>
@@ -1190,7 +1195,7 @@ export default function MasksPanel() {
                     animate={{ opacity: 1 }}
                     exit={{ opacity: 0 }}
                     transition={{ duration: 0.2, ease: 'easeOut' }}
-                    className="flex-1 min-h-0"
+                    className="grow shrink-0"
                   >
                     <Text variant={TextVariants.heading} className="mb-2">
                       {t('editor.masks.maskAdjustmentsTitle')}
@@ -1203,7 +1208,7 @@ export default function MasksPanel() {
                       setBrushSettings={setBrushSettings}
                       updateContainer={updateContainer}
                       updateSubMask={updateSubMask}
-                      histogram={histogram}
+                      setAdjustments={setAdjustments}
                       appSettings={appSettings}
                       setIsMaskControlHovered={setIsMaskControlHovered}
                       collapsibleState={collapsibleState}
@@ -1214,7 +1219,10 @@ export default function MasksPanel() {
                       isSettingsSectionOpen={isSettingsSectionOpen}
                       setSettingsSectionOpen={setSettingsSectionOpen}
                       presets={presets}
-                      handleGenerateAiDepthMask={handleGenerateAiDepthMask}
+                      handleGenerateAiTextMask={handleGenerateAiTextMask}
+                      handleGenerateAiFaceMask={handleGenerateAiFaceMask}
+                      handleCancelAiTask={handleCancelAiTask}
+                      activeAiTasks={activeAiTasks}
                     />
                   </motion.div>
                 )}
@@ -1419,7 +1427,10 @@ function ContainerRow({
               label: item.name || item.preset.name,
               onClick: () => {
                 const newAdj = { ...container.adjustments, ...(item.adjustments || item.preset.adjustments) };
-                newAdj.sectionVisibility = { ...container.adjustments.sectionVisibility, ...newAdj.sectionVisibility };
+                newAdj.activeTools = mergeActiveTools(
+                  container.adjustments,
+                  item.adjustments || item.preset.adjustments,
+                );
                 updateContainer(container.id, { adjustments: newAdj });
               },
             };
@@ -1687,7 +1698,7 @@ function SubMaskRow({
     setNodeRef(node);
     setDroppableRef(node);
   };
-  const MaskIcon = MASK_ICON_MAP[subMask.type] || Circle;
+  const MaskIcon = MASK_ICON_MAP[subMask.type as Mask] || Circle;
   const { showContextMenu } = useContextMenu();
   const [isHovered, setIsHovered] = useState(false);
   const hoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -1906,7 +1917,7 @@ function SettingsPanel({
   setBrushSettings,
   updateContainer,
   updateSubMask,
-  histogram,
+  setAdjustments,
   appSettings,
   setIsMaskControlHovered,
   collapsibleState,
@@ -1917,12 +1928,21 @@ function SettingsPanel({
   isSettingsSectionOpen,
   setSettingsSectionOpen,
   presets,
-  handleGenerateAiDepthMask,
+  handleGenerateAiTextMask,
+  handleGenerateAiFaceMask,
+  handleCancelAiTask,
+  activeAiTasks,
 }: any) {
   const { t } = useTranslation();
   const { showContextMenu } = useContextMenu();
   const isActive = !!container;
   const presetButtonRef = useRef<HTMLButtonElement>(null);
+  const faceMaskTimeoutRef = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const [textPrompt, setTextPrompt] = useState(activeSubMask?.parameters?.prompt || '');
+
+  useEffect(() => {
+    setTextPrompt(activeSubMask?.parameters?.prompt || '');
+  }, [activeSubMask?.id]);
 
   const placeholderContainer = {
     ...INITIAL_MASK_CONTAINER,
@@ -1936,10 +1956,7 @@ function SettingsPanel({
     const newMaskAdjustments = {
       ...currentAdjustments,
       ...presetAdjustments,
-      sectionVisibility: {
-        ...(currentAdjustments.sectionVisibility || INITIAL_MASK_ADJUSTMENTS.sectionVisibility),
-        ...(presetAdjustments.sectionVisibility || {}),
-      },
+      activeTools: mergeActiveTools(currentAdjustments, presetAdjustments),
     };
     updateContainer(container.id, { adjustments: newMaskAdjustments });
   };
@@ -2001,17 +2018,52 @@ function SettingsPanel({
     updateSubMask(activeSubMask.id, { parameters: newParams });
   };
 
-  const subMaskConfig = activeSubMask ? SUB_MASK_CONFIG[activeSubMask.type] || {} : {};
+  const subMaskConfig = activeSubMask ? SUB_MASK_CONFIG[activeSubMask.type as Mask] || {} : {};
   const isAiMask =
-    activeSubMask && [Mask.AiSubject, Mask.AiForeground, Mask.AiSky, Mask.AiDepth].includes(activeSubMask.type);
+    activeSubMask &&
+    [Mask.AiSubject, Mask.AiForeground, Mask.AiSky, Mask.AiDepth, Mask.AiText, Mask.AiFace].includes(
+      activeSubMask.type,
+    );
   const isComponentMode = !!activeSubMask;
+  const isTextMask = activeSubMask?.type === Mask.AiText;
+  const isFaceMask = activeSubMask?.type === Mask.AiFace;
+  const isTextMaskRunning = isTextMask && Boolean(activeAiTasks?.[activeSubMask.id]);
+  const faceParts: Array<string> = activeSubMask?.parameters?.parts || [];
 
-  const setMaskContainerAdjustments = (updater: any) => {
-    if (!isActive) return;
-    const currentAdjustments = container.adjustments;
-    const newAdjustments = typeof updater === 'function' ? updater(currentAdjustments) : updater;
-    updateContainer(container.id, { adjustments: newAdjustments });
+  const handleToggleFacePart = (part: string) => {
+    if (!isActive || !isFaceMask) return;
+    const subMaskId = activeSubMask.id;
+    const parts = FACE_PARTS.filter((p) => (p === part ? !faceParts.includes(p) : faceParts.includes(p)));
+    updateSubMask(subMaskId, {
+      parameters: { ...activeSubMask.parameters, parts, ...(parts.length === 0 && { maskDataBase64: null }) },
+    });
+    clearTimeout(faceMaskTimeoutRef.current);
+    if (parts.length > 0) {
+      faceMaskTimeoutRef.current = setTimeout(() => handleGenerateAiFaceMask(subMaskId, parts), FACE_MASK_DELAY_MS);
+    }
   };
+
+  const handleGenerateTextMaskClick = () => {
+    if (!isActive || !isTextMask || !textPrompt.trim()) return;
+    updateSubMask(activeSubMask.id, { parameters: { ...activeSubMask.parameters, prompt: textPrompt } });
+    handleGenerateAiTextMask(activeSubMask.id, textPrompt);
+  };
+
+  const containerId: string | null = container?.id ?? null;
+  const setMaskContainerAdjustments = useCallback(
+    (updater: any) => {
+      if (!containerId) return;
+      setAdjustments((prev: Adjustments) => ({
+        ...prev,
+        masks: prev.masks.map((m) =>
+          m.id === containerId
+            ? { ...m, adjustments: typeof updater === 'function' ? updater(m.adjustments) : updater }
+            : m,
+        ),
+      }));
+    },
+    [containerId, setAdjustments],
+  );
 
   const handleToggleSection = (section: string) => {
     setCollapsibleState((prev: any) => {
@@ -2029,14 +2081,15 @@ function SettingsPanel({
     });
   };
 
-  const handleToggleVisibility = (sectionName: string) => {
-    if (!isActive) return;
-    const cur = container.adjustments;
-    const vis = cur.sectionVisibility || INITIAL_MASK_ADJUSTMENTS.sectionVisibility;
-    updateContainer(container.id, {
-      adjustments: { ...cur, sectionVisibility: { ...vis, [sectionName]: !vis[sectionName] } },
-    });
-  };
+  const handleToggleVisibility = useCallback(
+    (id: string) => {
+      setMaskContainerAdjustments((cur: Adjustments) => ({
+        ...cur,
+        activeTools: toggleToolActive(getActiveTools(cur), id),
+      }));
+    },
+    [setMaskContainerAdjustments],
+  );
 
   const handleSectionContextMenu = (event: any, sectionName: string) => {
     if (!isActive) return;
@@ -2062,10 +2115,7 @@ function SettingsPanel({
       setMaskContainerAdjustments((prev: any) => ({
         ...prev,
         ...copiedSectionAdjustments.values,
-        sectionVisibility: {
-          ...(prev.sectionVisibility || INITIAL_MASK_ADJUSTMENTS.sectionVisibility),
-          [sectionName]: true,
-        },
+        activeTools: setToolActive(getActiveTools(prev), sectionName, true),
       }));
     };
 
@@ -2079,15 +2129,12 @@ function SettingsPanel({
       setMaskContainerAdjustments((prev: any) => ({
         ...prev,
         ...resetValues,
-        sectionVisibility: {
-          ...(prev.sectionVisibility || INITIAL_MASK_ADJUSTMENTS.sectionVisibility),
-          [sectionName]: true,
-        },
+        activeTools: setToolActive(getActiveTools(prev), sectionName, true),
       }));
     };
 
     const isPasteAllowed = copiedSectionAdjustments && copiedSectionAdjustments.section === sectionName;
-    const sectionTitle = t(`editor.adjustments.sections.${sectionName}`);
+    const sectionTitle = t(`editor.adjustments.sections.${sectionName}` as ParseKeys);
 
     const pasteLabel = copiedSectionAdjustments
       ? t('editor.masks.settings.pasteSectionSettings', { section: sectionTitle })
@@ -2115,8 +2162,12 @@ function SettingsPanel({
     ]);
   };
 
-  const sectionVisibility =
-    displayContainer.adjustments.sectionVisibility || INITIAL_MASK_ADJUSTMENTS.sectionVisibility;
+  const containerActiveTools = displayContainer.adjustments.activeTools;
+  const containerSectionVisibility = displayContainer.adjustments.sectionVisibility;
+  const activeTools = useMemo(
+    () => getActiveTools({ activeTools: containerActiveTools, sectionVisibility: containerSectionVisibility }),
+    [containerActiveTools, containerSectionVisibility],
+  );
   const visibleSections = getVisibleAdjustmentSections(appSettings?.adjustmentLayout);
 
   return (
@@ -2148,6 +2199,74 @@ function SettingsPanel({
         isContentVisible={true}
       >
         <div className="space-y-4 pt-2">
+          {isTextMask && (
+            <>
+              <div className="flex items-center gap-2">
+                <Input
+                  autoFocus={!activeSubMask.parameters?.prompt}
+                  className="grow"
+                  disabled={isTextMaskRunning}
+                  key={activeSubMask.id}
+                  onChange={(e: ChangeEvent<HTMLInputElement>) => setTextPrompt(e.target.value)}
+                  onBlur={() =>
+                    isActive &&
+                    updateSubMask(activeSubMask.id, { parameters: { ...activeSubMask.parameters, prompt: textPrompt } })
+                  }
+                  onKeyDown={(e: React.KeyboardEvent<HTMLInputElement>) => {
+                    if (e.key === 'Enter' && !isTextMaskRunning) handleGenerateTextMaskClick();
+                  }}
+                  placeholder={t('editor.masks.settings.textPromptPlaceholder')}
+                  type="text"
+                  value={textPrompt}
+                />
+              </div>
+
+              {isTextMaskRunning ? (
+                <Button
+                  className="group w-full bg-red-500/15 hover:bg-red-500/25 text-red-400 border border-red-500/30 transition-colors"
+                  onClick={() => handleCancelAiTask(activeSubMask.id)}
+                >
+                  <span className="flex items-center justify-center group-hover:hidden">
+                    <Loader2 size={16} className="animate-spin mr-2" />
+                    {t('editor.ai.settings.generating')}
+                  </span>
+                  <span className="hidden items-center justify-center group-hover:flex">
+                    <X size={16} className="mr-2" />
+                    {t('editor.ai.settings.cancelGeneration')}
+                  </span>
+                </Button>
+              ) : (
+                <Button className="w-full" disabled={!textPrompt.trim()} onClick={handleGenerateTextMaskClick}>
+                  <Send size={16} />
+                  <span className="ml-2">{t('editor.masks.settings.generateTextMask')}</span>
+                </Button>
+              )}
+            </>
+          )}
+
+          {isFaceMask && (
+            <>
+              <FacePartsIllustration selected={faceParts} />
+
+              <div className="grid grid-cols-3 gap-2">
+                {FACE_PARTS.map((part) => (
+                  <button
+                    key={part}
+                    onClick={() => handleToggleFacePart(part)}
+                    className={clsx(
+                      'px-1 py-2 text-xs leading-tight rounded-md transition-colors',
+                      faceParts.includes(part)
+                        ? 'bg-accent text-button-text'
+                        : 'bg-bg-primary text-text-secondary hover:bg-card-active hover:text-text-primary',
+                    )}
+                  >
+                    {t(`editor.masks.settings.faceParts.${part}`)}
+                  </button>
+                ))}
+              </div>
+            </>
+          )}
+
           <Switch
             checked={!!(isComponentMode ? activeSubMask.invert : displayContainer.invert)}
             label={isComponentMode ? t('editor.masks.settings.invertComponent') : t('editor.masks.settings.invertMask')}
@@ -2206,6 +2325,21 @@ function SettingsPanel({
                 </Text>
               )}
 
+              {activeSubMask.type === Mask.AiDepth && activeSubMask.parameters?.maskDataBase64 && (
+                <DepthScope
+                  mapData={activeSubMask.parameters.maskDataBase64}
+                  scene={{
+                    kind: 'depthMask',
+                    minDepth: activeSubMask.parameters?.minDepth ?? 0,
+                    maxDepth: activeSubMask.parameters?.maxDepth ?? 100,
+                    minFade: activeSubMask.parameters?.minFade ?? 15,
+                    maxFade: activeSubMask.parameters?.maxFade ?? 15,
+                  }}
+                  onChange={handleSubMaskParametersChange}
+                  onDragStateChange={onDragStateChange}
+                />
+              )}
+
               {activeSubMask.type === Mask.AiDepth && (
                 <DepthRangePicker
                   minDepth={100 - (activeSubMask.parameters?.maxDepth ?? 100)}
@@ -2227,7 +2361,7 @@ function SettingsPanel({
                   label={
                     param.key === 'feather' && activeSubMask.type === Mask.AiDepth
                       ? t('editor.masks.params.globalFeather')
-                      : t('editor.masks.params.' + param.key)
+                      : t(('editor.masks.params.' + param.key) as ParseKeys)
                   }
                   min={param.min}
                   max={param.max}
@@ -2270,28 +2404,23 @@ function SettingsPanel({
         className="flex flex-col gap-2"
       >
         {visibleSections.map((sectionName) => {
-          const SectionComponent: any = {
-            basic: BasicAdjustments,
-            curves: CurveGraph,
-            color: ColorPanel,
-            details: DetailsPanel,
-            effects: EffectsPanel,
-          }[sectionName];
-          const title = t(`editor.adjustments.sections.${sectionName}`);
+          const title = t(`editor.adjustments.sections.${sectionName}` as ParseKeys);
           return (
             <CollapsibleSection
               key={sectionName}
               title={title}
               isOpen={collapsibleState[sectionName]}
-              isContentVisible={sectionVisibility[sectionName]}
+              isContentVisible={isToolActive(activeTools, sectionName)}
               onToggle={() => handleToggleSection(sectionName)}
               onToggleVisibility={() => handleToggleVisibility(sectionName)}
               onContextMenu={(e: any) => handleSectionContextMenu(e, sectionName)}
             >
-              <SectionComponent
+              <AdjustmentSection
+                sectionName={sectionName}
+                activeTools={activeTools}
+                onToggleTool={handleToggleVisibility}
                 adjustments={displayContainer.adjustments}
                 setAdjustments={setMaskContainerAdjustments}
-                histogram={histogram}
                 isForMask={true}
                 appSettings={appSettings}
                 onDragStateChange={onDragStateChange}

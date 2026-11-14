@@ -6,7 +6,8 @@ import { listen } from '@tauri-apps/api/event';
 import { useSettingsStore } from '../../../store/useSettingsStore';
 import { useSyncStore } from '../../../store/useSyncStore';
 import { useSyncActions } from '../../../hooks/useSyncActions';
-import { Invokes, SyncSettings } from '../../ui/AppProperties';
+import { Invokes } from '../../../types/invokes';
+import { SyncSettings } from '../../../types/sync';
 import DeviceManagementPanel from './DeviceManagementPanel';
 import RecentlyDeletedView from './RecentlyDeletedView';
 
@@ -47,9 +48,7 @@ export default function SyncSettingsSection() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerBuckets, setPickerBuckets] = useState<string[] | null>(null);
   const [pickerManual, setPickerManual] = useState('');
-  const [pairState, setPairState] = useState<'idle' | 'waiting' | 'applying' | 'done' | 'error'>(
-    'idle',
-  );
+  const [pairState, setPairState] = useState<'idle' | 'waiting' | 'applying' | 'done' | 'error'>('idle');
   const [pairMessage, setPairMessage] = useState('');
 
   useEffect(() => {
@@ -141,9 +140,7 @@ export default function SyncSettingsSection() {
     const n = name.trim();
     if (!n) return;
     setForm((f) =>
-      f.watchedMediaBuckets.includes(n)
-        ? f
-        : { ...f, watchedMediaBuckets: [...f.watchedMediaBuckets, n] },
+      f.watchedMediaBuckets.includes(n) ? f : { ...f, watchedMediaBuckets: [...f.watchedMediaBuckets, n] },
     );
     setPickerOpen(false);
     setPickerManual('');
@@ -164,15 +161,9 @@ export default function SyncSettingsSection() {
       <section className="flex flex-col gap-3">
         <h3 className="text-text-primary font-medium">Pair with cloud</h3>
         <p className="text-text-secondary text-sm">
-          Have a pairing service? Enter its URL and sign in — endpoint, bucket, and
-          credentials are configured for you.
+          Have a pairing service? Enter its URL and sign in — endpoint, bucket, and credentials are configured for you.
         </p>
-        <Field
-          label="Pairing service URL"
-          value={pairUrl}
-          onChange={setPairUrl}
-          placeholder="rrc.example.com"
-        />
+        <Field label="Pairing service URL" value={pairUrl} onChange={setPairUrl} placeholder="rrc.example.com" />
         <button
           className="self-start px-3 py-1.5 rounded-md bg-accent text-button-text disabled:opacity-50"
           disabled={!pairUrl || pairState === 'waiting' || pairState === 'applying'}
@@ -183,11 +174,7 @@ export default function SyncSettingsSection() {
         {pairMessage && (
           <p
             className={`text-sm ${
-              pairState === 'error'
-                ? 'text-red-400'
-                : pairState === 'done'
-                  ? 'text-green-400'
-                  : 'text-text-secondary'
+              pairState === 'error' ? 'text-red-400' : pairState === 'done' ? 'text-green-400' : 'text-text-secondary'
             }`}
           >
             {pairMessage}
@@ -201,17 +188,22 @@ export default function SyncSettingsSection() {
         <h3 className="text-text-primary font-medium">Cloud Sync</h3>
         <label className="flex items-center justify-between">
           <span className="text-text-secondary">Enable sync</span>
-          <input
-            type="checkbox"
-            checked={form.enabled}
-            onChange={(e) => patch({ enabled: e.target.checked })}
-          />
+          <input type="checkbox" checked={form.enabled} onChange={(e) => patch({ enabled: e.target.checked })} />
         </label>
-        <Field label="Endpoint" value={form.endpoint} onChange={(v) => patch({ endpoint: v })} placeholder="https://garage.example" />
+        <Field
+          label="Endpoint"
+          value={form.endpoint}
+          onChange={(v) => patch({ endpoint: v })}
+          placeholder="https://garage.example"
+        />
         <Field label="Bucket" value={form.bucket} onChange={(v) => patch({ bucket: v })} />
         <Field label="Region" value={form.region} onChange={(v) => patch({ region: v })} placeholder="garage" />
         <NumField label="Cache budget (GB)" value={form.cacheSizeGb} onChange={(v) => patch({ cacheSizeGb: v })} />
-        <NumField label="Preview budget (GB)" value={form.previewBudgetGb} onChange={(v) => patch({ previewBudgetGb: v })} />
+        <NumField
+          label="Preview budget (GB)"
+          value={form.previewBudgetGb}
+          onChange={(v) => patch({ previewBudgetGb: v })}
+        />
         <label className="flex items-center justify-between">
           <span className="text-text-secondary">Auto-watch DCIM</span>
           <input
@@ -226,7 +218,10 @@ export default function SyncSettingsSection() {
             <p className="text-text-secondary text-xs">None — new photos are not auto-imported.</p>
           )}
           {form.watchedMediaBuckets.map((b) => (
-            <div key={b} className="flex items-center justify-between px-2 py-1 rounded-md bg-bg-primary border border-border-color/40">
+            <div
+              key={b}
+              className="flex items-center justify-between px-2 py-1 rounded-md bg-bg-primary border border-border-color/40"
+            >
               <span className="text-text-primary text-sm">{b}</span>
               <button
                 className="text-text-secondary hover:text-red-400 px-2"

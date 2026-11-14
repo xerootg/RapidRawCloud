@@ -181,7 +181,8 @@ async fn stub_mtime_keeps_the_thumbnail_cache_hash_stable_across_hydration() {
     let path_str = stub_path.to_string_lossy().to_string();
     let adjustments = br#"{"exposure":0.0}"#;
     let hash_before =
-        sync::compute_thumbnail_cache_hash(&path_str, adjustments).expect("hash before hydration");
+        sync::compute_thumbnail_cache_hash(&path_str, adjustments, &Default::default())
+            .expect("hash before hydration");
 
     // Hydrate, then the hash must be identical (mtime preserved).
     mgr_b.ensure_local(&stub_path, "test").expect("hydrate");
@@ -200,7 +201,8 @@ async fn stub_mtime_keeps_the_thumbnail_cache_hash_stable_across_hydration() {
         "hydration must restore the remote mtime"
     );
     let hash_after =
-        sync::compute_thumbnail_cache_hash(&path_str, adjustments).expect("hash after hydration");
+        sync::compute_thumbnail_cache_hash(&path_str, adjustments, &Default::default())
+            .expect("hash after hydration");
     assert_eq!(
         hash_before, hash_after,
         "the thumbnail cache hash must be stable across hydration"
@@ -577,9 +579,12 @@ async fn seeding_an_edited_stub_keys_the_thumb_where_the_grid_looks_it_up() {
     let content = std::fs::read_to_string(&sidecar).expect("read sidecar");
     let meta: sync::ImageMetadata = serde_json::from_str(&content).expect("parse sidecar");
     let adjustments = serde_json::to_vec(&meta.adjustments).expect("serialize adjustments");
-    let expected_hash =
-        sync::compute_thumbnail_cache_hash(&stub_path.to_string_lossy(), &adjustments)
-            .expect("expected cache hash");
+    let expected_hash = sync::compute_thumbnail_cache_hash(
+        &stub_path.to_string_lossy(),
+        &adjustments,
+        &Default::default(),
+    )
+    .expect("expected cache hash");
     let expected_name = format!("{expected_hash}_small.jpg");
 
     assert_eq!(

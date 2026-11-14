@@ -42,6 +42,9 @@
 //!   `rrcloud-worker` bin (`src/bin/rrcloud-worker.rs`), which depends on
 //!   this crate **only** (a documented refinement of §6 — no
 //!   `rapidraw_lib`/tauri linkage; color parity comes from [`proxy`]).
+//! - [`as_shot`]: the original's as-shot exposure (maker-note highlight
+//!   preservation, DNG baseline) that a smart preview carries for proxy
+//!   edit mode, computed with upstream's own reader (§4.2, §4.4).
 //! - [`android`]: the §5 Android platform integration — the
 //!   `tauri-plugin-rrcloud` JNI bridge entry points (target-gated, needs a
 //!   JVM) plus the host-testable pure decision logic those entry points
@@ -49,6 +52,7 @@
 //!   dedupe, scan-window arithmetic).
 
 pub mod android;
+pub mod as_shot;
 pub mod clock;
 pub mod compact;
 pub mod cycle;
@@ -68,6 +72,21 @@ pub mod state;
 pub mod tls;
 pub mod transfer;
 pub mod worker;
+
+/// Field-only stand-in for the app's `AppSettings`, for upstream's
+/// `baseline_exposure.rs`, which [`as_shot`] compiles verbatim: that file
+/// imports `crate::app::settings::AppSettings` for
+/// `BaselineOptions::from_settings`, which this crate never calls.
+#[allow(dead_code)]
+mod app {
+    pub mod settings {
+        pub struct AppSettings {
+            pub enable_baseline_exposure: bool,
+            pub baseline_exposure: f32,
+            pub compensate_highlight_preservation: bool,
+        }
+    }
+}
 
 /// Crate-private helpers shared across modules.
 pub(crate) mod hexutil {

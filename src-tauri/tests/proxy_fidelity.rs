@@ -40,7 +40,8 @@ use std::path::{Path, PathBuf};
 
 use rapidraw_lib::rrcloud_core::proxy;
 use rapidraw_lib::sync::proxy_support::{
-    develop_raw_image, gpu_adapter_probe, proxy_decode_settings, proxy_reported_dimensions,
+    develop_raw_image, gpu_adapter_probe, proxy_as_shot, proxy_decode_settings,
+    proxy_reported_dimensions, read_as_shot,
 };
 
 const HL: f32 = 2.5;
@@ -125,7 +126,7 @@ fn read(path: &Path) -> Vec<u8> {
 /// decode (empty string = the `(apply_ungamma=false, apply_calibration=true)`
 /// default arm).
 fn develop_rgb(bytes: &[u8], fast: bool, linear_mode: &str) -> (Vec<f32>, u32, u32) {
-    let img = develop_raw_image(bytes, fast, HL, linear_mode.to_string(), None)
+    let img = develop_raw_image(bytes, fast, HL, linear_mode.to_string(), 0.0, 0.0, None)
         .expect("develop_raw_image");
     let (w, h) = (img.width(), img.height());
     let rgba = img.into_rgba32f().into_raw();
@@ -498,10 +499,50 @@ fn wh_provenance_matches_develop() {
     }
 }
 
+/// §4.4: a stub edited through its proxy renders with its original's as-shot
+/// inputs. The exposure — including the maker-note highlight preservation no
+/// DNG tag of the proxy can carry — must be exactly upstream's `read_as_shot`
+/// of the original (it travels in the proxy's as-shot record); the white
+/// balance comes from the original's `AsShotNeutral` + matrices the proxy
+/// carries, equal up to the DNG rational encoding.
+#[test]
+fn proxy_as_shot_matches_the_original() {
+    let dir = skip_without_corpus!("proxy_as_shot_matches_the_original");
+    for (fmt, path) in format_samples(&dir) {
+        let bytes = read(&path);
+        let original = read_as_shot(&bytes).expect("upstream as-shot of the original");
+        let out = proxy::generate_proxy(&bytes).expect("generate proxy");
+        let stub = proxy_as_shot(&out.dng).expect("sync build reads the proxy");
+
+        let (o, p) = (original.exposure, stub.exposure);
+        assert_eq!(
+            (o.scene_referred, o.dng_baseline, o.highlight_preservation),
+            (p.scene_referred, p.dng_baseline, p.highlight_preservation),
+            "{fmt}: proxy-mode exposure must be the original's"
+        );
+
+        let (ow, pw) = (original.white_balance, stub.white_balance);
+        assert!(
+            (ow.temperature - pw.temperature).abs() <= 1.0 && (ow.tint - pw.tint).abs() <= 0.1,
+            "{fmt}: proxy-mode as-shot WB drifted: original {ow:?}, proxy {pw:?}"
+        );
+        eprintln!(
+            "{fmt}: highlight preservation {:+.2} EV, DNG baseline {:+.2} EV, \
+             WB {:.1} K / {:+.2} (proxy {:.1} K / {:+.2})",
+            o.highlight_preservation,
+            o.dng_baseline,
+            ow.temperature,
+            ow.tint,
+            pw.temperature,
+            pw.tint
+        );
+    }
+}
+
 /// The proxy decode pin neutralizes the user's `linear_raw_mode` (§4.1/§4.4).
 #[test]
 fn proxy_decode_settings_pins_linear_mode() {
-    let base = rapidraw_lib::AppSettings {
+    let base = rapidraw_lib::sync::test_seams::AppSettings {
         linear_raw_mode: "skip_calib".to_string(),
         ..Default::default()
     };
@@ -600,10 +641,11 @@ fn fidelity_gpu_confirmation_under_aggressive_settings() {
     let context = rapidraw_lib::sync::proxy_support::init_gpu_context_headless()
         .expect("headless GPU context");
 
-    let orig_img = develop_raw_image(&bytes, false, HL, String::new(), None).expect("develop orig");
+    let orig_img =
+        develop_raw_image(&bytes, false, HL, String::new(), 0.0, 0.0, None).expect("develop orig");
     let out = proxy::generate_proxy(&bytes).expect("generate proxy");
-    let proxy_img =
-        develop_raw_image(&out.dng, false, HL, String::new(), None).expect("develop proxy");
+    let proxy_img = develop_raw_image(&out.dng, false, HL, String::new(), 0.0, 0.0, None)
+        .expect("develop proxy");
 
     let rendered_orig = rapidraw_lib::sync::proxy_support::render_adjustments_headless(
         &context,

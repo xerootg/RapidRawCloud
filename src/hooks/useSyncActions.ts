@@ -1,11 +1,7 @@
 import { useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import {
-  Invokes,
-  SyncRecentlyDeleted,
-  SyncSettings,
-  SyncStatusDto,
-} from '../components/ui/AppProperties';
+import { Invokes } from '../types/invokes';
+import { SyncRecentlyDeleted, SyncSettings, SyncStatusDto } from '../types/sync';
 import { useSyncStore } from '../store/useSyncStore';
 
 /**
@@ -74,24 +70,17 @@ export function useSyncActions() {
     [],
   );
 
-  const hydrate = useCallback(
-    (path: string): Promise<void> => invoke(Invokes.SyncHydrate, { path }),
-    [],
-  );
+  const hydrate = useCallback((path: string): Promise<void> => invoke(Invokes.SyncHydrate, { path }), []);
 
   const recentlyDeleted = useCallback(
     (): Promise<SyncRecentlyDeleted[]> => invoke<SyncRecentlyDeleted[]>(Invokes.SyncRecentlyDeleted),
     [],
   );
 
-  const restore = useCallback(
-    (path: string): Promise<string[]> => invoke<string[]>(Invokes.SyncRestore, { path }),
-    [],
-  );
+  const restore = useCallback((path: string): Promise<string[]> => invoke<string[]>(Invokes.SyncRestore, { path }), []);
 
   const resolveConflict = useCallback(
-    (path: string, keep: 'winner' | 'copy'): Promise<void> =>
-      invoke(Invokes.SyncResolveConflict, { path, keep }),
+    (path: string, keep: 'winner' | 'copy'): Promise<void> => invoke(Invokes.SyncResolveConflict, { path, keep }),
     [],
   );
 
@@ -100,10 +89,7 @@ export function useSyncActions() {
     [],
   );
 
-  const verifyLibrary = useCallback(
-    (): Promise<unknown> => invoke(Invokes.SyncVerifyLibrary),
-    [],
-  );
+  const verifyLibrary = useCallback((): Promise<unknown> => invoke(Invokes.SyncVerifyLibrary), []);
 
   return {
     refreshStatus,

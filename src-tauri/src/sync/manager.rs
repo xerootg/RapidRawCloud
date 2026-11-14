@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::app_settings::SyncSettings;
+use crate::app::settings::SyncSettings;
 use crate::sync::WriteOrigin;
 use crate::sync::credentials::Credentials;
 
@@ -258,6 +258,14 @@ impl SyncManager {
     /// Whether [`configure`](Self::configure) has run.
     pub fn is_configured(&self) -> bool {
         self.configured.load(Ordering::SeqCst)
+    }
+
+    /// Emits `sync-error {path?, message}` through the app handle stored in
+    /// [`start_in_setup`]; a silent no-op in tests / headless (no handle).
+    pub fn emit_error(&self, path: Option<&str>, message: &str) {
+        if let Some(app) = self.app.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            crate::sync::events::emit_error(app, path, message);
+        }
     }
 
     /// Points the engine at a bucket and local roots: opens the redb state
@@ -506,7 +514,7 @@ impl SyncManager {
         let Some(app) = self.app.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
             return;
         };
-        let cache_dir = match crate::file_management::get_thumb_cache_dir(&app) {
+        let cache_dir = match crate::library::thumbnails::resolve_thumbnail_cache_dir(&app) {
             Ok(dir) => dir,
             Err(e) => {
                 log::warn!("stub thumbs: thumbnail cache dir: {e}");
@@ -515,7 +523,7 @@ impl SyncManager {
         };
         for path in seeded {
             if let Some((small, medium)) = cfg.link_stub_thumbs_into_cache(&path, &cache_dir) {
-                crate::file_management::emit_thumbnail_seeded(
+                crate::library::thumbnails::emit_thumbnail_seeded(
                     &app,
                     &path.to_string_lossy(),
                     &small.to_string_lossy(),
@@ -1299,7 +1307,7 @@ mod imp {
         ConflictKeep, EvictionReport, PeerDevice, RecentlyDeleted, SyncError, SyncState,
         SyncStatus, ThumbVariant, VerifyReport,
     };
-    use crate::app_settings::SyncSettings;
+    use crate::app::settings::SyncSettings;
     use crate::sync::credentials::Credentials;
     use crate::sync::{MetaKind, WriteOrigin};
 
@@ -2595,6 +2603,24 @@ mod imp {
         /// touching the store or the record. The P4 worker reuses the same
         /// `proxy` module for backfill + the S3/journal upload of previews.
         pub fn generate_and_store_proxy(&self, image_path: &Path) -> Result<(), SyncError> {
+            self.store_proxy(image_path, false)
+        }
+
+        /// §4.4: regenerate the original's existing smart preview if it
+        /// predates the as-shot exposure record (`rrcloud_core::as_shot`), so
+        /// the stub an eviction leaves behind renders with the original's
+        /// maker-note highlight preservation. Called only at eviction — the
+        /// last moment the original is local — so the record check reads one
+        /// proxy per evicted original instead of the whole store every cycle.
+        /// No proxy: nothing to refresh (editing the stub hydrates it).
+        fn refresh_stale_proxy(&self, image_path: &Path) -> Result<(), SyncError> {
+            self.store_proxy(image_path, true)
+        }
+
+        /// [`Self::generate_and_store_proxy`]'s body. `refresh_stale` turns it
+        /// into [`Self::refresh_stale_proxy`]: act only on an existing proxy
+        /// without the as-shot record, and replace it in place.
+        fn store_proxy(&self, image_path: &Path, refresh_stale: bool) -> Result<(), SyncError> {
             let rk = relkey(image_path, &self.sync_root).map_err(se)?;
             let Some(record) = self.db.get_item(&rk).map_err(se)? else {
                 return Ok(());
@@ -2616,8 +2642,16 @@ mod imp {
                 content_id.as_str(),
                 rrcloud_core::proxy::PROXY_FILE_SUFFIX
             ));
-            // Already generated — nothing to do.
             if dng_path.is_file() {
+                // Already generated — nothing to do, unless this is a refresh
+                // and the proxy predates the as-shot record.
+                let stale = refresh_stale
+                    && std::fs::read(&dng_path)
+                        .is_ok_and(|b| rrcloud_core::proxy::read_as_shot_exposure(&b).is_none());
+                if !stale {
+                    return Ok(());
+                }
+            } else if refresh_stale {
                 return Ok(());
             }
             let bytes = match std::fs::read(image_path) {
@@ -3180,6 +3214,15 @@ mod imp {
             path: &Path,
             on_evicted: &mut dyn FnMut(&Path),
         ) -> Result<(), SyncError> {
+            // §4.4: the stub keeps editing through its smart preview; bring an
+            // older one up to the as-shot record while the original is still
+            // here to compute it from. Best-effort: never blocks the eviction.
+            if let Err(e) = self.refresh_stale_proxy(path) {
+                log::warn!(
+                    "smart preview refresh before evicting {}: {e}",
+                    path.display()
+                );
+            }
             self.db
                 .transition(rk, record.state, ItemState::Stub, |_| {})
                 .map_err(se)?;
@@ -3285,10 +3328,21 @@ mod imp {
             cache_thumbnails_dir: &Path,
         ) -> Result<PathBuf, SyncError> {
             let path_str = image_path.to_string_lossy();
-            let adjustments = crate::file_management::thumbnail_adjustments_key_bytes(&path_str);
-            let hash =
-                crate::file_management::compute_thumbnail_cache_hash(&path_str, &adjustments)
-                    .ok_or_else(|| se("seed_thumbnail: cannot compute thumbnail cache key"))?;
+            let adjustments =
+                crate::library::thumbnails::thumbnail_adjustments_key_bytes(&path_str);
+            // The key also folds in the render settings (upstream's thumbnail
+            // cache keys on them), so read the app's current settings; headless
+            // / tests (no app handle) key on the defaults.
+            let settings = crate::sync::global_manager()
+                .and_then(|m| m.app.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                .and_then(|app| crate::app::settings::load_settings(app).ok())
+                .unwrap_or_default();
+            let hash = crate::library::thumbnails::compute_thumbnail_cache_hash(
+                &path_str,
+                &adjustments,
+                &settings,
+            )
+            .ok_or_else(|| se("seed_thumbnail: cannot compute thumbnail cache key"))?;
             std::fs::create_dir_all(cache_thumbnails_dir).map_err(se)?;
             let linked = cache_thumbnails_dir.join(format!("{hash}_{suffix}.jpg"));
             // Replace any stale link/file at the key first.

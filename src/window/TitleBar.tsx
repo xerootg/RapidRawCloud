@@ -1,4 +1,4 @@
-import { useCallback, useState, useEffect } from 'react';
+import { useCallback, useState, useEffect, useMemo } from 'react';
 import { platform } from '@tauri-apps/plugin-os';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { Minus, Square, X } from 'lucide-react';
@@ -24,7 +24,7 @@ export default function TitleBar() {
   const [osPlatform, setOsPlatform] = useState('');
   const [isMaximized, setIsMaximized] = useState(false);
 
-  const appWindow = getCurrentWindow();
+  const appWindow = useMemo(() => getCurrentWindow(), []);
 
   useEffect(() => {
     const getPlatform = async () => {
@@ -115,7 +115,7 @@ export default function TitleBar() {
             </div>
           )}
           <div data-tauri-drag-region className={`flex items-center h-full ${isMac ? '' : 'px-4'}`}>
-            <p className="text-sm font-semibold text-text-secondary pointer-events-none">RapidRAW</p>
+            <p className="text-sm font-semibold text-text-secondary pointer-events-none">{'RapidRAW'}</p>
           </div>
         </div>
         <div data-tauri-drag-region className="flex-1 h-full" />

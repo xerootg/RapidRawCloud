@@ -68,11 +68,11 @@ and that pin also applies to `rrcloud-core` because rustup walks up the director
    - `cargo build --no-default-features` must build and behave like upstream. The `sync` feature
      is on by default.
 2. **Sidecar writes go through the chokepoint.** Never `fs::write` a `.rrdata` sidecar. Use
-   `exif_processing::save_sidecar` for a full write, or `update_sidecar` for load-modify-write
+   `metadata::sidecar::save_sidecar` for a full write, or `update_sidecar` for load-modify-write
    (it holds the per-path lock; anything else races AI tagging and loses edits).
 3. **Originals may be cloud stubs.** Before reading an original image's bytes in a new code path, call
    `crate::sync::hooks::ensure_local(&path, "<reason>")` (returns `io::Result<PathBuf>`) and read the path it returns (see the
-   guards in `export_processing.rs`, `denoising.rs`, `panorama_stitching.rs`).
+   guards in `export/mod.rs`, `library/file_ops.rs`, `merge/panorama/mod.rs`).
 4. **The wire format is generated.** To change any S3 document, key, or constant: edit
    `protocol/rrcloud.protocol.toml`, run `python3 protocol/rrcgen`, commit the regenerated
    `protocol/gen/`. Never hand-edit `protocol/gen/`. See `protocol/CLAUDE.md`.
@@ -163,6 +163,7 @@ Run the matching local commands before pushing.
 - `rawler` must stay at the **same git rev** in `src-tauri` and `rrcloud-core` (proxy color parity).
 - `src-tauri/capabilities/sync/` is only loaded for `sync` builds (`build.rs`). Don't reference
   `rrcloud:*` permissions from `capabilities/default.json`.
-- Big upstream files (`file_management.rs` ≈4.6k lines, `lib.rs` ≈2.8k) — search with grep for the
-  function you need; don't read them end to end.
+- Upstream's backend is split into module folders (`app/`, `decode/`, `render/`, `library/`, `metadata/`,
+  `export/`, …) and several files are still 1–2k lines — search with grep for the function you need;
+  don't read them end to end.
 - `README.md` is upstream's README; fork documentation goes in `docs/`.

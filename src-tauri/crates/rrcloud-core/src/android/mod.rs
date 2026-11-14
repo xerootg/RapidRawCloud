@@ -28,11 +28,13 @@
 //!   arithmetic (the API 30+ path uses `MediaStore.getGeneration()`
 //!   instead, which has no host-side arithmetic to pull out).
 //! - [`platform_init`]: the process-wide `ndk_context`/
-//!   `rustls_platform_verifier` init guards shared by [`bridge`]'s JNI
-//!   entry points **and** `src-tauri`'s own `android_integration.rs` —
-//!   see that module's doc for the double-init crash this exists to
-//!   prevent. The guard mechanic itself has no `target_os` gate, so its
-//!   regression tests run on the host.
+//!   `rustls_platform_verifier` init guards — the latter shared by
+//!   [`bridge`]'s JNI entry points **and** `src-tauri`'s own
+//!   `android_integration.rs`, the former used only by the app bootstrap
+//!   (tao 0.37+ initializes `ndk_context` itself) — see that module's doc
+//!   for the double-init crashes this exists to prevent. The guard
+//!   mechanic itself has no `target_os` gate, so its regression tests run
+//!   on the host.
 
 pub mod bounded_cycle;
 pub mod bridge;

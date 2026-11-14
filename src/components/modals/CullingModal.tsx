@@ -3,13 +3,17 @@ import { invoke } from '@tauri-apps/api/core';
 import { useTranslation } from 'react-i18next';
 import { CheckCircle, XCircle, Loader2, Users, Trash2, Star, Tag } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
-import { CullingSettings, CullingSuggestions, Invokes, Progress } from '../ui/AppProperties';
+import { CullingSettings, CullingSuggestions, Progress } from '../../types/library';
+import { Invokes } from '../../types/invokes';
 import Button from '../ui/Button';
 import Switch from '../ui/Switch';
 import Slider from '../ui/Slider';
 import Dropdown from '../ui/Dropdown';
 import Text from '../ui/Text';
 import { TextColors, TextVariants } from '../../types/typography';
+import { useProcessStore } from '../../store/useProcessStore';
+
+const EMPTY_THUMBNAILS: Record<string, string> = {};
 
 interface CullingModalProps {
   isOpen: boolean;
@@ -18,7 +22,6 @@ interface CullingModalProps {
   suggestions: CullingSuggestions | null;
   error: string | null;
   imagePaths: string[];
-  thumbnails: Record<string, string>;
   onApply(action: 'reject' | 'rate_zero' | 'delete', paths: string[]): void;
   onError(error: string): void;
 }
@@ -66,13 +69,13 @@ export default function CullingModal({
   suggestions,
   error,
   imagePaths,
-  thumbnails,
   onApply,
   onError,
 }: CullingModalProps) {
   const { t } = useTranslation();
   const [isMounted, setIsMounted] = useState(false);
   const [show, setShow] = useState(false);
+  const thumbnails = useProcessStore((s) => (isMounted ? s.thumbnails : EMPTY_THUMBNAILS));
   const [stage, setStage] = useState<'settings' | 'progress' | 'results'>('settings');
 
   const [settings, setSettings] = useState<CullingSettings>({
@@ -242,7 +245,7 @@ export default function CullingModal({
         <div className="w-full bg-surface rounded-full h-2.5 mt-2">
           <div
             className="bg-accent h-2.5 rounded-full"
-            style={{ width: `${(progress.current / progress.total) * 100}%` }}
+            style={{ width: `${((progress.current ?? 0) / progress.total) * 100}%` }}
           />
         </div>
       )}

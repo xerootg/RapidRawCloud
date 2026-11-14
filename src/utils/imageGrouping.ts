@@ -1,4 +1,5 @@
-import { GroupPreference, GroupingMode, ImageFile } from '../components/ui/AppProperties';
+import { GroupPreference, GroupingMode } from '../types/settings';
+import { ImageFile } from '../types/library';
 
 export type GroupId = string;
 
@@ -90,12 +91,23 @@ export function expandGroupedPaths(images: ImageFile[], paths: string[], groupin
   const expandedPaths = new Set(paths);
   if (groupingMode === 'off') return Array.from(expandedPaths);
 
-  for (const path of paths) {
-    const image = images.find((item) => item.path === path);
-    if (!image?.group_id) continue;
+  const groupIdByPath = new Map<string, string | null | undefined>();
+  const variantsByGroup = new Map<string, string[]>();
+  for (const image of images) {
+    if (!groupIdByPath.has(image.path)) groupIdByPath.set(image.path, image.group_id);
+    if (image.group_id && !image.is_virtual_copy) {
+      const variants = variantsByGroup.get(image.group_id);
+      if (variants) variants.push(image.path);
+      else variantsByGroup.set(image.group_id, [image.path]);
+    }
+  }
 
-    for (const variant of findGroupVariants(images, image.group_id)) {
-      expandedPaths.add(variant.path);
+  for (const path of paths) {
+    const groupId = groupIdByPath.get(path);
+    if (!groupId) continue;
+
+    for (const variantPath of variantsByGroup.get(groupId) ?? []) {
+      expandedPaths.add(variantPath);
     }
   }
 
