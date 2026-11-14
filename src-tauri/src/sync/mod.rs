@@ -29,6 +29,7 @@ use once_cell::sync::Lazy;
 pub mod commands;
 pub mod credentials;
 pub mod events;
+pub mod headless_gpu;
 pub mod hooks;
 pub mod manager;
 #[cfg(feature = "sync")]
@@ -50,16 +51,18 @@ pub use manager::{
 
 // Re-exports so the integration tests (and future command layer) reach the
 // chokepoint and settings types through one module path.
-pub use crate::app_settings::{AppSettings, SyncSettings};
-pub use crate::exif_processing::{save_sidecar, update_sidecar};
-pub use crate::image_processing::ImageMetadata;
+pub use crate::app::settings::{AppSettings, SyncSettings};
+pub use crate::metadata::sidecar::ImageMetadata;
+pub use crate::metadata::sidecar::{save_sidecar, update_sidecar};
 
 // §3.5 guard-site test seams. The upstream placeholder check and the stub
 // thumbnail-cache key live in the private `file_management` module; re-export
 // them through `sync` (pure visibility, no behavior change) so the P2
 // integration suite can assert placeholder/hash behavior. Both are plain
 // functions (not `#[tauri::command]`s), so a `pub use` is safe.
-pub use crate::file_management::{compute_thumbnail_cache_hash, is_cloud_placeholder};
+pub use crate::library::{
+    file_ops::is_cloud_placeholder, thumbnails::compute_thumbnail_cache_hash,
+};
 
 /// P3 smart-preview fidelity test seams (ARCHITECTURE.md §8-P3).
 ///
@@ -72,19 +75,20 @@ pub use crate::file_management::{compute_thumbnail_cache_hash, is_cloud_placehol
 /// `ProxyHandle` type only.
 #[doc(hidden)]
 pub mod proxy_support {
-    pub use crate::gpu_processing::{
-        gpu_adapter_probe, init_gpu_context_headless, render_adjustments_headless,
-    };
-    pub use crate::image_loader::{
+    pub use crate::decode::image_loader::{
         load_image_with_orientation, proxy_decode_settings, proxy_reported_dimensions,
     };
-    pub use crate::image_processing::{GpuContext, apply_srgb_to_linear, downscale_f32_image};
-    pub use crate::raw_processing::{develop_raw_image, read_as_shot};
+    pub use crate::decode::raw_processing::{develop_raw_image, read_as_shot};
+    pub use crate::render::gpu::context::GpuContext;
+    pub use crate::render::image_processing::{apply_srgb_to_linear, downscale_f32_image};
+    pub use crate::sync::headless_gpu::{
+        gpu_adapter_probe, init_gpu_context_headless, render_adjustments_headless,
+    };
     pub use crate::sync::hooks::{ProxyHandle, proxy_as_shot};
     // The as-shot types the two readers above return (§4.4 parity test).
-    pub use crate::as_shot::AsShot;
-    pub use crate::baseline_exposure::RawExposure;
-    pub use crate::white_balance::WhiteBalance;
+    pub use crate::decode::as_shot::AsShot;
+    pub use crate::decode::baseline_exposure::RawExposure;
+    pub use crate::decode::white_balance::WhiteBalance;
 }
 
 /// Test seam for the §3.5 `copy_files` guard: a plain-function wrapper over
@@ -98,7 +102,38 @@ pub async fn copy_files_guarded(
     destination_folder: String,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
-    crate::file_management::copy_files(source_paths, destination_folder, app_handle).await
+    crate::library::file_ops::copy_files(source_paths, destination_folder, app_handle).await
+}
+
+/// Test seams for integration tests that need private upstream commands:
+/// plain-function wrappers over the `library` commands (`rename_separators`,
+/// `show_in_finder_injection`) and the app settings type (`proxy_fidelity`).
+/// A direct `pub use` of a `#[tauri::command]` is avoided because the attribute
+/// also defines a same-named macro which a re-export would pull along. No
+/// behavior change.
+#[doc(hidden)]
+pub mod test_seams {
+    pub use crate::app::settings::AppSettings;
+
+    pub fn rename_folder(
+        path: String,
+        new_name: String,
+        app_handle: tauri::AppHandle,
+    ) -> Result<(), String> {
+        crate::library::folders::rename_folder(path, new_name, app_handle)
+    }
+
+    pub fn rename_files(
+        paths: Vec<String>,
+        name_template: String,
+        app_handle: tauri::AppHandle,
+    ) -> Result<Vec<String>, String> {
+        crate::library::file_ops::rename_files(paths, name_template, app_handle)
+    }
+
+    pub fn show_in_finder(path: String) -> Result<(), String> {
+        crate::library::file_ops::show_in_finder(path)
+    }
 }
 
 /// Where a sidecar write came from, threaded through the [`save_sidecar`]

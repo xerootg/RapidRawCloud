@@ -1,5 +1,5 @@
 import { create } from 'zustand';
-import { SyncConflict, SyncStatusDto } from '../components/ui/AppProperties';
+import { SyncConflict, SyncStatusDto } from '../types/sync';
 
 /**
  * Cloud-sync UI state (ARCHITECTURE.md §3.8). Fed by the `sync-*` Tauri
@@ -53,9 +53,7 @@ export const useSyncStore = create<SyncState>((set) => ({
 
   setStatus: (status) =>
     set((state) => ({
-      status: state.status
-        ? { ...state.status, ...status }
-        : (status as SyncStatusDto),
+      status: state.status ? { ...state.status, ...status } : (status as SyncStatusDto),
     })),
 
   applyItemStates: (updates) =>
@@ -84,8 +82,7 @@ export const useSyncStore = create<SyncState>((set) => ({
         : [...state.conflicts, conflict],
     })),
 
-  dismissConflict: (path) =>
-    set((state) => ({ conflicts: state.conflicts.filter((c) => c.path !== path) })),
+  dismissConflict: (path) => set((state) => ({ conflicts: state.conflicts.filter((c) => c.path !== path) })),
 
   setError: (error) => set({ lastError: error }),
 }));

@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { addPluginListener, invoke, PluginListener } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-shell';
-import { Invokes } from '../../ui/AppProperties';
+import { Invokes } from '../../../types/invokes';
 import DockFirmware from './DockFirmware';
 import { useSettingsStore } from '../../../store/useSettingsStore';
 
@@ -151,7 +151,9 @@ export default function DockSection() {
   const [info, setInfo] = useState<DockInfo | null>(null);
   const [status, setStatus] = useState<DockStatus | null>(null);
   const [config, setConfig] = useState<DockConfig | null>(null);
-  const [form, setForm] = useState<Partial<DockConfig> & { s3_secret_key?: string; wifi_password?: string; admin_password?: string }>({});
+  const [form, setForm] = useState<
+    Partial<DockConfig> & { s3_secret_key?: string; wifi_password?: string; admin_password?: string }
+  >({});
   const [auth, setAuth] = useState('');
   const [needAuth, setNeedAuth] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -255,7 +257,9 @@ export default function DockSection() {
     BOOL_FIELDS.forEach((f) => (next[f] = !!c[f]));
     next.min_size_kb = c.min_size_kb ?? 0;
     setForm(next as Partial<DockConfig>);
-    setPairUrl((u) => u || c.pairing_url || appSettings?.sync?.endpoint?.replace(/^https?:\/\/garage\./, 'https://rrc.') || '');
+    setPairUrl(
+      (u) => u || c.pairing_url || appSettings?.sync?.endpoint?.replace(/^https?:\/\/garage\./, 'https://rrc.') || '',
+    );
   }, [rpc, appSettings?.sync?.endpoint]);
 
   const connect = async (address: string) => {
@@ -392,8 +396,8 @@ export default function DockSection() {
     <section className="flex flex-col gap-3">
       <h3 className="text-text-primary font-medium">Camera dock (Bluetooth)</h3>
       <p className="text-text-secondary text-sm">
-        Set up a RapidRawCloud camera dock without a network: what it uploads, which cloud it
-        uploads to, Wi‑Fi, and its radio firmware.
+        Set up a RapidRawCloud camera dock without a network: what it uploads, which cloud it uploads to, Wi‑Fi, and its
+        radio firmware.
       </p>
 
       {!connected && (
@@ -406,9 +410,15 @@ export default function DockSection() {
             {scanning ? 'Scanning…' : 'Find docks'}
           </button>
           {found.map((d) => (
-            <div key={d.address} className="flex items-center justify-between gap-2 px-2 py-1 rounded-md bg-bg-primary border border-border-color/40">
+            <div
+              key={d.address}
+              className="flex items-center justify-between gap-2 px-2 py-1 rounded-md bg-bg-primary border border-border-color/40"
+            >
               <span className="text-text-primary text-sm">
-                {d.name || 'dock'} <span className="text-text-secondary">· {d.address} · {d.rssi} dBm</span>
+                {d.name || 'dock'}{' '}
+                <span className="text-text-secondary">
+                  · {d.address} · {d.rssi} dBm
+                </span>
               </span>
               <button
                 className="px-2 py-1 rounded-md bg-accent text-button-text text-sm disabled:opacity-50"
@@ -472,11 +482,16 @@ export default function DockSection() {
               </div>
               <div className="flex justify-between">
                 <span className="text-text-secondary">Network</span>
-                <span className="text-text-primary">{status.network || 'no address'}{status.eth_link ? '' : ' (no ethernet link)'}</span>
+                <span className="text-text-primary">
+                  {status.network || 'no address'}
+                  {status.eth_link ? '' : ' (no ethernet link)'}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-text-secondary">Uploaded</span>
-                <span className="text-text-primary">{y.lifetime_uploaded} files · {fmtBytes(y.lifetime_bytes)}</span>
+                <span className="text-text-primary">
+                  {y.lifetime_uploaded} files · {fmtBytes(y.lifetime_bytes)}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-text-secondary">Last run</span>
@@ -484,7 +499,9 @@ export default function DockSection() {
               </div>
               {active && (
                 <div className="text-text-secondary">
-                  {y.current_file ? `${y.current_file} — ${fmtBytes(y.current_done)} / ${fmtBytes(y.current_size)}` : 'scanning camera…'}
+                  {y.current_file
+                    ? `${y.current_file} — ${fmtBytes(y.current_done)} / ${fmtBytes(y.current_size)}`
+                    : 'scanning camera…'}
                   {' · '}
                   {y.run_done} uploaded · {y.run_skipped} skipped · {y.run_failed} failed · {y.run_total} queued
                 </div>
@@ -519,7 +536,12 @@ export default function DockSection() {
           {config && (
             <>
               <h4 className="text-text-primary text-sm font-medium pt-1">Pair the dock with the cloud</h4>
-              <Field label="Pairing service URL" value={pairUrl} onChange={setPairUrl} placeholder="https://rrc.example.com" />
+              <Field
+                label="Pairing service URL"
+                value={pairUrl}
+                onChange={setPairUrl}
+                placeholder="https://rrc.example.com"
+              />
               {!pair || pair.state === 'idle' || pair.state === 'done' || pair.state === 'failed' ? (
                 <button
                   className="self-start px-3 py-1.5 rounded-md bg-accent text-button-text disabled:opacity-50"
@@ -564,48 +586,114 @@ export default function DockSection() {
               >
                 Use this phone's endpoint and bucket
               </button>
-              <Field label="S3 endpoint" value={form.s3_endpoint ?? ''} onChange={(v) => patchForm({ s3_endpoint: v })} placeholder="https://garage.example.com" />
+              <Field
+                label="S3 endpoint"
+                value={form.s3_endpoint ?? ''}
+                onChange={(v) => patchForm({ s3_endpoint: v })}
+                placeholder="https://garage.example.com"
+              />
               <Field label="Bucket" value={form.s3_bucket ?? ''} onChange={(v) => patchForm({ s3_bucket: v })} />
               <Field label="Region" value={form.s3_region ?? ''} onChange={(v) => patchForm({ s3_region: v })} />
-              <Field label="Access key ID" value={form.s3_access_key ?? ''} onChange={(v) => patchForm({ s3_access_key: v })} />
+              <Field
+                label="Access key ID"
+                value={form.s3_access_key ?? ''}
+                onChange={(v) => patchForm({ s3_access_key: v })}
+              />
               <Field
                 label={`Secret access key ${config.has_s3_secret ? '(stored; leave blank to keep)' : '(not set)'}`}
                 value={form.s3_secret_key ?? ''}
                 onChange={(v) => patchForm({ s3_secret_key: v })}
                 type="password"
               />
-              <Check label="Skip TLS certificate verification (self-signed endpoint)" value={!!form.s3_tls_insecure} onChange={(v) => patchForm({ s3_tls_insecure: v })} />
+              <Check
+                label="Skip TLS certificate verification (self-signed endpoint)"
+                value={!!form.s3_tls_insecure}
+                onChange={(v) => patchForm({ s3_tls_insecure: v })}
+              />
 
               <h4 className="text-text-primary text-sm font-medium pt-1">What to sync</h4>
-              <Field label="Include patterns" value={form.include_globs ?? ''} onChange={(v) => patchForm({ include_globs: v })} />
-              <Field label="Exclude patterns" value={form.exclude_globs ?? ''} onChange={(v) => patchForm({ exclude_globs: v })} />
-              <Field label="Library path template" value={form.key_template ?? ''} onChange={(v) => patchForm({ key_template: v })} />
-              <Field label="Mass-storage scan folder" value={form.msc_root ?? ''} onChange={(v) => patchForm({ msc_root: v })} placeholder="DCIM" />
-              <Check label="Sync automatically when a camera is plugged in" value={!!form.auto_sync} onChange={(v) => patchForm({ auto_sync: v })} />
-              <Check label="Also upload videos (*.mov *.mp4)" value={!!form.upload_videos} onChange={(v) => patchForm({ upload_videos: v })} />
-              <NumField label="Minimum file size (KB)" value={form.min_size_kb ?? 0} onChange={(v) => patchForm({ min_size_kb: v })} />
+              <Field
+                label="Include patterns"
+                value={form.include_globs ?? ''}
+                onChange={(v) => patchForm({ include_globs: v })}
+              />
+              <Field
+                label="Exclude patterns"
+                value={form.exclude_globs ?? ''}
+                onChange={(v) => patchForm({ exclude_globs: v })}
+              />
+              <Field
+                label="Library path template"
+                value={form.key_template ?? ''}
+                onChange={(v) => patchForm({ key_template: v })}
+              />
+              <Field
+                label="Mass-storage scan folder"
+                value={form.msc_root ?? ''}
+                onChange={(v) => patchForm({ msc_root: v })}
+                placeholder="DCIM"
+              />
+              <Check
+                label="Sync automatically when a camera is plugged in"
+                value={!!form.auto_sync}
+                onChange={(v) => patchForm({ auto_sync: v })}
+              />
+              <Check
+                label="Also upload videos (*.mov *.mp4)"
+                value={!!form.upload_videos}
+                onChange={(v) => patchForm({ upload_videos: v })}
+              />
+              <NumField
+                label="Minimum file size (KB)"
+                value={form.min_size_kb ?? 0}
+                onChange={(v) => patchForm({ min_size_kb: v })}
+              />
 
               <h4 className="text-text-primary text-sm font-medium pt-1">Device</h4>
-              <Field label="Name in the device registry" value={form.device_name ?? ''} onChange={(v) => patchForm({ device_name: v })} />
+              <Field
+                label="Name in the device registry"
+                value={form.device_name ?? ''}
+                onChange={(v) => patchForm({ device_name: v })}
+              />
               <Field label="Hostname" value={form.hostname ?? ''} onChange={(v) => patchForm({ hostname: v })} />
-              <Field label="Wi‑Fi SSID (optional; Ethernet is always on)" value={form.wifi_ssid ?? ''} onChange={(v) => patchForm({ wifi_ssid: v })} />
+              <Field
+                label="Wi‑Fi SSID (optional; Ethernet is always on)"
+                value={form.wifi_ssid ?? ''}
+                onChange={(v) => patchForm({ wifi_ssid: v })}
+              />
               <Field
                 label={`Wi‑Fi password ${config.has_wifi_password ? '(stored; leave blank to keep)' : ''}`}
                 value={form.wifi_password ?? ''}
                 onChange={(v) => patchForm({ wifi_password: v })}
                 type="password"
               />
-              <Check label="Require a password for the dock's admin page and app access" value={!!form.admin_auth} onChange={(v) => patchForm({ admin_auth: v })} />
+              <Check
+                label="Require a password for the dock's admin page and app access"
+                value={!!form.admin_auth}
+                onChange={(v) => patchForm({ admin_auth: v })}
+              />
               <Field
                 label={`Admin password ${config.has_admin_password ? '(stored; leave blank to keep)' : ''}`}
                 value={form.admin_password ?? ''}
                 onChange={(v) => patchForm({ admin_password: v })}
                 type="password"
               />
-              <Check label="Bluetooth setup from this app" value={!!form.ble_enabled} onChange={(v) => patchForm({ ble_enabled: v })} />
-              <Check label="Verbose USB logging on the dock's console" value={!!form.usb_debug} onChange={(v) => patchForm({ usb_debug: v })} />
+              <Check
+                label="Bluetooth setup from this app"
+                value={!!form.ble_enabled}
+                onChange={(v) => patchForm({ ble_enabled: v })}
+              />
+              <Check
+                label="Verbose USB logging on the dock's console"
+                value={!!form.usb_debug}
+                onChange={(v) => patchForm({ usb_debug: v })}
+              />
               <div className="flex gap-2">
-                <button className="px-3 py-1.5 rounded-md bg-accent text-button-text disabled:opacity-50" disabled={busy} onClick={() => void saveConfig()}>
+                <button
+                  className="px-3 py-1.5 rounded-md bg-accent text-button-text disabled:opacity-50"
+                  disabled={busy}
+                  onClick={() => void saveConfig()}
+                >
                   Save to dock
                 </button>
                 <button
@@ -626,13 +714,19 @@ export default function DockSection() {
                       : radio.linking
                         ? 'linking over SDIO…'
                         : `not linked${radio.error ? ' — ' + radio.error : ''}`}
-                    {radio.update?.state && radio.update.state !== 'idle' && ` · update ${radio.update.state}: ${radio.update.message}`}
+                    {radio.update?.state &&
+                      radio.update.state !== 'idle' &&
+                      ` · update ${radio.update.state}: ${radio.update.message}`}
                   </p>
                   <div className="flex gap-2">
                     <button
                       className="px-2 py-1 rounded-md bg-bg-primary border border-border-color/40 text-text-primary text-sm disabled:opacity-50"
                       disabled={busy || !radio.linked || radio.update?.state === 'running'}
-                      onClick={() => void run('Radio update started; the dock restarts when done', () => rpc('POST', '/api/coproc/update', {}))}
+                      onClick={() =>
+                        void run('Radio update started; the dock restarts when done', () =>
+                          rpc('POST', '/api/coproc/update', {}),
+                        )
+                      }
                     >
                       Update radio firmware
                     </button>
@@ -647,7 +741,10 @@ export default function DockSection() {
                 </>
               )}
 
-              <button className="self-start text-text-secondary text-sm underline" onClick={() => setShowLog((v) => !v)}>
+              <button
+                className="self-start text-text-secondary text-sm underline"
+                onClick={() => setShowLog((v) => !v)}
+              >
                 {showLog ? 'Hide dock log' : 'Show dock log'}
               </button>
               {showLog && (

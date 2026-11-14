@@ -150,6 +150,8 @@
       "aiDenoise": "Reducción de ruido IA",
       "classicDenoise": "Reducción de ruido clásica",
       "aiDenoiseDetail": "Detalle",
+      "aiUpscale": "RapidRes 2x",
+      "aiUpscaleDetail": "Detalle",
       "blueYellow": "Azul/Amarillo",
       "centre": "Centro",
       "chromaticAberration": "Aberración cromática",
@@ -165,6 +167,7 @@
       "negativeGreen": "Verde",
       "negativeRed": "Rojo",
       "noiseReduction": "Reducción de ruido",
+      "superResolution": "RapidRes",
       "presence": "Presencia",
       "redCyan": "Rojo/Cian",
       "sharpening": "Enfoque",
@@ -325,8 +328,12 @@
       "removeBlackWhite": "Quitar blanco y negro",
       "removeDenoise": "Quitar reducción de ruido",
       "removeNegativeConversion": "Quitar conversión de negativo",
+      "removeSuperResolution": "Quitar RapidRes",
       "resetAdjustments": "Restablecer ajustes",
+      "resetToDefaults": "Restablecer a predeterminados",
+      "resetToNeutral": "Restablecer a neutro",
       "stitchPanorama": "Unir panorama",
+      "superResolution": "RapidRes (2x)",
       "tagging": "Etiquetado",
       "undo": "Deshacer",
       "unflagged": "Sin marca"
@@ -399,6 +406,9 @@
       "denoise_many": "Reducir ruido",
       "denoise_one": "Reducir ruido",
       "denoise_other": "Reducir ruido",
+      "superResolution_many": "RapidRes (2x)",
+      "superResolution_one": "RapidRes (2x)",
+      "superResolution_other": "RapidRes (2x)",
       "duplicateImage": "Duplicar imagen",
       "enable": "Activar",
       "exportImage_many": "Exportar {{count}} imágenes",
@@ -527,6 +537,7 @@
       "createNewTitle": "Crear nueva edición generativa",
       "createNewTooltip": "Crear nueva edición {{name}}",
       "denoising": "Ejecutando reducción de ruido IA...",
+      "upscaling": "Ejecutando RapidRes...",
       "dropzoneText": "Suelta aquí para crear una nueva edición",
       "editSettingsTitle": "Ajustes de edición",
       "editsTitle": "Ediciones",
@@ -737,11 +748,13 @@
       "cancel": "Cancelar",
       "drawingActive": "Dibujo activo",
       "hint": "Dibuja a lo largo de los bordes de tu foto que deberían ser verticales u horizontales.",
+      "horizontalLine": "Guía horizontal n.º {{index}}",
       "linesStatus": "Líneas guía activas",
       "toast": {
         "angleRejected": "El ángulo de la línea está demasiado lejos de la horizontal o vertical",
         "maxLines": "Se permiten un máximo de 2 líneas verticales y 2 horizontales"
-      }
+      },
+      "verticalLine": "Guía vertical n.º {{index}}"
     },
     "layout": {
       "split": "Dividir"
@@ -901,6 +914,8 @@
     },
     "presets": {
       "amount": "Cantidad",
+      "defaultForAllCameras": "Predeterminado para todas las cámaras",
+      "defaultForCamera": "Predeterminado para {{camera}}",
       "dialog": {
         "allPresetFiles": "Todos los archivos de ajustes",
         "exportAllTitle": "Exportar todos los ajustes preestablecidos",
@@ -921,7 +936,11 @@
         "newPreset": "Nuevo ajuste preestablecido",
         "overwrite": "Sobrescribir",
         "renameFolder": "Renombrar carpeta",
-        "sortAll": "Ordenar todo alfabéticamente"
+        "setDefaultAllCameras": "Establecer como predeterminado para todas las cámaras",
+        "setDefaultForCamera": "Establecer como predeterminado para {{camera}}",
+        "sortAll": "Ordenar todo alfabéticamente",
+        "unsetDefaultAllCameras": "Dejar de usar como predeterminado para todas las cámaras",
+        "unsetDefaultForCamera": "Dejar de usar como predeterminado para {{camera}}"
       },
       "status": {
         "empty": "Aún no hay ajustes guardados. Crea el tuyo, impórtalo desde un archivo o explora los de la comunidad.",
@@ -1186,6 +1205,7 @@
       "failed": "Fallidos ({{failedCount}})",
       "kinds": {
         "denoise": "Reduciendo ruido con IA",
+        "upscale": "Ampliando con RapidRes",
         "depthMap": "Analizando la profundidad",
         "depthMask": "Generando máscara de profundidad",
         "faceMask": "Generando máscara de rostro",
@@ -1584,6 +1604,7 @@
       "descReplace": "Sobrescribe todos los ajustes seleccionados, restableciendo el resto a sus valores predeterminados.",
       "groups": {
         "aiDenoise": "Reducción de ruido con IA",
+        "aiUpscale": "RapidRes",
         "blackWhite": "Blanco y negro",
         "chromaticAberration": "Aberración cromática",
         "clarityDehaze": "Claridad y Borrar neblina",
@@ -1880,6 +1901,7 @@
       "limit": "Límite",
       "modals": {
         "aiDenoiseMessage": "¿Seguro que quieres borrar la caché de reducción de ruido IA?\n\nLas imágenes con la reducción de ruido IA activada tendrán que procesarse de nuevo, lo que puede tardar varios minutos por imagen.",
+        "aiUpscaleMessage": "¿Seguro que quieres borrar la caché de RapidRes?\n\nLas imágenes con RapidRes activado tendrán que ampliarse de nuevo.",
         "aiMapsMessage": "¿Seguro que quieres vaciar los mapas de profundidad y normales?\n\nLas imágenes que usan desenfoque de lente, niebla o reiluminación regenerarán sus mapas la próxima vez que se abran.",
         "aiMessage": "¿Estás seguro de que quieres eliminar todas las etiquetas generadas por IA de todas las imágenes en todas las carpetas raíz activas?\n\nEsto no afectará a las etiquetas añadidas por el usuario. Esta acción no se puede deshacer.",
         "allMessage": "¿Estás seguro de que quieres eliminar todas las etiquetas generadas por IA y las añadidas por el usuario de todas las imágenes en todas las carpetas raíz activas?\n\nEsta acción no se puede deshacer.",
@@ -1907,6 +1929,7 @@
       "show": "Mostrar",
       "statuses": {
         "aiDenoiseSuccess": "Caché de reducción de ruido IA borrada correctamente.",
+        "aiUpscaleSuccess": "Caché de RapidRes borrada correctamente.",
         "aiSuccess": "{{count}} archivos actualizados. Etiquetas de IA eliminadas.",
         "aiSuccess_many": "{{count}} archivos actualizados. Etiquetas de IA eliminadas.",
         "aiSuccess_one": "{{count}} archivo actualizado. Etiquetas de IA eliminadas.",
@@ -1926,6 +1949,8 @@
       "storage": {
         "aiDenoise": "Reducción de ruido IA",
         "aiDenoiseDesc": "Resultados de reducción de ruido en caché.",
+        "aiUpscale": "RapidRes",
+        "aiUpscaleDesc": "Ampliaciones 2x de RapidRes en caché.",
         "aiMaps": "Mapas de profundidad y normales",
         "aiMapsDesc": "Los usan el desenfoque de lente, la niebla y la reiluminación.",
         "immich": "Immich",
@@ -2155,6 +2180,31 @@
         "metal": "Metal",
         "vulkan": "Vulkan"
       },
+      "defaultAdjustments": {
+        "addCamera": "Añadir cámara…",
+        "applyToNonRaw": "Aplicar también a JPEG, TIFF, PNG y otros archivos no RAW",
+        "applyToNonRawDesc": "Si está desactivado, solo los archivos RAW usan estos valores. Los JPEG de la cámara suelen estar ya procesados y corregidos, y aplicarlos otra vez puede ser excesivo.",
+        "autoLensCorrection": "Corrección automática de lente",
+        "autoLensCorrectionDesc": "Corrige la distorsión, la aberración cromática y el viñeteado con el perfil de lente detectado en los metadatos de cada imagen.",
+        "cameraDefaults": "Valores predeterminados por cámara",
+        "cameraDefaultsDesc": "Da a las imágenes de cámaras concretas su propio ajuste preestablecido. Las cámaras no listadas usan el ajuste predeterminado de arriba, y la corrección de lente se aplica a todas las cámaras.",
+        "cameraPresetMissing": "El ajuste preestablecido elegido se eliminó, así que las imágenes de esta cámara vuelven a usar el de todas las cámaras.",
+        "description": "Define con qué empiezan las imágenes sin editar y a qué vuelve «Restablecer ajustes»; las imágenes editadas conservan su configuración. Con valores predeterminados, las miniaturas RAW se generan en lugar de usar la vista previa incrustada de la cámara y tardan más al principio.",
+        "lensCorrection": "Corrección de lente",
+        "noCamerasFound": "No se encontraron otras cámaras. Abre una carpeta con imágenes de una cámara o haz clic derecho en un ajuste preestablecido mientras editas una de sus imágenes.",
+        "noPreset": "Ninguno (neutro)",
+        "preset": "Ajuste preestablecido predeterminado",
+        "presetDesc": "Se aplica a cada imagen sin editar. Se omiten máscaras, recortes y transformaciones, porque solo encajan con la imagen en la que se crearon.",
+        "presetMissing": "El ajuste preestablecido elegido se eliminó, así que las imágenes sin editar vuelven a usar valores neutros.",
+        "removeCamera": "Quitar cámara",
+        "sameAsAllCameras": "Igual que todas las cámaras",
+        "scope": "Se aplica a",
+        "sliderReset": "Restablecer controles deslizantes",
+        "sliderResetDefaults": "Ajustes predeterminados",
+        "sliderResetDesc": "El valor al que vuelve un control deslizante al restablecerlo, por ejemplo con doble clic o en la edición rápida. Los controles de máscara siempre vuelven a su valor neutro.",
+        "sliderResetNeutral": "Valor neutro",
+        "title": "Ajustes predeterminados"
+      },
       "dynamicDesc": "El editor renderiza la vista previa para que coincida con la densidad real de píxeles de tu pantalla. Esto garantiza que cada detalle se represente con precisión de 1:1 píxeles, proporcionando la máxima claridad al hacer zoom y verificar el enfoque.",
       "editIn": {
         "add": "Añadir programa",
@@ -2297,6 +2347,7 @@
         "mediapipe": "Por los rápidos modelos de puntos faciales y segmentación que impulsan las máscaras de rostro con IA.",
         "negpy": "Por la inspiración tras la lógica de conversión de negativos.",
         "nind": "Por proporcionar los modelos de IA que impulsan las capacidades de reducción de ruido por IA en RapidRAW.",
+        "span": "Por el modelo de IA base de RapidRes, la ampliación 2x con IA de RapidRAW, ajustado por RapidRAW a su propio procesado RAW (de Philip Hofmann, CC BY 4.0).",
         "rawler": "Por la excelente caja (crate) de Rust que proporciona la base para el procesamiento de archivos RAW en este proyecto.",
         "sam2": "Por proporcionar el modelo base usado para las capacidades de detección de sujetos de la IA.",
         "spektrafilm": "Por las LUTs de emulación de película basadas en espectros, de Andrea Volpato, que impulsan las emulaciones integradas de RapidRAW. Con licencia CC BY-SA 4.0.",

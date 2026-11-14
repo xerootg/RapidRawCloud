@@ -9,13 +9,13 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::image_processing::ImageMetadata;
+use crate::metadata::sidecar::ImageMetadata;
 use crate::sync::WriteOrigin;
 
 /// A sidecar was atomically written and its semantic hash changed
 /// (ARCHITECTURE.md §3.4 step 5). Enqueues the §3.7 debounced upload.
 /// No-op when the semantic hash is unchanged (the churn gate lives in the
-/// [`crate::exif_processing::save_sidecar`] chokepoint, which only calls
+/// [`crate::metadata::sidecar::save_sidecar`] chokepoint, which only calls
 /// this when the hash actually moved).
 pub fn notify_sidecar_saved(sidecar_path: &Path, meta: &ImageMetadata, origin: WriteOrigin) {
     #[cfg(feature = "sync")]
@@ -232,7 +232,7 @@ pub fn proxy_handle(path: &Path) -> Option<ProxyHandle> {
 /// the original as usual. Backs the stub branch of `as_shot::as_shot`; the
 /// result is never put in upstream's per-path cache, so the real values are
 /// read once the original is hydrated.
-pub fn stub_as_shot(path: &Path) -> Option<crate::as_shot::AsShot> {
+pub fn stub_as_shot(path: &Path) -> Option<crate::decode::as_shot::AsShot> {
     #[cfg(feature = "sync")]
     {
         imp::stub_as_shot(path)
@@ -252,7 +252,7 @@ pub fn stub_as_shot(path: &Path) -> Option<crate::as_shot::AsShot> {
 /// proxy's own tags cannot carry. A proxy generated before the record
 /// existed keeps what it yields itself (no highlight preservation). `None`
 /// when sync is off.
-pub fn proxy_as_shot(proxy_bytes: &[u8]) -> Option<crate::as_shot::AsShot> {
+pub fn proxy_as_shot(proxy_bytes: &[u8]) -> Option<crate::decode::as_shot::AsShot> {
     #[cfg(feature = "sync")]
     {
         Some(imp::proxy_as_shot(proxy_bytes))
@@ -336,7 +336,7 @@ mod imp {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use crate::image_processing::ImageMetadata;
+    use crate::metadata::sidecar::ImageMetadata;
     use crate::sync::{WriteOrigin, global_manager};
 
     /// The §3.3 exit-flush budget: bounded so the process never stalls on
@@ -459,7 +459,7 @@ mod imp {
         global_manager().and_then(|mgr| mgr.proxy_handle(path))
     }
 
-    pub fn stub_as_shot(path: &Path) -> Option<crate::as_shot::AsShot> {
+    pub fn stub_as_shot(path: &Path) -> Option<crate::decode::as_shot::AsShot> {
         // §4.4: a stub has no readable original, so its as-shot inputs come
         // from its smart preview. No proxy (editing it hydrates first): the
         // reference, which is what upstream yields for an unreadable raw.
@@ -469,15 +469,15 @@ mod imp {
         let proxy_bytes = proxy_handle(path).and_then(|h| std::fs::read(&h.dng_path).ok());
         Some(match proxy_bytes {
             Some(bytes) => proxy_as_shot(&bytes),
-            None => crate::as_shot::AsShot::reference(),
+            None => crate::decode::as_shot::AsShot::reference(),
         })
     }
 
-    pub fn proxy_as_shot(proxy_bytes: &[u8]) -> crate::as_shot::AsShot {
-        let mut as_shot = crate::raw_processing::read_as_shot(proxy_bytes)
-            .unwrap_or_else(crate::as_shot::AsShot::reference);
+    pub fn proxy_as_shot(proxy_bytes: &[u8]) -> crate::decode::as_shot::AsShot {
+        let mut as_shot = crate::decode::raw_processing::read_as_shot(proxy_bytes)
+            .unwrap_or_else(crate::decode::as_shot::AsShot::reference);
         if let Some(e) = rrcloud_core::proxy::read_as_shot_exposure(proxy_bytes) {
-            as_shot.exposure = crate::baseline_exposure::RawExposure {
+            as_shot.exposure = crate::decode::baseline_exposure::RawExposure {
                 scene_referred: e.scene_referred,
                 dng_baseline: e.dng_baseline,
                 highlight_preservation: e.highlight_preservation,
@@ -538,7 +538,7 @@ mod imp {
         {
             if let Some(mgr) = global_manager()
                 && mgr.dirty_count() > 0
-                && let Err(e) = crate::android_integration::android_enqueue_expedited_sync()
+                && let Err(e) = crate::platform::android::android_enqueue_expedited_sync()
             {
                 log::warn!("exit flush: could not enqueue expedited Android sync: {e}");
             }

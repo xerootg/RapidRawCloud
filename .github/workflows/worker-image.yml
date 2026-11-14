@@ -8,7 +8,7 @@ on:
     branches: [main, cloud, ccr-70e6b1a3-bux8cz]
     paths:
       - 'src-tauri/crates/rrcloud-core/**'
-      - 'src-tauri/src/baseline_exposure.rs'
+      - 'src-tauri/src/decode/baseline_exposure.rs'
       - 'protocol/gen/rust/**'
       - 'worker/Dockerfile'
       - '.github/workflows/worker-image.yml'
@@ -48,7 +48,7 @@ jobs:
         with:
           # rrcloud-core is a standalone crate (own Cargo.lock) with one path
           # dependency, the generated protocol SDK under protocol/gen/rust, and
-          # one compiled-in app file (src-tauri/src/baseline_exposure.rs, see
+          # one compiled-in app file (src-tauri/src/decode/baseline_exposure.rs, see
           # rrcloud-core's as_shot module), so the context is the repository
           # root; the Dockerfile COPYs only those, so the image carries no
           # app/tauri code beyond that one pure-rawler file.

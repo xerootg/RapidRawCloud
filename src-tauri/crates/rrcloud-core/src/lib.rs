@@ -75,14 +75,16 @@ pub mod worker;
 
 /// Field-only stand-in for the app's `AppSettings`, for upstream's
 /// `baseline_exposure.rs`, which [`as_shot`] compiles verbatim: that file
-/// imports `crate::app_settings::AppSettings` for
+/// imports `crate::app::settings::AppSettings` for
 /// `BaselineOptions::from_settings`, which this crate never calls.
 #[allow(dead_code)]
-mod app_settings {
-    pub struct AppSettings {
-        pub enable_baseline_exposure: bool,
-        pub baseline_exposure: f32,
-        pub compensate_highlight_preservation: bool,
+mod app {
+    pub mod settings {
+        pub struct AppSettings {
+            pub enable_baseline_exposure: bool,
+            pub baseline_exposure: f32,
+            pub compensate_highlight_preservation: bool,
+        }
     }
 }
 

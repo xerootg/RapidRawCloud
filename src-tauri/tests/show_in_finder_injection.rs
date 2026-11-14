@@ -26,7 +26,7 @@ use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rapidraw_lib::file_management::show_in_finder;
+use rapidraw_lib::sync::test_seams::show_in_finder;
 
 /// The fake `xdg-open` and the log it appends to. Created once per test
 /// binary; the directory is kept alive for the whole run.

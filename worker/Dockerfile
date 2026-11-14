@@ -25,7 +25,7 @@ COPY src-tauri/crates/rrcloud-core/tests ./src-tauri/crates/rrcloud-core/tests
 # rrcloud-core compiles upstream's maker-note exposure reader verbatim
 # (src/as_shot.rs, `#[path]`) so proxies carry the original's highlight
 # preservation exactly as the app computes it. Only that one app file.
-COPY src-tauri/src/baseline_exposure.rs ./src-tauri/src/baseline_exposure.rs
+COPY src-tauri/src/decode/baseline_exposure.rs ./src-tauri/src/decode/baseline_exposure.rs
 WORKDIR /build/src-tauri/crates/rrcloud-core
 # Build only the worker bin in release.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

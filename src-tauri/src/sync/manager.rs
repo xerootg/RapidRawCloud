@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::app_settings::SyncSettings;
+use crate::app::settings::SyncSettings;
 use crate::sync::WriteOrigin;
 use crate::sync::credentials::Credentials;
 
@@ -514,7 +514,7 @@ impl SyncManager {
         let Some(app) = self.app.lock().unwrap_or_else(|e| e.into_inner()).clone() else {
             return;
         };
-        let cache_dir = match crate::file_management::get_thumb_cache_dir(&app) {
+        let cache_dir = match crate::library::thumbnails::resolve_thumbnail_cache_dir(&app) {
             Ok(dir) => dir,
             Err(e) => {
                 log::warn!("stub thumbs: thumbnail cache dir: {e}");
@@ -523,7 +523,7 @@ impl SyncManager {
         };
         for path in seeded {
             if let Some((small, medium)) = cfg.link_stub_thumbs_into_cache(&path, &cache_dir) {
-                crate::file_management::emit_thumbnail_seeded(
+                crate::library::thumbnails::emit_thumbnail_seeded(
                     &app,
                     &path.to_string_lossy(),
                     &small.to_string_lossy(),
@@ -1307,7 +1307,7 @@ mod imp {
         ConflictKeep, EvictionReport, PeerDevice, RecentlyDeleted, SyncError, SyncState,
         SyncStatus, ThumbVariant, VerifyReport,
     };
-    use crate::app_settings::SyncSettings;
+    use crate::app::settings::SyncSettings;
     use crate::sync::credentials::Credentials;
     use crate::sync::{MetaKind, WriteOrigin};
 
@@ -3328,15 +3328,16 @@ mod imp {
             cache_thumbnails_dir: &Path,
         ) -> Result<PathBuf, SyncError> {
             let path_str = image_path.to_string_lossy();
-            let adjustments = crate::file_management::thumbnail_adjustments_key_bytes(&path_str);
+            let adjustments =
+                crate::library::thumbnails::thumbnail_adjustments_key_bytes(&path_str);
             // The key also folds in the render settings (upstream's thumbnail
             // cache keys on them), so read the app's current settings; headless
             // / tests (no app handle) key on the defaults.
             let settings = crate::sync::global_manager()
                 .and_then(|m| m.app.lock().unwrap_or_else(|e| e.into_inner()).clone())
-                .and_then(|app| crate::app_settings::load_settings(app).ok())
+                .and_then(|app| crate::app::settings::load_settings(app).ok())
                 .unwrap_or_default();
-            let hash = crate::file_management::compute_thumbnail_cache_hash(
+            let hash = crate::library::thumbnails::compute_thumbnail_cache_hash(
                 &path_str,
                 &adjustments,
                 &settings,

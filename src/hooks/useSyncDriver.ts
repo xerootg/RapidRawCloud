@@ -1,7 +1,7 @@
 import { useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
-import { Invokes } from '../components/ui/AppProperties';
+import { Invokes } from '../types/invokes';
 import { useSyncActions } from './useSyncActions';
 import { useSyncStore } from '../store/useSyncStore';
 

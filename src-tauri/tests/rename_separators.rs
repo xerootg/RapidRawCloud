@@ -17,7 +17,7 @@
 //!   to construct its event loop, so run this under `xvfb-run -a`.
 //! - `app.appDirectoriesOverride` is pointed at a temp dir so the commands'
 //!   `sync_album_path_changes` -> `get_albums_path` never touches `$HOME`.
-//! - Reached through `rapidraw_lib::rename_test_seams`, a `#[doc(hidden)]`
+//! - Reached through `rapidraw_lib::sync::test_seams`, a `#[doc(hidden)]`
 //!   plain-function wrapper over the private `file_management` commands
 //!   (same pattern as `sync::copy_files_guarded`).
 
@@ -29,7 +29,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use rapidraw_lib::rename_test_seams::{rename_files, rename_folder};
+use rapidraw_lib::sync::test_seams::{rename_files, rename_folder};
 use tauri::AppHandle;
 use tauri::utils::config::AppDirectoriesOverride;
 use tempfile::TempDir;

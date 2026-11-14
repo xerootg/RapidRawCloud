@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// S3 access credentials for the sync bucket. Deliberately *not* part of
-/// [`crate::app_settings::AppSettings`].
+/// [`crate::app::settings::AppSettings`].
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Credentials {
     pub access_key: String,
@@ -96,7 +96,7 @@ impl Default for AndroidCredentialStore {
 #[cfg(target_os = "android")]
 impl CredentialStore for AndroidCredentialStore {
     fn load(&self) -> std::io::Result<Option<Credentials>> {
-        let json = crate::android_integration::android_credential_store_load()
+        let json = crate::platform::android::android_credential_store_load()
             .map_err(std::io::Error::other)?;
         let Some(json) = json else {
             return Ok(None);
@@ -109,12 +109,12 @@ impl CredentialStore for AndroidCredentialStore {
     fn store(&self, creds: &Credentials) -> std::io::Result<()> {
         let json = serde_json::to_string(creds)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        crate::android_integration::android_credential_store_save(&json)
+        crate::platform::android::android_credential_store_save(&json)
             .map_err(std::io::Error::other)
     }
 
     fn clear(&self) -> std::io::Result<()> {
-        crate::android_integration::android_credential_store_clear().map_err(std::io::Error::other)
+        crate::platform::android::android_credential_store_clear().map_err(std::io::Error::other)
     }
 }
 

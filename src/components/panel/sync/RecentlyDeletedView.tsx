@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { RotateCcw, Trash2 } from 'lucide-react';
 import { useSyncActions } from '../../../hooks/useSyncActions';
-import { SyncRecentlyDeleted } from '../../ui/AppProperties';
+import { SyncRecentlyDeleted } from '../../../types/sync';
 
 /**
  * "Recently Deleted" view in settings (ARCHITECTURE.md §2.7/§3.8): lists

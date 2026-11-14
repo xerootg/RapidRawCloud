@@ -5,13 +5,13 @@ on:
     paths:
       - 'src-tauri/crates/rrcloud-core/**'
       # Compiled into rrcloud-core verbatim (src/as_shot.rs).
-      - 'src-tauri/src/baseline_exposure.rs'
+      - 'src-tauri/src/decode/baseline_exposure.rs'
       - '.github/workflows/rrcloud.yml'
   pull_request:
     paths:
       - 'src-tauri/crates/rrcloud-core/**'
       # Compiled into rrcloud-core verbatim (src/as_shot.rs).
-      - 'src-tauri/src/baseline_exposure.rs'
+      - 'src-tauri/src/decode/baseline_exposure.rs'
       - '.github/workflows/rrcloud.yml'
 
 permissions:

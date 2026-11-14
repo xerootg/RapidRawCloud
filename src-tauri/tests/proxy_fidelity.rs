@@ -126,7 +126,7 @@ fn read(path: &Path) -> Vec<u8> {
 /// decode (empty string = the `(apply_ungamma=false, apply_calibration=true)`
 /// default arm).
 fn develop_rgb(bytes: &[u8], fast: bool, linear_mode: &str) -> (Vec<f32>, u32, u32) {
-    let img = develop_raw_image(bytes, fast, HL, linear_mode.to_string(), None)
+    let img = develop_raw_image(bytes, fast, HL, linear_mode.to_string(), 0.0, 0.0, None)
         .expect("develop_raw_image");
     let (w, h) = (img.width(), img.height());
     let rgba = img.into_rgba32f().into_raw();
@@ -542,7 +542,7 @@ fn proxy_as_shot_matches_the_original() {
 /// The proxy decode pin neutralizes the user's `linear_raw_mode` (§4.1/§4.4).
 #[test]
 fn proxy_decode_settings_pins_linear_mode() {
-    let base = rapidraw_lib::AppSettings {
+    let base = rapidraw_lib::sync::test_seams::AppSettings {
         linear_raw_mode: "skip_calib".to_string(),
         ..Default::default()
     };
@@ -641,10 +641,11 @@ fn fidelity_gpu_confirmation_under_aggressive_settings() {
     let context = rapidraw_lib::sync::proxy_support::init_gpu_context_headless()
         .expect("headless GPU context");
 
-    let orig_img = develop_raw_image(&bytes, false, HL, String::new(), None).expect("develop orig");
+    let orig_img =
+        develop_raw_image(&bytes, false, HL, String::new(), 0.0, 0.0, None).expect("develop orig");
     let out = proxy::generate_proxy(&bytes).expect("generate proxy");
-    let proxy_img =
-        develop_raw_image(&out.dng, false, HL, String::new(), None).expect("develop proxy");
+    let proxy_img = develop_raw_image(&out.dng, false, HL, String::new(), 0.0, 0.0, None)
+        .expect("develop proxy");
 
     let rendered_orig = rapidraw_lib::sync::proxy_support::render_adjustments_headless(
         &context,

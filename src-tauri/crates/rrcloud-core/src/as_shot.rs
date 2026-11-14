@@ -18,10 +18,10 @@
 //! app's proxy-mode as-shot reader takes in place of the proxy's own.
 //!
 //! **Parity by construction.** The computation is upstream's own
-//! `src-tauri/src/baseline_exposure.rs`, compiled into this crate verbatim
+//! `src-tauri/src/decode/baseline_exposure.rs`, compiled into this crate verbatim
 //! (`#[path]`, against the same rawler lineage) and fed exactly what
 //! `read_as_shot` feeds it, rather than a port that could drift. Its one
-//! app-crate import, `crate::app_settings::AppSettings` (used only by
+//! app-crate import, `crate::app::settings::AppSettings` (used only by
 //! `BaselineOptions::from_settings`, which this crate never calls), is met
 //! by a field-only shim in `lib.rs`. If upstream gives the file another
 //! app-crate import, this crate stops compiling until the shim covers it;
@@ -53,7 +53,7 @@ use rawler::rawimage::{RawImage, RawPhotometricInterpretation};
 // and `RawExposure` are used here (`BaselineOptions` is the app's). Not
 // formatted from here: the file is upstream's, in the app crate's edition
 // 2024 style, which this edition-2021 crate's rustfmt would rewrite.
-#[path = "../../../src/baseline_exposure.rs"]
+#[path = "../../../src/decode/baseline_exposure.rs"]
 #[allow(dead_code)]
 #[rustfmt::skip]
 mod upstream;

@@ -1,5 +1,5 @@
 import Switch from '../../ui/Switch';
-import { LibraryViewMode } from '../../ui/AppProperties';
+import { LibraryViewMode } from '../../../types/settings';
 import { useLibraryLayoutStore } from '../../../store/useLibraryLayoutStore';
 
 /**

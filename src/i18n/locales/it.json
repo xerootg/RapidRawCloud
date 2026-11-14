@@ -150,6 +150,8 @@
       "aiDenoise": "Riduzione rumore IA",
       "classicDenoise": "Riduzione rumore classica",
       "aiDenoiseDetail": "Dettaglio",
+      "aiUpscale": "RapidRes 2x",
+      "aiUpscaleDetail": "Dettaglio",
       "blueYellow": "Blu/Giallo",
       "centre": "Centro",
       "chromaticAberration": "Aberrazione Cromatica",
@@ -165,6 +167,7 @@
       "negativeGreen": "Verde",
       "negativeRed": "Rosso",
       "noiseReduction": "Riduzione Rumore",
+      "superResolution": "RapidRes",
       "presence": "Presenza",
       "redCyan": "Rosso/Ciano",
       "sharpening": "Aumento Nitidezza",
@@ -325,8 +328,12 @@
       "removeBlackWhite": "Rimuovi Bianco e Nero",
       "removeDenoise": "Rimuovi Riduzione Rumore",
       "removeNegativeConversion": "Rimuovi Conversione Negativo",
+      "removeSuperResolution": "Rimuovi RapidRes",
       "resetAdjustments": "Ripristina Regolazioni",
+      "resetToDefaults": "Ripristina ai predefiniti",
+      "resetToNeutral": "Ripristina al neutro",
       "stitchPanorama": "Unisci Panorama",
+      "superResolution": "RapidRes (2x)",
       "tagging": "Tag",
       "undo": "Annulla",
       "unflagged": "Senza flag"
@@ -399,6 +406,9 @@
       "denoise_many": "Riduci Rumore",
       "denoise_one": "Riduci Rumore",
       "denoise_other": "Riduci Rumore",
+      "superResolution_many": "RapidRes (2x)",
+      "superResolution_one": "RapidRes (2x)",
+      "superResolution_other": "RapidRes (2x)",
       "duplicateImage": "Duplica Immagine",
       "enable": "Attiva",
       "exportImage_many": "Esporta {{count}} Immagini",
@@ -527,6 +537,7 @@
       "createNewTitle": "Crea Nuova Modifica Generativa",
       "createNewTooltip": "Crea Nuova Modifica {{name}}",
       "denoising": "Riduzione rumore IA in corso...",
+      "upscaling": "RapidRes in corso...",
       "dropzoneText": "Rilascia qui per creare una nuova modifica",
       "editSettingsTitle": "Impostazioni Modifica",
       "editsTitle": "Modifiche",
@@ -737,11 +748,13 @@
       "cancel": "Annulla",
       "drawingActive": "Disegno attivo",
       "hint": "Disegna lungo i bordi della tua foto che dovrebbero essere verticali o orizzontali.",
+      "horizontalLine": "Guida orizzontale n. {{index}}",
       "linesStatus": "Linee guida attive",
       "toast": {
         "angleRejected": "L'angolo della linea è troppo lontano dall'orizzontale o verticale",
         "maxLines": "Sono consentite massimo 2 linee verticali e 2 orizzontali"
-      }
+      },
+      "verticalLine": "Guida verticale n. {{index}}"
     },
     "layout": {
       "split": "Dividi"
@@ -901,6 +914,8 @@
     },
     "presets": {
       "amount": "Quantità",
+      "defaultForAllCameras": "Predefinito per tutte le fotocamere",
+      "defaultForCamera": "Predefinito per {{camera}}",
       "dialog": {
         "allPresetFiles": "Tutti i File Predefiniti",
         "exportAllTitle": "Esporta Tutti i Predefiniti",
@@ -921,7 +936,11 @@
         "newPreset": "Nuovo Predefinito",
         "overwrite": "Sovrascrivi",
         "renameFolder": "Rinomina Cartella",
-        "sortAll": "Ordina Tutti in Ordine Alfabetico"
+        "setDefaultAllCameras": "Imposta come predefinito per tutte le fotocamere",
+        "setDefaultForCamera": "Imposta come predefinito per {{camera}}",
+        "sortAll": "Ordina Tutti in Ordine Alfabetico",
+        "unsetDefaultAllCameras": "Non usare più come predefinito per tutte le fotocamere",
+        "unsetDefaultForCamera": "Non usare più come predefinito per {{camera}}"
       },
       "status": {
         "empty": "Ancora nessun predefinito salvato. Creane uno, importalo da un file o esplora i predefiniti della community.",
@@ -1186,6 +1205,7 @@
       "failed": "Non riusciti ({{failedCount}})",
       "kinds": {
         "denoise": "Riduzione rumore IA",
+        "upscale": "Ingrandimento RapidRes",
         "depthMap": "Analisi della profondità",
         "depthMask": "Generazione maschera profondità",
         "faceMask": "Generazione maschera viso",
@@ -1584,6 +1604,7 @@
       "descReplace": "Sovrascrive tutte le impostazioni selezionate, ripristinando il resto ai valori predefiniti.",
       "groups": {
         "aiDenoise": "Riduzione rumore IA",
+        "aiUpscale": "RapidRes",
         "blackWhite": "Bianco e nero",
         "chromaticAberration": "Aberrazione Cromatica",
         "clarityDehaze": "Chiarezza e Rimozione Foschia",
@@ -1880,6 +1901,7 @@
       "limit": "Limite",
       "modals": {
         "aiDenoiseMessage": "Vuoi davvero svuotare la cache della riduzione rumore IA?\n\nLe immagini con la riduzione rumore IA attiva dovranno essere elaborate di nuovo, operazione che può richiedere diversi minuti per immagine.",
+        "aiUpscaleMessage": "Vuoi davvero svuotare la cache di RapidRes?\n\nLe immagini con RapidRes attivo dovranno essere ingrandite di nuovo.",
         "aiMapsMessage": "Vuoi davvero svuotare le mappe di profondità e normali?\n\nLe immagini che usano sfocatura obiettivo, nebbia o reilluminazione rigenereranno le mappe alla prossima apertura.",
         "aiMessage": "Sei sicuro di voler rimuovere tutti i tag generati dall'AI da tutte le immagini in tutte le cartelle principali attive?\n\nQuesto non influirà sui tag aggiunti dall'utente. Questa azione non può essere annullata.",
         "allMessage": "Sei sicuro di voler rimuovere tutti i tag generati dall'AI e aggiunti dall'utente da tutte le immagini in tutte le cartelle principali attive?\n\nQuesta azione non può essere annullata.",
@@ -1907,6 +1929,7 @@
       "show": "Mostra",
       "statuses": {
         "aiDenoiseSuccess": "Cache della riduzione rumore IA svuotata correttamente.",
+        "aiUpscaleSuccess": "Cache di RapidRes svuotata correttamente.",
         "aiSuccess": "{{count}} file aggiornati. Tag AI rimossi.",
         "aiSuccess_many": "{{count}} file aggiornati. Tag AI rimossi.",
         "aiSuccess_one": "{{count}} file aggiornato. Tag AI rimossi.",
@@ -1926,6 +1949,8 @@
       "storage": {
         "aiDenoise": "Riduzione rumore IA",
         "aiDenoiseDesc": "Risultati della riduzione rumore in cache.",
+        "aiUpscale": "RapidRes",
+        "aiUpscaleDesc": "Ingrandimenti 2x di RapidRes in cache.",
         "aiMaps": "Mappe di profondità e normali",
         "aiMapsDesc": "Usate da sfocatura obiettivo, nebbia e reilluminazione.",
         "immich": "Immich",
@@ -2155,6 +2180,31 @@
         "metal": "Metal",
         "vulkan": "Vulkan"
       },
+      "defaultAdjustments": {
+        "addCamera": "Aggiungi fotocamera…",
+        "applyToNonRaw": "Applica anche a JPEG, TIFF, PNG e altri file non RAW",
+        "applyToNonRawDesc": "Se disattivato, solo i file RAW usano questi valori. I JPEG della fotocamera sono di solito già elaborati e corretti, e applicarli di nuovo può essere eccessivo.",
+        "autoLensCorrection": "Correzione automatica dell'obiettivo",
+        "autoLensCorrectionDesc": "Corregge distorsione, aberrazione cromatica e vignettatura usando il profilo dell'obiettivo rilevato dai metadati di ogni immagine.",
+        "cameraDefaults": "Valori predefiniti per fotocamera",
+        "cameraDefaultsDesc": "Assegna alle immagini di fotocamere specifiche un proprio preset. Le fotocamere non elencate usano il preset predefinito sopra, e la correzione dell'obiettivo vale per tutte le fotocamere.",
+        "cameraPresetMissing": "Il preset scelto è stato eliminato, quindi le immagini di questa fotocamera usano di nuovo il preset di tutte le fotocamere.",
+        "description": "Imposta da cosa partono le immagini non modificate e a cosa torna «Ripristina regolazioni»; le immagini modificate mantengono le proprie impostazioni. Con i valori predefiniti, le miniature RAW vengono generate invece di usare l'anteprima incorporata della fotocamera e all'inizio si caricano più lentamente.",
+        "lensCorrection": "Correzione obiettivo",
+        "noCamerasFound": "Nessun'altra fotocamera trovata. Apri una cartella con immagini di una fotocamera, oppure fai clic destro su un preset mentre modifichi una delle sue immagini.",
+        "noPreset": "Nessuno (neutro)",
+        "preset": "Preset predefinito",
+        "presetDesc": "Applicato a ogni immagine non modificata. Maschere, ritagli e trasformazioni vengono ignorati, perché si adattano solo all'immagine su cui sono stati creati.",
+        "presetMissing": "Il preset scelto è stato eliminato, quindi le immagini non modificate usano di nuovo valori neutri.",
+        "removeCamera": "Rimuovi fotocamera",
+        "sameAsAllCameras": "Come tutte le fotocamere",
+        "scope": "Si applica a",
+        "sliderReset": "Ripristino dei cursori",
+        "sliderResetDefaults": "Regolazioni predefinite",
+        "sliderResetDesc": "Il valore a cui torna un singolo cursore quando lo ripristini, ad esempio con un doppio clic o nella modifica rapida. I cursori delle maschere tornano sempre al valore neutro.",
+        "sliderResetNeutral": "Valore neutro",
+        "title": "Regolazioni predefinite"
+      },
       "dynamicDesc": "L'editor renderizza l'anteprima per adattarla all'effettiva densità di pixel del tuo display. Questo garantisce che ogni dettaglio sia rappresentato con un'accuratezza pixel 1:1, fornendo la massima chiarezza durante lo zoom e il controllo della messa a fuoco.",
       "editIn": {
         "add": "Aggiungi programma",
@@ -2297,6 +2347,7 @@
         "mediapipe": "Per i rapidi modelli di punti del viso e segmentazione che alimentano le maschere viso IA.",
         "negpy": "Per l'ispirazione dietro alla logica di conversione dei negativi.",
         "nind": "Per aver fornito i modelli AI che alimentano le capacità di riduzione del rumore AI in RapidRAW.",
+        "span": "Per il modello IA di base di RapidRes, l'ingrandimento 2x con IA di RapidRAW, perfezionato da RapidRAW sulla propria elaborazione RAW (di Philip Hofmann, CC BY 4.0).",
         "rawler": "Per l'eccellente crate Rust che fornisce le basi per l'elaborazione dei file RAW in questo progetto.",
         "sam2": "Per aver fornito il modello fondamentale usato per le funzionalità di rilevamento del soggetto tramite AI.",
         "spektrafilm": "Per le LUT di emulazione pellicola su base spettrale di Andrea Volpato, che alimentano le emulazioni integrate di RapidRAW. Concesse in licenza CC BY-SA 4.0.",

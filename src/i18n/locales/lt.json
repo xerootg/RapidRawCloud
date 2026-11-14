@@ -149,6 +149,8 @@
     "details": {
       "aiDenoise": "DI triukšmo slopinimas",
       "aiDenoiseDetail": "Detalumas",
+      "aiUpscale": "RapidRes 2x",
+      "aiUpscaleDetail": "Detalumas",
       "blueYellow": "Mėlyna / Geltona",
       "centre": "Centras",
       "chromaticAberration": "Chromatinė aberacija",
@@ -165,6 +167,7 @@
       "negativeGreen": "Žalia",
       "negativeRed": "Raudona",
       "noiseReduction": "Triukšmo slopinimas",
+      "superResolution": "RapidRes",
       "presence": "Ryškumas ir buvimas",
       "redCyan": "Raudona / Žalsvai mėlyna",
       "sharpening": "Ryškinimas",
@@ -326,8 +329,12 @@
       "removeBlackWhite": "Pašalinti nespalvotą (J/B)",
       "removeDenoise": "Pašalinti triukšmo slopinimą",
       "removeNegativeConversion": "Pašalinti negatyvo konvertavimą",
+      "removeSuperResolution": "Pašalinti RapidRes",
       "resetAdjustments": "Atstatyti koregavimus",
+      "resetToDefaults": "Atstatyti į numatytąsias",
+      "resetToNeutral": "Atstatyti į neutralias",
       "stitchPanorama": "Sujungti panoramą",
+      "superResolution": "RapidRes (2x)",
       "tagging": "Žymėjimas",
       "undo": "Atšaukti",
       "unflagged": "Nežymėta"
@@ -411,6 +418,10 @@
       "denoise_many": "Triukšmo slopinimas",
       "denoise_one": "Triukšmo slopinimas",
       "denoise_other": "Triukšmo slopinimas",
+      "superResolution_few": "RapidRes (2x)",
+      "superResolution_many": "RapidRes (2x)",
+      "superResolution_one": "RapidRes (2x)",
+      "superResolution_other": "RapidRes (2x)",
       "duplicateImage": "Dubliuoti nuotrauką",
       "enable": "Įjungti",
       "exportImage_few": "Eksportuoti {{count}} nuotraukas",
@@ -544,6 +555,7 @@
       "createNewTitle": "Sukurti naują generatyvinį redagavimą",
       "createNewTooltip": "Sukurti naują „{{name}}“ redagavimą",
       "denoising": "Vykdomas DI triukšmo slopinimas...",
+      "upscaling": "Vykdomas RapidRes...",
       "dropzoneText": "Užtempkite čia, norėdami sukurti naują redagavimą",
       "editSettingsTitle": "Redagavimo nustatymai",
       "editsTitle": "Redagavimai",
@@ -784,11 +796,13 @@
       "cancel": "Atšaukti",
       "drawingActive": "Nubrėžkite liniją palei objektą, kuris turėtų būti horizontalus arba vertikalus.",
       "hint": "Nubrėžkite 2–4 linijas, kad ištaisytumėte perspektyvą.",
+      "horizontalLine": "Horizontali linija Nr. {{index}}",
       "linesStatus": "Nubrėžta linijų: {{count}} iš 4",
       "toast": {
         "angleRejected": "Linijos kampas per daug nutolęs nuo horizontalės ar vertikalės",
         "maxLines": "Leidžiamos daugiausiai 2 vertikalios ir 2 horizontalios linijos"
-      }
+      },
+      "verticalLine": "Vertikali linija Nr. {{index}}"
     },
     "layout": {
       "split": "Padalintas vaizdas"
@@ -964,6 +978,8 @@
     },
     "presets": {
       "amount": "Kiekis",
+      "defaultForAllCameras": "Numatytasis visiems fotoaparatams",
+      "defaultForCamera": "Numatytasis: {{camera}}",
       "dialog": {
         "allPresetFiles": "Visi nustatymų failai",
         "exportAllTitle": "Eksportuoti visus nustatymus",
@@ -984,7 +1000,11 @@
         "newPreset": "Naujas nustatymas",
         "overwrite": "Perrašyti",
         "renameFolder": "Pervadinti aplanką",
-        "sortAll": "Rikiuoti visus pagal abėcėlę"
+        "setDefaultAllCameras": "Nustatyti kaip numatytąjį visiems fotoaparatams",
+        "setDefaultForCamera": "Nustatyti kaip numatytąjį: {{camera}}",
+        "sortAll": "Rikiuoti visus pagal abėcėlę",
+        "unsetDefaultAllCameras": "Nebenaudoti kaip numatytojo visiems fotoaparatams",
+        "unsetDefaultForCamera": "Nebenaudoti kaip numatytojo: {{camera}}"
       },
       "status": {
         "empty": "Nėra išsaugotų nustatymų. Sukurkite savo, importuokite iš failo arba peržiūrėkite bendruomenės nustatymus.",
@@ -1251,6 +1271,7 @@
       "failed": "Nepavyko ({{failedCount}})",
       "kinds": {
         "denoise": "DI triukšmo slopinimas",
+        "upscale": "RapidRes didinimas",
         "depthMap": "Gylio analizė",
         "depthMask": "Gylio kaukės generavimas",
         "faceMask": "Veido kaukės generavimas",
@@ -1655,6 +1676,7 @@
       "descReplace": "Perrašo visus pasirinktus nustatymus, o likusius atstato į numatytuosius.",
       "groups": {
         "aiDenoise": "DI triukšmo slopinimas",
+        "aiUpscale": "RapidRes",
         "blackWhite": "Nespalvota (J/B)",
         "chromaticAberration": "Chromatinė aberacija",
         "clarityDehaze": "Aiškumas ir miglos šalinimas",
@@ -1958,6 +1980,7 @@
       "limit": "Limitas",
       "modals": {
         "aiDenoiseMessage": "Ar tikrai norite išvalyti DI triukšmo slopinimo podėlį?\n\nNuotraukoms su įjungtu DI triukšmo slopinimu reikės atlikti slopinimą iš naujo, o tai gali užtrukti kelias minutes kiekvienai nuotraukai.",
+        "aiUpscaleMessage": "Ar tikrai norite išvalyti RapidRes podėlį?\n\nNuotraukas su įjungtu RapidRes reikės padidinti iš naujo.",
         "aiMapsMessage": "Ar tikrai norite išvalyti gylio ir normalių žemėlapius?\n\nNuotraukos, naudojančios objektyvo suliejimą, rūką arba apšvietimo keitimą, atidarytos sugeneruos žemėlapius iš naujo.",
         "aiMessage": "Ar tikrai norite pašalinti visas DI sugeneruotas žymas iš visų aktyvių šakninių aplankų nuotraukų?\n\nTai nepaveiks jūsų pačių pridėtų žymų. Šio veiksmo negalima atšaukti.",
         "allMessage": "Ar tikrai norite pašalinti visas DI sugeneruotas ir jūsų pridėtas žymas iš visų aktyvių šakninių aplankų nuotraukų?\n\nŠio veiksmo negalima atšaukti.",
@@ -1985,6 +2008,7 @@
       "show": "Rodyti",
       "statuses": {
         "aiDenoiseSuccess": "DI triukšmo slopinimo podėlis sėkmingai išvalytas.",
+        "aiUpscaleSuccess": "RapidRes podėlis sėkmingai išvalytas.",
         "aiSuccess": "Atnaujinta failų: {{count}}. DI žymos pašalintos.",
         "aiSuccess_few": "Atnaujinti {{count}} failai. DI žymos pašalintos.",
         "aiSuccess_many": "Atnaujinta {{count}} failų. DI žymos pašalintos.",
@@ -2007,6 +2031,8 @@
       "storage": {
         "aiDenoise": "DI triukšmo slopinimas",
         "aiDenoiseDesc": "Išsaugoti triukšmo slopinimo rezultatai.",
+        "aiUpscale": "RapidRes",
+        "aiUpscaleDesc": "Išsaugoti RapidRes 2x padidinimai.",
         "aiMaps": "Gylio ir normalių žemėlapiai",
         "aiMapsDesc": "Naudoja objektyvo suliejimas, rūkas ir apšvietimo keitimas.",
         "immich": "Immich",
@@ -2236,6 +2262,31 @@
         "metal": "Metal",
         "vulkan": "Vulkan"
       },
+      "defaultAdjustments": {
+        "addCamera": "Pridėti fotoaparatą…",
+        "applyToNonRaw": "Taikyti ir JPEG, TIFF, PNG bei kitiems ne RAW failams",
+        "applyToNonRawDesc": "Išjungus šias reikšmes naudoja tik RAW failai. Fotoaparato JPEG paprastai jau apdoroti ir pataisyti, todėl taikant dar kartą galima persistengti.",
+        "autoLensCorrection": "Automatinė objektyvo korekcija",
+        "autoLensCorrectionDesc": "Ištaiso iškraipymą, chromatinę aberaciją ir vinjetavimą pagal objektyvo profilį, aptiktą kiekvienos nuotraukos metaduomenyse.",
+        "cameraDefaults": "Numatytosios reikšmės pagal fotoaparatą",
+        "cameraDefaultsDesc": "Suteikite konkrečių fotoaparatų nuotraukoms savo šabloną. Čia nenurodyti fotoaparatai naudoja aukščiau esantį numatytąjį šabloną, o objektyvo korekcija taikoma visiems fotoaparatams.",
+        "cameraPresetMissing": "Pasirinktas šablonas ištrintas, todėl šio fotoaparato nuotraukos vėl naudoja visų fotoaparatų šabloną.",
+        "description": "Nustatykite, nuo ko pradeda neredaguotos nuotraukos ir į ką grąžina „Atstatyti koregavimus“; redaguotos nuotraukos išlaiko savo nustatymus. Nustačius numatytąsias reikšmes, RAW miniatiūros kuriamos vietoj įterptos fotoaparato peržiūros ir iš pradžių įkeliamos lėčiau.",
+        "lensCorrection": "Objektyvo korekcija",
+        "noCamerasFound": "Kitų fotoaparatų nerasta. Atidarykite aplanką su fotoaparato nuotraukomis arba dešiniuoju pelės mygtuku spustelėkite šabloną redaguodami vieną iš jo nuotraukų.",
+        "noPreset": "Nėra (neutralu)",
+        "preset": "Numatytasis šablonas",
+        "presetDesc": "Taikoma kiekvienai neredaguotai nuotraukai. Kaukės, apkarpymai ir transformacijos praleidžiami, nes tinka tik tai nuotraukai, kurioje buvo sukurti.",
+        "presetMissing": "Pasirinktas šablonas ištrintas, todėl neredaguotos nuotraukos vėl naudoja neutralias reikšmes.",
+        "removeCamera": "Pašalinti fotoaparatą",
+        "sameAsAllCameras": "Kaip visiems fotoaparatams",
+        "scope": "Taikoma",
+        "sliderReset": "Slankiklių atstatymas",
+        "sliderResetDefaults": "Numatytieji koregavimai",
+        "sliderResetDesc": "Reikšmė, į kurią grįžta slankiklis jį atstačius, pavyzdžiui, dukart spustelėjus arba greitajame redagavime. Kaukių slankikliai visada atstatomi į neutralią reikšmę.",
+        "sliderResetNeutral": "Neutrali reikšmė",
+        "title": "Numatytieji koregavimai"
+      },
       "dynamicDesc": "Redaktorius atvaizduoja peržiūrą pagal tikrąjį jūsų ekrano pikselių tankį. Tai užtikrina 1:1 pikselių tikslumą vertinant fokusavimą ir triukšmą.",
       "editIn": {
         "add": "Pridėti programą",
@@ -2390,6 +2441,7 @@
         "mediapipe": "Už greitus veido bruožų ir segmentavimo modelius, kuriais paremtos DI veido kaukės.",
         "negpy": "Už įkvėpimą kuriant negatyvų konvertavimo logiką.",
         "nind": "Už DI modelius, kurie užtikrina DI triukšmo slopinimą programoje RapidRAW.",
+        "span": "Už bazinį DI modelį, naudojamą RapidRes – RapidRAW 2x DI didinimui, kurį RapidRAW pritaikė savo RAW apdorojimui (autorius Philip Hofmann, CC BY 4.0).",
         "rawler": "Už puikią Rust biblioteką, suteikiančią RAW failų apdorojimo pagrindą šiame projekte.",
         "sam2": "Už bazinį modelį, naudojamą DI pagrindinio objekto aptikimui.",
         "spektrafilm": "Už Andrea Volpato sukurtus spektrinius juostos emuliacijos LUT failus (CC BY-SA 4.0).",
