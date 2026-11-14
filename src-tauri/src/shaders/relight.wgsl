@@ -46,7 +46,7 @@ fn rl_depth(
         let uv = (vec2<f32>(id.xy) + 0.5) / size;
         let tap = tap_uv(uv, params.map_size);
         let guide = textureLoad(t0, id.xy, 0).x;
-        let d = clamp(tap_sample(t1, tap).w * guide + tap_sample(t2, tap).w, 0.0, 1.0);
+        let d = clamp(tap_sample_t1(tap).w * guide + tap_sample_t2(tap).w, 0.0, 1.0);
         textureStore(out_f32, id.xy, vec4<f32>(d, 0.0, 0.0, 0.0));
         let bits = select(bitcast<u32>(d), 0u, d <= 0.0);
         atomicMin(&wg_lo, bits);
@@ -113,7 +113,7 @@ fn rl_apply(@builtin(global_invocation_id) id: vec3<u32>) {
     let map_tap = tap_uv(vec2<f32>(u, v), params.map_size);
     let shadow_tap = tap_uv(vec2<f32>(u, v), params.shadow_size);
 
-    let s = tap_sample(t1, map_tap) * guide + tap_sample(t2, map_tap);
+    let s = tap_sample_t1(map_tap) * guide + tap_sample_t2(map_tap);
     let len = max(sqrt(s.x * s.x + s.y * s.y + s.z * s.z), 1e-6);
     let n = s.xyz / len;
     let p = vec3<f32>((u - 0.5) * params.aspect.x, (v - 0.5) * params.aspect.y, clamp(s.w, 0.0, 1.0));

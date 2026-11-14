@@ -70,8 +70,27 @@ fn graded_luma(l: f32) -> f32 {
     return y;
 }
 
-fn bilinear(t: texture_2d<f32>, uv: vec2<f32>) -> vec4<f32> {
-    return tap_sample(t, tap_uv(uv, textureDimensions(t)));
+// Mali Vulkan drivers (r54p3, Pixel 7-10a) segfault in vkCreateComputePipelines
+// when a texture is passed as a function argument, so each global texture gets
+// its own copy of the sampler. Same math.
+fn bilinear_t0(uv: vec2<f32>) -> vec4<f32> {
+    return tap_sample_t0(tap_uv(uv, textureDimensions(t0)));
+}
+
+fn bilinear_t1(uv: vec2<f32>) -> vec4<f32> {
+    return tap_sample_t1(tap_uv(uv, textureDimensions(t1)));
+}
+
+fn bilinear_t2(uv: vec2<f32>) -> vec4<f32> {
+    return tap_sample_t2(tap_uv(uv, textureDimensions(t2)));
+}
+
+fn bilinear_t3(uv: vec2<f32>) -> vec4<f32> {
+    return tap_sample_t3(tap_uv(uv, textureDimensions(t3)));
+}
+
+fn bilinear_t4(uv: vec2<f32>) -> vec4<f32> {
+    return tap_sample_t4(tap_uv(uv, textureDimensions(t4)));
 }
 
 fn dst_uv(id: vec3<u32>) -> vec2<f32> {
@@ -118,19 +137,19 @@ fn lt_down(@builtin(global_invocation_id) id: vec3<u32>) {
     if (outside(id)) { return; }
     let uv = dst_uv(id);
     let ts = 1.0 / vec2<f32>(textureDimensions(t0));
-    let a = bilinear(t0, uv + ts * vec2<f32>(-2.0, -2.0));
-    let b = bilinear(t0, uv + ts * vec2<f32>(0.0, -2.0));
-    let c = bilinear(t0, uv + ts * vec2<f32>(2.0, -2.0));
-    let d = bilinear(t0, uv + ts * vec2<f32>(-1.0, -1.0));
-    let e = bilinear(t0, uv + ts * vec2<f32>(1.0, -1.0));
-    let f = bilinear(t0, uv + ts * vec2<f32>(-2.0, 0.0));
-    let g = bilinear(t0, uv);
-    let h = bilinear(t0, uv + ts * vec2<f32>(2.0, 0.0));
-    let i = bilinear(t0, uv + ts * vec2<f32>(-1.0, 1.0));
-    let j = bilinear(t0, uv + ts * vec2<f32>(1.0, 1.0));
-    let k = bilinear(t0, uv + ts * vec2<f32>(-2.0, 2.0));
-    let l = bilinear(t0, uv + ts * vec2<f32>(0.0, 2.0));
-    let m = bilinear(t0, uv + ts * vec2<f32>(2.0, 2.0));
+    let a = bilinear_t0(uv + ts * vec2<f32>(-2.0, -2.0));
+    let b = bilinear_t0(uv + ts * vec2<f32>(0.0, -2.0));
+    let c = bilinear_t0(uv + ts * vec2<f32>(2.0, -2.0));
+    let d = bilinear_t0(uv + ts * vec2<f32>(-1.0, -1.0));
+    let e = bilinear_t0(uv + ts * vec2<f32>(1.0, -1.0));
+    let f = bilinear_t0(uv + ts * vec2<f32>(-2.0, 0.0));
+    let g = bilinear_t0(uv);
+    let h = bilinear_t0(uv + ts * vec2<f32>(2.0, 0.0));
+    let i = bilinear_t0(uv + ts * vec2<f32>(-1.0, 1.0));
+    let j = bilinear_t0(uv + ts * vec2<f32>(1.0, 1.0));
+    let k = bilinear_t0(uv + ts * vec2<f32>(-2.0, 2.0));
+    let l = bilinear_t0(uv + ts * vec2<f32>(0.0, 2.0));
+    let m = bilinear_t0(uv + ts * vec2<f32>(2.0, 2.0));
     let v = (d + e + i + j) * 0.125
         + (a + c + k + m) * 0.03125
         + (b + f + h + l) * 0.0625
@@ -143,11 +162,11 @@ fn lt_up(@builtin(global_invocation_id) id: vec3<u32>) {
     if (outside(id)) { return; }
     let uv = dst_uv(id);
     let tc = 1.0 / vec2<f32>(textureDimensions(t0));
-    let tent = (bilinear(t0, uv) * 4.0
-        + (bilinear(t0, uv + vec2<f32>(tc.x, 0.0)) + bilinear(t0, uv - vec2<f32>(tc.x, 0.0))
-            + bilinear(t0, uv + vec2<f32>(0.0, tc.y)) + bilinear(t0, uv - vec2<f32>(0.0, tc.y))) * 2.0
-        + bilinear(t0, uv + tc) + bilinear(t0, uv - tc)
-        + bilinear(t0, uv + vec2<f32>(tc.x, -tc.y)) + bilinear(t0, uv + vec2<f32>(-tc.x, tc.y)))
+    let tent = (bilinear_t0(uv) * 4.0
+        + (bilinear_t0(uv + vec2<f32>(tc.x, 0.0)) + bilinear_t0(uv - vec2<f32>(tc.x, 0.0))
+            + bilinear_t0(uv + vec2<f32>(0.0, tc.y)) + bilinear_t0(uv - vec2<f32>(0.0, tc.y))) * 2.0
+        + bilinear_t0(uv + tc) + bilinear_t0(uv - tc)
+        + bilinear_t0(uv + vec2<f32>(tc.x, -tc.y)) + bilinear_t0(uv + vec2<f32>(-tc.x, tc.y)))
         * (1.0 / 16.0);
     let fine = textureLoad(t1, id.xy, 0);
     let fw = params.fine_weight;
@@ -165,7 +184,7 @@ fn lt_source(@builtin(global_invocation_id) id: vec3<u32>) {
     if (outside(id)) { return; }
     let f = textureLoad(t0, id.xy, 0).rgb;
     let l = plain_luma(f);
-    let surround = plain_luma(bilinear(t1, dst_uv(id)).rgb);
+    let surround = plain_luma(bilinear_t1(dst_uv(id)).rgb);
     let compact = smooth_step(COMPACT_LO, COMPACT_HI, l / max(surround, 1.0e-6));
     let compressed = f / (1.0 + l * FLARE_COMPRESS);
     let weight = 0.05 + 0.95 * compact * compact;
@@ -206,10 +225,10 @@ fn lt_aperture(@builtin(global_invocation_id) id: vec3<u32>) {
 
 fn aperture_level(level: i32, uv: vec2<f32>) -> vec3<f32> {
     switch level {
-        case 1: { return bilinear(t1, uv).rgb; }
-        case 2: { return bilinear(t2, uv).rgb; }
-        case 3: { return bilinear(t3, uv).rgb; }
-        default: { return bilinear(t4, uv).rgb; }
+        case 1: { return bilinear_t1(uv).rgb; }
+        case 2: { return bilinear_t2(uv).rgb; }
+        case 3: { return bilinear_t3(uv).rgb; }
+        default: { return bilinear_t4(uv).rgb; }
     }
 }
 
