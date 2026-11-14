@@ -58,11 +58,64 @@ fn tap_uv(uv: vec2<f32>, size: vec2<u32>) -> Tap {
     return tap_from(uv * vec2<f32>(size) - 0.5, size);
 }
 
-fn tap_sample(t: texture_2d<f32>, tap: Tap) -> vec4<f32> {
-    let a = textureLoad(t, tap.p00, 0);
-    let b = textureLoad(t, vec2<i32>(tap.p11.x, tap.p00.y), 0);
-    let c = textureLoad(t, vec2<i32>(tap.p00.x, tap.p11.y), 0);
-    let d = textureLoad(t, tap.p11, 0);
+// Mali Vulkan drivers (r54p3, Pixel 7-10a) segfault in vkCreateComputePipelines
+// when a texture is passed as a function argument, so each global texture gets
+// its own copy of the sampler. Same math.
+fn tap_sample_t0(tap: Tap) -> vec4<f32> {
+    let a = textureLoad(t0, tap.p00, 0);
+    let b = textureLoad(t0, vec2<i32>(tap.p11.x, tap.p00.y), 0);
+    let c = textureLoad(t0, vec2<i32>(tap.p00.x, tap.p11.y), 0);
+    let d = textureLoad(t0, tap.p11, 0);
+    let top = a + (b - a) * tap.w.x;
+    let bot = c + (d - c) * tap.w.x;
+    return top + (bot - top) * tap.w.y;
+}
+
+fn tap_sample_t1(tap: Tap) -> vec4<f32> {
+    let a = textureLoad(t1, tap.p00, 0);
+    let b = textureLoad(t1, vec2<i32>(tap.p11.x, tap.p00.y), 0);
+    let c = textureLoad(t1, vec2<i32>(tap.p00.x, tap.p11.y), 0);
+    let d = textureLoad(t1, tap.p11, 0);
+    let top = a + (b - a) * tap.w.x;
+    let bot = c + (d - c) * tap.w.x;
+    return top + (bot - top) * tap.w.y;
+}
+
+fn tap_sample_t2(tap: Tap) -> vec4<f32> {
+    let a = textureLoad(t2, tap.p00, 0);
+    let b = textureLoad(t2, vec2<i32>(tap.p11.x, tap.p00.y), 0);
+    let c = textureLoad(t2, vec2<i32>(tap.p00.x, tap.p11.y), 0);
+    let d = textureLoad(t2, tap.p11, 0);
+    let top = a + (b - a) * tap.w.x;
+    let bot = c + (d - c) * tap.w.x;
+    return top + (bot - top) * tap.w.y;
+}
+
+fn tap_sample_t3(tap: Tap) -> vec4<f32> {
+    let a = textureLoad(t3, tap.p00, 0);
+    let b = textureLoad(t3, vec2<i32>(tap.p11.x, tap.p00.y), 0);
+    let c = textureLoad(t3, vec2<i32>(tap.p00.x, tap.p11.y), 0);
+    let d = textureLoad(t3, tap.p11, 0);
+    let top = a + (b - a) * tap.w.x;
+    let bot = c + (d - c) * tap.w.x;
+    return top + (bot - top) * tap.w.y;
+}
+
+fn tap_sample_t4(tap: Tap) -> vec4<f32> {
+    let a = textureLoad(t4, tap.p00, 0);
+    let b = textureLoad(t4, vec2<i32>(tap.p11.x, tap.p00.y), 0);
+    let c = textureLoad(t4, vec2<i32>(tap.p00.x, tap.p11.y), 0);
+    let d = textureLoad(t4, tap.p11, 0);
+    let top = a + (b - a) * tap.w.x;
+    let bot = c + (d - c) * tap.w.x;
+    return top + (bot - top) * tap.w.y;
+}
+
+fn tap_sample_t5(tap: Tap) -> vec4<f32> {
+    let a = textureLoad(t5, tap.p00, 0);
+    let b = textureLoad(t5, vec2<i32>(tap.p11.x, tap.p00.y), 0);
+    let c = textureLoad(t5, vec2<i32>(tap.p00.x, tap.p11.y), 0);
+    let d = textureLoad(t5, tap.p11, 0);
     let top = a + (b - a) * tap.w.x;
     let bot = c + (d - c) * tap.w.x;
     return top + (bot - top) * tap.w.y;

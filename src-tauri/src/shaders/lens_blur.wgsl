@@ -109,7 +109,7 @@ fn lb_guide(@builtin(global_invocation_id) id: vec3<u32>) {
         }
     }
     let uv = (vec2<f32>(id.xy) + 0.5) / vec2<f32>(params.grid.dst);
-    let depth = tap_sample(t1, tap_uv(uv, textureDimensions(t1))).x / 255.0;
+    let depth = tap_sample_t1(tap_uv(uv, textureDimensions(t1))).x / 255.0;
     textureStore(out_f32, id.xy, vec4<f32>(acc / max(count, 1.0), depth, 0.0, 0.0));
 }
 
@@ -151,7 +151,7 @@ fn lb_coeffs(@builtin(global_invocation_id) id: vec3<u32>) {
 fn lb_coc(@builtin(global_invocation_id) id: vec3<u32>) {
     if (outside(id)) { return; }
     let f = (vec2<f32>(id.xy) + 0.5) * params.scale - 0.5;
-    let m = tap_sample(t1, tap_from(f, params.guide_size));
+    let m = tap_sample_t1(tap_from(f, params.guide_size));
     let luma = textureLoad(t0, id.xy, 0).x;
     let d = clamp(clamp(m.x * luma + m.y, m.z, m.w), 0.0, 1.0);
     textureStore(out_r32, id.xy, vec4<f32>(signed_coc(d), 0.0, 0.0, 0.0));
@@ -386,8 +386,8 @@ fn lb_final(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let tap = tap_from((vec2<f32>(id.xy) + 0.5) * params.scale - 0.5, params.small_size);
-    let fs = tap_sample(t2, tap);
-    let ns = tap_sample(t3, tap);
+    let fs = tap_sample_t2(tap);
+    let ns = tap_sample_t3(tap);
     let fa = min(tent(abs(textureLoad(t1, id.xy, 0).x), 0u), fs.w);
     let na = clamp(ns.w, 0.0, 1.0);
     let inv_na = 1.0 - na;
@@ -397,7 +397,7 @@ fn lb_final(@builtin(global_invocation_id) id: vec3<u32>) {
         textureStore(out_f16, id.xy, vec4<f32>(max(base, vec3<f32>(0.0)), 1.0));
         return;
     }
-    let bloom = tap_sample(t4, tap);
+    let bloom = tap_sample_t4(tap);
     let mask = smooth_step(0.0, 1.0, clamp(bloom.w, 0.0, 1.0));
     let veil = params.veil * mask;
     let keep = 1.0 - (0.55 * params.diffusion * mask);

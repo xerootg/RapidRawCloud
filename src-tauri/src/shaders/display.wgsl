@@ -57,7 +57,10 @@ fn vs_main(@builtin(vertex_index) id: u32) -> VertexOutput {
     return out;
 }
 
-fn sample_layer(layer: texture_2d<f32>, uv: vec2<f32>, image_size: vec2<f32>, texture_size: vec2<f32>) -> vec4<f32> {
+// Mali Vulkan drivers (r54p3, Pixel 7-10a) segfault in pipeline creation
+// when a texture is passed as a function argument, so each global texture gets
+// its own copy of the sampler. Same math.
+fn sample_layer_tex(uv: vec2<f32>, image_size: vec2<f32>, texture_size: vec2<f32>) -> vec4<f32> {
     let adjusted_uv = uv * (image_size / texture_size);
     let half_texel = vec2<f32>(0.5, 0.5) / texture_size;
 
@@ -69,10 +72,29 @@ fn sample_layer(layer: texture_2d<f32>, uv: vec2<f32>, image_size: vec2<f32>, te
         let nearest_uv = (texel_coords + vec2<f32>(0.5, 0.5)) / texture_size;
 
         let clamped_nearest = clamp(nearest_uv, min_uv, max_uv);
-        return textureSampleLevel(layer, samp, clamped_nearest, 0.0);
+        return textureSampleLevel(tex, samp, clamped_nearest, 0.0);
     } else {
         let clamped_uv = clamp(adjusted_uv, min_uv, max_uv);
-        return textureSampleLevel(layer, samp, clamped_uv, 0.0);
+        return textureSampleLevel(tex, samp, clamped_uv, 0.0);
+    }
+}
+
+fn sample_layer_original(uv: vec2<f32>, image_size: vec2<f32>, texture_size: vec2<f32>) -> vec4<f32> {
+    let adjusted_uv = uv * (image_size / texture_size);
+    let half_texel = vec2<f32>(0.5, 0.5) / texture_size;
+
+    let min_uv = half_texel;
+    let max_uv = (image_size / texture_size) - half_texel;
+
+    if (transform.pixelated > 0.5) {
+        let texel_coords = floor(adjusted_uv * texture_size);
+        let nearest_uv = (texel_coords + vec2<f32>(0.5, 0.5)) / texture_size;
+
+        let clamped_nearest = clamp(nearest_uv, min_uv, max_uv);
+        return textureSampleLevel(original_tex, samp, clamped_nearest, 0.0);
+    } else {
+        let clamped_uv = clamp(adjusted_uv, min_uv, max_uv);
+        return textureSampleLevel(original_tex, samp, clamped_uv, 0.0);
     }
 }
 
@@ -86,7 +108,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if (is_original) {
-        return sample_layer(original_tex, uv, transform.original_size, transform.original_size);
+        return sample_layer_original(uv, transform.original_size, transform.original_size);
     }
-    return sample_layer(tex, uv, transform.image_size, transform.texture_size);
+    return sample_layer_tex(uv, transform.image_size, transform.texture_size);
 }

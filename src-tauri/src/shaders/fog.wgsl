@@ -88,7 +88,7 @@ fn fog_stats(@builtin(local_invocation_index) li: u32) {
     for (var i = li; i < count; i += STATS_THREADS) {
         let xy = vec2<u32>(i % size.x, i / size.x);
         let tap = tap_uv((vec2<f32>(xy) + 0.5) / vec2<f32>(size), params.depth_size);
-        let weight = clamp((0.3 - tap_sample(t1, tap).x) / 0.3, 0.0, 1.0);
+        let weight = clamp((0.3 - tap_sample_t1(tap).x) / 0.3, 0.0, 1.0);
         let rgb = textureLoad(t0, xy, 0).rgb;
         far += vec4<f32>(rgb * weight, weight);
         mean += rgb;
@@ -137,12 +137,12 @@ fn fog_apply(@builtin(global_invocation_id) id: vec3<u32>) {
     let pixel = textureLoad(t0, id.xy, 0);
     let uv = vec2<f32>((f32(id.x) + 0.5) / size.x, (f32(id.y) + 0.5) / size.y);
     let depth_tap = tap_uv(uv, params.depth_size);
-    let d = clamp(guided(tap_sample(t1, depth_tap), relight_luma(pixel.rgb)), 0.0, 1.0);
+    let d = clamp(guided(tap_sample_t1(depth_tap), relight_luma(pixel.rgb)), 0.0, 1.0);
     let distance = (1.0 / (d + params.near) - params.z_near) / params.z_range;
     let t = clamp((distance - params.start) / (1.0 - params.start), 0.0, 1.0);
 
     let up = 1.0 - to_display(uv).y;
-    let patches = max(1.0 + 1.6 * params.variation * (tap_sample(t2, depth_tap).x * 2.0 - 1.0), 0.0);
+    let patches = max(1.0 + 1.6 * params.variation * (tap_sample_t2(depth_tap).x * 2.0 - 1.0), 0.0);
     let optical = params.density * t * exp(-params.height * up) * patches;
     let fog = clamp(params.amount * (1.0 - exp(-optical)) / params.norm, 0.0, 1.0);
     if (fog <= 0.0) {
@@ -156,10 +156,10 @@ fn fog_apply(@builtin(global_invocation_id) id: vec3<u32>) {
         bitcast<f32>(atomicLoad(&scratch[3])),
     );
     let low_tap = tap_uv(uv, params.low_size);
-    let scattered = fog_rgb + (tap_sample(t3, low_tap).rgb - fog_rgb) * 0.35;
+    let scattered = fog_rgb + (tap_sample_t3(low_tap).rgb - fog_rgb) * 0.35;
     var halo = vec3<f32>(0.0);
     if (params.glow > 0.0) {
-        halo = tap_sample(t4, low_tap).rgb * params.glow;
+        halo = tap_sample_t4(low_tap).rgb * params.glow;
     }
     textureStore(out_f16, id.xy, vec4<f32>(pixel.rgb * (1.0 - fog) + (scattered + halo) * fog, 1.0));
 }
