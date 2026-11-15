@@ -405,7 +405,12 @@ mod imp {
         // Unknown dimensions (an unreadable header, an exotic format) fall
         // through to upstream's own checks rather than blocking the preload
         // on a guess.
-        let Some(pixels) = header_pixel_count(path) else {
+        // rawler asserts on some malformed headers even in a dry run; a
+        // panic here would take the single preloader thread with it (the
+        // real decode runs under upstream's own `catch_unwind`).
+        let probed =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| header_pixel_count(path)));
+        let Some(pixels) = probed.unwrap_or(None) else {
             return true;
         };
         let mut sys = sysinfo::System::new();
