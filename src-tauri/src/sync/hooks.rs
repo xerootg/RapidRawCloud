@@ -370,14 +370,20 @@ mod imp {
         pixels.saturating_mul(GPU_DEVELOP_BYTES_PER_PIXEL) <= available_bytes
     }
 
-    /// Source pixel count from the file header only. Raws go through
-    /// rawler's own file-backed `RawSource` (an mmap: page cache, no anon
-    /// copy — `RawSource::new_from_slice` would `Vec::from` the whole file,
-    /// hundreds of MB for the very files this guard exists for) and a
-    /// dry-run `raw_image`, which parses metadata without decoding pixels.
+    /// Source pixel count from the file header only. Raws are parsed from
+    /// a *lazy* mapping (`read_file_mapped`: no populate, no `WillNeed`)
+    /// so only the pages rawler's metadata parse touches are faulted in.
+    /// At the pinned rawler rev the two safe constructors both pull in the
+    /// whole file — `RawSource::new_from_slice` copies it into a `Vec`,
+    /// `RawSource::new` maps it with `populate()` + `WillNeed` — hundreds
+    /// of MB for the very files this guard exists to reject. The dry-run
+    /// `raw_image` parses metadata without decoding pixels.
     fn header_pixel_count(path: &Path) -> Option<u64> {
         if crate::decode::formats::is_raw_file(path) {
-            let source = rawler::rawsource::RawSource::new(path).ok()?;
+            let mapped = crate::library::file_ops::read_file_mapped(path).ok()?;
+            // SAFETY: `mapped` outlives `source` and `decoder`, which are
+            // the only borrowers and are dropped at the end of this block.
+            let source = unsafe { rawler::rawsource::RawSource::new_from_slice_unchecked(&mapped) };
             let decoder = rawler::get_decoder(&source).ok()?;
             let raw = decoder
                 .raw_image(&source, &rawler::decoders::RawDecodeParams::default(), true)
