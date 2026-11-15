@@ -370,12 +370,36 @@ mod imp {
         pixels.saturating_mul(GPU_DEVELOP_BYTES_PER_PIXEL) <= available_bytes
     }
 
+    /// Source pixel count from the file header only. Raws go through
+    /// rawler's own file-backed `RawSource` (an mmap: page cache, no anon
+    /// copy — `RawSource::new_from_slice` would `Vec::from` the whole file,
+    /// hundreds of MB for the very files this guard exists for) and a
+    /// dry-run `raw_image`, which parses metadata without decoding pixels.
+    fn header_pixel_count(path: &Path) -> Option<u64> {
+        if crate::decode::formats::is_raw_file(path) {
+            let source = rawler::rawsource::RawSource::new(path).ok()?;
+            let decoder = rawler::get_decoder(&source).ok()?;
+            let raw = decoder
+                .raw_image(&source, &rawler::decoders::RawDecodeParams::default(), true)
+                .ok()?;
+            return Some(raw.width as u64 * raw.height as u64);
+        }
+        let (width, height) = image::image_dimensions(path).ok()?;
+        Some(width as u64 * height as u64)
+    }
+
     pub fn preload_fits(path: &Path) -> bool {
-        // Unknown dimensions (a stub, an unreadable header, an exotic
-        // format) fall through to upstream's own checks rather than
-        // blocking the preload on a guess.
-        let is_raw = crate::decode::formats::is_raw_file(path);
-        let Some(pixels) = crate::app::memory_budget::image_pixel_count(path, is_raw) else {
+        // A cloud placeholder (iCloud dataless file, Immich placeholder,
+        // sync stub) must not be touched here: reading it could hydrate it
+        // and block the preload worker. Let upstream's own
+        // `is_cloud_placeholder` guard in `decode_pristine` reject it.
+        if crate::library::file_ops::is_cloud_placeholder(path) {
+            return true;
+        }
+        // Unknown dimensions (an unreadable header, an exotic format) fall
+        // through to upstream's own checks rather than blocking the preload
+        // on a guess.
+        let Some(pixels) = header_pixel_count(path) else {
             return true;
         };
         let mut sys = sysinfo::System::new();
