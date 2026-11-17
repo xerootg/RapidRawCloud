@@ -102,6 +102,7 @@ tauri-plugin-rrcloud = { path = "../tauri-plugin-rrcloud", optional = true }
 # "Pair with cloud" (docs/CLOUD_SETUP.md §6): receives the OIDC/PKCE
 # rapidraw://auth-callback redirect. sync-only, like rrcloud-core.
 tauri-plugin-deep-link = { version = "2", optional = true }
+zstd = "0.13"
 
 [target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
 trash = "5.2.6"

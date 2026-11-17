@@ -35,9 +35,19 @@
 //! |---|---|
 //! | `0..14` | `RapidRawCloud\0` — the null-terminated creator id the DNG spec requires |
 //! | `14` | record version, `1` |
-//! | `15` | flags: bit 0 = `scene_referred` |
-//! | `16..20` | `dng_baseline`, f32 little-endian (EV) |
+//! | `15` | flags: bit 0 = `scene_referred`, bit 1 = explicit zero baseline |
+//! | `16..20` | `dng_baseline`, f32 little-endian (EV); `0` = no tag |
 //! | `20..24` | `highlight_preservation`, f32 little-endian (EV) |
+//!
+//! Upstream distinguishes "no DNG baseline tag" (`None`: a scene-referred
+//! raw gets the user's default baseline) from a tag (`Some(v)`: `v`
+//! replaces that default). On the wire `None` is written as `0.0` with no
+//! extra flag, which is byte-identical to every record written before the
+//! distinction existed, so older app builds keep reading new proxies and
+//! new builds read old ones the way the old code rendered them. Only the
+//! rare tag that is present and exactly `0.0` sets flag bit 1; an older
+//! reader rejects that one record (unknown flag) and falls back to the
+//! proxy's own exposure.
 //!
 //! A proxy without the record (generated before it existed) decodes to
 //! `None`. The record is read back from synced, untrusted bytes, so
@@ -66,6 +76,8 @@ const RECORD_VERSION: u8 = 1;
 /// Creator id + version + flags + two f32s.
 const RECORD_LEN: usize = RECORD_CREATOR.len() + 2 + 4 + 4;
 const FLAG_SCENE_REFERRED: u8 = 0b1;
+/// `dng_baseline` is `Some(0.0)`, not `None` (module docs).
+const FLAG_ZERO_BASELINE: u8 = 0b10;
 /// Upstream clamps highlight preservation to this range
 /// (`HIGHLIGHT_BIAS_MIN..=HIGHLIGHT_BIAS_MAX`), so a record outside it was
 /// not written by this module.
@@ -82,8 +94,9 @@ pub struct AsShotExposure {
     /// The data is scene-referred (not monochrome): upstream adds the
     /// user's baseline-exposure amount only when this is set.
     pub scene_referred: bool,
-    /// DNG `BaselineExposure` + `BaselineExposureOffset` (EV).
-    pub dng_baseline: f32,
+    /// DNG `BaselineExposure` + `BaselineExposureOffset` (EV); `None` when
+    /// the original has neither tag.
+    pub dng_baseline: Option<f32>,
     /// The camera's highlight-preservation bias from the maker notes (EV,
     /// upstream-clamped to `-1..=4`).
     pub highlight_preservation: f32,
@@ -109,12 +122,15 @@ impl AsShotExposure {
         let mut out = Vec::with_capacity(RECORD_LEN);
         out.extend_from_slice(RECORD_CREATOR);
         out.push(RECORD_VERSION);
-        out.push(if self.scene_referred {
-            FLAG_SCENE_REFERRED
-        } else {
-            0
-        });
-        out.extend_from_slice(&self.dng_baseline.to_le_bytes());
+        let mut flags = 0;
+        if self.scene_referred {
+            flags |= FLAG_SCENE_REFERRED;
+        }
+        if self.dng_baseline == Some(0.0) {
+            flags |= FLAG_ZERO_BASELINE;
+        }
+        out.push(flags);
+        out.extend_from_slice(&self.dng_baseline.unwrap_or(0.0).to_le_bytes());
         out.extend_from_slice(&self.highlight_preservation.to_le_bytes());
         out
     }
@@ -130,7 +146,7 @@ impl AsShotExposure {
         let rest = data.strip_prefix(RECORD_CREATOR)?;
         let (&version, rest) = rest.split_first()?;
         let (&flags, rest) = rest.split_first()?;
-        if version != RECORD_VERSION || flags & !FLAG_SCENE_REFERRED != 0 {
+        if version != RECORD_VERSION || flags & !(FLAG_SCENE_REFERRED | FLAG_ZERO_BASELINE) != 0 {
             return None;
         }
         let dng_baseline = f32::from_le_bytes(rest.get(0..4)?.try_into().ok()?);
@@ -142,6 +158,13 @@ impl AsShotExposure {
         {
             return None;
         }
+        let dng_baseline = if dng_baseline != 0.0 {
+            Some(dng_baseline)
+        } else if flags & FLAG_ZERO_BASELINE != 0 {
+            Some(0.0)
+        } else {
+            None
+        };
         Some(AsShotExposure {
             scene_referred: flags & FLAG_SCENE_REFERRED != 0,
             dng_baseline,
@@ -157,7 +180,7 @@ mod tests {
     fn sample() -> AsShotExposure {
         AsShotExposure {
             scene_referred: true,
-            dng_baseline: -0.35,
+            dng_baseline: Some(-0.35),
             highlight_preservation: 0.66,
         }
     }
@@ -168,12 +191,17 @@ mod tests {
             sample(),
             AsShotExposure {
                 scene_referred: false,
-                dng_baseline: 0.0,
+                dng_baseline: None,
                 highlight_preservation: 0.0,
             },
             AsShotExposure {
                 scene_referred: true,
-                dng_baseline: 16.0,
+                dng_baseline: Some(0.0),
+                highlight_preservation: 0.0,
+            },
+            AsShotExposure {
+                scene_referred: true,
+                dng_baseline: Some(16.0),
                 highlight_preservation: 4.0,
             },
         ] {
@@ -182,6 +210,23 @@ mod tests {
             assert!(bytes.starts_with(b"RapidRawCloud\0"));
             assert_eq!(AsShotExposure::decode(&bytes), Some(e));
         }
+    }
+
+    /// Records written before upstream made the baseline optional stored
+    /// "no tag" as `0.0` with no extra flag; they must still mean `None`,
+    /// and a `None` record must stay byte-identical to them so older app
+    /// builds keep reading it.
+    #[test]
+    fn none_baseline_is_wire_compatible_with_v1_records() {
+        let none = AsShotExposure {
+            scene_referred: true,
+            dng_baseline: None,
+            highlight_preservation: 0.66,
+        };
+        let bytes = none.encode();
+        assert_eq!(bytes[RECORD_CREATOR.len() + 1], FLAG_SCENE_REFERRED);
+        assert_eq!(&bytes[16..20], &0.0f32.to_le_bytes());
+        assert_eq!(AsShotExposure::decode(&bytes), Some(none));
     }
 
     /// The record is read from synced bytes: every malformed or foreign
@@ -207,7 +252,7 @@ mod tests {
         version[RECORD_CREATOR.len()] = 2;
         assert_eq!(AsShotExposure::decode(&version), None);
         let mut flags = good.clone();
-        flags[RECORD_CREATOR.len() + 1] = 0b10;
+        flags[RECORD_CREATOR.len() + 1] = 0b100;
         assert_eq!(AsShotExposure::decode(&flags), None);
 
         // Non-finite and out-of-range values.

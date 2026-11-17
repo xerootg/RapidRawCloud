@@ -873,7 +873,7 @@ mod tests {
     fn as_shot_exposure_round_trips_through_the_dng_writer() {
         let exposure = AsShotExposure {
             scene_referred: true,
-            dng_baseline: 0.5,
+            dng_baseline: Some(0.5),
             highlight_preservation: 0.66,
         };
         let dng = synthetic_proxy_dng(&exposure);
@@ -887,7 +887,7 @@ mod tests {
     fn foreign_private_data_or_garbage_yields_no_as_shot_exposure() {
         let exposure = AsShotExposure {
             scene_referred: true,
-            dng_baseline: 0.0,
+            dng_baseline: None,
             highlight_preservation: 1.0,
         };
         let mut dng = synthetic_proxy_dng(&exposure);

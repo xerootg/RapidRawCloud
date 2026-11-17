@@ -1039,12 +1039,16 @@
         "adjust": "Koreguoti",
         "crop": "Kadruoti",
         "export": "Eksportuoti",
+        "filmstrip": "Kadrų juosta",
         "info": "Informacija",
         "inpaint": "Objektų šalinimas",
         "masks": "Kaukės",
         "presets": "Nustatymai",
         "tethering": "Prijungimas"
       }
+    },
+    "toasts": {
+      "embeddedPreview": "RapidRAW nepavyko iškoduoti šio RAW failo, todėl matote ir redaguojate įterptą fotoaparato JPEG peržiūrą. Tikėkitės prastesnės kokybės ir mažesnės redagavimo atsargos nei tikro RAW."
     },
     "toolbar": {
       "history": "Istorija",
@@ -1580,10 +1584,7 @@
       "originalRatio": "Pradinis santykis"
     },
     "thumbnailSize": {
-      "large": "Didelis",
-      "list": "Sąrašas",
-      "medium": "Vidutinis",
-      "small": "Mažas"
+      "list": "Sąrašas"
     },
     "tooltips": {
       "communityPresets": "Bendruomenės nustatymai",
@@ -2344,7 +2345,7 @@
         "baselineExposure": "Bazinė ekspozicija",
         "baselineExposureAmount": "Bazinė reikšmė",
         "baselineExposureAmountDesc": "RAW failams pridedama ekspozicija. „darktable“ naudoja +0.7 EV.",
-        "baselineExposureDesc": "Pašviesina RAW failus fiksuota reikšme plius DNG BaselineExposure žyma, jei ji yra.",
+        "baselineExposureDesc": "Pašviesina RAW failus fiksuota reikšme arba, jei yra, DNG BaselineExposure žymos reikšme.",
         "colorNr": "Bazinis spalvinio triukšmo slopinimas",
         "colorNrDesc": "Taikomas ankstyvoje eigoje chrominiam triukšmui šalinti. Didesnė reikšmė = stipresnis slopinimas.",
         "defaultNonRawTonemapper": "Numatytasis ne RAW tonų atvaizdavimas",
@@ -2517,13 +2518,11 @@
     "bottomBar": {
       "imagesSelected": "Pasirinkta nuotraukų: {{current}} iš {{total}}",
       "tooltips": {
-        "collapseFilmstrip": "Suskleisti juostą",
         "collapseLeft": "Suskleisti kairįjį skydelį",
         "collapseRight": "Suskleisti dešinįjį skydelį",
         "copyPasteSettings": "Kopijuoti ir įklijuoti nustatymus",
         "copySettings": "Kopijuoti nustatymus",
         "customZoom": "Spustelėkite, kad įvestumėte mastelį procentais",
-        "expandFilmstrip": "Išskleisti juostą",
         "expandLeft": "Išskleisti kairįjį skydelį",
         "expandRight": "Išskleisti dešinįjį skydelį",
         "export": "Eksportuoti",

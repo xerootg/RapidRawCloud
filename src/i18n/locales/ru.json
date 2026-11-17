@@ -895,6 +895,7 @@
         "focalLength": "Фокусное расстояние",
         "iso": "ISO",
         "lens": "Объектив",
+        "model": "Модель",
         "shutterSpeed": "Выдержка",
         "title": "Параметры съемки"
       },
@@ -1000,12 +1001,16 @@
         "adjust": "Коррекция",
         "crop": "Обрезка",
         "export": "Экспорт",
+        "filmstrip": "Лента кадров",
         "info": "Инфо",
         "inpaint": "Восстановление",
         "masks": "Маски",
         "presets": "Пресеты",
         "tethering": "Съемка на ПК (Тетеринг)"
       }
+    },
+    "toasts": {
+      "embeddedPreview": "RapidRAW не удалось декодировать этот RAW-файл, поэтому вы видите и редактируете встроенное JPEG-превью камеры. Качество будет ниже, а запас для редактирования меньше, чем у настоящего RAW."
     },
     "toolbar": {
       "history": "История",
@@ -1541,10 +1546,7 @@
       "originalRatio": "Исходный формат"
     },
     "thumbnailSize": {
-      "large": "Большой",
-      "list": "Список",
-      "medium": "Средний",
-      "small": "Маленький"
+      "list": "Список"
     },
     "tooltips": {
       "communityPresets": "Пресеты сообщества",
@@ -2292,7 +2294,7 @@
         "baselineExposure": "Базовая экспозиция",
         "baselineExposureAmount": "Базовая величина",
         "baselineExposureAmountDesc": "Экспозиция, добавляемая к RAW-файлам. В darktable используется +0,7 EV.",
-        "baselineExposureDesc": "Осветляет RAW-файлы на фиксированную величину и добавляет тег DNG BaselineExposure, если он есть.",
+        "baselineExposureDesc": "Осветляет RAW-файлы на фиксированную величину или, если есть тег DNG BaselineExposure, на его значение.",
         "colorNr": "Базовое шумоподавление цвета",
         "colorNrDesc": "Применяет двусторонний пространственный фильтр на раннем этапе обработки для удаления хроматического шума. Больше значение — сильнее эффект.",
         "defaultNonRawTonemapper": "Тон-маппер для не-RAW",
@@ -2465,13 +2467,11 @@
     "bottomBar": {
       "imagesSelected": "Выбрано снимков: {{current}} из {{total}}",
       "tooltips": {
-        "collapseFilmstrip": "Свернуть ленту кадров",
         "collapseLeft": "Свернуть левую панель",
         "collapseRight": "Свернуть правую панель",
         "copyPasteSettings": "Копирование и вставка настроек",
         "copySettings": "Копировать настройки",
         "customZoom": "Нажмите, чтобы ввести произвольный масштаб в процентах",
-        "expandFilmstrip": "Развернуть ленту кадров",
         "expandLeft": "Развернуть левую панель",
         "expandRight": "Развернуть правую панель",
         "export": "Экспорт",
