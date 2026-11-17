@@ -41,6 +41,7 @@ import SettingsPanel from './SettingsPanel';
 
 import LibraryGrid from './library/LibraryGrid';
 import SyncStatusBadge from './sync/SyncStatusBadge';
+import QuickCullButton from '../quickcull/QuickCullButton';
 import { JobsMenu, SearchInput, ViewOptionsDropdown } from './library/LibraryHeader';
 
 interface MainLibraryProps {
@@ -591,6 +592,7 @@ export default function MainLibrary(props: MainLibraryProps) {
               )}
             </div>
             <div className="flex items-center gap-4 shrink-0">
+              <QuickCullButton />
               <SyncStatusBadge />
               <DisplayModeSwitch displayMode={libraryDisplayMode} setDisplayMode={setLibraryDisplayMode} t={t} />
 

@@ -912,6 +912,8 @@ pub fn run() {
             sync::commands::sync_retire_device,
             #[cfg(feature = "sync")]
             sync::commands::sync_verify_library,
+            sync::cull::cull_apply,
+            sync::cull::cull_preview,
             integrations::immich::commands::immich_get_api_key,
             integrations::immich::commands::immich_set_api_key,
             integrations::immich::commands::immich_test_connection,
