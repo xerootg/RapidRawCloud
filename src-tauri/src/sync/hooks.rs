@@ -331,10 +331,101 @@ pub fn sync_exit_flush(app: &tauri::AppHandle) {
     }
 }
 
+/// Whether the background image preloader may decode `path` right now.
+/// Upstream's preloader sizes its cache check from the *current* image,
+/// so a 100 MP neighbour of a 24 MP photo passes the check and its GPU
+/// develop (measured ~52 bytes per pixel transient on Mali) is what
+/// Android's low-memory killer reaps the foreground app for. When sync is
+/// off this is upstream's behaviour: always `true`.
+pub fn preload_fits(path: &Path) -> bool {
+    #[cfg(feature = "sync")]
+    {
+        imp::preload_fits(path)
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = path;
+        true
+    }
+}
+
 #[cfg(feature = "sync")]
 mod imp {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
+
+    /// Peak transient process memory per source pixel while upstream's GPU
+    /// raw develop runs (`Mosaic::develop` + `finish_rgb`: camera buffer,
+    /// denoise/sharpen planes, banded readback and the f32 RGB result).
+    /// Measured on a Pixel 10a (Mali-G715, Vulkan): a 6048x4032 NEF took
+    /// RSS from 756 MB to 2016 MB, about 52 bytes per pixel; rounded up.
+    const GPU_DEVELOP_BYTES_PER_PIXEL: u64 = 56;
+
+    /// Pure budget rule behind [`preload_fits`]: a background develop may
+    /// start only when its measured peak fits in the memory the OS reports
+    /// as available right now. The foreground image is already resident,
+    /// so a preload that would not fit is simply skipped — it is a
+    /// latency optimisation, never a correctness requirement.
+    pub(crate) fn develop_fits(pixels: u64, available_bytes: u64) -> bool {
+        pixels.saturating_mul(GPU_DEVELOP_BYTES_PER_PIXEL) <= available_bytes
+    }
+
+    /// Source pixel count from the file header only. Raws are parsed from
+    /// a *lazy* mapping (`read_file_mapped`: no populate, no `WillNeed`)
+    /// so only the pages rawler's metadata parse touches are faulted in.
+    /// At the pinned rawler rev the two safe constructors both pull in the
+    /// whole file — `RawSource::new_from_slice` copies it into a `Vec`,
+    /// `RawSource::new` maps it with `populate()` + `WillNeed` — hundreds
+    /// of MB for the very files this guard exists to reject. The dry-run
+    /// `raw_image` parses metadata without decoding pixels.
+    fn header_pixel_count(path: &Path) -> Option<u64> {
+        if crate::decode::formats::is_raw_file(path) {
+            let mapped = crate::library::file_ops::read_file_mapped(path).ok()?;
+            // SAFETY: `mapped` outlives `source` and `decoder`, which are
+            // the only borrowers and are dropped at the end of this block.
+            let source = unsafe { rawler::rawsource::RawSource::new_from_slice_unchecked(&mapped) };
+            let decoder = rawler::get_decoder(&source).ok()?;
+            let raw = decoder
+                .raw_image(&source, &rawler::decoders::RawDecodeParams::default(), true)
+                .ok()?;
+            return Some(raw.width as u64 * raw.height as u64);
+        }
+        let (width, height) = image::image_dimensions(path).ok()?;
+        Some(width as u64 * height as u64)
+    }
+
+    pub fn preload_fits(path: &Path) -> bool {
+        // A cloud placeholder (iCloud dataless file, Immich placeholder,
+        // sync stub) must not be touched here: reading it could hydrate it
+        // and block the preload worker. Let upstream's own
+        // `is_cloud_placeholder` guard in `decode_pristine` reject it.
+        if crate::library::file_ops::is_cloud_placeholder(path) {
+            return true;
+        }
+        // Unknown dimensions (an unreadable header, an exotic format) fall
+        // through to upstream's own checks rather than blocking the preload
+        // on a guess.
+        // rawler asserts on some malformed headers even in a dry run; a
+        // panic here would take the single preloader thread with it (the
+        // real decode runs under upstream's own `catch_unwind`).
+        let probed =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| header_pixel_count(path)));
+        let Some(pixels) = probed.unwrap_or(None) else {
+            return true;
+        };
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        let fits = develop_fits(pixels, sys.available_memory());
+        if !fits {
+            log::info!(
+                "preload: skipping '{}' ({} MP) — would not fit in {} MB available",
+                path.display(),
+                pixels / 1_000_000,
+                sys.available_memory() / (1024 * 1024)
+            );
+        }
+        fits
+    }
 
     use crate::metadata::sidecar::ImageMetadata;
     use crate::sync::{WriteOrigin, global_manager};
@@ -602,6 +693,17 @@ mod imp {
             LOCK.get_or_init(|| Mutex::new(()))
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+        }
+
+        /// The measured Pixel 10a case: with ~2 GB reported available, the
+        /// 24 MP foreground NEF fits but the 100 MP 3FR neighbour (whose GPU
+        /// develop peaked past 4 GB RSS and got the app killed) does not.
+        #[test]
+        fn develop_fits_uses_measured_bytes_per_pixel() {
+            let available = 1_992_764u64 * 1024;
+            assert!(super::develop_fits(6048 * 4032, available));
+            assert!(!super::develop_fits(11656 * 8742, available));
+            assert!(!super::develop_fits(u64::MAX, available), "no overflow");
         }
 
         /// A manager configured against an unreachable endpoint with nothing

@@ -350,7 +350,7 @@ impl ImagePreloader {
                 .unwrap_or_else(|e| e.into_inner())
                 .has_room_for(keep)
         };
-        if is_cached() || !has_room() {
+        if is_cached() || !has_room() || !crate::sync::hooks::preload_fits(source_path) {
             return;
         }
         let FlightRole::Leader(_flight) = app_state.decode_flights.begin(path) else {
