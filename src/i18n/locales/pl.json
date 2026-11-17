@@ -895,6 +895,7 @@
         "focalLength": "Ogniskowa",
         "iso": "ISO",
         "lens": "Obiektyw",
+        "model": "Model",
         "shutterSpeed": "Czas otwarcia migawki",
         "title": "Szczegóły aparatu"
       },
@@ -1000,12 +1001,16 @@
         "adjust": "Dopasuj",
         "crop": "Kadruj",
         "export": "Eksportuj",
+        "filmstrip": "Pasek z klatkami",
         "info": "Informacje",
         "inpaint": "Inpaint",
         "masks": "Maski",
         "presets": "Presety",
         "tethering": "Tethering (Połączenie przewodowe)"
       }
+    },
+    "toasts": {
+      "embeddedPreview": "RapidRAW nie mógł zdekodować tego pliku RAW, więc widzisz i edytujesz osadzony podgląd JPEG z aparatu. Spodziewaj się niższej jakości i mniejszego zapasu do edycji niż w prawdziwym pliku RAW."
     },
     "toolbar": {
       "history": "Historia",
@@ -1541,10 +1546,7 @@
       "originalRatio": "Oryginalne proporcje"
     },
     "thumbnailSize": {
-      "large": "Duży",
-      "list": "Lista",
-      "medium": "Średni",
-      "small": "Mały"
+      "list": "Lista"
     },
     "tooltips": {
       "communityPresets": "Presety społeczności",
@@ -2292,7 +2294,7 @@
         "baselineExposure": "Ekspozycja bazowa",
         "baselineExposureAmount": "Wartość bazowa",
         "baselineExposureAmountDesc": "Ekspozycja dodawana do plików RAW. darktable używa +0,7 EV.",
-        "baselineExposureDesc": "Rozjaśnia pliki RAW o stałą wartość oraz uwzględnia znacznik DNG BaselineExposure, jeśli występuje.",
+        "baselineExposureDesc": "Rozjaśnia pliki RAW o stałą wartość lub, jeśli występuje, o wartość znacznika DNG BaselineExposure.",
         "colorNr": "Bazowa redukcja szumu koloru",
         "colorNrDesc": "Stosuje filtr na wczesnym etapie w celu usunięcia szumu koloru (Chroma). Wyższa wartość = Silniejsza redukcja szumów.",
         "defaultNonRawTonemapper": "Domyślne mapowanie tonów (Non-RAW)",
@@ -2465,13 +2467,11 @@
     "bottomBar": {
       "imagesSelected": "Zaznaczono {{current}} z {{total}} obrazów",
       "tooltips": {
-        "collapseFilmstrip": "Zwiń pasek z klatkami",
         "collapseLeft": "Zwiń lewy panel",
         "collapseRight": "Zwiń prawy panel",
         "copyPasteSettings": "Kopiuj i Wklej Ustawienia",
         "copySettings": "Kopiuj Ustawienia",
         "customZoom": "Kliknij, aby wpisać niestandardowy procent przybliżenia",
-        "expandFilmstrip": "Rozwiń pasek z klatkami",
         "expandLeft": "Rozwiń lewy panel",
         "expandRight": "Rozwiń prawy panel",
         "export": "Eksport",

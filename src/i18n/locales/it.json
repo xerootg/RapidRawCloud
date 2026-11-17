@@ -870,6 +870,7 @@
         "focalLength": "Lunghezza Focale",
         "iso": "ISO",
         "lens": "Obiettivo",
+        "model": "Modello",
         "shutterSpeed": "Tempo di Esposizione",
         "title": "Dettagli Fotocamera"
       },
@@ -975,12 +976,16 @@
         "adjust": "Regola",
         "crop": "Ritaglio",
         "export": "Esporta",
+        "filmstrip": "Striscia immagini",
         "info": "Info",
         "inpaint": "Inpainting",
         "masks": "Maschere",
         "presets": "Predefiniti",
         "tethering": "Acquisizione diretta"
       }
+    },
+    "toasts": {
+      "embeddedPreview": "RapidRAW non è riuscito a decodificare questo file RAW, quindi stai vedendo e modificando l'anteprima JPEG incorporata della fotocamera. Aspettati una qualità inferiore e meno margine di modifica rispetto a un vero RAW."
     },
     "toolbar": {
       "history": "Cronologia",
@@ -1508,10 +1513,7 @@
       "originalRatio": "Proporzioni Originali"
     },
     "thumbnailSize": {
-      "large": "Grande",
-      "list": "Elenco",
-      "medium": "Media",
-      "small": "Piccola"
+      "list": "Elenco"
     },
     "tooltips": {
       "communityPresets": "Predefiniti della Community",
@@ -2250,7 +2252,7 @@
         "baselineExposure": "Esposizione di base",
         "baselineExposureAmount": "Valore di base",
         "baselineExposureAmountDesc": "Esposizione aggiunta ai file RAW. darktable usa +0,7 EV.",
-        "baselineExposureDesc": "Schiarisce i file RAW di un valore fisso, più il tag DNG BaselineExposure se presente.",
+        "baselineExposureDesc": "Schiarisce i file RAW di un valore fisso, oppure del valore del tag DNG BaselineExposure se presente.",
         "colorNr": "Riduzione Rumore Cromatico di Base",
         "colorNrDesc": "Applica un filtro bilaterale incrociato all'inizio del processo per rimuovere il rumore cromatico. Valore più alto = Riduzione Rumore (NR) più forte.",
         "defaultNonRawTonemapper": "Tonemapper Predefinito per Non-RAW",
@@ -2423,13 +2425,11 @@
     "bottomBar": {
       "imagesSelected": "{{current}} di {{total}} immagini selezionate",
       "tooltips": {
-        "collapseFilmstrip": "Comprimi Striscia Immagini",
         "collapseLeft": "Riduci pannello sinistro",
         "collapseRight": "Riduci pannello destro",
         "copyPasteSettings": "Copia e Incolla Impostazioni",
         "copySettings": "Copia Impostazioni",
         "customZoom": "Clicca per inserire la percentuale di zoom personalizzata",
-        "expandFilmstrip": "Espandi Striscia Immagini",
         "expandLeft": "Espandi pannello sinistro",
         "expandRight": "Espandi pannello destro",
         "export": "Esporta",

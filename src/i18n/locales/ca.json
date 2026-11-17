@@ -870,6 +870,7 @@
         "focalLength": "Distància focal",
         "iso": "ISO",
         "lens": "Objectiu",
+        "model": "Model",
         "shutterSpeed": "Velocitat d'obturació",
         "title": "Detalls de la càmera"
       },
@@ -975,12 +976,16 @@
         "adjust": "Ajustar",
         "crop": "Retallar",
         "export": "Exportar",
+        "filmstrip": "Tira d'imatges",
         "info": "Informació",
         "inpaint": "Inpainting",
         "masks": "Màscares",
         "presets": "Ajustos preestablerts",
         "tethering": "Captura connectada"
       }
+    },
+    "toasts": {
+      "embeddedPreview": "RapidRAW no ha pogut descodificar aquest fitxer RAW, així que estàs veient i editant la previsualització JPEG incrustada de la càmera. Espera menys qualitat i menys marge d'edició que amb un RAW real."
     },
     "toolbar": {
       "history": "Historial",
@@ -1508,10 +1513,7 @@
       "originalRatio": "Proporció original"
     },
     "thumbnailSize": {
-      "large": "Gran",
-      "list": "Llista",
-      "medium": "Mitjana",
-      "small": "Petita"
+      "list": "Llista"
     },
     "tooltips": {
       "communityPresets": "Ajustos preestablerts de la comunitat",
@@ -2250,7 +2252,7 @@
         "baselineExposure": "Exposició base",
         "baselineExposureAmount": "Quantitat base",
         "baselineExposureAmountDesc": "Exposició afegida als fitxers RAW. darktable utilitza +0,7 EV.",
-        "baselineExposureDesc": "Aclareix els fitxers RAW en una quantitat fixa, més l'etiqueta DNG BaselineExposure si n'hi ha.",
+        "baselineExposureDesc": "Aclareix els fitxers RAW en una quantitat fixa, o en el valor de l'etiqueta DNG BaselineExposure si n'hi ha.",
         "colorNr": "Reducció de soroll de color base",
         "colorNrDesc": "Aplica un filtre bilateral creuat d'hora a la canonada per eliminar el soroll de croma. Valor més alt = Més reducció.",
         "defaultNonRawTonemapper": "Mapejador de tons predeterminat No-RAW",
@@ -2423,13 +2425,11 @@
     "bottomBar": {
       "imagesSelected": "{{current}} de {{total}} imatges seleccionades",
       "tooltips": {
-        "collapseFilmstrip": "Contraure Tira d'imatges",
         "collapseLeft": "Plegar el panell esquerre",
         "collapseRight": "Plegar el panell dret",
         "copyPasteSettings": "Copiar i enganxar ajustaments",
         "copySettings": "Copiar ajustaments",
         "customZoom": "Feu clic per introduir un percentatge de zoom personalitzat",
-        "expandFilmstrip": "Expandir Tira d'imatges",
         "expandLeft": "Desplegar el panell esquerre",
         "expandRight": "Desplegar el panell dret",
         "export": "Exportar",

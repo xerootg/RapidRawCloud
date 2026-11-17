@@ -527,7 +527,7 @@ fn proxy_as_shot_matches_the_original() {
             "{fmt}: proxy-mode as-shot WB drifted: original {ow:?}, proxy {pw:?}"
         );
         eprintln!(
-            "{fmt}: highlight preservation {:+.2} EV, DNG baseline {:+.2} EV, \
+            "{fmt}: highlight preservation {:+.2} EV, DNG baseline {:?} EV, \
              WB {:.1} K / {:+.2} (proxy {:.1} K / {:+.2})",
             o.highlight_preservation,
             o.dng_baseline,

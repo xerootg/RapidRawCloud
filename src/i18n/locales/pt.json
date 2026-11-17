@@ -870,6 +870,7 @@
         "focalLength": "Distância Focal",
         "iso": "ISO",
         "lens": "Lente",
+        "model": "Modelo",
         "shutterSpeed": "Velocidade do Obturador",
         "title": "Detalhes da Câmera"
       },
@@ -975,12 +976,16 @@
         "adjust": "Ajustar",
         "crop": "Cortar",
         "export": "Exportar",
+        "filmstrip": "Tira de Filme",
         "info": "Informações",
         "inpaint": "Preencher",
         "masks": "Máscaras",
         "presets": "Predefinições",
         "tethering": "Captura Conectada (Tethering)"
       }
+    },
+    "toasts": {
+      "embeddedPreview": "O RapidRAW não conseguiu decodificar este arquivo RAW, então você está vendo e editando a pré-visualização JPEG incorporada da câmera. Espere qualidade menor e menos margem de edição do que com um RAW real."
     },
     "toolbar": {
       "history": "Histórico",
@@ -1508,10 +1513,7 @@
       "originalRatio": "Proporção Original"
     },
     "thumbnailSize": {
-      "large": "Grande",
-      "list": "Lista",
-      "medium": "Médio",
-      "small": "Pequeno"
+      "list": "Lista"
     },
     "tooltips": {
       "communityPresets": "Predefinições da Comunidade",
@@ -2250,7 +2252,7 @@
         "baselineExposure": "Exposição base",
         "baselineExposureAmount": "Valor base",
         "baselineExposureAmountDesc": "Exposição adicionada aos arquivos RAW. O darktable usa +0,7 EV.",
-        "baselineExposureDesc": "Clareia os arquivos RAW em um valor fixo, mais a etiqueta DNG BaselineExposure quando presente.",
+        "baselineExposureDesc": "Clareia os arquivos RAW em um valor fixo, ou pelo valor da etiqueta DNG BaselineExposure quando presente.",
         "colorNr": "Redução Base de Ruído de Cor",
         "colorNrDesc": "Aplica um filtro bilateral cruzado no início do pipeline para remover o ruído de croma. Valor mais alto = Redução mais forte.",
         "defaultNonRawTonemapper": "Mapeador de Tons Padrão Não-RAW",
@@ -2423,13 +2425,11 @@
     "bottomBar": {
       "imagesSelected": "{{current}} de {{total}} imagens selecionadas",
       "tooltips": {
-        "collapseFilmstrip": "Recolher Tira de Filme",
         "collapseLeft": "Recolher painel esquerdo",
         "collapseRight": "Recolher painel direito",
         "copyPasteSettings": "Copiar e Colar Configurações",
         "copySettings": "Copiar Configurações",
         "customZoom": "Clique para inserir a porcentagem de zoom personalizada",
-        "expandFilmstrip": "Expandir Tira de Filme",
         "expandLeft": "Expandir painel esquerdo",
         "expandRight": "Expandir painel direito",
         "export": "Exportar",
