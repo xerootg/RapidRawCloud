@@ -117,6 +117,27 @@ impl AsShotExposure {
         }
     }
 
+    /// [`Self::from_original`] from the original's bytes alone, parsing
+    /// metadata only (a dry-run `raw_image`, no pixel decode). `None` when
+    /// rawler cannot read the file.
+    pub fn from_original_bytes(raw_bytes: &[u8]) -> Option<Self> {
+        let source = rawler::rawsource::RawSource::new_from_slice(raw_bytes);
+        let decoder = rawler::get_decoder(&source).ok()?;
+        let raw_image = decoder
+            .raw_image(&source, &rawler::decoders::RawDecodeParams::default(), true)
+            .ok()?;
+        Some(Self::from_original(decoder.as_ref(), raw_bytes, &raw_image))
+    }
+
+    /// A record that means "no DNG baseline tag" on a scene-referred
+    /// original is byte-identical to a record written before upstream made
+    /// the baseline optional for an original whose tag was present and
+    /// exactly `0.0` (module docs). The two render differently, so such a
+    /// record can only be trusted after checking the original.
+    pub fn is_ambiguous_legacy(&self) -> bool {
+        self.scene_referred && self.dng_baseline.is_none()
+    }
+
     /// The `DNGPrivateData` payload for this record (module table).
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(RECORD_LEN);
@@ -170,6 +191,21 @@ impl AsShotExposure {
             dng_baseline,
             highlight_preservation,
         })
+    }
+}
+
+/// Whether a stored proxy's exposure record must be regenerated, given
+/// the record it carries (`None`: no valid record) and, only consulted for
+/// an [ambiguous](AsShotExposure::is_ambiguous_legacy) record, the
+/// original's own exposure (`None`: unknown, keep the record).
+pub fn record_is_stale(
+    record: Option<AsShotExposure>,
+    original: impl FnOnce() -> Option<AsShotExposure>,
+) -> bool {
+    match record {
+        None => true,
+        Some(r) if r.is_ambiguous_legacy() => original().is_some_and(|o| o != r),
+        Some(_) => false,
     }
 }
 
@@ -227,6 +263,38 @@ mod tests {
         assert_eq!(bytes[RECORD_CREATOR.len() + 1], FLAG_SCENE_REFERRED);
         assert_eq!(&bytes[16..20], &0.0f32.to_le_bytes());
         assert_eq!(AsShotExposure::decode(&bytes), Some(none));
+    }
+
+    /// A legacy record of a DNG whose `BaselineExposure` is present and
+    /// exactly zero reads back as "no tag", which gives a scene-referred
+    /// proxy the user's default baseline while the original renders at
+    /// 0 EV. The refresh check must catch exactly that disagreement, and
+    /// only consult the original for the ambiguous kind of record.
+    #[test]
+    fn legacy_zero_baseline_record_is_refreshed_from_the_original() {
+        let legacy = AsShotExposure::decode(
+            &AsShotExposure {
+                scene_referred: true,
+                dng_baseline: None,
+                highlight_preservation: 0.0,
+            }
+            .encode(),
+        );
+        let original = AsShotExposure {
+            scene_referred: true,
+            dng_baseline: Some(0.0),
+            highlight_preservation: 0.0,
+        };
+        assert!(record_is_stale(legacy, || Some(original)));
+        // The same record for an original without the tag is correct.
+        assert!(!record_is_stale(legacy, || legacy));
+        // Unknown original: keep the record rather than churn.
+        assert!(!record_is_stale(legacy, || None));
+        // No record at all: always refresh.
+        assert!(record_is_stale(None, || unreachable!()));
+        // An unambiguous record never reads the original.
+        assert!(!record_is_stale(Some(original), || unreachable!()));
+        assert!(!record_is_stale(Some(sample()), || unreachable!()));
     }
 
     /// The record is read from synced bytes: every malformed or foreign

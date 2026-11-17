@@ -2619,7 +2619,7 @@ mod imp {
 
         /// [`Self::generate_and_store_proxy`]'s body. `refresh_stale` turns it
         /// into [`Self::refresh_stale_proxy`]: act only on an existing proxy
-        /// without the as-shot record, and replace it in place.
+        /// whose as-shot record is missing or stale, and replace it in place.
         fn store_proxy(&self, image_path: &Path, refresh_stale: bool) -> Result<(), SyncError> {
             let rk = relkey(image_path, &self.sync_root).map_err(se)?;
             let Some(record) = self.db.get_item(&rk).map_err(se)? else {
@@ -2644,10 +2644,30 @@ mod imp {
             ));
             if dng_path.is_file() {
                 // Already generated — nothing to do, unless this is a refresh
-                // and the proxy predates the as-shot record.
+                // and the proxy's as-shot record is missing, or is the
+                // ambiguous pre-v1.7.0 kind and disagrees with the original
+                // (`rrcloud_core::as_shot::record_is_stale`). Only a DNG
+                // original can carry a `BaselineExposure` tag, so only those
+                // are re-read here.
+                let is_dng = image_path
+                    .extension()
+                    .is_some_and(|e| e.eq_ignore_ascii_case("dng"));
                 let stale = refresh_stale
-                    && std::fs::read(&dng_path)
-                        .is_ok_and(|b| rrcloud_core::proxy::read_as_shot_exposure(&b).is_none());
+                    && std::fs::read(&dng_path).is_ok_and(|b| {
+                        rrcloud_core::as_shot::record_is_stale(
+                            rrcloud_core::proxy::read_as_shot_exposure(&b),
+                            || {
+                                is_dng
+                                    .then(|| std::fs::read(image_path).ok())
+                                    .flatten()
+                                    .and_then(|o| {
+                                        rrcloud_core::as_shot::AsShotExposure::from_original_bytes(
+                                            &o,
+                                        )
+                                    })
+                            },
+                        )
+                    });
                 if !stale {
                     return Ok(());
                 }
