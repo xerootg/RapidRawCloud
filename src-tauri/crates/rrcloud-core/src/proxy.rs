@@ -203,7 +203,34 @@ pub fn generate_proxy(raw_bytes: &[u8]) -> Result<ProxyOutput, ProxyError> {
 ///
 /// The convenience `rgb_image_u16` is **not** used (it hard-codes
 /// `wb_coeffs [1,1,1,1]` and a fresh `Camera`).
+///
+/// A decoder panic is returned as [`ProxyError::Decode`]: rawler asserts on
+/// some malformed files instead of returning an error (a Plustek film-scan
+/// DNG whose `BlackLevel` count does not match its samples per pixel
+/// crash-looped the worker for 13 days at rawler 934af4b). Both the worker
+/// and the app treat a proxy error as "adopt without a preview", so one bad
+/// file can never take the process down.
 pub fn generate_proxy_with(
+    raw_bytes: &[u8],
+    params: &ProxyParams,
+) -> Result<ProxyOutput, ProxyError> {
+    panic_as_decode_error(|| generate_proxy_unguarded(raw_bytes, params))
+}
+
+/// Runs `f`, turning a panic into [`ProxyError::Decode`] carrying the panic
+/// message.
+fn panic_as_decode_error<T>(f: impl FnOnce() -> Result<T, ProxyError>) -> Result<T, ProxyError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|payload| {
+        let message = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        Err(ProxyError::Decode(format!("decoder panicked: {message}")))
+    })
+}
+
+fn generate_proxy_unguarded(
     raw_bytes: &[u8],
     params: &ProxyParams,
 ) -> Result<ProxyOutput, ProxyError> {
@@ -811,6 +838,19 @@ pub fn read_as_shot_exposure(dng_bytes: &[u8]) -> Option<AsShotExposure> {
 
 #[cfg(test)]
 mod tests {
+    /// A decoder that asserts instead of returning an error must surface as
+    /// a proxy error, not unwind into the worker's main loop.
+    #[test]
+    fn decoder_panic_becomes_a_decode_error() {
+        let out: Result<(), ProxyError> =
+            panic_as_decode_error(|| panic!("assertion `left == right` failed"));
+        match out {
+            Err(ProxyError::Decode(m)) => assert!(m.contains("decoder panicked"), "{m}"),
+            other => panic!("expected a decode error, got {other:?}"),
+        }
+        assert!(panic_as_decode_error(|| Ok::<_, ProxyError>(7)).is_ok());
+    }
+
     use super::*;
 
     #[test]

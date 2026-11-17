@@ -1303,6 +1303,7 @@ pub fn get_or_decode_pristine(
             return Ok(hit);
         }
 
+        crate::sync::hooks::ensure_fits_in_memory(source_path)?;
         let (image, exif) = decode_pristine(source_path, &path_str, settings, cancel_token)?;
         return Ok(cache_pristine(state, path_str, fingerprint, image, exif));
     }
