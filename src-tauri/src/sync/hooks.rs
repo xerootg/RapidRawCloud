@@ -349,6 +349,26 @@ pub fn preload_fits(path: &Path) -> bool {
     }
 }
 
+/// Refuses to open `path` when its raw develop cannot fit in the memory
+/// the OS reports as available, with an error the editor shows instead of
+/// the app being killed. Upstream develops every raw on the GPU at full
+/// size (~52 bytes per source pixel transient on Mali), so a 100 MP
+/// Hasselblad 3FR needs about 6 GB and an 8 GB phone's low-memory killer
+/// reaps the foreground app mid-develop. `Ok` when the size is unknown, so
+/// an unreadable header still reaches upstream's own decode errors. When
+/// sync is off this is upstream's behaviour: always `Ok`.
+pub fn ensure_fits_in_memory(path: &Path) -> Result<(), String> {
+    #[cfg(feature = "sync")]
+    {
+        imp::ensure_fits_in_memory(path)
+    }
+    #[cfg(not(feature = "sync"))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
 #[cfg(feature = "sync")]
 mod imp {
     use std::path::{Path, PathBuf};
@@ -394,37 +414,64 @@ mod imp {
         Some(width as u64 * height as u64)
     }
 
-    pub fn preload_fits(path: &Path) -> bool {
+    /// `Some((pixels, available_bytes))` when developing `path` would not
+    /// fit in the memory available right now; `None` when it fits or its
+    /// size is unknown.
+    fn develop_shortfall(path: &Path) -> Option<(u64, u64)> {
         // A cloud placeholder (iCloud dataless file, Immich placeholder,
         // sync stub) must not be touched here: reading it could hydrate it
-        // and block the preload worker. Let upstream's own
-        // `is_cloud_placeholder` guard in `decode_pristine` reject it.
+        // and block the caller. Upstream's own `is_cloud_placeholder` guard
+        // in `decode_pristine` handles it.
         if crate::library::file_ops::is_cloud_placeholder(path) {
-            return true;
+            return None;
         }
         // Unknown dimensions (an unreadable header, an exotic format) fall
-        // through to upstream's own checks rather than blocking the preload
-        // on a guess.
+        // through to upstream's own checks rather than blocking on a guess.
         // rawler asserts on some malformed headers even in a dry run; a
-        // panic here would take the single preloader thread with it (the
-        // real decode runs under upstream's own `catch_unwind`).
+        // panic here would take the calling thread with it (the real decode
+        // runs under upstream's own `catch_unwind`).
         let probed =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| header_pixel_count(path)));
-        let Some(pixels) = probed.unwrap_or(None) else {
-            return true;
-        };
+        let pixels = probed.unwrap_or(None)?;
         let mut sys = sysinfo::System::new();
         sys.refresh_memory();
-        let fits = develop_fits(pixels, sys.available_memory());
-        if !fits {
-            log::info!(
-                "preload: skipping '{}' ({} MP) — would not fit in {} MB available",
-                path.display(),
-                pixels / 1_000_000,
-                sys.available_memory() / (1024 * 1024)
-            );
-        }
-        fits
+        let available = sys.available_memory();
+        (!develop_fits(pixels, available)).then_some((pixels, available))
+    }
+
+    pub fn preload_fits(path: &Path) -> bool {
+        let Some((pixels, available)) = develop_shortfall(path) else {
+            return true;
+        };
+        log::info!(
+            "preload: skipping '{}' ({} MP) — would not fit in {} MB available",
+            path.display(),
+            pixels / 1_000_000,
+            available / (1024 * 1024)
+        );
+        false
+    }
+
+    pub fn ensure_fits_in_memory(path: &Path) -> Result<(), String> {
+        let Some((pixels, available)) = develop_shortfall(path) else {
+            return Ok(());
+        };
+        let message = too_large_message(pixels, available);
+        log::warn!("load: refusing '{}': {message}", path.display());
+        Err(message)
+    }
+
+    /// The editor-facing refusal, in whole GB (rounded up for the need,
+    /// down for what is free, so the two never read as equal).
+    pub(crate) fn too_large_message(pixels: u64, available_bytes: u64) -> String {
+        const GB: u64 = 1024 * 1024 * 1024;
+        let needed = pixels.saturating_mul(GPU_DEVELOP_BYTES_PER_PIXEL);
+        format!(
+            "This {} MP image is too large to open on this device right now: it needs about {} GB of memory and {} GB is free.",
+            pixels / 1_000_000,
+            needed.div_ceil(GB),
+            available_bytes / GB
+        )
     }
 
     use crate::metadata::sidecar::ImageMetadata;
@@ -704,6 +751,16 @@ mod imp {
             assert!(super::develop_fits(6048 * 4032, available));
             assert!(!super::develop_fits(11656 * 8742, available));
             assert!(!super::develop_fits(u64::MAX, available), "no overflow");
+        }
+
+        /// The refusal shown for the 105 MP X2D 3FR on the Pixel 10a.
+        #[test]
+        fn too_large_message_names_the_need_and_the_free_memory() {
+            let msg = super::too_large_message(11656 * 8742, 1_992_764 * 1024);
+            assert_eq!(
+                msg,
+                "This 101 MP image is too large to open on this device right now: it needs about 6 GB of memory and 1 GB is free."
+            );
         }
 
         /// A manager configured against an unreachable endpoint with nothing
