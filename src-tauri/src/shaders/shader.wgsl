@@ -1308,7 +1308,7 @@ fn apply_sharpen(
 
     let l = sqrt(max(get_luma(color), 0.0));
     let l1 = sqrt(max(get_luma(b1_lin), 0.0));
-    let band = sample_gf_tex(gf_coeffs_texture, abs_coord).zw;
+    let band = sample_gf_tex_coeffs(abs_coord).zw;
     let wide = band.x * min(l, SH_WIDE_SPAN * band.y);
 
     let max_idx = vec2<i32>(textureDimensions(input_texture)) - vec2<i32>(1);
