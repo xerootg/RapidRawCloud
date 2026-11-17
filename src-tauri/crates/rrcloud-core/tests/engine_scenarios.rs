@@ -2847,3 +2847,52 @@ async fn s25_resurrect_original_readvertises_the_published_bytes_content_id() {
         "the published bytes at the key are O0, matching the advertised content id"
     );
 }
+
+// ===========================================================================
+// S-flag — a pick/reject-only edit syncs (culling: Reject = archive)
+// ===========================================================================
+
+/// Regression: `flag` was outside the §2.5 projection, so setting Reject
+/// (the Quick Cull "archive") changed no `sem_hash`, was reported
+/// `Unchanged`, never uploaded, and never reached a second device. Now a
+/// flag-only edit marks dirty, publishes, and lands byte-identical on B;
+/// clearing it does the same.
+#[tokio::test]
+async fn s_flag_only_edit_publishes_and_applies_on_a_second_device() {
+    let Some(g) = garage::shared() else { return };
+    let bucket = g.create_unique_bucket("s-flag");
+    let a = device(g, &bucket, DEV_A);
+    let mut b = device(g, &bucket, DEV_B);
+    let image = rel("p/IMG_0099.NEF");
+    let sidecar_rel = sidecar_item_relkey(&image).expect("sidecar item");
+    let (_orig, base) = seed_photo(&image, &a, &mut [&mut b]).await;
+
+    let with_flag = |flag: Option<&str>| {
+        let mut v: serde_json::Value = serde_json::from_slice(&base).expect("base parses");
+        match flag {
+            Some(f) => v["flag"] = serde_json::json!(f),
+            None => {
+                v.as_object_mut().expect("object").remove("flag");
+            }
+        }
+        serde_json::to_vec(&v).expect("encodes")
+    };
+
+    for (flag, step) in [(Some("reject"), "reject"), (None, "unflag")] {
+        let doc = with_flag(flag);
+        assert_eq!(
+            a.write_and_notify(&image, Kind::Sidecar, &doc),
+            ChangeOutcome::MarkedDirty,
+            "{step}: a flag-only edit must mark the sidecar dirty"
+        );
+        a.sync_up().await;
+        b.poll_apply().await;
+        b.pump_down().await;
+        assert_eq!(b.file(&sidecar_rel), doc, "{step}: B mirrors A's sidecar");
+        assert_eq!(
+            b.item(&sidecar_rel).sem_hash,
+            a.item(&sidecar_rel).sem_hash,
+            "{step}: both devices agree on the head"
+        );
+    }
+}

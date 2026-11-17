@@ -6,7 +6,7 @@
 //! would upload on every such rewrite; instead, change detection hashes a
 //! **canonical projection** of the document:
 //!
-//! `sem_hash = blake3(canonical_json({rating, tags: sorted, adjustments'}))`
+//! `sem_hash = blake3(canonical_json({rating, flag, tags: sorted, adjustments'}))`
 //!
 //! where `adjustments'` is `adjustments` with `lutPath` removed (LUT files
 //! are not synced, §1.2) and `null` normalized, and the `exif` and `version`
@@ -188,7 +188,7 @@ fn write_json_string(s: &str, out: &mut String) {
 
 /// Computes the semantic hash of a sidecar document (§2.5).
 ///
-/// Parses `sidecar_json_bytes`, projects `{rating, tags: sorted,
+/// Parses `sidecar_json_bytes`, projects `{rating, flag, tags: sorted,
 /// adjustments'}` (where `adjustments'` strips `lutPath` and normalizes
 /// `null`; `exif` and `version` are excluded), canonicalizes, and hashes
 /// with blake3.
@@ -217,7 +217,7 @@ pub fn sem_hash(sidecar_json_bytes: &[u8]) -> Result<SemHash, SemHashError> {
 }
 
 /// The **canonical semantic document** of a sidecar (§2.5): the
-/// `{rating, tags: sorted, adjustments'}` projection serialized as
+/// `{rating, flag, tags: sorted, adjustments'}` projection serialized as
 /// [`canonical_json`] — exactly the bytes [`sem_hash`] hashes, so
 /// `sem_hash(semantic_document(x)) == sem_hash(x)` and the projection is
 /// idempotent (`semantic_document(semantic_document(x)) ==
@@ -244,6 +244,21 @@ pub fn semantic_document(sidecar_json_bytes: &[u8]) -> Result<String, SemHashErr
     if let Some(rating) = root.get("rating") {
         if !rating.is_null() {
             projection.insert("rating".to_string(), rating.clone());
+        }
+    }
+
+    // The pick/reject flag is user intent (culling: Reject is "archive"),
+    // so it is content. It was missing from the original §2.5 projection,
+    // which meant a flag-only edit never marked the sidecar dirty and a
+    // remote flag change was never applied. Projected only when it holds
+    // one of the two values upstream's lenient `ImageFlag` deserializer
+    // accepts (`"pick"`/`"reject"`): anything else reads back as no flag
+    // in the app, so it must hash as no flag here too. Absent → no key, so
+    // every pre-existing unflagged sidecar keeps its exact hash (no
+    // re-upload storm on upgrade).
+    if let Some(Value::String(flag)) = root.get("flag") {
+        if flag == "pick" || flag == "reject" {
+            projection.insert("flag".to_string(), Value::String(flag.clone()));
         }
     }
 

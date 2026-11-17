@@ -661,3 +661,62 @@ fn semantic_document_is_idempotent_and_sem_stable() {
     assert!(semantic_document(b"not json").is_err());
     assert!(semantic_document(b"[1,2]").is_err());
 }
+
+// ---------------------------------------------------------------------------
+// The pick/reject flag is content (culling: Reject = archive)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unflagged_documents_keep_their_pre_flag_projection() {
+    // Upgrade safety: adding `flag` to the projection must not change the
+    // hash of any existing sidecar that has no flag, or every device would
+    // re-upload its whole library. Pinned byte-exactly.
+    use rrcloud_core::semhash::semantic_document;
+    let doc = br#"{"version":1,"rating":3,"tags":["b","a"],"adjustments":{"exposure":0.5}}"#;
+    assert_eq!(
+        semantic_document(doc).expect("projects"),
+        r#"{"adjustments":{"exposure":0.5},"rating":3,"tags":["a","b"]}"#
+    );
+}
+
+#[test]
+fn flag_change_alone_changes_hash() {
+    let base = parse(FULL);
+    let h0 = hash_value(&base);
+    let mut reject = base.clone();
+    reject["flag"] = json!("reject");
+    let mut pick = base;
+    pick["flag"] = json!("pick");
+    assert_ne!(
+        h0,
+        hash_value(&reject),
+        "reject must mark the sidecar dirty"
+    );
+    assert_ne!(h0, hash_value(&pick), "pick must mark the sidecar dirty");
+    assert_ne!(hash_value(&reject), hash_value(&pick));
+}
+
+#[test]
+fn unknown_or_null_flag_hashes_as_no_flag() {
+    // Upstream's `ImageFlag` deserializer reads any invalid value back as
+    // no flag, so the hash must agree or a junk value would be a phantom
+    // edit.
+    let base = parse(FULL);
+    let h0 = hash_value(&base);
+    for junk in [json!(null), json!("maybe"), json!(1), json!({"x": 1})] {
+        let mut v = base.clone();
+        v["flag"] = junk.clone();
+        assert_eq!(h0, hash_value(&v), "flag {junk} must hash as absent");
+    }
+}
+
+#[test]
+fn flag_survives_the_semantic_document_round_trip() {
+    // The §2.6 loser virtual copy materializes the semantic document, so a
+    // rejected loser must stay rejected.
+    use rrcloud_core::semhash::semantic_document;
+    let doc = br#"{"rating":2,"flag":"reject","exif":{"a":"b"}}"#;
+    let canonical = semantic_document(doc).expect("projects");
+    assert_eq!(canonical, r#"{"flag":"reject","rating":2}"#);
+    assert_eq!(semantic_document(canonical.as_bytes()).unwrap(), canonical);
+}

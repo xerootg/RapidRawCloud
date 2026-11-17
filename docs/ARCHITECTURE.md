@@ -131,7 +131,7 @@ Part size 16 MiB (≥ AWS/B2/R2 5 MiB minimum; a 60 MB RAW is 4 parts). Concurre
 
 The sidecar is rewritten by EXIF caching, auto-heal, and XMP import *without* user intent (research report §1.1 write-site table). Therefore:
 
-`sem_hash = blake3(canonical_json({rating, tags: sorted, adjustments'}))` where `adjustments'` = adjustments with `lutPath` removed and `Null` normalized; the `exif` field and `version` are **excluded**. Canonical JSON = serde_json with sorted keys (serialize via `BTreeMap` re-parse).
+`sem_hash = blake3(canonical_json({rating, flag, tags: sorted, adjustments'}))` where `adjustments'` = adjustments with `lutPath` removed and `Null` normalized; the `exif` field and `version` are **excluded**. `flag` (pick/reject) is projected only when it is `"pick"` or `"reject"` (any other value reads back as no flag in the app); an absent flag adds no key, so unflagged sidecars hash exactly as before the flag joined the projection. Before that fix a flag-only edit (e.g. a Quick Cull reject) never marked the sidecar dirty and never synced. Canonical JSON = serde_json with sorted keys (serialize via `BTreeMap` re-parse).
 
 The save chokepoint (§3.4) computes `sem_hash` on every write; only a changed `sem_hash` marks `dirty`. EXIF-cache/auto-heal rewrites change file bytes but not `sem_hash` → no upload, no version bump, no churn. The same test is applied to *downloaded* sidecars before overwriting local state.
 
