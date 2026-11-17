@@ -20,6 +20,7 @@ import TitleBar from './window/TitleBar';
 import FolderTree from './components/panel/right/FolderTree';
 import SettingsPanel from './components/panel/SettingsPanel';
 import SyncConflictToast from './components/panel/sync/SyncConflictToast';
+import QuickCullOverlay from './components/quickcull/QuickCullOverlay';
 import ExportPanel from './components/panel/right/ExportPanel';
 import GlobalTooltip from './components/ui/GlobalTooltip';
 import AppModals from './components/modals/AppModals';
@@ -1098,6 +1099,7 @@ function App() {
         />
       </div>
       <SyncConflictToast />
+      <QuickCullOverlay />
     </>
   );
 }
