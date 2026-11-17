@@ -453,6 +453,13 @@ mod imp {
     }
 
     pub fn ensure_fits_in_memory(path: &Path) -> Result<(), String> {
+        // The budget is the measured GPU *raw* develop; other formats are
+        // decoded without it, so the refusal would be wrong for them. (The
+        // preload skip keeps the conservative rule for every format: a
+        // skipped preload costs nothing.)
+        if !crate::decode::formats::is_raw_file(path) {
+            return Ok(());
+        }
         let Some((pixels, available)) = develop_shortfall(path) else {
             return Ok(());
         };
